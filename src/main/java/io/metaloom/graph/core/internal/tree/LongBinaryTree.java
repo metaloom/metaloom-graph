@@ -71,13 +71,11 @@ public class LongBinaryTree {
 		public void setLeft(Node node) {
 			NODE_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("leftChildOffset"))
 				.set(segment, 0, node.segment);
-			// segment.set(ValueLayout.ADDRESS, 16, node.segment);
 		}
 
 		public void setRight(Node node) {
 			NODE_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("rightChildOffset"))
 				.set(segment, 0, node.segment);
-			// segment.set(ValueLayout.ADDRESS, 24, node.segment);
 		}
 	}
 
@@ -110,21 +108,28 @@ public class LongBinaryTree {
 		return current;
 	}
 
-	// Method to search for a key
+	/**
+	 * Recursively search the given key.
+	 * 
+	 * @param key
+	 * @return
+	 */
 	public Long search(long key) {
 		return searchRecursive(root, key);
 	}
 
-	// Recursive helper method for search
 	private Long searchRecursive(Node current, long key) {
+		// The key was not found
 		if (current == null) {
-			return null; // Key not found
+			return null;
 		}
 
+		// Key located - return the value
 		if (key == current.getKey()) {
-			return current.getValue(); // Key found, return its value
+			return current.getValue();
 		}
 
+		// Continue the recursion
 		if (key < current.getKey()) {
 			return searchRecursive(current.getLeft(), key);
 		} else {

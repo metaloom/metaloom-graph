@@ -4,6 +4,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.lang.invoke.VarHandle;
 import java.nio.charset.StandardCharsets;
 
 import org.junit.jupiter.api.Test;
@@ -13,6 +14,8 @@ public class MemoryAPITest {
 	public static final MemoryLayout LAYOUT = MemoryLayout.structLayout(
 		MemoryLayout.sequenceLayout(256, ValueLayout.JAVA_CHAR.withName("key")),
 		MemoryLayout.sequenceLayout(256, ValueLayout.JAVA_CHAR.withName("value")));
+
+
 
 	@Test
 	public void testAPI() {

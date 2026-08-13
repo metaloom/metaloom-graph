@@ -40,7 +40,7 @@ public class FFMLibraryTest {
 
 		// Get a pointer to an int value
 		MemorySegment pointer = (MemorySegment) createIntPointer.invokeExact(42);
-		pointer=pointer.reinterpret(ValueLayout.JAVA_INT.byteSize());
+		pointer = pointer.reinterpret(ValueLayout.JAVA_INT.byteSize());
 
 		// Access the value at the pointer
 		int value = pointer.get(ValueLayout.JAVA_INT, 0);
