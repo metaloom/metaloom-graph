@@ -1,0 +1,283 @@
+# Property and Attribute Storage
+
+How attributes are stored so that reading all properties of an element costs one read, and so that
+the same key string is not written a million times.
+
+The PoC stores every property as an independent `(id, keyLen, key, valueLen, value)` record with the
+key and value as raw UTF-8, and gives every element a 1024-byte array of property offsets. That is
+three separate problems: no interning, no typing, and a per-element pointer array that dwarfs the
+data ([CURRENT_STATE.md §2.5](CURRENT_STATE.md#25-space-cost)).
+
+---
+
+## 1. Model
+
+| Concept | Storage |
+|---------|---------|
+| Property **key** (`"name"`, `"createdAt"`) | Interned in the key dictionary, referenced as a `u16`/`u24` `key_id` |
+| Element **label** / relationship **type** | Interned in the label dictionary, referenced as `label_id` / `type_id` |
+| Property **value** | Typed; small values inline, large values in the blob store |
+| An element's **whole property set** | One contiguous **property block**, referenced by a single `prop_block_id` |
+
+The unit of read and write is the **property block**, not the individual property. Elements
+overwhelmingly want all their properties at once, and rewriting a small block is cheaper than
+maintaining per-property records.
+
+---
+
+## 2. Property Block
+
+A property block is a variable-length structure stored in `PROP` segments, allocated in units of the
+32-byte **property cell**. A block of `n` cells occupies `n` consecutive cells; its id addresses the
+first cell.
+
+```
+offset size field
+0      2    cell_count          total cells occupied
+2      2    entry_count
+4      2    used_bytes          payload bytes following the header
+6      2    gen                 low 12 bits must match the id
+8      8    owner_id            back-pointer to the node/rel (compaction and repair)
+16     N    entries             sorted ascending by key_id
+```
+
+Liveness is tracked by the free-slot bitmap rather than a flag in the block, so the header is 16
+bytes with no flags field; flags will come from the spare bits of `cell_count` if ever needed.
+
+Each entry:
+
+```
+ 0   3 bytes   key_id            (16.7M distinct keys)
+ 3   1 byte    type_tag          see §4
+ 4   n bytes   value payload     length implied by type_tag, or a leading varint
+```
+
+Entries are **sorted by `key_id`**, so `get(key)` is a binary search inside a block that is already
+in cache — no hashing, no probing, no allocation.
+
+### 2.1 Sizing
+
+A node with `name = "Wes Anderson"` and `age = 42`:
+
+```
+header                16 B
+name  entry: 3 + 1 + 1 + 12 = 17 B   (SHORT_STRING, 1-byte length)
+age   entry: 3 + 1 + 1      =  5 B   (INT_1, value fits a byte)
+                              ----
+                              38 B  ->  2 cells = 64 B
+```
+
+Against the PoC: 1080 bytes of node record plus two property records of ~32 bytes each = ~1144
+bytes, versus 64 (node) + 64 (property block) = **128 bytes**.
+
+### 2.2 Update
+
+Property blocks are rewritten wholesale:
+
+1. Decode the current block (or start empty).
+2. Apply the change in memory.
+3. If the new size fits the same cell count, write in place under the page latch.
+4. Otherwise allocate a new block, write it, point the element's `prop_block_id` at it, free the old
+   block. Under MVCC the old block is retained until no snapshot needs it — see
+   [TRANSACTIONS.md §5](TRANSACTIONS.md#5-undo-segments-and-version-chains).
+
+Rewriting looks wasteful until you count: a typical block is 1 to 4 cells, so a rewrite is 32 to 128
+bytes, which is less than the cost of the metadata that per-property mutability would require.
+
+---
+
+## 3. Dictionaries
+
+Two dictionaries, both stored as `INDEX`-kind B+trees plus a dense array for the reverse mapping:
+
+| Dictionary | Maps | Id width | Cardinality |
+|------------|------|----------|-------------|
+| `keys.dict` | property key string <-> `key_id` | 24 bit | 16.7M |
+| `labels.dict` | label / relationship type string <-> `label_id` | 32 bit for labels, 14 bit for edge types in packed edges | see below |
+
+Relationship types are constrained to **14 bits (16,384)** by the packed-edge layout
+([RELATIONSHIP_STORAGE.md §3](RELATIONSHIP_STORAGE.md#3-the-packed-edge-8-bytes)). Types beyond
+that are legal but force every edge of that type to be materialised. Node labels use the full 32-bit
+`label_id` space since they live in the node record.
+
+Interning:
+
+- Forward lookup (string -> id) is a B+tree probe, done **once per session per string** and then
+  cached in an on-heap `HashMap` in the `Catalog`.
+- Reverse lookup (id -> string) is a dense array read; ids are assigned sequentially so the array is
+  a direct index.
+- Dictionary entries are **never deleted**, only marked unused. A dictionary id is stable for the
+  life of the store, which is what makes it safe to embed one in a million records.
+- Dictionary writes are WAL-logged like everything else and are visible to concurrent readers only
+  after the interning transaction commits.
+
+Space effect: a store with 10M nodes each carrying `name` and `createdAt` stores the strings
+`"name"` and `"createdAt"` **once**, not 10 million times. In the PoC that is 130 MB of repeated key
+text.
+
+---
+
+## 4. Value Encoding
+
+`type_tag` is one byte: the low 5 bits are the type, the top 3 bits are a per-type size class.
+
+| Type | Code | Size class | Payload | Status |
+|------|------|-----------|---------|--------|
+| `NULL` | 0 | — | 0 B | done — an explicitly-set null, distinct from an absent key |
+| `BOOL` | 1 | 0 false, 1 true | 0 B | done — the value is the tag, so a boolean costs one byte in total |
+| `INT` | 2 | 0..3 | 1, 2, 4 or 8 B | done — zig-zag, **compared unsigned**; most integers cost 1 B |
+| `FLOAT` | 3 | 0 f32, 1 f64 | 4 or 8 B | done |
+| `STRING` | 4 | 0 inline, 1 blob | 1 B length + UTF-8, or 4 B length + 8 B `BLOB` id | done |
+| `BYTES` | 5 | 0 inline, 1 blob | same | done |
+| `TIMESTAMP` | 6 | — | 8 B epoch micros, UTC | done |
+| `UUID` | 7 | — | 16 B | done |
+| `ELEMENT_REF` | 8 | — | 8 B `ElementId` | done — a property pointing at another element |
+| `VECTOR_F32` | 9 | — | 4 B dim + 8 B `BLOB` id | done — embeddings, stored out of line |
+| `LIST` | 10 | — | varint count + encoded elements | done, recursive |
+| `MAP` | 11 | — | varint count + (key_id, value) pairs | not implemented |
+| `DURATION` | 12 | — | 8 B | not implemented |
+
+**The zig-zag comparison must be unsigned.** `Long.MAX_VALUE` zig-zag encodes to `0xFFFFFFFFFFFFFFFE`,
+which is negative as a signed `long`; a signed `<=` test classifies it as a one-byte value and
+truncates it to 127. Use `Long.compareUnsigned`.
+
+Values above 255 bytes escape to the blob store automatically.
+
+Two decisions worth calling out:
+
+- **Typed values, not strings.** The PoC's `Map<String,String>` forces every integer, timestamp and
+  boolean through decimal text: `42` costs 2 bytes of text plus a length plus a record header, and
+  every read allocates a `String` and reparses. Typed storage is smaller, faster and lossless.
+- **`VECTOR_F32` is in the list from the start.** MetaLoom stores embeddings, and retrofitting a
+  vector type into a format that only knows strings is exactly the migration this spec exists to
+  avoid.
+
+### 4.1 String deduplication
+
+Optional, per-store flag. When enabled, `SHORT_STRING` values above a threshold (default 32 bytes)
+are hashed (xxh3, native) and looked up in a **string intern table** in the `INDEX` kind; a hit
+stores an 8-byte `STRING_REF` instead of the bytes, with a reference count.
+
+Worth it for stores with heavy value repetition (categories, tags, enum-like fields), a net loss for
+stores with unique values. Off by default; measurable with the benchmark harness.
+
+---
+
+## 5. Property Block Allocation
+
+Property cells are allocated in **runs** from the `PROP` segment's free-slot bitmap. Because blocks
+are variable length, the bitmap allocator needs a run-finding path:
+
+- Sizes 1..8 cells: per-size free lists (a segregated free list held in memory, rebuilt from the FSB
+  at open). This covers well over 99 percent of blocks.
+- Sizes 9..2048 cells: first-fit scan over the FSB using `Long.numberOfTrailingZeros` on 64-cell
+  words, from a rotating hint.
+- A block never straddles a page: an allocation that would cross a page boundary starts at the next
+  page instead, and the skipped cells go back on the free list. This preserves invariant I1 and keeps
+  every property read to a single page.
+
+Fragmentation is bounded by the size classes and reclaimed by segment compaction
+([FILE_FORMAT.md §9](FILE_FORMAT.md#9-compaction)).
+
+---
+
+## 6. Blob Store
+
+`BLOB` segments hold page-sized extents for anything that does not belong inline: long strings,
+binary payloads, embedding vectors.
+
+```
+Blob header (first extent):
+offset size field
+0      8    total_length
+8      8    next_extent_id     NULL_ID if this is the last
+16     4    crc32c             over the whole blob
+20     2    gen
+22     1    flags              LIVE, COMPRESSED
+23     1    compression        0 none, 1 lz4, 2 zstd
+24     8    refcount           for deduplicated strings
+32     N    payload
+```
+
+Extents chain for blobs above `PAGE_SIZE - 32`. A chain is read with a single vectored/queued I/O
+batch rather than one read per extent, because the whole chain's ids are discovered as the first
+extent is read; for large blobs the extents are allocated **consecutively** whenever possible, so the
+read degenerates into one large sequential read.
+
+Compression (lz4 by default above 4 KiB) is applied per blob, in native code.
+
+---
+
+## 7. Conventions and Gotchas
+
+- **Never store a key as a string in a record.** If you find yourself writing UTF-8 into a node or
+  relationship record, you have missed the dictionary.
+- **`key_id` is 3 bytes, not 4.** Read it as `u16 | (u8 << 16)` or with an unaligned 4-byte read
+  masked to 24 bits; do not accidentally define a 4-byte field.
+- **An absent key and a `NULL` value are different.** `get` returns an "absent" marker for the first
+  and a null value for the second. The API distinguishes them; the PoC cannot.
+- **Property blocks are sorted by `key_id`.** Any writer that appends without re-sorting breaks
+  binary search silently. The block encoder sorts; do not bypass it.
+- **`owner_id` is not optional.** Without the back-pointer, compaction and repair cannot tell which
+  element a block belongs to, and an orphaned block is undetectable.
+- **Dictionary ids are never reused.** Reusing one silently rewrites the meaning of every record that
+  references it.
+- **Rewriting a block is the update path.** Do not add in-place mutation of a single entry; it
+  reintroduces variable-length in-place edits, which is the thing that makes formats fragile.
+
+---
+
+## 8. Test Setup
+
+- `PropertyBlockTest`: encode/decode round trip for every type tag, at minimum, maximum and boundary
+  sizes; assert sortedness and binary-search correctness.
+- `PropertyBlockFuzzTest`: property-based — a random `Map<key, typedValue>` encodes and decodes to an
+  equal map; block size is within the predicted bound.
+- `DictionaryTest`: intern 10^6 distinct keys, assert forward and reverse agree, assert ids are
+  stable across a store reopen, assert a second intern of the same string returns the same id.
+- `PageStraddleTest`: allocate blocks of every size class until a segment is full; assert no block
+  crosses a page boundary (the I1 regression).
+- `BlobChainTest`: store a 100 MB blob, assert the extent chain reads back byte-identical and that
+  the CRC is validated; corrupt one extent and assert the read fails loudly.
+- `PropertyUpdateTest`: grow a block through every size class and shrink it back, asserting no leaked
+  cells (compare the FSB before and after).
+- `DedupTest`: with dedup enabled, store the same 1 KB string 10^5 times; assert the blob store holds
+  one copy with refcount 10^5, and that deleting all but one leaves the blob live.
+
+---
+
+## 9. Progress Assessment
+
+- [x] `Catalog` with key and label dictionaries and an on-heap cache (append-only file; the B+tree
+      backing arrives in Phase 7)
+- [x] `PropertyStore` block encoder/decoder with entries sorted by key id
+- [x] Single-property read that stops at the first key past the target
+- [x] Value type tags per §4, all except `MAP` and `DURATION`
+- [x] Segregated free lists for cell runs, page-straddle avoidance
+- [x] `BlobStore` with extent chaining and a whole-blob CRC
+- [x] `VECTOR_F32` support
+- [x] Cascade: freeing an element frees its property block and every blob it references (the D12
+      regression)
+- [x] Tests: every value type, blob escape, type mismatch, grow-and-shrink without leaking cells
+- [ ] `MAP` and `DURATION` types
+- [ ] lz4 compression for blobs (Phase 6, native)
+- [ ] Optional string deduplication with refcounts
+- [ ] WAL-logged interning (Phase 4)
+
+---
+
+## 10. Key Classes Reference (target)
+
+| Class | Package | Purpose |
+|-------|---------|---------|
+| `PropertyStore` | `io.metaloom.graph.core.store.prop` | Read, write, free property blocks |
+| `PropertyBlock` | `io.metaloom.graph.core.store.prop` | Encode/decode, binary search by `key_id` |
+| `ValueCodec` | `io.metaloom.graph.core.store.prop` | Type tags and payload encoding |
+| `BlobStore` | `io.metaloom.graph.core.store.blob` | Extent allocation, chaining, compression |
+| `Catalog` | `io.metaloom.graph.core.catalog` | Key and label interning |
+| `Dictionary` | `io.metaloom.graph.core.catalog` | One string <-> id mapping, persistent |
+
+---
+
+_Git HEAD revision: `c016a41`_
+_Last updated: 2026-08-13 (synced with the Phase 0 to 3 implementation)_

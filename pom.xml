@@ -20,15 +20,17 @@
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.github.repository>jotschi/graph-storage-ffm-poc</project.github.repository>
+        <!-- Tags excluded from the default surefire run. See spec/TESTING.md -->
+        <excluded.test.groups>slow,bench,crash,fuzz</excluded.test.groups>
     </properties>
 
     <dependencies>
-    
+
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
         </dependency>
-         
+
         <!-- Test -->
         <dependency>
             <groupId>commons-io</groupId>
@@ -59,10 +61,84 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
                 <configuration>
-                    <release>23</release>
+                    <release>25</release>
+                </configuration>
+            </plugin>
+            <!--
+                Builds the Rust native layer when cargo is present, and skips with a message when it is not.
+                A missing Rust toolchain must never make the project unbuildable for a Java-only contributor:
+                every native capability has a pure-Java fallback. See spec/NATIVE_FFM.md section 5.
+            -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.1.0</version>
+                <executions>
+                    <execution>
+                        <id>build-native</id>
+                        <phase>generate-resources</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <executable>sh</executable>
+                            <workingDirectory>${project.basedir}</workingDirectory>
+                            <arguments>
+                                <argument>-c</argument>
+                                <argument>if command -v cargo >/dev/null 2>&amp;1; then cargo build --release --manifest-path native-rust-lib/Cargo.toml; else echo "[native] cargo not found, skipping the Rust layer (pure-Java fallback in use)"; fi</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <excludedGroups>${excluded.test.groups}</excludedGroups>
+                    <!--
+                        Surefire's default patterns cover *Test and Test* only, so a class called *Benchmark was
+                        silently never run and `mvn test -Pbench` quietly did nothing. The tag, not the file name,
+                        is what decides whether a class runs in a given profile.
+                    -->
+                    <includes>
+                        <include>**/Test*.java</include>
+                        <include>**/*Test.java</include>
+                        <include>**/*Tests.java</include>
+                        <include>**/*TestCase.java</include>
+                        <include>**/*Benchmark.java</include>
+                    </includes>
                 </configuration>
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!-- mvn test -Pslow / -Pbench / -Pcrash : see spec/TESTING.md -->
+        <profile>
+            <id>slow</id>
+            <properties>
+                <excluded.test.groups>bench,crash,fuzz</excluded.test.groups>
+            </properties>
+        </profile>
+        <profile>
+            <id>bench</id>
+            <properties>
+                <excluded.test.groups>slow,crash,fuzz</excluded.test.groups>
+            </properties>
+        </profile>
+        <profile>
+            <id>crash</id>
+            <properties>
+                <excluded.test.groups>slow,bench,fuzz</excluded.test.groups>
+            </properties>
+        </profile>
+        <profile>
+            <id>all-tests</id>
+            <properties>
+                <excluded.test.groups></excluded.test.groups>
+            </properties>
+        </profile>
+    </profiles>
 
 </project>

@@ -1,10 +1,18 @@
 [package]
-name = "rust_lib"
+name = "metaloom-graph-native"
 version = "0.1.0"
 edition = "2021"
+description = "Native hot paths for the metaloom graph storage engine"
 
 [lib]
+name = "metaloom_graph_native"
 crate-type = ["cdylib"]
 
-
 [dependencies]
+
+[profile.release]
+# A panic must never unwind across the FFI boundary; aborting is the second line of defence behind
+# catch_unwind at every entry point. See spec/NATIVE_FFM.md section 2.2.
+panic = "abort"
+opt-level = 3
+lto = true

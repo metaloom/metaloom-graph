@@ -1,0 +1,98 @@
+name: CI
+
+# The dual run is the point. spec/NATIVE_FFM.md section 4 promises that every native capability has a pure-Java
+# fallback and that the engine behaves identically without it; a promise like that is worth exactly as much as the
+# job that checks it, so the suite runs twice and both must pass.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (native ${{ matrix.native }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        native: [enabled, disabled]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Test
+        run: |
+          if [ "${{ matrix.native }}" = "disabled" ]; then
+            mvn -B test -Dmetaloom.graph.native.enabled=false
+          else
+            mvn -B test
+          fi
+
+      - name: Keep the failing store
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-${{ matrix.native }}
+          path: target/surefire-reports/
+
+  slow:
+    name: slow (concurrency, soak)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          cache: maven
+      # A short soak in CI, not the twelve hour one. The long run is a manual command; see spec/TESTING.md.
+      - run: mvn -B test -Pslow -Dsoak.seconds=60
+
+  crash:
+    name: kill -9 loop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          cache: maven
+      - run: mvn -B test-compile
+      - run: tools/kill9-loop.sh 15 3
+
+  gates:
+    name: performance gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          cache: maven
+      # A shared CI runner is the worst possible place to measure throughput, which is why the floors in
+      # performance-gates.properties are set at roughly 40 percent of the reference machine. The structural
+      # gates — reads per operation, write amplification — are exact and are the ones that carry the weight here.
+      - run: mvn -B test -Pbench
+
+  rust:
+    name: rust native layer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      # The crate has never been compiled in the development environment, which has no cargo. This job is the
+      # first thing that would actually build and test it.
+      - run: cargo build --release --manifest-path native-rust-lib/Cargo.toml
+      - run: cargo test --manifest-path native-rust-lib/Cargo.toml
+      - run: cargo clippy --manifest-path native-rust-lib/Cargo.toml -- -D warnings
