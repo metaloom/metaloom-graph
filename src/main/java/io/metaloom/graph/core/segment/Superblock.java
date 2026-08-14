@@ -23,7 +23,7 @@ import io.metaloom.graph.core.util.Layouts;
 public final class Superblock {
 
 	public static final long MAGIC = 0x004745535347_4C4DL;
-	public static final int FORMAT_VERSION = 1;
+	public static final int FORMAT_VERSION = 2;
 
 	private static final int OFF_MAGIC = 0;
 	private static final int OFF_FORMAT_VERSION = 8;

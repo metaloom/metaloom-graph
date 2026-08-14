@@ -6,9 +6,19 @@ description = "Native hot paths for the metaloom graph storage engine"
 
 [lib]
 name = "metaloom_graph_native"
-crate-type = ["cdylib"]
+# cdylib is what the JVM dlopens. rlib is added so Rust code can link the crate too, which the fuzz targets need:
+# libFuzzer builds a Rust binary against the entry points, and a cdylib cannot be a Rust dependency.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+# Dependency policy from spec/NATIVE_FFM.md section 2.1: hashes and compression come from maintained crates rather
+# than being hand-rolled, because hand-rolling them is how you get subtle corruption. crc32c uses the SSE4.2/CRC32
+# instruction, which is the whole point of having it here at all.
+crc32c = "0.6"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
+io-uring = "0.7"
+libc = "0.2"
 
 [profile.release]
 # A panic must never unwind across the FFI boundary; aborting is the second line of defence behind

@@ -1,23 +1,7 @@
-//! CRC32C and the adjacency edge codec.
+//! The adjacency edge codec: delta plus varint over packed 8-byte entries.
 //!
-//! Both must produce output that is byte-for-byte identical to the Java implementations in
-//! `io.metaloom.graph.core.util.Crc` and `io.metaloom.graph.core.store.adj.EdgeCodec`, which remain the reference.
-//! The differential test in `NativeCodecTest` is what enforces that.
-
-/// The CRC32C (Castagnoli) polynomial, reflected.
-const POLY: u32 = 0x82F6_3B78;
-
-pub fn crc32c(data: &[u8], seed: u32) -> u32 {
-    let mut crc = !seed;
-    for byte in data {
-        crc ^= *byte as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (POLY & mask);
-        }
-    }
-    !crc
-}
+//! Output must be byte-for-byte identical to `io.metaloom.graph.core.store.adj.EdgeCodec`, which remains the
+//! reference. The differential test in `NativeCodecTest` is what enforces that.
 
 // ---------------------------------------------------------------- varint
 
@@ -127,8 +111,19 @@ pub fn decode_edges(src: &[u8], dst: &mut [u64]) -> Result<usize, ()> {
         let (count, next) = varint_read(src, pos)?;
         pos = next;
         let count = count as usize;
-        if written + count > dst.len() {
+        // A group of zero entries is malformed: the encoder emits a group only when it has something to put in it.
+        // Rejecting it is not pedantry — the first entry below is written before the `1..count` loop, so a zero count
+        // still produced one entry, and with a full destination that was an out-of-bounds index. The second defect
+        // `cargo fuzz run edges_decode` found, and the second one the Java decoder shared exactly.
+        if count == 0 {
             return Err(());
+        }
+        // checked_add, not `+`: `count` comes off a page and can be anything a varint can hold. The sum overflows
+        // usize for a large enough one, and an overflowed sum compares as small — so the bound below would pass and
+        // the loop would run against a destination it does not fit.
+        match written.checked_add(count) {
+            Some(total) if total <= dst.len() => {}
+            _ => return Err(()),
         }
         let (first, next) = varint_read(src, pos)?;
         pos = next;
@@ -141,7 +136,20 @@ pub fn decode_edges(src: &[u8], dst: &mut [u64]) -> Result<usize, ()> {
         for _ in 1..count {
             let (delta, next) = varint_read(src, pos)?;
             pos = next;
-            current += delta;
+            // Found by `cargo fuzz run edges_decode`, within seconds of the target existing.
+            //
+            // This was `current += delta`. Deltas are read from the page and are therefore arbitrary, so the sum
+            // overflows for a large one — and in the release build that ships as the shared object, overflow checks
+            // are off, so it wrapped. A wrapped value is usually small, which means it passed the range check below
+            // and the decoder emitted a **plausible wrong neighbour id** rather than reporting corruption. The one
+            // failure mode a corrupt block must never have.
+            //
+            // It was invisible to the differential test against Java, because the Java decoder wrapped in exactly the
+            // same way and the two agreed on the wrong answer. Both are fixed.
+            current = match current.checked_add(delta) {
+                Some(sum) => sum,
+                None => return Err(()),
+            };
             if current > LOCATION_MASK {
                 return Err(());
             }

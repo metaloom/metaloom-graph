@@ -1,5 +1,6 @@
 package io.metaloom.graph.core.integration;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -135,6 +136,41 @@ public class InvariantTest {
 				txn.commit();
 			}
 			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	/**
+	 * A long blob must verify, and its length must not be what decides.
+	 *
+	 * <p>
+	 * The blob chain checker bounded its hop count at {@code segmentCount() * slotsPerPage() + 1}. A BLOB extent is
+	 * page sized, so {@code slotsPerPage()} is 1 and the bound was 2 on a single-segment store: every blob past about
+	 * 16 KiB was reported as a chain that does not terminate, with its remaining extents reported as orphaned. Healthy
+	 * data, flagged as corruption. Nothing caught it because no test wrote a blob and then ran {@code verify(FULL)}.
+	 * </p>
+	 *
+	 * <p>
+	 * The sizes below straddle the old bound deliberately: 8 KiB fits in one extent and always passed, and 200 KiB
+	 * needs twenty-odd and never could.
+	 * </p>
+	 */
+	@Test
+	public void testAMultiExtentBlobVerifies() throws Exception {
+		try (GraphStore store = stores.open()) {
+			for (int size : new int[] { 8_000, 40_000, 200_000 }) {
+				// Random, therefore incompressible: a compressible payload would collapse to one extent and the chain
+				// this is about would never be built.
+				byte[] payload = new byte[size];
+				new java.util.Random(size).nextBytes(payload);
+
+				long node = store.createNode("Holder", Properties.of().set("data", payload));
+				store.verify(VerifyLevel.FULL);
+				assertArrayEquals(payload, (byte[]) store.nodeProperty(node, "data"),
+					"the blob must also read back intact at " + size + " bytes");
+
+				store.deleteNode(node);
+				store.verify(VerifyLevel.FULL);
+			}
 		}
 	}
 }

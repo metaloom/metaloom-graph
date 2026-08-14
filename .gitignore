@@ -2,3 +2,9 @@ target
 .project
 .classpath
 .settings
+
+# cargo-fuzz keeps its corpus and crash artefacts here. Crashes are worth committing when they are
+# regressions; the corpus is regenerated and is not.
+native-rust-lib/fuzz/target/
+native-rust-lib/fuzz/corpus/
+native-rust-lib/fuzz/artifacts/

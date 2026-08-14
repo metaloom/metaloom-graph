@@ -11,12 +11,21 @@ import io.metaloom.graph.core.segment.SegmentSet;
 import io.metaloom.graph.core.store.node.NodeStore;
 
 /**
- * Edge storage in three tiers: the two inline slots of the node record, a single adjacency block, and a chain of
- * blocks for dense nodes.
+ * Edge storage in tiers: the two inline slots of the node record, then a block that <b>grows with the node</b>, then a
+ * chain of page-sized blocks for dense nodes.
  * <p>
  * A node of degree one or two costs no adjacency I/O at all, because its edges live in the node record that a
- * traversal has already read. Beyond that, one page-sized block serves thousands of edges. The proof of concept's
- * singly linked list cost one random read and one fresh memory mapping per edge.
+ * traversal has already read. Beyond that, a block starts at one 512 byte cell and doubles as it fills — 512, 1 KiB,
+ * 2 KiB, 4 KiB, one page — and only a node that fills a whole page starts a chain.
+ * <p>
+ * <b>The growth is the point.</b> The block used to be a page from the first edge that did not fit inline, so a node
+ * of degree three cost 8 KiB. On a random graph of mean degree 4 that is roughly three quarters of all nodes, and it
+ * measured as 59 of the 61 GiB of a ten million node store (spec/reports/SCALE.md). Doubling costs one copy per
+ * doubling — five copies to reach a page, amortised O(1) per edge — and leaves a full page holding a full page's
+ * worth of edges, exactly as before.
+ * <p>
+ * Growing rather than chaining also keeps reads cheap: a chain costs a read per block on every traversal, a larger run
+ * costs none, because a block never straddles a page.
  * <p>
  * New blocks are pushed onto the <em>head</em> of the chain so that appending is O(1) rather than a walk to the tail.
  *
@@ -26,7 +35,8 @@ public final class AdjacencyStore {
 
 	private final SegmentSet segments;
 	private final NodeStore nodes;
-	private final int pageSize;
+	private final int cellBytes;
+	private final int maxCells;
 
 	public AdjacencyStore(SegmentSet segments, NodeStore nodes) {
 		if (segments.kind() != Kind.ADJ) {
@@ -34,8 +44,12 @@ public final class AdjacencyStore {
 		}
 		this.segments = segments;
 		this.nodes = nodes;
-		this.pageSize = segments.stride();
+		this.cellBytes = segments.stride();
+		this.maxCells = segments.slotsPerPage();
 	}
+
+	/** Cells in the smallest block. One, which is the whole point of the tier. */
+	public static final int MIN_CELLS = 1;
 
 	/**
 	 * Upper bound on the length of any chain: every live block in the store.
@@ -56,14 +70,66 @@ public final class AdjacencyStore {
 		return blockId;
 	}
 
-	/** Read view of a block. */
+	/**
+	 * Read view of a block.
+	 * <p>
+	 * A block declares its own length, so reading one means knowing the length before slicing it. The run from the
+	 * block's first cell to the end of its page is always safe to acquire — a block never straddles a page — so a
+	 * single acquisition yields both the header and the payload, and the slice is then cut to the declared size.
+	 */
 	private AdjacencyBlock block(long blockId) {
-		return new AdjacencyBlock(segments.resolve(blockId), pageSize);
+		return view(segments.resolveRunToPageEnd(blockId), blockId);
 	}
 
-	/** Write view of a block: copies the page into the transaction overlay on first touch. */
+	/** Write view of a block: copies the pages into the transaction overlay on first touch. */
 	private AdjacencyBlock blockForWrite(long blockId) {
-		return new AdjacencyBlock(segments.mutable(blockId), pageSize);
+		int cells = block(blockId).cells();
+		return new AdjacencyBlock(segments.mutableRun(blockId, cells), cells * cellBytes);
+	}
+
+	private AdjacencyBlock view(java.lang.foreign.MemorySegment toPageEnd, long blockId) {
+		int cells = AdjacencyBlock.cellsOf(toPageEnd);
+		if (cells < MIN_CELLS || cells > maxCells || (long) cells * cellBytes > toPageEnd.byteSize()) {
+			throw new PageCorruptException("Adjacency block " + ElementId.toString(blockId) + " declares " + cells
+				+ " cells, which is outside 1.." + maxCells + " or runs past the end of its page");
+		}
+		return new AdjacencyBlock(toPageEnd.asSlice(0, (long) cells * cellBytes), cells * cellBytes);
+	}
+
+	/** Cells a block occupies. Compaction needs it to relocate the whole run rather than its first cell. */
+	public int blockCells(long blockId) {
+		return block(blockId).cells();
+	}
+
+	/**
+	 * Every block in the store, found by walking the chain of every node.
+	 * <p>
+	 * A block spans a run of cells and the free-slot bitmap is per cell, so a sweep over live ADJ slots sees
+	 * continuation cells as well as block headers — and a continuation cell holds compressed edge data, so nothing
+	 * in it distinguishes it from a header. (Zeroing continuation cells at allocation does not help: the payload
+	 * overwrites them as soon as the block fills.) The owners are the only reliable authority, exactly as they are
+	 * for property blocks, so enumeration goes through them.
+	 * <p>
+	 * An orphaned block — allocated but reachable from no node — is therefore invisible here. That is deliberate and
+	 * matches the property store: {@code InvariantChecker} reports orphans, and maintenance leaves them alone rather
+	 * than guessing at their shape.
+	 */
+	public long[] blockIds() {
+		long[] blocks = new long[64];
+		int written = 0;
+		long limit = chainLimit();
+		for (long nodeId : nodes.segments().liveIds()) {
+			long blockId = nodes.adjHeadId(nodeId);
+			long hops = 0;
+			while (!ElementId.isNull(blockId)) {
+				if (written == blocks.length) {
+					blocks = java.util.Arrays.copyOf(blocks, blocks.length * 2);
+				}
+				blocks[written++] = blockId;
+				blockId = block(step(nodeId, blockId, ++hops, limit)).nextBlockId();
+			}
+		}
+		return java.util.Arrays.copyOf(blocks, written);
 	}
 
 	/** Adds one adjacency entry to a node, promoting it between tiers as needed. */
@@ -85,10 +151,22 @@ public final class AdjacencyStore {
 			segments.touched(head);
 			return;
 		}
+
+		// Full at its current size. Doubling is cheaper than chaining for as long as there is room in the page: a
+		// chain costs a read per block on every traversal, a larger run costs none.
+		if (target.cells() < maxCells) {
+			long grown = grow(nodeId, head, target.cells() * 2);
+			if (!blockForWrite(grown).appendRaw(packedEdge)) {
+				throw new IllegalStateException("A grown adjacency block rejected the entry that grew it");
+			}
+			segments.touched(grown);
+			return;
+		}
+
 		target.markFull();
 		segments.touched(head);
 
-		long fresh = allocateBlock(nodeId);
+		long fresh = allocateBlock(nodeId, maxCells);
 		AdjacencyBlock freshBlock = blockForWrite(fresh);
 		freshBlock.nextBlockId(head);
 		if (!freshBlock.appendRaw(packedEdge)) {
@@ -98,15 +176,41 @@ public final class AdjacencyStore {
 		nodes.adjHeadId(nodeId, fresh);
 	}
 
-	private long allocateBlock(long nodeId) throws IOException {
-		long id = segments.allocate();
-		AdjacencyBlock fresh = blockForWrite(id);
-		fresh.initialise(nodeId);
+	/**
+	 * Copies a full block into a larger run and frees the old one, leaving the chain and the node's head pointer
+	 * consistent. Returns the id of the replacement, which is the node's new head.
+	 */
+	private long grow(long nodeId, long blockId, int cells) throws IOException {
+		AdjacencyBlock old = block(blockId);
+		long[] entries = old.readAll();
+		long next = old.nextBlockId();
+		int oldCells = old.cells();
+
+		long grown = allocateBlock(nodeId, Math.min(cells, maxCells));
+		AdjacencyBlock target = blockForWrite(grown);
+		target.nextBlockId(next);
+		if (!target.rewrite(entries)) {
+			throw new IllegalStateException("A larger adjacency block did not fit the entries of a smaller one");
+		}
+		segments.touched(grown);
+
+		// The old block is only reachable through the node's head pointer, so repointing it before the free is what
+		// makes this safe to crash in the middle of: the transaction either applies both or neither.
+		nodes.adjHeadId(nodeId, grown);
+		segments.free(blockId, oldCells);
+		return grown;
+	}
+
+	private long allocateBlock(long nodeId, int cells) throws IOException {
+		long id = cells == 1 ? segments.allocate() : segments.allocateRun(cells);
+		AdjacencyBlock fresh = new AdjacencyBlock(segments.mutableRun(id, cells), cells * cellBytes);
+		fresh.initialise(nodeId, cells);
+		segments.touched(id);
 		return id;
 	}
 
 	private long migrateInlineToBlock(long nodeId) throws IOException {
-		long id = allocateBlock(nodeId);
+		long id = allocateBlock(nodeId, MIN_CELLS);
 		AdjacencyBlock target = blockForWrite(id);
 		int inline = nodes.inlineEdgeCount(nodeId);
 		for (int i = 0; i < inline; i++) {
@@ -196,8 +300,9 @@ public final class AdjacencyStore {
 		long hops = 0;
 		long limit = chainLimit();
 		while (!ElementId.isNull(blockId)) {
-			long next = block(step(nodeId, blockId, ++hops, limit)).nextBlockId();
-			segments.free(blockId);
+			AdjacencyBlock current = block(step(nodeId, blockId, ++hops, limit));
+			long next = current.nextBlockId();
+			segments.free(blockId, current.cells());
 			blockId = next;
 		}
 		nodes.adjHeadId(nodeId, ElementId.NULL);
@@ -241,9 +346,17 @@ public final class AdjacencyStore {
 		return block(blockId).readAll();
 	}
 
-	/** Replaces a block's entries. Returns false when the re-encoded form does not fit. */
+	/**
+	 * Replaces a block's entries. Returns false when the re-encoded form does not fit, leaving both the block and the
+	 * given array untouched.
+	 * <p>
+	 * The copy is not incidental. {@link AdjacencyBlock#rewrite} consumes what it is given, and compaction calls this
+	 * in a loop, shortening the array by a few entries after each refusal — so it must get back exactly what it passed
+	 * in. Handing over the caller's own array would let a failed attempt reorder it and leave stale duplicates past
+	 * the live prefix, which the next attempt would then move to another block.
+	 */
 	public boolean rewriteBlock(long blockId, long[] entries) {
-		if (!blockForWrite(blockId).rewrite(entries)) {
+		if (!blockForWrite(blockId).rewrite(entries.clone())) {
 			return false;
 		}
 		segments.touched(blockId);

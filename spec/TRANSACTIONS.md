@@ -7,21 +7,25 @@ this file is about what a transaction *means*.
 
 ## 1. Guarantees
 
-> **Implementation status.** Atomicity, durability and rollback are implemented, and isolation is
-> **single-writer serialisable**: one writer at a time, many concurrent readers, no reader sees half a commit. The
-> MVCC machinery described in this file — version chains, undo segments, `xmin` visibility, snapshot isolation,
-> concurrent writers, vacuum — is **not implemented**. The `xmin` and `version_ptr` fields exist in the record
-> layouts and are written as zero. See [reports/PHASE_STATUS.md](reports/PHASE_STATUS.md) section 2.
+> **Implementation status.** Atomicity, durability, rollback, **snapshot isolation, the reclamation horizon and
+> vacuum** are implemented. Writers are still serialised — one at a time — and **concurrent writers are not built**.
+>
+> The mechanism differs from what the rest of this file describes, and section 5 explains why: visibility is resolved
+> per **page** from in-memory before-images, not per record from an on-disk `UNDO` segment. `xmin`, `version_ptr` and
+> the undo record layout are therefore **not used**; the fields stay in the record layouts, written as zero, and the
+> format is unchanged. Sections 2, 3, 4.1, 5.1 and 6 describe what was built; sections 4 and 5's record-level
+> machinery is retained as the design that would be needed if the writer ever stopped being singular.
 
 | Property | Mechanism | Notes |
 |----------|-----------|-------|
-| **Atomicity** | WAL undo + CLRs | A transaction is all-or-nothing across all seven record kinds, the dictionaries and the indexes |
+| **Atomicity** | No-steal redo WAL; private page copies discarded on rollback | A transaction is all-or-nothing across all seven record kinds, the dictionaries and the indexes |
 | **Consistency** | Invariant checkers plus cascade rules | The engine enforces structural invariants (bidirectional edges, degree counters, no orphan property blocks); application-level constraints are out of scope |
-| **Isolation** | MVCC snapshot isolation, optionally serializable | See §3 |
+| **Isolation** | Serialised writers; MVCC snapshot isolation for readers | See §3 |
 | **Durability** | WAL group commit with `fdatasync` | See [WAL.md §4](WAL.md#4-group-commit) |
 
-Default isolation is **snapshot isolation**. Read-committed and serializable are selectable per
-transaction.
+A read on its own sees the latest commit. `store.beginRead()` opens a **snapshot** view that fixes what
+every read on that thread sees until it is closed; `beginRead(READ_COMMITTED)` opts out and costs
+nothing. Writes are serialised, so they are effectively serializable — see §3.
 
 ---
 
@@ -31,103 +35,235 @@ One global 64-bit counter, and it is the **LSN**.
 
 | Concept | Value |
 |---------|-------|
-| `snapshot_ts` | The `durable_lsn` (or current append LSN, for read-your-writes within the process) at transaction begin |
+| `snapshot_ts` | The LSN of the newest commit **already applied to the mapping** when the view began — `appliedLsn`, not `durable_lsn`. Durability and visibility are different instants, and a view must be fixed at what it can actually see |
 | `commit_ts` | The LSN of the transaction's `TXN_COMMIT` record |
-| `xmin` on a record | The `commit_ts` of the transaction that created that version |
-| `oldest_valid_ts` | The minimum `snapshot_ts` over all active transactions; anything older may be vacuumed |
+| `supersededAt` on a version entry | The `commit_ts` of the commit that overwrote those bytes |
+| `oldest_valid_ts` | The minimum `snapshot_ts` over open `SNAPSHOT` views — the reclamation horizon. Anything superseded at or below it is dead. With no view open it is the present, so the version store empties itself |
 
 Using the LSN as the timestamp means commit order and log order are the same order by construction.
 There is no second counter to keep in step, and recovery does not have to reconstruct one.
+
+On a reopened store the counter starts at the resume LSN rather than at zero, so a view opened before
+the session's first commit reports where the store actually is.
 
 ---
 
 ## 3. Isolation Levels
 
-| Level | Reads see | Write conflicts | Anomalies possible |
-|-------|-----------|-----------------|--------------------|
-| `READ_COMMITTED` | Latest committed version as of each statement | First-updater-wins | Non-repeatable read, phantom |
-| `SNAPSHOT` (default) | Everything committed at or before `snapshot_ts` | First-updater-wins, abort the later | Write skew, phantom |
-| `SERIALIZABLE` | As snapshot, plus SSI conflict tracking | Also aborts on dangerous read-write dependency structures | None |
+| Level | Reads see | Anomalies possible | Built |
+|-------|-----------|--------------------|-------|
+| `READ_COMMITTED` | The latest commit, per operation | Non-repeatable read, phantom | **Yes** |
+| `SNAPSHOT` (default for `beginRead`) | Everything committed at or before `snapshot_ts` | None reachable — see below | **Yes** |
+| `SERIALIZABLE` | As snapshot, plus SSI conflict tracking | None | **Not built, and not needed** |
 
-`SERIALIZABLE` is implemented with Serializable Snapshot Isolation: track read/write dependencies
-between concurrent transactions and abort a transaction that sits at the pivot of a dangerous
-structure. It is a Phase 5 stretch item; the visibility machinery it needs is built in Phase 5's
-core, so it does not require a format change.
+`SnapshotIsolationTest` asserts each anomaly at each level, and asserts the read-committed ones
+**actually occur** — a level that silently behaves like a stricter one is a level nobody should be
+paying for.
+
+| Anomaly | `READ_COMMITTED` | `SNAPSHOT` |
+|---|---|---|
+| Dirty read | prevented | prevented |
+| Non-repeatable read | **possible** | prevented |
+| Phantom | **possible** | prevented |
+| Lost update | prevented | prevented |
+| Write skew | prevented | prevented |
+
+The last two rows are stronger than this file originally predicted, and the reason is structural
+rather than clever. **Write transactions are serialised by one writer lock, and a writer reads the
+current mapping rather than any view** — `SegmentFile.readSlice` returns the writer its own
+uncommitted pages and otherwise the mapping, never a reconstruction, even when the same thread has a
+view open. Two writers therefore never overlap, and neither can decide on stale input. That is what
+removes write skew, and with it the entire reason `SERIALIZABLE` and SSI existed in this plan: SSI
+detects dangerous structures between *concurrent* writers, and there are none. It is not built
+because there is nothing left for it to find, which is a different thing from being unfinished.
+
+**The writer-reads-current rule is load-bearing, not an optimisation.** A writer decides what to
+write from what it reads — which slot to allocate, where to append in an adjacency block, whether an
+index page must split. Reading any of that through a view fixed in the past would compute the new
+state from stale input and overwrite everything committed since: a lost update, silent, with no
+conflict for anything to report. `SnapshotIsolationTest.testLostUpdateIsPrevented` runs four threads
+incrementing one counter with a snapshot view held open throughout, precisely to pin that down.
 
 ### 3.1 Visibility rule
 
-For a record version with `xmin` and a `version_ptr` chain:
+Visibility is resolved per **page**, at one choke point — `SegmentFile.readSlice` — rather than per
+record. For a page with a chain of before-images (§5):
 
 ```java
-boolean visible(long xmin, long snapshotTs, Set<Long> inFlight) {
-    return xmin <= snapshotTs && !inFlight.contains(xmin);
+// null means "the mapping already is what this view should see", which is the common answer.
+MemorySegment pageAsOf(long pageKey, long snapshotLsn) {
+    Version head = versions.head(pageKey);
+    if (head == null || head.supersededAt <= snapshotLsn) {
+        return null;                       // one comparison, no copy, no allocation
+    }
+    ...                                    // otherwise rebuild, once, and cache for this view
 }
 ```
 
-If the home record is not visible, follow `version_ptr` into the undo chain until a visible version
-is found. If the chain ends, the element did not exist at that snapshot.
+**Cost**: for a reader with no view open, zero — the branch is not even reached. For a view, one
+comparison per page access, and a rebuild only for pages the writer has changed *and* the reader
+actually touches. A rebuilt image is cached for the life of the view and never goes stale, because a
+later commit appends an entry that undoes itself back to the same bytes.
 
-`inFlight` is the set of transactions that had begun but not committed at snapshot time — needed
-because a commit LSN can be lower than a later-started transaction's snapshot while the commit was
-still in flight. It is a small array copied at begin, not a shared structure consulted under a lock.
-
-**Cost**: for the overwhelmingly common case of reading current data, visibility is **one 64-bit
-compare** against a field that is in the same cache line as the record you already read. No chain
-walk, no side table.
+**There is no in-flight set**, and the original rule's `!inFlight.contains(xmin)` term is not needed.
+It exists in ARIES because a commit LSN is published before the data lands, leaving a window where a
+commit is numbered but not observable. No-steal does the opposite: a commit becomes visible at
+exactly one instant — when its pages are copied into the mapping, under the apply lock, by the single
+writer — so there is no such window and nothing to exclude.
 
 ---
 
 ## 4. Transaction Lifecycle
 
+What actually happens, for both kinds of transaction:
+
 ```mermaid
 sequenceDiagram
     participant App
-    participant TX as Transaction
     participant TM as TransactionManager
     participant ST as Stores
     participant W as WalManager
+    participant PV as PageVersions
 
-    App->>TM: begin(SNAPSHOT)
-    TM->>W: append TXN_BEGIN
-    TM-->>TX: snapshot_ts, txn_id, inFlight set
-    App->>TX: setProperty(nodeId, ...)
-    TX->>TM: acquire write intent on nodeId
-    alt already held by another live txn
-        TM-->>TX: TransactionConflictException
-    end
-    TX->>ST: read current version, copy before-image to UNDO
-    TX->>W: append UNDO + NODE_WRITE
-    TX->>ST: write home record in place (page latch), set version_ptr, xmin = txn_id
-    App->>TX: commit()
-    TX->>W: append TXN_COMMIT, park on durable_lsn
-    W-->>TX: durable
-    TX->>TM: publish commit_ts, rewrite xmin placeholders, release intents
-    TX-->>App: committed
+    App->>ST: store.begin()
+    Note over ST: takes the writer lock; one writer at a time
+    App->>ST: setNodeProperties(id, ...)
+    ST->>ST: copy the page into this transaction's overlay on first write
+    Note over ST: reads see the overlay, then the current mapping — never a view
+    App->>W: commit()
+    W->>W: append the changed byte runs, then TXN_COMMIT, then fsync
+    Note over W: the barrier — nothing above it has touched a data file
+    W->>PV: keep the bytes about to be overwritten (only if a view is open)
+    W->>ST: apply the runs to the mapping, under the apply lock
+    W->>PV: reclaim everything no open view still needs
 ```
 
-**The `xmin` placeholder problem.** A record's `xmin` must be the commit timestamp, but that is not
-known until commit. Two standard options:
+A read view is simpler, and deliberately so:
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant TM as TransactionManager
+    participant SF as SegmentFile
+
+    App->>TM: store.beginRead()
+    Note over TM: under the apply read lock, so the LSN and the registration land together
+    TM-->>App: a view fixed at appliedLsn, published to this thread
+    App->>SF: any read method
+    SF->>SF: head(page) == null or superseded <= snapshotLsn? return the mapping
+    SF->>SF: otherwise rebuild once from the chain, and cache for this view
+    App->>TM: close()
+    Note over TM: leaves the active set; the horizon moves at the next commit
+```
+
+### 4.1 Rollback
+
+Discard the overlay and reload the allocator state from the bitmap, which is the authority. There are
+no undo records to walk and no CLRs to emit, because nothing was written.
+
+`RollbackTest` asserts the strong form of that: after a transaction performing every mutation kind is
+rolled back, the segment files are **byte-identical** and no flush was needed — not "the store behaves
+as though nothing happened" but "nothing happened". `RollbackEqualsRecoveryTest` then performs the
+same transaction in one store and crashes mid-transaction in another, and asserts both reach the same
+state, with a control that proves the comparison can tell them apart.
+
+### 4.2 The `xmin` placeholder problem, and why it does not arise
+
+A record's `xmin` would have to be the commit timestamp, which is not known until commit. Two standard
+options:
 
 - Write `txn_id` into `xmin` with a high bit set meaning "uncommitted", and have readers consult a
   small commit table to resolve it. Cheap write, slightly costlier read.
 - Rewrite every touched record at commit. Cheap read, costlier commit, and it re-dirties pages.
 
-**Chosen: the first.** `xmin` holds `txn_id | UNCOMMITTED_BIT` until commit; a hash map of recently
-committed transactions (`txn_id -> commit_ts`) resolves it, and a background pass lazily rewrites
-`xmin` to the real commit timestamp so the map stays small. Reads of long-settled data never touch
-the map. This is the standard approach and it keeps commit at one log append.
-
-### 4.1 Rollback
-
-Walk the transaction's `prev_lsn` chain, apply undo, emit CLRs, release write intents. Identical to
-recovery's undo pass, and it uses the same code — which is the only way to be confident that the
-recovery path is exercised.
+**Neither is needed.** The question only exists because visibility is being resolved from a field
+written *before* the commit timestamp is known. Page versions are recorded **at apply time**, when the
+commit LSN is already in hand, so an entry carries its real LSN from the moment it exists. There is no
+placeholder, no recent-commit map and no lazy rewrite pass. The first option remains the right one if
+the record-level design of §5.2 is ever built.
 
 ---
 
-## 5. Undo Segments and Version Chains
+## 5. Version Storage
 
-Undo records live in `UNDO` segments, 64 bytes each:
+**Built as in-memory before-images at page granularity** (`PageVersions`), not as the on-disk `UNDO`
+segment described below. The original design is kept after the new one, because it is what would be
+needed if the writer ever stopped being singular.
+
+### 5.1 What was built
+
+One chain per page, newest first, each entry recording the bytes one commit overwrote:
+
+```
+page 7 ── (superseded at 940, offset 128, 64 bytes) ── (at 902, offset 4096, 8 bytes) ── null
+```
+
+To read page 7 as of LSN 910: start from the mapping as it is now and apply every entry above 910,
+newest first. Older entries win where ranges overlap, which walking newest-first gives for free. An
+entry at or below the snapshot LSN describes a change the view is entitled to see, so the walk stops.
+
+The entries come from the commit path at no extra cost: `logCommit` already computes the exact byte
+runs a commit changes, in order to log them. Recording the previous content of those same runs is one
+copy, and it is **skipped entirely when no snapshot view is open**, which is the state a write-only
+or read-committed workload stays in permanently.
+
+**Why not the record-level design below.** Two reasons, and the first is the decisive one:
+
+1. **Record-level undo cannot cover what a reader actually reads.** A traversal touches adjacency
+   blocks; a lookup touches index pages; every read of anything consults the free-slot bitmap and the
+   page-metadata array. None of those has an `xmin` or a `version_ptr`, and none could easily be
+   given one. Versioning the page covers the whole engine through a single choke point instead of
+   requiring every store, the allocator, the B+tree and the catalog each to grow its own visibility
+   rule. `VisibilityTest` exercises exactly this: a view must still resolve a node whose slot has
+   since been freed *and handed out again*, which is a question about the bitmap and the generation
+   counter, not about the record.
+2. **Undo does not need to be durable here.** Under no-steal, uncommitted data structurally cannot
+   reach a data file, recovery is redo-only, and after a crash there are no live snapshots. Undo is
+   needed exactly as long as the oldest open reader — a process-lifetime concern — so it lives in
+   memory and costs no log record, no segment kind and no format version bump.
+
+**The cost** is memory proportional to what the writer changed while a view was open, which is the
+standard MVCC trade. It is bounded rather than hoped about: past `retainedVersionBytes` (256 MiB by
+default) the oldest views are abandoned, oldest first, and an abandoned view raises
+`SnapshotTooOldException` on its next operation. Giving a reader an error is the only honest
+alternative to giving it the wrong answer.
+
+**Measured** (`LongRunningReaderTest`), one view held across 60,000 property updates over 2,000 nodes:
+
+| | |
+|---|---|
+| Peak retained | **200.6 MiB** |
+| Entries | 990,899 over 392 pages |
+| Rebuilt *by the reader* | **192 KiB** — the pages it actually read |
+
+The gap between those last two is where the next optimisation is. Retention accumulates one entry per
+overwritten byte run **per commit**, so a page that every commit touches — the segment metadata page
+above all, which carries the allocator bitmap and the page-metadata array and is therefore dirtied by
+every write and consulted by every read — collects one entry per commit, when only the oldest can ever
+be needed. Collapsing an entry whose byte range is already covered by a newer-than-every-open-view
+entry would remove most of that. **It is not done**: the rule has to be exactly right or a reader gets
+a silently wrong page, and the budget already bounds the damage. What it costs today is that a default
+256 MiB budget supports roughly 75,000 commits under an open reader before the reader is abandoned.
+
+**Reclamation** runs after every commit. Everything superseded at or below the oldest open view is
+dead and is cut from the chains; with no view open the horizon is the present, so the store empties
+itself. Each chain also carries the LSN of its *oldest* entry, which lets vacuum decline in one
+comparison — without it, a pinned view makes every commit walk the accumulated chains looking for
+nothing, which is quadratic over a run and was measured as a reader that would not finish.
+
+**Two maintenance operations are refused while a view is open**, because they reach past this
+mechanism rather than through it. `reclaim()` punches holes in all-free pages, and a hole reads back
+as zeros that a view cannot distinguish from data — silent. `compact()` unlinks emptied segment
+files, pulling the mapping out from under a reader. Both are rare and deliberate, and compaction
+already invalidates every id a caller holds, so refusing costs nothing.
+
+### 5.2 The record-level design, retained
+
+Not built. It is what would be needed if concurrent writers were added, because two writers cannot
+share page-granular versions: their private copies of one page would compose by last-writer-wins and
+lose each other's records.
+
+Undo records would live in `UNDO` segments, 64 bytes each:
 
 ```
 offset size field
@@ -142,53 +278,47 @@ offset size field
 48     16   payload            before-image, inline, or a BLOB id + length
 ```
 
-For a 64-byte node record the before-image does not fit inline, so `payload` holds a `BLOB` id. For
-a property-only change the payload records just the changed entries, which is why `payload_len`
-exists.
+The chain would be doubly useful: rollback and recovery undo read it backwards from the newest, and
+snapshot reads read it backwards until `begin_ts <= snapshot_ts`. One structure, two consumers.
 
-The chain is doubly useful:
-
-1. **Rollback and recovery undo** read it backwards from the newest.
-2. **Snapshot reads** read it backwards until `begin_ts <= snapshot_ts`.
-
-One structure, two consumers. Contrast with engines that keep undo and MVCC versions separate.
-
-### 5.1 Vacuum
-
-A background worker reclaims:
-
-- Undo records whose `end_ts < oldest_valid_ts` — no live snapshot can need them.
-- Dead home records (deleted and invisible to every snapshot): free the slot, the property block, the
-  adjacency blocks, and any uniquely-owned blobs.
-- Mirror adjacency entries left behind by a lazily deleted node
-  ([RELATIONSHIP_STORAGE.md §6.2](RELATIONSHIP_STORAGE.md#62-delete-an-edge)).
-
-Vacuum is incremental, WAL-logged and interruptible. A reader whose snapshot has been vacuumed past
-gets `SnapshotTooOldException` rather than wrong data — the check is `snapshot_ts >=
-oldest_valid_ts`, evaluated once at read time.
-
----
+Its vacuum would additionally reclaim dead home records — freeing the slot, the property block, the
+adjacency blocks and any uniquely-owned blobs — and mirror adjacency entries left behind by a lazily
+deleted node ([RELATIONSHIP_STORAGE.md §6.2](RELATIONSHIP_STORAGE.md#62-delete-an-edge)). None of
+that is needed by the page-level scheme, where a deleted record's old content is simply part of its
+page's history.
 
 ## 6. Conflict Detection
 
-**Write intents, detected eagerly.** A striped table maps `ElementId -> txn_id` for elements
-currently being written. Acquiring an intent that is already held by a live transaction throws
-`TransactionConflictException` immediately, rather than at commit.
+**There is nothing to detect, because writers are serialised.** `store.begin()` takes one writer lock;
+a second writer waits rather than conflicting. No `LockTable`, no write intents, no
+`TransactionConflictException` — a striped intent table whose every lookup misses would be machinery
+that documents an ambition rather than doing work, and `ConflictTest` against it would assert a
+conflict that cannot arise.
 
-Eager detection is chosen deliberately: it fails fast, it keeps the abort cheap (less work has been
-done), and it makes the failure attributable to a specific statement, which is enormously easier to
-debug than a commit-time abort.
+What is built instead is the retry seam the spec asks for in a different item:
+`store.inTransaction(work, attempts)` runs a unit of work in a transaction and retries it, refusing to
+retry the failures that repeating cannot fix — a constraint violation is about data that has not
+changed, and `SnapshotTooOldException` is about a reader that no longer exists. If concurrent writers
+are ever built, that is where eager per-element detection would surface, and the design below is what
+it should be.
 
-The table is memory-only and its loss is harmless — after a crash there are no live transactions.
+### 6.1 The design, if writers ever go concurrent
 
-**Granularity** is per element, not per page. Two transactions writing different nodes in the same
-page never conflict logically; they serialise only on the page latch, for the duration of a memcpy.
+**Write intents, detected eagerly.** A striped table mapping `ElementId -> txn_id` for elements
+currently being written. Acquiring an intent already held by a live transaction throws immediately
+rather than at commit: it fails fast, keeps the abort cheap, and makes the failure attributable to a
+specific statement rather than to a commit.
 
-**Deadlock** is impossible, because intents are never waited on: a conflict is an immediate abort,
-not a block. This is a deliberate simplification. If waiting is added later (for `SERIALIZABLE` with
-locking rather than SSI), it needs a wait-for graph and a detector.
+The table would be memory-only and its loss harmless — after a crash there are no live transactions.
+**Granularity** per element, not per page, so two transactions writing different nodes in one page
+never conflict logically. **Deadlock** impossible, because intents are never waited on.
 
----
+**The harder half is not the table.** Page overlays are what make concurrent writers difficult here:
+two writers each take a private copy of a page, and applying both at commit resolves by
+last-writer-wins across the whole page, losing the other's records. That needs either record-granular
+overlays or per-writer allocation arenas plus commit-time validation, and it is a rewrite of the write
+path rather than an addition to it — which is the honest reason concurrent writers are not in this
+phase.
 
 ## 7. Where Copy-on-Write Actually Applies
 
@@ -228,42 +358,46 @@ the kind field already selects the addressing policy. Do not do this speculative
 
 ## 8. Conventions and Gotchas
 
-- **`xmin` with the high bit set means uncommitted.** Never compare `xmin` to a snapshot without
-  masking and resolving.
-- **A transaction sees its own writes.** Visibility short-circuits on `xmin == myTxnId`.
-- **Never hold a page latch across a WAL append.** Append first, then latch, copy, unlatch.
-- **Undo before overwrite, always.** The order is: append undo record, write the home record. A
-  reversed order loses the old version on a crash between the two.
-- **Read-only transactions still need a snapshot** and still register in the active set, because that
-  is what holds back `oldest_valid_ts`. A forgotten read-only transaction blocks vacuum indefinitely
-  — the store logs a warning past a configurable age.
-- **Conflicts abort the *later* writer, not the earlier one.** No transaction is ever silently rolled
-  back after doing work it thinks succeeded.
-- **`SnapshotTooOldException` is a normal outcome**, not a bug. Long analytical traversals must either
-  retry or run with a pinned snapshot (which holds back vacuum, and is a deliberate choice).
+- **A writer reads the current mapping, never a view** — even on a thread that has one open. This is
+  the rule that prevents a lost update, not a convenience. See §3.
+- **A transaction sees its own writes.** The overlay is consulted before anything else, so
+  read-your-writes outranks both the mapping and any view.
+- **Close read views.** An open view holds every version committed since it began. A forgotten one is
+  a memory leak with a name: `snapshotStats()` reports its age and what it is holding, and past
+  `retainedVersionBytes` the store abandons it rather than growing.
+- **`SnapshotTooOldException` is a normal outcome**, not a bug. Retry with a fresh view, or raise the
+  budget if the workload genuinely needs a reader open that long.
+- **A view is thread-confined.** It is published to the thread that opened it, and using the handle
+  from another is refused — the reconstruction cache under it is unsynchronised by design. Open one
+  per thread.
+- **Nothing is retained while no view is open**, so a write-only or read-committed workload never
+  pays for any of this. It also means the first thing to check when retention is unexpectedly high is
+  which reader is open, not how much the writer wrote.
+- **`reclaim()` and `compact()` are refused while a view is open.** Both reach past the versioning
+  mechanism — a punched hole reads back as zeros, and a retired segment file takes its mapping with
+  it — and a refusal is much better than either failure.
+- **Reclamation runs at the end of a commit**, not on a timer. A store that has stopped committing
+  never releases what its last reader was holding until the next commit.
 
 ---
 
 ## 9. Test Setup
 
-- `VisibilityTest`: a matrix over (writer state, reader snapshot) covering insert, update, delete,
-  and their combinations; assert exactly the expected version is returned.
-- `SnapshotIsolationTest`: the classic anomaly suite — dirty read, non-repeatable read, phantom,
-  lost update, write skew — asserting which are prevented at each level.
-- `ConflictTest`: two transactions writing the same node; assert the second gets
-  `TransactionConflictException` at the write, not at commit, and that the first commits cleanly.
-- `RollbackTest`: perform every mutation type, roll back, assert the store is byte-identical to
-  before (compare segment checksums), including the FSB.
-- `RollbackEqualsRecoveryTest`: perform a transaction, roll it back; separately perform the same
-  transaction and crash; assert both end states are identical. This is the test that proves the undo
-  path is shared.
-- `VacuumTest`: assert undo is reclaimed exactly when the last snapshot needing it ends, and never
-  earlier; assert a pinned snapshot holds it.
-- `SnapshotTooOldTest`: pin a snapshot, force vacuum past it, assert the exception rather than wrong
-  data.
-- `LongRunningReaderTest`: a reader open for the duration of 10^6 writes; assert it sees a stable
-  view and that memory and undo growth are bounded and reported.
-- Concurrency stress under `jcstress` or a custom harness for the visibility and latch protocols.
+Built, in `io.metaloom.graph.core.txn`:
+
+| Class | Cases | What it holds down |
+|---|---|---|
+| `VisibilityTest` | 13 | Create, update, delete and edge changes invisible to an earlier view; adjacency blocks and both indexes read as of the view; a freed **and reused** slot still resolving; read-your-writes outranking the view; thread confinement |
+| `SnapshotIsolationTest` | 7 | The anomaly matrix of §3, including the read-committed anomalies actually occurring; lost update and write skew under real concurrency |
+| `VacuumTest` | 8 | Nothing retained with no view open; read-committed views retaining nothing; the oldest view setting the horizon; a pinned view holding what a later one does not need; the budget abandoning a view rather than serving it wrongly |
+| `ConcurrentReaderTest` | 4 | Sixteen views at sixteen instants against a continuous writer; reconstruction proportional to what is read; maintenance refused while a view is open; no view left behind on a pooled thread |
+| `RollbackTest` | 7 | Every mutation type rolled back to **byte-identical** segment files, with no flush; repeated rollbacks not ratcheting the allocator |
+| `RollbackEqualsRecoveryTest` | 2 | The same transaction rolled back and crashed reaching the same state, plus a control proving the comparison can tell them apart |
+| `LongRunningReaderTest` | 2 | `@Tag("slow")`. A view held across 60,000 commits; and the same run against a budget too small, abandoned cleanly with the store unharmed |
+
+Not built, with reasons: `ConflictTest` (§6 — no conflict can arise), `SnapshotTooOldTest` (folded
+into `VacuumTest` and `LongRunningReaderTest`, which reach the condition through real workloads rather
+than by construction), jcstress harnesses (jcstress is not in the offline repository).
 
 ---
 
@@ -272,32 +406,40 @@ the kind field already selects the addressing policy. Do not do this speculative
 - [x] `Transaction` with begin/commit/rollback, read-your-writes, and auto-commit for single operations
 - [x] Single-writer lock plus a reader-excluding latch held only for the commit apply step
 - [x] Rollback by discarding the page overlay, with allocator state restored from the bitmap
-- [ ] `TransactionManager`: timestamps, active set, in-flight snapshot capture
-- [ ] `xmin` placeholder scheme plus the recent-commit map and the lazy rewrite pass
-- [ ] Visibility check and version-chain walk
-- [ ] `UndoStore` and undo record layout
-- [ ] Undo-before-overwrite ordering in every store
-- [ ] Write-intent table with striping and eager conflict detection
-- [ ] `READ_COMMITTED` and `SNAPSHOT` levels
-- [ ] Vacuum worker with cascade reclamation
-- [ ] `SnapshotTooOldException` and the retention horizon
-- [ ] `SERIALIZABLE` via SSI (stretch)
-- [ ] Tests per §9
+- [x] `TransactionManager`: LSN timestamps, the active set, the horizon, the retention budget
+- [x] Visibility check and version walk — **per page**, at one choke point (§3.1, §5.1)
+- [x] `PageVersions` in place of `UndoStore`, with the reasoning in §5.1
+- [x] `READ_COMMITTED` and `SNAPSHOT` levels
+- [x] `Vacuum`: reclamation after every commit, declining in O(1) when nothing is cuttable
+- [x] `SnapshotTooOldException` and the retention horizon
+- [x] `store.inTransaction` with retry
+- [x] Optimistic lock-free reads via the `StampedLock`; a view forces the locked path only to rebuild a page
+- [x] Tests per §9
+- [ ] **Concurrent writers.** The remaining half of the phase, and the one that needs the write path
+      rewritten rather than extended — §6.1
+- [ ] `xmin` placeholder scheme, the recent-commit map, the lazy rewrite pass — **not needed** by the
+      page-level scheme; part of §5.2, which concurrent writers would require
+- [ ] `UndoStore` and the 64-byte undo record — as above
+- [ ] `LockTable` with eager conflict detection — **nothing to detect** while writers are serialised (§6)
+- [ ] `SERIALIZABLE` via SSI — **nothing to detect** (§3): write skew is already unreachable
+- [ ] jcstress harnesses — jcstress is not in the offline repository
 
----
-
-## 11. Key Classes Reference (target)
+## 11. Key Classes Reference
 
 | Class | Package | Purpose |
 |-------|---------|---------|
-| `TransactionManager` | `io.metaloom.graph.core.txn` | Timestamps, active snapshots, commit publication |
-| `Transaction` | `io.metaloom.graph.core.api` | Per-transaction state and the mutation API |
-| `Snapshot` | `io.metaloom.graph.core.txn` | `snapshot_ts` plus the in-flight set; the visibility predicate |
-| `LockTable` | `io.metaloom.graph.core.txn` | Striped write-intent table |
-| `UndoStore` | `io.metaloom.graph.core.store.undo` | Before-images and version chains |
-| `Vacuum` | `io.metaloom.graph.core.txn` | Reclamation of undo and dead versions |
+| `TransactionManager` | `io.metaloom.graph.core.txn` | Active views, the reclamation horizon, the retention budget |
+| `Snapshot` | `io.metaloom.graph.core.txn` | One view: its LSN, its visibility rule, its reconstruction cache |
+| `SnapshotHolder` | `io.metaloom.graph.core.txn` | Thread-local publication of a view to the segment layer |
+| `PageVersions` | `io.metaloom.graph.core.txn` | Per-page before-image chains, reconstruction and reclamation |
+| `Transaction` | `io.metaloom.graph.core.api` | Per-transaction write state |
+| `ReadTransaction` | `io.metaloom.graph.core.api` | The public view handle; `Snapshot` implements it |
+| `IsolationLevel`, `SnapshotStats`, `SnapshotTooOldException` | `io.metaloom.graph.core.api` | The level, what a view costs, and what happens when it costs too much |
+
+Not built, and named here so nobody looks for them: `LockTable`, `UndoStore`, `Vacuum` as a separate
+worker (reclamation is a call at the end of commit, not a thread).
 
 ---
 
-_Git HEAD revision: `c016a41`_
-_Last updated: 2026-08-13 (synced with the Phase 0 to 3 implementation)_
+_Git HEAD revision: `364b5f7`_
+_Last updated: 2026-08-14_

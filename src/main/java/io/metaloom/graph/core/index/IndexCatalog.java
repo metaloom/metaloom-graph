@@ -34,6 +34,16 @@ public final class IndexCatalog {
 	private static final int OFF_MAGIC = 0;
 	private static final int OFF_LABEL_ROOT = 8;
 	private static final int OFF_PROP_ROOT = 16;
+	/**
+	 * Unique-constraint key ids: a count, then that many ints.
+	 * <p>
+	 * Deliberately past offset 64. {@code Kind.INDEX} keeps its <b>generation at offset 30</b>, maintained by the slot
+	 * allocator and invisible to this class, so anything written between 24 and 32 silently destroys it and every id
+	 * naming this page becomes stale. The first version of this field sat at 28 and did exactly that.
+	 */
+	private static final int OFF_UNIQUE_COUNT = 64;
+	private static final int OFF_UNIQUE_KEYS = 68;
+	private static final int MAX_UNIQUE_KEYS = 256;
 
 	private final SegmentSet segments;
 	private final Catalog catalog;
@@ -56,9 +66,22 @@ public final class IndexCatalog {
 		return gen == 0 ? ElementId.NULL : ElementId.encode(segments.kind(), 0, 0, gen);
 	}
 
+	/**
+	 * Whether the catalog page exists and is readable.
+	 * <p>
+	 * {@code catalogPageId} is in-memory state, and {@link #ensureInitialised()} sets it inside a transaction that may
+	 * then roll back — which frees the page underneath it and leaves the field naming a slot that is no longer
+	 * allocated. So the field is a hint, not an authority: it is re-derived from the segment whenever it does not
+	 * resolve, which turns "the index was created by a transaction that was discarded" back into "there is no index
+	 * yet" instead of a {@code StaleIdException} on the next lookup.
+	 */
 	private boolean initialised() {
-		if (ElementId.isNull(catalogPageId)) {
-			return false;
+		if (!segments.isLive(catalogPageId)) {
+			catalogPageId = firstSlotId();
+			if (!segments.isLive(catalogPageId)) {
+				catalogPageId = ElementId.NULL;
+				return false;
+			}
 		}
 		return segments.resolve(catalogPageId).get(Layouts.LONG, OFF_MAGIC) == CATALOG_MAGIC;
 	}
@@ -96,6 +119,74 @@ public final class IndexCatalog {
 	private void propRoot(long rootId) {
 		segments.mutable(catalogPageId).set(Layouts.LONG, OFF_PROP_ROOT, rootId);
 		segments.touched(catalogPageId);
+	}
+
+	// ---------------------------------------------------------------- unique constraints
+
+	/**
+	 * Declares that no two live elements may share a value for this property key.
+	 * <p>
+	 * Enforced at write time by the same index that answers lookups, so a violation costs one probe rather than a
+	 * scan. The caller checks the existing data first: declaring a constraint that is already violated is refused,
+	 * because a constraint that was never true is worse than none — everything downstream is entitled to assume it.
+	 */
+	public void addUniqueConstraint(int keyId) throws IOException {
+		ensureInitialised();
+		int[] existing = uniqueKeys();
+		for (int key : existing) {
+			if (key == keyId) {
+				return;
+			}
+		}
+		if (existing.length >= MAX_UNIQUE_KEYS) {
+			throw new IllegalStateException("At most " + MAX_UNIQUE_KEYS + " unique constraints are supported");
+		}
+		int count = existing.length;
+		MemorySegment page = segments.mutable(catalogPageId);
+		page.set(Layouts.INT, OFF_UNIQUE_KEYS + 4L * count, keyId);
+		page.set(Layouts.INT, OFF_UNIQUE_COUNT, count + 1);
+		segments.touched(catalogPageId);
+	}
+
+	public int[] uniqueKeys() {
+		if (!initialised()) {
+			return new int[0];
+		}
+		MemorySegment page = segments.resolve(catalogPageId);
+		int count = page.get(Layouts.INT, OFF_UNIQUE_COUNT);
+		if (count < 0 || count > MAX_UNIQUE_KEYS) {
+			throw new io.metaloom.graph.core.api.PageCorruptException(
+				"The index catalog declares " + count + " unique constraints, which is outside 0.." + MAX_UNIQUE_KEYS);
+		}
+		int[] keys = new int[count];
+		for (int i = 0; i < count; i++) {
+			keys[i] = page.get(Layouts.INT, OFF_UNIQUE_KEYS + 4L * i);
+		}
+		return keys;
+	}
+
+	public boolean isUnique(int keyId) {
+		for (int key : uniqueKeys()) {
+			if (key == keyId) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** Candidate ids already carrying this key and value, excluding one element. Empty when the key is not unique. */
+	public List<Long> conflicts(int keyId, Object value, long excluding) {
+		if (!initialised() || value == null) {
+			return List.of();
+		}
+		List<Long> candidates = tree.scanPrefix(propRoot(), propertyKey(keyId, value));
+		List<Long> conflicting = new java.util.ArrayList<>(1);
+		for (long id : candidates) {
+			if (id != excluding) {
+				conflicting.add(id);
+			}
+		}
+		return conflicting;
 	}
 
 	// ---------------------------------------------------------------- maintenance hooks

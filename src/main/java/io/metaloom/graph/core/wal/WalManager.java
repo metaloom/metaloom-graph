@@ -11,6 +11,7 @@ import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.metaloom.graph.core.api.PageCorruptException;
 import io.metaloom.graph.core.api.WalSyncMode;
 import io.metaloom.graph.core.id.Kind;
 import io.metaloom.graph.core.page.PageOverlay;
@@ -44,10 +45,27 @@ public final class WalManager implements AutoCloseable {
 
 	public WalManager(Path storePath, long segmentBytes, long startLsn, Map<Kind, SegmentSet> segmentSets,
 		WalSyncMode syncMode, long syncIntervalMillis) throws IOException {
+		this(storePath, segmentBytes, startLsn, segmentSets, syncMode, syncIntervalMillis,
+			io.metaloom.graph.core.api.GraphStoreOptions.IoEngineKind.MMAP);
+	}
+
+	public WalManager(Path storePath, long segmentBytes, long startLsn, Map<Kind, SegmentSet> segmentSets,
+		WalSyncMode syncMode, long syncIntervalMillis,
+		io.metaloom.graph.core.api.GraphStoreOptions.IoEngineKind engine) throws IOException {
 		this.storePath = storePath;
 		this.segmentBytes = segmentBytes;
 		this.segmentSets = segmentSets;
-		this.writer = new WalWriter(storePath, segmentBytes, startLsn, syncMode, syncIntervalMillis);
+		// Recovery has already run, so everything up to here is in the data files. Leaving this at zero would make a
+		// reopened store claim its last commit was at LSN 0 — harmless to visibility, because every later commit is
+		// still greater, but wrong in StoreStats and in any SnapshotTooOldException raised before the first commit of
+		// the session.
+		this.lastCommitLsn = startLsn;
+		this.writer = new WalWriter(storePath, segmentBytes, startLsn, syncMode, syncIntervalMillis, engine);
+	}
+
+	/** Whether the log is bypassing the page cache. */
+	public boolean isDirect() {
+		return writer.isDirect();
 	}
 
 	/** Points the writer at the store's counters, so log volume and fsyncs are measurable. */
@@ -69,8 +87,30 @@ public final class WalManager implements AutoCloseable {
 
 	// ---------------------------------------------------------------- commit
 
+	/**
+	 * One byte run of one page that a durable commit is about to copy into the mapping.
+	 *
+	 * <p>
+	 * Named rather than closed over as a {@code Runnable} so that the commit path can look at what is about to change
+	 * before it changes — which is what {@link io.metaloom.graph.core.txn.PageVersions} needs to keep the previous
+	 * content for readers that began earlier.
+	 * </p>
+	 */
+	public record PageWrite(SegmentFile file, Kind kind, int segmentNumber, int pageIndex, MemorySegment source,
+		int offset, int length) {
+
+		/** The page as it currently stands in the mapping, before this write lands. */
+		public MemorySegment mappedPage() {
+			return file.mappedPage(pageIndex);
+		}
+
+		void apply() {
+			file.applyPage(pageIndex, source, offset, offset, length);
+		}
+	}
+
 	/** A logged, durable transaction that has not yet been copied into the mapped files. */
-	public record CommitBatch(long commitLsn, List<Runnable> applications) {
+	public record CommitBatch(long commitLsn, List<PageWrite> writes) {
 	}
 
 	/**
@@ -82,7 +122,7 @@ public final class WalManager implements AutoCloseable {
 			return new CommitBatch(lastCommitLsn, List.of());
 		}
 		long prevLsn = 0;
-		List<Runnable> applications = new ArrayList<>();
+		List<PageWrite> writes = new ArrayList<>();
 
 		for (Map.Entry<Long, MemorySegment> entry : overlay.pages().entrySet()) {
 			long key = entry.getKey();
@@ -101,20 +141,20 @@ public final class WalManager implements AutoCloseable {
 				byte[] payload = WalRecord.encodePageImage(kind.code(), segmentNumber, pageIndex, offset,
 					image, 0, length);
 				prevLsn = writer.append(prevLsn, txnId, WalRecord.TYPE_PAGE_IMAGE, payload);
-				applications.add(() -> file.applyPage(pageIndex, copy, offset, offset, length));
+				writes.add(new PageWrite(file, kind, segmentNumber, pageIndex, copy, offset, length));
 			}
 		}
 		long commitLsn = writer.append(prevLsn, txnId, WalRecord.TYPE_TXN_COMMIT, new byte[0]);
 		// The barrier: nothing below this line can be lost, and nothing above it has touched a data file.
 		writer.sync();
 		lastCommitLsn = commitLsn;
-		return new CommitBatch(commitLsn, applications);
+		return new CommitBatch(commitLsn, writes);
 	}
 
 	/** Copies a durable transaction into the mapped files. Idempotent; recovery does the same thing. */
 	public void apply(CommitBatch batch) {
-		for (Runnable application : batch.applications()) {
-			application.run();
+		for (PageWrite write : batch.writes()) {
+			write.apply();
 		}
 	}
 
@@ -193,6 +233,10 @@ public final class WalManager implements AutoCloseable {
 					}
 					case WalRecord.TYPE_CHECKPOINT_BEGIN, WalRecord.TYPE_CHECKPOINT_END,
 						WalRecord.TYPE_SEGMENT_CREATE -> resumeLsn = reader.lsn();
+					// Alignment filler from a direct-IO commit. It carries nothing, but it must not advance the resume
+					// point either: a padding record can sit between a page image and the commit that makes it durable.
+					case WalRecord.TYPE_PADDING -> {
+					}
 					default -> throw new IOException("Unknown WAL record type " + WalRecord.type(record, 0)
 						+ " at LSN " + WalRecord.lsn(record, 0));
 				}
@@ -212,8 +256,14 @@ public final class WalManager implements AutoCloseable {
 		Kind kind = Kind.byCode(image.kindCode());
 		SegmentSet set = segmentSets.get(kind);
 		if (set == null || image.segmentNumber() >= set.segmentCount()) {
-			throw new IllegalStateException("Recovery references " + kind + " segment " + image.segmentNumber()
-				+ ", which does not exist. The store is incomplete.");
+			// A typed failure, not an IllegalStateException. This is reached by opening a store whose data files are
+			// older than its log — a restored-from-backup segment directory, a partial copy, a filesystem that lost a
+			// file a crash should have kept — and a caller has to be able to catch it as a store problem rather than
+			// as a programming error. Found by the crash matrix, which asserts that a damaged store never fails in a
+			// vocabulary the engine does not own.
+			throw new PageCorruptException("Recovery references " + kind + " segment " + image.segmentNumber()
+				+ " at LSN " + lsn + ", which does not exist. The store is incomplete: its data files are older than"
+				+ " its log.");
 		}
 		SegmentFile file = set.segment(image.segmentNumber());
 		MemorySegment source = MemorySegment.ofArray(image.buffer())

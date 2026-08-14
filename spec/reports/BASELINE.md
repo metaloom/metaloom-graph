@@ -93,11 +93,19 @@ change once to the log and once to the data file.
 | Workload | Amplification |
 |----------|---------------|
 | Bulk load, one transaction | 1.97x |
-| Mixed 80/20 read/write | **1.70x** |
+| Mixed 80/20 read/write | **3.50x** — see note |
 | One node per transaction | 8.03x |
 
 The last row is not a failure; it is the cost of per-operation durability, measured so that the batching advice in
 [OPERATIONS.md §3](../OPERATIONS.md#3-tuning) is a number rather than an opinion.
+
+**The mixed figure used to read 1.70x, and the change was in the denominator rather than the engine.** Amplification is
+measured against `recordBytes()`, which counts *allocated* record space, and an adjacency block used to be a whole
+8 KiB page from the third edge onwards — so a workload that promoted a few hundred nodes credited itself with megabytes
+of "payload" holding a few thousand edges. With 512 byte cells the denominator halved and the ratio doubled, while the
+bytes written moved by less than half a percent: **1,458,816 before against 1,452,282 after**, same workload, only the
+cell size changed. The gate for this workload is 4x and the reason is page-image granularity — 20,000 operations
+scattered over 5,000 nodes means almost every 64 byte write carries an 8 KiB page into the log.
 
 ### 1.5 Compaction
 
@@ -125,6 +133,23 @@ size they are a fixed floor of roughly 6 MB per segment regardless of how much d
 themselves shrank by the 360,009 slots the marks came down by. `slotsReclaimed` is the honest measure of what
 compaction recovered; `storageBytes` is the honest measure of what the store costs.
 
+### 1.5a Device reads
+
+`DeviceReadBudgetTest` counts **major faults** — faults the kernel had to serve from the device —
+around an operation on a store whose pages have been evicted. It is the only unit in which the
+"1 device read" and "at most 4 device reads" targets are stated, and until the Phase 6 I/O engine
+landed nothing could count it.
+
+**It cannot be taken on this machine, and the test skips rather than reporting a number.**
+`posix_fadvise(POSIX_FADV_DONTNEED)` returns success on this overlay filesystem and evicts nothing:
+touching 16,384 pages of a freshly evicted 64 MiB file produced **one** major fault. An earlier
+version of the test believed the success code and reported 0.15 device reads per cold node read,
+which is not a good result — it is a warm cache with a cold label. The test now proves eviction works
+before trusting anything downstream of it.
+
+On a filesystem that honours the advice (ext4, xfs) the three assertions are ≤ 1 device read for a
+node read by id, ≤ 4 for an indexed lookup, and ≤ 1 for a degree-two traversal.
+
 ### 1.6 Space
 
 | Measurement | Value |
@@ -133,6 +158,8 @@ compaction recovered; `storageBytes` is the honest measure of what the store cos
 | Secondary index cost, same workload | 133 bytes per node (one label entry + two property entries) |
 | Directed adjacency entry, 20,000 edge hub | **1.23 bytes** |
 | Directed adjacency entry, 500,000 edge hub | **1.02 bytes** (8065 entries per 8 KiB block) |
+| Directed adjacency entry, degree 3 | **170 bytes** (one 512 byte cell) — was 2,730, one 8 KiB page |
+| Directed adjacency entry, degree 400 | **1.28 bytes** (still one 512 byte cell) |
 | Adjacency blocks for a chain graph (degree <= 2) | **0** — every edge stays inline |
 | Relationship records for property-free edges | **0** |
 
@@ -169,7 +196,7 @@ Flat. **The twelve hour run has not been performed**; `-Dsoak.seconds=43200` is 
 ### 1.9 Test suite
 
 ```
-mvn test           127 tests, 0 failures, ~20 s
+mvn test           240 tests, 0 failures, ~40 s
 mvn test -Pslow    adds the scaling curve and the soak
 mvn test -Pbench   adds the benchmarks and the performance gates
 tools/kill9-loop.sh 20 3     8 iterations run clean
@@ -186,7 +213,11 @@ Both the native-enabled and native-disabled runs pass, which is what CI checks.
 ## 2. What These Numbers Do Not Show
 
 - **Warm cache only.** Every benchmark fits in RAM, so it measures the engine, not the device. Cold-cache and
-  larger-than-RAM numbers need the io_uring engine to be meaningful, and that is not implemented.
+  larger-than-RAM numbers need the io_uring engine to be meaningful. The engine now exists and measures 12.4x on a
+  batch of scattered reads ([../NATIVE_FFM.md](../NATIVE_FFM.md) section 1), but no traversal issues a batch through
+  it yet, so nothing here reflects it.
+- **Nothing at scale.** These are small-store numbers. A 10M node / 20M edge load, and how far it has moved across
+  runs, is in [../GRAPH_BENCHMARK.md](../GRAPH_BENCHMARK.md).
 - **No multi-writer number**, because there are no multi-writer transactions. The read scaling curve in §1.2 is real;
   the write curve is flat by construction.
 - **No foreground latency budget during compaction.** `CompactionTest` shows a concurrent writer making progress

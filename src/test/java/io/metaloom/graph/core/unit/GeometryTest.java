@@ -36,12 +36,12 @@ public class GeometryTest {
 		assertEquals(512 * MIB, g.dataBytes(Kind.PROP));
 		assertEquals(4 * MIB + 8192, g.dataStart(Kind.PROP));
 
-		assertEquals(8192, g.stride(Kind.ADJ));
-		assertEquals(1 << 19, g.slotsPerSegment(Kind.ADJ));
+		// An adjacency block is a run of 512 byte cells, not a page. See Kind.ADJ_CELL_BYTES and
+		// spec/RELATIONSHIP_STORAGE.md section 5.
+		assertEquals(512, g.stride(Kind.ADJ));
+		assertEquals(16, g.recordsPerPage(Kind.ADJ));
+		assertEquals(1 << 23, g.slotsPerSegment(Kind.ADJ));
 		assertEquals(4 * GIB, g.dataBytes(Kind.ADJ));
-		assertEquals(16 * MIB, g.pmaBytes(Kind.ADJ));
-		assertEquals(64 * 1024, g.fsbBytes(Kind.ADJ));
-		assertEquals(16 * MIB + 64 * 1024 + 8192, g.dataStart(Kind.ADJ));
 	}
 
 	@Test

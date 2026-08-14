@@ -34,7 +34,7 @@ graph TB
         CUR["Cursors / traversal"]
     end
     subgraph L4["L4 — Transaction and log"]
-        TM["TransactionManager<br/>snapshots, conflicts, commit"]
+        TM["TransactionManager<br/>snapshots, horizon, page versions"]
         WM["WalManager<br/>append, group commit, recovery"]
         VAC["Vacuum<br/>undo GC, dead version reclaim"]
     end
@@ -80,8 +80,8 @@ page write.
 | Component | Owns | Does not own |
 |-----------|------|--------------|
 | `GraphStore` | Store lifecycle, open/close, manifest, background workers | Any per-transaction state |
-| `Transaction` | Snapshot timestamp, write set, undo chain head, lock set | Durability |
-| `TransactionManager` | Timestamp allocation, active-snapshot set, conflict detection, commit protocol | The log format |
+| `Transaction` | The write set, as private page copies | Durability |
+| `TransactionManager` | Active read views, the reclamation horizon, the retention budget | The log format |
 | `WalManager` | Log record encoding, LSN allocation, group commit, recovery driver, retention | Element semantics |
 | `NodeStore` / `RelStore` | Record encode/decode, generation checks, cascade rules on delete | Page I/O |
 | `AdjacencyStore` | Inline edges, adjacency blocks, edge codec, degree maintenance | Relationship properties |
@@ -109,10 +109,9 @@ io.metaloom.graph.core
     adj/          AdjacencyStore, AdjacencyBlock, EdgeCodec
     prop/         PropertyStore, PropertyBlock, ValueCodec
     blob/         BlobStore
-    undo/         UndoStore, UndoRecord
     index/        BTree, IndexCatalog
   catalog/        Catalog, Dictionary
-  txn/            TransactionManager, Snapshot, LockTable, ConflictDetector, Vacuum
+  txn/            TransactionManager, Snapshot, SnapshotHolder, PageVersions, TransactionImpl
   wal/            WalManager, WalRecord, WalWriter, WalReader, Recovery, Checkpointer
   native/         NativeLib, NativeBindings, FallbackImpl
   util/           Bits, Crc, VarInt, Preconditions
@@ -136,7 +135,9 @@ ElementId  ->  kind, segment, slot, gen          3 shifts, 3 masks
            ->  copy 64 bytes                     one cache line
            ->  re-read PMA epoch, retry if changed
            ->  check gen and LIVE                one branch
-           ->  visibility check against snapshot one compare, chain walk only if xmin > snapshot
+           ->  visibility check                  skipped entirely with no read view open;
+                                                 otherwise one compare per page, and a rebuild
+                                                 only for a page the writer has since changed
 ```
 
 Zero locks, zero allocations, one potential page fault. This sequence is the reason for every
@@ -245,8 +246,7 @@ they conflict.
 | `StaleIdException` | Generation mismatch: the id refers to a slot that has been freed and reused | Yes, application-level |
 | `PageCorruptException` | Checksum mismatch on a data page or a PMA entry | No, requires restore or repair |
 | `FormatVersionException` | Store written by a newer version | No |
-| `TransactionConflictException` | Write-write conflict under snapshot isolation | Yes, retry the transaction |
-| `SnapshotTooOldException` | Reading a snapshot whose undo has been vacuumed | Yes, retry with a fresh snapshot |
+| `SnapshotTooOldException` | Reading a view whose retained versions have been reclaimed | Yes, retry with a fresh view |
 | `StoreClosedException` | Use after close | No |
 | `OutOfSegmentsException` | Kind exhausted its 2^24 segments | No |
 
@@ -311,8 +311,9 @@ exist" makes three different conditions indistinguishable.
 | Class | Package | Purpose |
 |-------|---------|---------|
 | `GraphStore` | `io.metaloom.graph.core.api` | Store lifecycle and transaction factory |
-| `Transaction` | `io.metaloom.graph.core.api` | Unit of work: snapshot, write set, commit/rollback |
-| `TransactionManager` | `io.metaloom.graph.core.txn` | Timestamps, active snapshots, conflicts |
+| `Transaction` | `io.metaloom.graph.core.api` | Unit of write work: page overlay, commit/rollback |
+| `ReadTransaction` | `io.metaloom.graph.core.api` | A view fixed at one LSN across many reads |
+| `TransactionManager` | `io.metaloom.graph.core.txn` | Active views, the horizon, the retention budget |
 | `PageCache` | `io.metaloom.graph.core.page` | Buffer management, latches, write-back |
 | `IoEngine` | `io.metaloom.graph.core.io` | Pluggable I/O: mmap, O_DIRECT, io_uring |
 | `Catalog` | `io.metaloom.graph.core.catalog` | Label and property-key interning |

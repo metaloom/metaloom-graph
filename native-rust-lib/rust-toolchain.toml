@@ -1,0 +1,15 @@
+# Pins the toolchain the crate is built and linted with.
+#
+# The Java side loads this library through the FFM linker and trusts its ABI, so "it built on my machine" is not a
+# sufficient description of what produced a `.so` that another process is going to call into. A version here makes the
+# build reproducible for anyone with rustup, and is ignored by a plain `cargo` install, which is what this development
+# environment has — so it constrains CI without breaking a local build.
+#
+# clippy is listed because `cargo clippy -D warnings` runs inside `mvn test`, not only in CI: five real defects came
+# out of it, every one an `extern "C"` entry point that dereferenced a caller pointer without being marked unsafe.
+
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]
+targets = ["x86_64-unknown-linux-gnu"]
+profile = "minimal"

@@ -6,9 +6,11 @@ import java.lang.foreign.MemorySegment;
 import io.metaloom.graph.core.api.PageCorruptException;
 import io.metaloom.graph.core.id.ElementId;
 import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.nativelib.NativeCodec;
 import io.metaloom.graph.core.segment.SegmentSet;
 import io.metaloom.graph.core.util.Crc;
 import io.metaloom.graph.core.util.Layouts;
+import io.metaloom.graph.core.util.Lz4;
 
 /**
  * Page sized extents for anything that does not belong inline: long strings, binary payloads, embedding vectors.
@@ -33,7 +35,22 @@ public final class BlobStore {
 	private static final int OFF_TOTAL_LENGTH = 0;
 	private static final int OFF_NEXT = 8;
 	private static final int OFF_CRC = 16;
+	private static final int OFF_COMPRESSION = 23;
 	private static final int OFF_REFCOUNT = 24;
+
+	/** Stored whole. */
+	public static final int COMPRESSION_NONE = 0;
+	/** lz4 block format, with the uncompressed length in the first eight bytes of the payload. */
+	public static final int COMPRESSION_LZ4 = 1;
+
+	/**
+	 * A blob is only stored compressed if it saves at least this much, because decompression is not free and a blob
+	 * that barely shrinks costs more to read than it saves to hold.
+	 */
+	private static final double WORTH_COMPRESSING = 0.9;
+
+	/** Bytes prefixed to a compressed payload to record what it decompresses to. */
+	private static final int ORIGINAL_LENGTH_BYTES = 8;
 
 	private final SegmentSet segments;
 	private final int payloadPerExtent;
@@ -52,7 +69,36 @@ public final class BlobStore {
 		return payloadPerExtent;
 	}
 
+	/**
+	 * Stores a blob, compressing it when that is available and worthwhile.
+	 *
+	 * <p>
+	 * The {@code compression} byte has been in the extent header since the format was written and has always been
+	 * zero, so switching it on is not a format change and no version bump is needed: an old store's blobs simply say
+	 * "none". The reverse direction is what needed care — a blob written compressed must be readable by a reader with
+	 * no native library at all, which is why {@link Lz4} decompresses in pure Java.
+	 * </p>
+	 *
+	 * <p>
+	 * Compressed payloads carry their uncompressed length in their first eight bytes. There is no spare header field
+	 * for it, and {@code total_length} has to keep meaning "bytes stored in this chain" or the chain walk would not
+	 * know when to stop.
+	 * </p>
+	 */
 	public long store(byte[] data) throws IOException {
+		byte[] payload = data;
+		int compression = COMPRESSION_NONE;
+		byte[] compressed = NativeCodec.compress(data);
+		if (compressed != null && compressed.length + ORIGINAL_LENGTH_BYTES < data.length * WORTH_COMPRESSING) {
+			payload = new byte[compressed.length + ORIGINAL_LENGTH_BYTES];
+			MemorySegment.ofArray(payload).set(Layouts.LONG, 0, data.length);
+			System.arraycopy(compressed, 0, payload, ORIGINAL_LENGTH_BYTES, compressed.length);
+			compression = COMPRESSION_LZ4;
+		}
+		return store(data, payload, compression);
+	}
+
+	private long store(byte[] original, byte[] data, int compression) throws IOException {
 		int extents = Math.max(1, (data.length + payloadPerExtent - 1) / payloadPerExtent);
 		long firstId = ElementId.NULL;
 		long previousId = ElementId.NULL;
@@ -75,7 +121,10 @@ public final class BlobStore {
 		}
 		MemorySegment head = segments.mutable(firstId);
 		head.set(Layouts.LONG, OFF_TOTAL_LENGTH, data.length);
-		head.set(Layouts.INT, OFF_CRC, Crc.crc32c(data));
+		// The checksum covers what the caller gave us, not what was stored, so it validates the bytes that come back
+		// out of decompression rather than the bytes that went into it.
+		head.set(Layouts.INT, OFF_CRC, Crc.crc32c(original));
+		head.set(Layouts.BYTE, OFF_COMPRESSION, (byte) compression);
 		head.set(Layouts.LONG, OFF_REFCOUNT, 1L);
 		segments.touched(firstId);
 		return firstId;
@@ -116,12 +165,50 @@ public final class BlobStore {
 				extent = segments.resolve(id);
 			}
 		}
+		byte[] payload = decompress(blobId, result, head.get(Layouts.BYTE, OFF_COMPRESSION));
+
 		int expected = head.get(Layouts.INT, OFF_CRC);
-		int actual = Crc.crc32c(result);
+		int actual = Crc.crc32c(payload);
 		if (expected != actual) {
 			throw new PageCorruptException("Blob " + ElementId.toString(blobId) + " failed its checksum");
 		}
-		return result;
+		return payload;
+	}
+
+	/**
+	 * Expands a stored payload according to its compression byte.
+	 * <p>
+	 * Everything read here comes off a page and is untrusted, including the compression byte itself and the length
+	 * prefix: an unknown codec, an implausible length or a malformed stream is corruption, not a reason to guess.
+	 */
+	private byte[] decompress(long blobId, byte[] stored, int compression) {
+		switch (compression) {
+			case COMPRESSION_NONE:
+				return stored;
+			case COMPRESSION_LZ4: {
+				if (stored.length < ORIGINAL_LENGTH_BYTES) {
+					throw new PageCorruptException("Blob " + ElementId.toString(blobId)
+						+ " claims lz4 compression but holds only " + stored.length + " bytes");
+				}
+				long originalLength = MemorySegment.ofArray(stored).get(Layouts.LONG, 0);
+				long ceiling = (long) payloadPerExtent * Math.max(1, segments.liveCount()) * 255L;
+				if (originalLength < 0 || originalLength > Math.min(Integer.MAX_VALUE, ceiling)) {
+					throw new PageCorruptException("Blob " + ElementId.toString(blobId)
+						+ " declares an uncompressed length of " + originalLength + ", which is not plausible");
+				}
+				byte[] expanded = new byte[(int) originalLength];
+				try {
+					Lz4.decompress(stored, ORIGINAL_LENGTH_BYTES, stored.length - ORIGINAL_LENGTH_BYTES, expanded);
+				} catch (IllegalArgumentException e) {
+					throw new PageCorruptException("Blob " + ElementId.toString(blobId)
+						+ " has a malformed lz4 payload: " + e.getMessage());
+				}
+				return expanded;
+			}
+			default:
+				throw new PageCorruptException("Blob " + ElementId.toString(blobId)
+					+ " declares compression codec " + compression + ", which this build does not know");
+		}
 	}
 
 	/** The next extent of a chain, or {@link ElementId#NULL}. */

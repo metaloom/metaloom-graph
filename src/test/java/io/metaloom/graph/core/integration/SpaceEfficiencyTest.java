@@ -11,6 +11,7 @@ import io.metaloom.graph.core.api.Properties;
 import io.metaloom.graph.core.api.StoreStats;
 import io.metaloom.graph.core.api.Transaction;
 import io.metaloom.graph.core.fixture.TempStore;
+import io.metaloom.graph.core.id.Kind;
 
 /**
  * The headline space number. The proof of concept spent 1080 bytes on a node record alone, before its property
@@ -57,7 +58,7 @@ public class SpaceEfficiencyTest {
 				"Space: %d nodes + %d edges -> %.1f element bytes/node, %.1f index bytes/node, "
 					+ "%d committed bytes (%.1f per node), %d adjacency blocks%n",
 				nodeCount, nodeCount - 1, elementBytesPerNode, indexBytesPerNode,
-				stats.storageBytes(), stats.bytesPerNode(), stats.adjacencyBlockCount());
+				stats.storageBytes(), stats.bytesPerNode(), stats.adjacencyCellCount());
 
 			assertTrue(elementBytesPerNode < 200,
 				"A node plus its two property block should stay under 200 bytes, got " + elementBytesPerNode);
@@ -65,7 +66,7 @@ public class SpaceEfficiencyTest {
 			assertTrue(elementBytesPerNode < POC_BYTES_PER_NODE / 3.0,
 				"Expected at least a threefold improvement over the old layout, got " + elementBytesPerNode
 					+ " bytes per node against " + POC_BYTES_PER_NODE);
-			assertTrue(stats.adjacencyBlockCount() == 0,
+			assertTrue(stats.adjacencyCellCount() == 0,
 				"A chain graph has degree at most two, so no adjacency block should exist");
 			assertTrue(stats.relationshipCount() == 0,
 				"Property free edges must not create relationship records");
@@ -85,17 +86,18 @@ public class SpaceEfficiencyTest {
 				for (int i = 0; i < degree; i++) {
 					others[i] = store.createNode("N");
 				}
-				before = store.stats().adjacencyBlockCount();
+				before = store.stats().adjacencyCellCount();
 				for (int i = 0; i < degree; i++) {
 					store.createEdge(hub, "T", others[i]);
 				}
 				txn.commit();
 			}
-			long blocks = store.stats().adjacencyBlockCount() - before;
-			// Every edge is stored twice, once per endpoint; the spokes keep theirs inline.
-			double bytesPerEdge = (double) blocks * 8192 / degree;
-			System.out.printf("Adjacency: %d edges in %d blocks (%.2f bytes per directed entry)%n",
-				degree, blocks, bytesPerEdge);
+			long cells = store.stats().adjacencyCellCount() - before;
+			// Every edge is stored twice, once per endpoint; the spokes keep theirs inline. Cells, not blocks: a
+			// block is a run of one or more 512 byte cells, so the space it costs is the cell count times the cell.
+			double bytesPerEdge = (double) cells * Kind.ADJ_CELL_BYTES / degree;
+			System.out.printf("Adjacency: %d edges in %d cells (%.2f bytes per directed entry)%n",
+				degree, cells, bytesPerEdge);
 			assertTrue(bytesPerEdge < 8.0,
 				"Compressed adjacency must beat a raw eight byte entry, got " + bytesPerEdge);
 			store.verify();

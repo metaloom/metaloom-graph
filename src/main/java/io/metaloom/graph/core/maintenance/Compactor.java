@@ -209,9 +209,16 @@ public final class Compactor {
 		List<Target> targets = new ArrayList<>();
 		runner.runRead(() -> {
 			switch (kind) {
-				case NODE, REL, ADJ, BLOB -> {
+				case NODE, REL, BLOB -> {
 					for (long id : sets.get(kind).liveIds()) {
 						targets.add(new Target(id, 1));
+					}
+				}
+				case ADJ -> {
+					// Like PROP, a block is a run of cells and the bitmap cannot tell a header from a continuation
+					// cell — but unlike PROP a block says so in its own header, so the sweep does not need the owners.
+					for (long id : adjacency.blockIds()) {
+						targets.add(new Target(id, adjacency.blockCells(id)));
 					}
 				}
 				case PROP -> {
@@ -282,7 +289,13 @@ public final class Compactor {
 	}
 
 	private int cellsOf(Kind kind, long newId) {
-		return kind == Kind.PROP ? properties.cellCount(newId) : 1;
+		return switch (kind) {
+			// Both are variable length runs and must be relocated whole; moving only the first cell of a block
+			// would leave its payload behind and its continuation cells allocated to nothing.
+			case PROP -> properties.cellCount(newId);
+			case ADJ -> adjacency.blockCells(newId);
+			default -> 1;
+		};
 	}
 
 	// ---------------------------------------------------------------- the reference sweep
@@ -302,7 +315,7 @@ public final class Compactor {
 						rels.toId(relId, mappedTo);
 					}
 				}
-				for (long blockId : sets.get(Kind.ADJ).liveIds()) {
+				for (long blockId : adjacency.blockIds()) {
 					long owner = adjacency.blockOwner(blockId);
 					long mappedOwner = map.mapId(owner);
 					if (mappedOwner != owner) {
@@ -321,7 +334,7 @@ public final class Compactor {
 				remapPropertyPayloads(map);
 			}
 			case REL -> {
-				for (long blockId : sets.get(Kind.ADJ).liveIds()) {
+				for (long blockId : adjacency.blockIds()) {
 					remapBlockEntries(blockId, map, true);
 				}
 				for (long nodeId : sets.get(Kind.NODE).liveIds()) {
@@ -356,7 +369,7 @@ public final class Compactor {
 						nodes.adjHeadId(nodeId, mapped);
 					}
 				}
-				for (long blockId : sets.get(Kind.ADJ).liveIds()) {
+				for (long blockId : adjacency.blockIds()) {
 					if (map.isSource(blockId)) {
 						continue;
 					}

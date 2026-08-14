@@ -12,9 +12,16 @@ import java.util.Set;
  * id costs no index probe and no extra seek.
  * <p>
  * <b>Durability.</b> Every commit is written to the write-ahead log and fsynced before it touches a data file, so a
- * crash loses nothing that was reported as committed. Isolation is single-writer serialisable: one writer at a time,
- * many concurrent readers, and a reader never observes half of a commit. Snapshot isolation with concurrent writers
- * needs the MVCC version chains of spec/TRANSACTIONS.md and is not implemented.
+ * crash loses nothing that was reported as committed.
+ * <p>
+ * <b>Isolation.</b> Writes are serialised — one writer at a time — and a writer always reads the current state, so
+ * lost updates and write skew cannot occur and writes are effectively serializable. Reads are concurrent with writing
+ * and with each other. A read on its own sees the latest commit and never half of one; {@link #beginRead()} fixes a
+ * view across many reads at {@link IsolationLevel#SNAPSHOT}, which is what a long traversal or a consistent export
+ * needs.
+ * <p>
+ * <b>Not present:</b> concurrent writers. The single writer is what makes the above true so cheaply, and the version
+ * machinery that would replace it is described in spec/TRANSACTIONS.md.
  *
  * @see <a href="../../../../../../../../spec/API.md">spec/API.md</a>
  */
@@ -35,6 +42,40 @@ public interface GraphStore extends AutoCloseable {
 	 * joins the caller's transaction if there is one, and otherwise runs in its own auto-commit transaction.
 	 */
 	Transaction begin();
+
+	/**
+	 * Opens a {@link IsolationLevel#SNAPSHOT} read view: every read on this thread sees the store as it was at this
+	 * instant until the view is closed, however many commits land underneath.
+	 *
+	 * <p>
+	 * Readers do not block the writer and the writer does not block readers. The cost is memory — see
+	 * {@link #snapshotStats()} — and it is only paid while a view is open.
+	 * </p>
+	 */
+	ReadTransaction beginRead();
+
+	ReadTransaction beginRead(IsolationLevel level);
+
+	/**
+	 * Runs the work in a write transaction, committing it, and retrying up to {@code attempts} times if the store
+	 * reports contention.
+	 *
+	 * <p>
+	 * Failures that repeating cannot fix — a constraint violation, an abandoned snapshot — are raised immediately
+	 * rather than retried into the same answer.
+	 * </p>
+	 */
+	<T> T inTransaction(TransactionalWork<T> work, int attempts) throws IOException;
+
+	default <T> T inTransaction(TransactionalWork<T> work) throws IOException {
+		return inTransaction(work, 3);
+	}
+
+	/** Work performed inside a transaction opened by {@link #inTransaction}. */
+	@FunctionalInterface
+	interface TransactionalWork<T> {
+		T run() throws IOException;
+	}
 
 	// ---------------------------------------------------------------- nodes
 
@@ -105,6 +146,18 @@ public interface GraphStore extends AutoCloseable {
 	/** Every node whose property equals the value, via the property index plus verification. */
 	List<Long> nodesByProperty(String key, Object value);
 
+	/**
+	 * Declares a property key unique across live nodes: a later write carrying a value another node already holds is
+	 * refused with {@link ConstraintViolationException}.
+	 * <p>
+	 * The existing data is checked first, so declaring a constraint that is already violated fails rather than
+	 * quietly recording something untrue. The declaration is durable and survives a reopen.
+	 */
+	void createUniqueConstraint(String key) throws IOException;
+
+	/** Property keys currently declared unique. */
+	List<String> uniqueConstraints();
+
 	// ---------------------------------------------------------------- maintenance
 
 	/** Flushes everything to disk. Until the log lands this is the only durability point. */
@@ -135,7 +188,15 @@ public interface GraphStore extends AutoCloseable {
 	 * Returns the blocks of every all-free page to the filesystem, without moving anything and without breaking a
 	 * single id. Requires the native layer; a no-op without it.
 	 *
+	 * <p>
+	 * <b>Refused while any {@link ReadTransaction} is open.</b> A punched hole reads back as zeros, which a view
+	 * entitled to the old content cannot distinguish from data — so this fails loudly rather than serving one a page
+	 * of nothing.
+	 * </p>
+	 *
 	 * @return the number of pages reclaimed
+	 * @throws GraphStoreException
+	 *             if a read view is open
 	 */
 	int reclaim() throws IOException;
 
@@ -152,12 +213,22 @@ public interface GraphStore extends AutoCloseable {
 	 * <p>
 	 * Prefer {@link #reclaim()}, which returns space without moving anything, and run this only when free space has
 	 * become scattered <em>within</em> pages.
+	 *
+	 * <p>
+	 * <b>Refused while any {@link ReadTransaction} is open</b>, because retiring an emptied segment unlinks the file a
+	 * view may still be reading.
+	 *
+	 * @throws GraphStoreException
+	 *             if a read view is open
 	 */
 	CompactionReport compact() throws IOException;
 
 	CompactionReport compact(CompactionOptions options) throws IOException;
 
 	StoreStats stats();
+
+	/** What open read views currently cost. Every field is zero when none is open. */
+	SnapshotStats snapshotStats();
 
 	/**
 	 * Counters and gauges: log volume and lag, fsyncs, record reads and writes per kind, checkpoint and recovery

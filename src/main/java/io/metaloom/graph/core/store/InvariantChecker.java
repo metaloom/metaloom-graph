@@ -314,13 +314,27 @@ public final class InvariantChecker {
 				}
 			}
 		}
-		for (long blockId : segmentSets.get(Kind.ADJ).liveIds()) {
+		// A block spans a run of cells, so the live-slot sweep sees continuation cells too. Every one of them must be
+		// covered by exactly one reachable block: a cell that is allocated but belongs to no block is leaked space,
+		// and one claimed by two blocks is the worst corruption the allocator can produce.
+		Set<Long> covered = new HashSet<>();
+		for (long blockId : reachable) {
+			int cells = adjacency.blockCells(blockId);
+			for (int i = 0; i < cells; i++) {
+				long cell = ElementId.encode(Kind.ADJ, ElementId.segment(blockId), ElementId.slot(blockId) + i,
+					ElementId.gen(blockId));
+				if (!covered.add(ElementId.location(cell))) {
+					violations.add("Adjacency cell " + ElementId.toString(cell) + " is claimed by more than one block");
+				}
+			}
+		}
+		for (long cellId : segmentSets.get(Kind.ADJ).liveIds()) {
 			if (!step(violations)) {
 				return;
 			}
-			if (!reachable.contains(blockId)) {
-				violations.add("Adjacency block " + ElementId.toString(blockId)
-					+ " is orphaned; no node's chain reaches it");
+			if (!covered.contains(ElementId.location(cellId))) {
+				violations.add("Adjacency cell " + ElementId.toString(cellId)
+					+ " is allocated but no node's chain reaches a block covering it");
 			}
 		}
 	}
@@ -355,7 +369,15 @@ public final class InvariantChecker {
 		if (ElementId.isNull(blockId) || !segmentSets.get(Kind.PROP).isLive(blockId)) {
 			return;
 		}
-		int limit = segmentSets.get(Kind.BLOB).segmentCount() * segmentSets.get(Kind.BLOB).slotsPerPage() + 1;
+		// A chain cannot visit more extents than exist, so the live count is both a correct bound and a tight one.
+		//
+		// This was segmentCount() * slotsPerPage() + 1. A BLOB extent is page sized, so slotsPerPage() is 1 and the
+		// bound came out at 2 for a single-segment store: every blob needing three or more extents — anything past
+		// about 16 KiB — was reported as a chain that "does not terminate", and its unvisited extents were then
+		// reported as orphaned on top. A false alarm on healthy data, which is worse than a missed one: it sends
+		// somebody hunting corruption that is not there, and it made verify(FULL) unusable on any store holding real
+		// blobs. Found by RollbackTest, which was the first test to write a blob and then verify.
+		long limit = segmentSets.get(Kind.BLOB).liveCount() + 1;
 		for (long blobId : properties.blobIds(blockId)) {
 			long extent = blobId;
 			int hops = 0;

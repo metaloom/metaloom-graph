@@ -19,7 +19,7 @@ device reads it takes to enumerate a node's neighbours.
 | PoC linked list | d | d x 8 KiB (one page each) | 32 |
 | Materialised relationship record per edge, contiguous | d | d x 8 KiB | 64 |
 | **Inline edges (d <= 2)** | **0** | **0** | **8** |
-| **Adjacency blocks, compressed** | **ceil(d / ~1000)** | **ceil(d/1000) x 8 KiB** | **~2 to 9** |
+| **Adjacency blocks, compressed** | **ceil(d / ~8000)** | **ceil(d/8000) x 8 KiB** | **~1 to 1.3** |
 
 The target is the last two rows. The mechanism is: put the first two edges in the node record where
 they are already paid for, and put the rest in page-sized blocks holding hundreds of
@@ -114,7 +114,17 @@ API therefore exposes `createEdge(from, type, to)` returning a lightweight handl
 
 ## 5. Adjacency Blocks
 
-An adjacency block is exactly one page (`PAGE_SIZE`, 8 KiB by default), addressed by an `ADJ` id.
+An adjacency block is a **run of consecutive 512 byte cells** (`Kind.ADJ_CELL_BYTES`), addressed by an
+`ADJ` id naming its first cell. It starts at one cell and **doubles as it fills** — 512 B, 1 KiB,
+2 KiB, 4 KiB, one page — and only a node that has filled a whole page starts a chain. A block never
+straddles a page, which is what lets the whole of one be acquired in a single read: the run from its
+first cell to the end of its page is always safe to take, and the header says how much of it to use.
+
+**This was a page from the first edge that did not fit inline, and that was the largest space defect
+the project has found in itself.** A node of degree three was given 8 KiB. On a random graph of mean
+degree 4 that is three quarters of all nodes; measured on ten million nodes it was 59 of 61 GiB, and
+making the block grow instead took the same graph to 6.2 GiB and its load from 43 minutes to 11.
+See [reports/SCALE.md](reports/SCALE.md). Store format version **2**.
 
 ```
 offset size field
@@ -126,28 +136,52 @@ offset size field
 30     2    gen
 32     4    sorted_count       entries in the compressed region
 36     1    flags              FULL
-37     3    reserved
+37     1    cells              allocation units this block spans, 1..pageSize/512
+38     2    reserved
 40     8    min_location       for skipping a block without decoding it
 48     8    max_location
 56     8    type_bitmap        Bloom-style over 64 hashed type ids
 64     N    payload
 ```
 
-64-byte header. The page is laid out as
+64-byte header. The block is laid out as
 
 ```
 [ header 64 B ][ compressed sorted region ][ free ][ raw tail entries, 8 B each, growing downwards ]
 ```
 
-**The hybrid is what makes the compression pay.** Compressing a full page into a smaller page saves
-nothing on its own, because a block always occupies one page. Instead an append writes an 8-byte raw
-entry at the tail; when the tail meets the sorted region the block recompresses everything into the
-sorted region, which typically reclaims most of the page and lets appending continue. Only when
-compression can no longer make room is the block marked `FULL` and a new one allocated.
+`flags` is **one byte**, not four. It was written four bytes wide once, which silently claimed the
+reserved bytes beside it and erased `cells` on every write.
 
-Measured: 500,000 edges on one node occupy **62 blocks**, or 8065 entries per 8 KiB block — about
-**1.02 bytes per directed entry**. A raw 8-byte layout would need 489 blocks and the proof of
-concept's linked list 1954.
+**The hybrid is what makes the compression pay.** An append writes an 8-byte raw entry at the tail;
+when the tail meets the sorted region the block recompresses everything into the sorted region, which
+typically reclaims most of the space and lets appending continue. Only when compression can no longer
+make room does the block grow to the next size — or, at page size, get marked `FULL` so a new block
+is chained in front of it.
+
+Growth is preferred over chaining wherever there is room in the page: a chain costs a read per block
+on every traversal, a larger run costs none. It costs one copy per doubling, five to reach a page,
+which is amortised O(1) per edge.
+
+Measured cost per directed entry:
+
+| Degree | Block | Bytes per entry |
+|---|---|---|
+| 3 | 1 cell | 170 |
+| 20 | 1 cell | 25.6 |
+| 60 | 1 cell | 8.53 |
+| 150 | 1 cell | 3.41 |
+| 400 | 1 cell | **1.28** |
+| 20,000 | 48 cells | **1.23** |
+| 500,000 | 62 pages | **1.02** (8065 entries per 8 KiB block) |
+
+One 512 byte cell holds **400 directed entries**, so on ordinary graphs growth rarely triggers at all.
+A raw 8-byte layout would need 489 pages for the last row and the proof of concept's linked list 1954.
+
+**Enumerating blocks goes through the owners, never the free-slot bitmap.** The bitmap is per cell, so
+a sweep over live `ADJ` slots sees continuation cells as well as block headers, and a continuation
+cell holds compressed edge data — nothing in it identifies it as one. Compaction and `verify(FULL)`
+both walk node chains instead, exactly as they do for property blocks.
 
 ### 5.1 Chain order
 

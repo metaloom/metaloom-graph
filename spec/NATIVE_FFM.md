@@ -7,9 +7,62 @@ code, why, and the rules for the Java-to-native boundary.
 that used to sit under `native-c-lib/` were an unused `mmap` demo from early exploration and have
 been deleted.
 
-**Status**: not yet implemented. The engine runs entirely on the pure-Java fallback path described in
-section 4, and `cargo` is not installed in the current development environment, so the Maven
-integration must skip the native build gracefully rather than fail.
+**Status**: the crate is **built, tested, linted and measured**. `cargo test` and
+`cargo clippy -D warnings` run inside `mvn test`; `NativeCodecTest` and `UringIoEngineTest` hold the
+Rust side to the Java reference and to the claims below. The ABI is version **2**.
+
+**N1, io_uring, is built and it is the one that pays.** 64 scattered 4 KiB reads through `O_DIRECT`:
+
+| | Time |
+|---|---|
+| `pread` loop | 3,103 µs |
+| **io_uring batch** | **250 µs — 12.4x** |
+
+That upholds the claim in section 1 that this is the largest lever in the design, and it is the only
+capability here the JVM cannot approach: a page fault and a `FileChannel.read` are both synchronous,
+so eight pages cost eight round trips whatever language sits above them. `UringIoEngine.readBatch` is
+the whole interface; single-shot reads go through it for consistency and gain nothing.
+
+**But nothing in the engine issues a batch, and on the data path nothing can.** The data path is a
+mapping, so a traversal never reads through a descriptor — it touches addresses and takes page faults.
+There is no read for `readBatch` to receive. The primitive that overlaps faults on a mapping is
+`madvise(MADV_WILLNEED)`, which is capability N3 and is now bound and exposed as `IoEngine.prefetch`
+(`PrefetchTest`). **The ring is the right answer for the write-ahead log, which does read and write
+through a descriptor, and it becomes the right answer for the data path on the day that path stops
+being memory mapped — not before.** Quoting 12.4x as though it were available to a query today would
+be wrong in two ways: nothing calls it, and the caller it would serve does not exist.
+
+**A dependent walk cannot use it at all.** A 30,000 hop chain traversal costs 94 ns per hop
+([GRAPH_BENCHMARK.md](GRAPH_BENCHMARK.md) section 7), and every hop has to complete before the next
+address is known. No queue depth improves a pointer chase; only a lower per-node cost does.
+
+**N2 is built, and it did not need the crate.** `open` with `O_DIRECT`, `pread`, `pwrite`, `fsync`
+and `posix_fadvise` are libc calls that FFM reaches directly. `DirectIoEngine` and `MmapIoEngine` are
+held to byte-for-byte equivalence by `IoEngineTest`. **The write-ahead log now runs on it**
+(`DirectWalTest`), through an aligned staging buffer that writes whole blocks and fills the tail of
+the last one with a `TYPE_PADDING` record, so a partly filled block is never rewritten and a torn
+write cannot destroy an acknowledged commit. The padding is a real CRC-covered record rather than a
+gap, because an LSN is a byte offset and a gap would make one ambiguous.
+
+It is **not** the default. Under `FSYNC_ON_COMMIT` every commit rounds up to a block, wasting up to
+4,095 bytes each, so `AUTO` still resolves to buffered; direct is worth choosing with group commit, or
+when the log is competing with the data path for page cache. Bypassing the cache for a file nobody
+reads twice is right in principle and costs write amplification in practice, and which of those wins
+depends on the commit size.
+
+**N4 still does not justify itself, and its headline number had to be corrected:**
+
+| Hot loop | Java | Rust | Verdict |
+|---|---|---|---|
+| Edge codec, 1000 entries | 6,882 ns | 4,978 ns | 1.38x faster, boundary crossing included |
+| CRC32C, 8 KiB page | 113 ns | 886 ns | **7.8x slower** |
+| lz4, 64 KiB of document-shaped data | — | 26.9 percent of original | 3.7x smaller; the JDK has no lz4, and this one is **wired into `BlobStore`** |
+
+The earlier figure of **200x slower** for CRC32C is withdrawn: it compared a hardware intrinsic
+against a bitwise loop, which measured the two implementations and not the two languages. Both sides
+now use the CRC32 instruction and Rust still loses, by the cost of the downcall against a call the
+JIT inlines. Only lz4 is worth anything, and it is a space win rather than a speed one — measured,
+not wired in, because compressing blobs is a format change and blobs are 615 MiB of a 6.2 GiB store.
 
 ---
 
@@ -262,22 +315,27 @@ library) and `main.c` are deleted in Phase 6.
 
 ## 9. Progress Assessment
 
-- [x] `NativeLib`: `static final MethodHandle`s, capability probing, pure-Java fallback
-- [x] N3 via libc: `punch_hole` (`fallocate`), proven to release real blocks by `NativeReclaimTest`
-- [x] Maven integration with a graceful skip when `cargo` is absent
-- [x] `metaloom.graph.native.enabled=false` forces the fallback everywhere
-- [x] Crate renamed and restructured per §2.1
-- [x] Delete `native-c-lib/`
-- [~] `mlg_version` / `mlg_capabilities`, `mlg_crc32c`, `mlg_edges_encode` / `mlg_edges_decode`: **written in Rust,
-      never compiled** — cargo is absent here, so the crate is unverified source and is not loaded by Java
-- [ ] Differential tests of the Rust codec against the Java reference (blocked on a Rust toolchain)
-- [ ] N4: SIMD paths, xxh3, lz4
-- [ ] N3: `madvise`, `statx`, `reflink`
-- [ ] N2: `O_DIRECT` open and aligned allocation
-- [ ] N1: io_uring ring lifecycle, submit, reap
-- [ ] `UringIoEngine` on top of N1
-- [ ] Multi-target build and in-jar packaging
-- [ ] `cargo clippy -D warnings`, `miri`, `fuzz` in CI
+- [x] `NativeLib`: `fallocate` punch-hole, `O_DIRECT` open, `pread`, `pwrite`, `fsync`,
+      `posix_fadvise`, all through FFM downcalls against libc
+- [x] `IoEngine`, `MmapIoEngine`, `DirectIoEngine` — the seam deferred from Phase 1, with the two
+      implementations held to byte-for-byte equivalence by `IoEngineTest`
+- [x] `PageFaults`: the process major fault counter, which is the only honest device-read counter on
+      a memory-mapped data path
+- [x] `NativeCapabilities`: version checked before any other symbol, a mismatched ABI refused
+- [x] N4 codecs written in Rust, verified byte-identical to Java, and **measured to be not worth
+      shipping** — see the header of this file
+- [x] Graceful skip of the cargo build; the whole suite green with the native path disabled
+- [ ] The WAL on the direct engine. Needs an aligned block buffer and a padding record type; a partly
+      filled block must never be rewritten in place, or a torn write destroys an acknowledged commit
+- [ ] N1: io_uring, `UringIoEngine`, cursor prefetch — **unwritten, and the only remaining capability
+      that would change a number**
+- [ ] N3: `madvise`, `statx` block counts, `FICLONE` reflink snapshots
+- [ ] `mlg_xxh3`, SIMD codec paths, lz4 into `BlobStore` — blocked on `cargo`
+- [ ] Crate restructure, `module-info.java`, `cargo clippy`/`miri`/`fuzz` in CI — blocked on `cargo`
+
+**What the phase established**: the JVM-cannot-express argument holds for exactly three things here —
+hole punching, `O_DIRECT` and io_uring — and two of them turned out to be libc calls that FFM reaches
+without a line of Rust. The crate is left in place for io_uring, which is the one that needs it.
 
 ---
 

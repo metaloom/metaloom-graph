@@ -198,7 +198,12 @@ public class HostileInputTest {
 			long blobId;
 			Geometry geometry;
 			try (GraphStore store = stores.open()) {
-				nodeId = store.createNode("N", Properties.of().set("k", "x".repeat(40_000)));
+				// Incompressible on purpose. A repeated character compresses to a couple of hundred bytes, which fits
+				// one extent — and a blob of one extent has no chain to point at itself, so the test would patch a
+				// pointer nothing follows and pass without exercising anything.
+				byte[] payload = new byte[40_000];
+				new java.util.Random(20260814L).nextBytes(payload);
+				nodeId = store.createNode("N", Properties.of().set("k", payload));
 				GraphStoreImpl impl = (GraphStoreImpl) store;
 				blobId = impl.propertyStore().blobIds(impl.nodeStore().propBlockId(nodeId)).get(0);
 				geometry = impl.geometry();

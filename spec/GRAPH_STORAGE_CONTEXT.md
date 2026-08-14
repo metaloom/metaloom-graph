@@ -24,7 +24,7 @@ The defining design constraint is:
 > **An element id decodes arithmetically into the exact file and byte offset of its record.
 > Reading an element by id costs zero index probes and zero extra seeks.**
 
-**Status.** Phases 0 to 10 are implemented to varying depth; 127 tests pass here, plus 23 in the MetaLoom
+**Status.** Phases 0 to 10 are implemented to varying depth; 240 tests pass here, plus 23 in the MetaLoom
 integration. The engine is **durable**
 (write-ahead log, fsync before any data page is touched, redo recovery), **transactional** (commit,
 rollback, auto-commit), **indexed** (label and property B+trees), and it reclaims space both without
@@ -33,13 +33,19 @@ reference to them and pulling the high water marks down.
 
 Reads take no lock and scale to **10x at 32 threads**; writes do not scale at all and are not meant to.
 
-It is **not concurrent for writers**: isolation is single-writer serialisable and there is **no MVCC**.
+It is **not concurrent for writers** — writers serialise on one lock — but readers get **MVCC snapshot
+isolation**: `store.beginRead()` fixes a view across many reads while the writer commits underneath.
 There is **no backup mechanism**. The Rust crate is written but has never been compiled here.
 
-Per-phase status with the reason for every gap:
-[reports/PHASE_STATUS.md](reports/PHASE_STATUS.md). Measured numbers:
-[reports/BASELINE.md](reports/BASELINE.md). Running it in anger:
-[OPERATIONS.md](OPERATIONS.md).
+**Adjacency sizing, if you touch that layer**: a block is a run of 512 byte cells that doubles as the
+node fills, not a page. It was a page until [reports/SCALE.md](reports/SCALE.md) measured what that
+cost — 59 of 61 GiB on a mean-degree-4 graph — and the change took the same graph to 6.2 GiB. Store
+format version 2; version 1 stores are rejected rather than converted.
+
+What is done and what is left: [PROGRESS.md](PROGRESS.md). Per-phase status with the reason for every
+gap: [reports/PHASE_STATUS.md](reports/PHASE_STATUS.md). Measured numbers:
+[reports/BASELINE.md](reports/BASELINE.md) and [reports/SCALE.md](reports/SCALE.md). Running it in
+anger: [OPERATIONS.md](OPERATIONS.md).
 
 [CURRENT_STATE.md](CURRENT_STATE.md) is the record of the proof of concept this replaced, including
 its defect register — worth reading before reintroducing any of its patterns.
@@ -61,12 +67,13 @@ GRAPH_STORAGE_CONTEXT.md (this file)
    ├─ CURRENT_STATE.md ......... what actually exists today, and its defects
    ├─ ARCHITECTURE.md .......... target layering, components, threading model
    ├─ PLAN.md .................. phased implementation plan — pick your work item here
+   ├─ PROGRESS.md .............. what is done and what is left, as one checklist
    └─ the spec for your area:
         ├─ ID_ENCODING.md ............ ids, offsets, generations
         ├─ FILE_FORMAT.md ............ segments, pages, records, on-disk layout
         ├─ RELATIONSHIP_STORAGE.md ... adjacency, traversal, edge compression
         ├─ PROPERTY_STORAGE.md ....... attributes, dictionaries, blobs
-        ├─ TRANSACTIONS.md ........... ACID, MVCC, snapshot isolation, CoW
+        ├─ TRANSACTIONS.md ........... ACID, snapshot isolation, page versions, CoW
         ├─ WAL.md .................... write-ahead log, recovery, checkpoints
         ├─ SSD_IO.md ................. I/O strategy, seek avoidance, alignment
         ├─ NATIVE_FFM.md ............. the Java <-> native boundary
@@ -87,7 +94,7 @@ GRAPH_STORAGE_CONTEXT.md (this file)
 | [FILE_FORMAT.md](FILE_FORMAT.md) | Store directory layout, manifest, segment anatomy, page metadata array, free-slot bitmap, node and relationship record layouts, versioning and compaction | Adjacency internals, property internals |
 | [RELATIONSHIP_STORAGE.md](RELATIONSHIP_STORAGE.md) | Inline edges, adjacency blocks, edge compression, lightweight edges, traversal cost model | Node record layout |
 | [PROPERTY_STORAGE.md](PROPERTY_STORAGE.md) | Property blocks, key and label dictionaries, value typing, inline vs blob, string dedup | Relationship storage |
-| [TRANSACTIONS.md](TRANSACTIONS.md) | ACID guarantees, MVCC, snapshot isolation, version chains, undo segments, conflict detection, where Copy-on-Write genuinely applies, vacuum | WAL record format |
+| [TRANSACTIONS.md](TRANSACTIONS.md) | ACID guarantees, snapshot isolation, the anomaly matrix, per-page version chains, the reclamation horizon and budget, where Copy-on-Write genuinely applies. Also why `SERIALIZABLE`, `LockTable` and `xmin` are *not* built rather than unfinished | WAL record format |
 | [WAL.md](WAL.md) | WAL record format, LSN semantics, group commit, ARIES recovery, checkpointing, log retention | Isolation semantics |
 | [SSD_IO.md](SSD_IO.md) | Seek-avoidance rules, alignment, page cache, prefetch, write amplification, TRIM, queue depth | Format details |
 | [NATIVE_FFM.md](NATIVE_FFM.md) | Which functions live in native code and why, the FFM binding rules, arena lifetimes, the pure-Java fallback contract | Storage semantics |
@@ -95,6 +102,9 @@ GRAPH_STORAGE_CONTEXT.md (this file)
 | [TESTING.md](TESTING.md) | Test layout, fixtures, benchmark harness, crash and fault injection, invariant checkers | Implementation steps |
 | [OPERATIONS.md](OPERATIONS.md) | Running it: sizing, tuning, what to monitor, backup and restore, disaster recovery, what every exception means for an operator, security posture | Design rationale |
 | [PLAN.md](PLAN.md) | The phased implementation plan with per-phase deliverables, exit criteria and checkboxes | Design rationale |
+| [PROGRESS.md](PROGRESS.md) | The consolidated done/pending checklist across every phase, and the backlog in priority order | Deliverable definitions, rationale for a gap |
+| [reports/SCALE.md](reports/SCALE.md) | 10M nodes / 20M relationships measured, before and after the cell-based adjacency block: load time, disk cost, throughput curves | Small-scale benchmarks (BASELINE.md) |
+| [GRAPH_BENCHMARK.md](GRAPH_BENCHMARK.md) | The run log: every `GraphScaleBenchmark` result in one progression table, what changed between runs, and what is measurement noise rather than progress | Why any one run came out as it did (SCALE.md) |
 
 ---
 
@@ -112,7 +122,7 @@ These constants are defined normatively in [ID_ENCODING.md](ID_ENCODING.md) and
 | Node record stride | 64 B | Exactly one cache line, never straddles a page |
 | Relationship record stride | 64 B | Same |
 | Property cell stride | 32 B | 256 cells per page |
-| Adjacency block stride | `PAGE_SIZE` | One block = one page = one I/O |
+| Adjacency cell stride | 512 B | A block is a run of cells that doubles as the node fills, up to one page. A page-per-node cost 10x the disk — [reports/SCALE.md](reports/SCALE.md) |
 | Undo record stride | 64 B | Same class as node/rel |
 | Slots per segment | `min(2^24, SEGMENT_CAPACITY / stride)` | Slot field is 24 bit; large strides simply use fewer bits |
 | `NULL_ID` | `0L` | Kind 0 is reserved as "none", so a zeroed page is unambiguously empty |
@@ -139,7 +149,7 @@ graph TB
     end
 
     subgraph engine["Storage engine (Java)"]
-        TXN["Transaction manager<br/>MVCC, snapshots, conflicts"]
+        TXN["Transaction manager<br/>snapshots, horizon, page versions"]
         LOG["WAL manager<br/>append, group commit, recovery"]
         CAT["Catalog<br/>label + key dictionaries"]
         STORES["Record stores<br/>node / rel / adj / prop / blob / undo"]
@@ -191,8 +201,10 @@ Full description in [ARCHITECTURE.md](ARCHITECTURE.md).
 | **LSN** | Log Sequence Number, equal to the byte offset of a record in the logical WAL stream. Also serves as the commit timestamp. |
 | **CSN** | Commit Sequence Number. In this design, the LSN of a transaction's commit record. |
 | **Snapshot** | A commit timestamp; a reader sees every version committed at or before it. |
-| **Undo record** | A before-image of a modified record, used both for rollback and for serving old snapshots. |
-| **Vacuum** | Background reclamation of undo records and dead versions no longer visible to any snapshot. |
+| **Before-image** | The bytes one commit overwrote, kept per page so an older reader can reconstruct what it is entitled to see. In memory, not on disk — undo does not need to be durable under no-steal. |
+| **Read view** | `ReadTransaction`. Fixes what every read on the calling thread sees, at `SNAPSHOT` or `READ_COMMITTED`. Thread-confined. |
+| **Horizon** | The oldest LSN any open view still needs. Everything superseded at or below it is reclaimed after the next commit. |
+| **Vacuum** | Reclamation of before-images no view can need. A call at the end of commit, not a worker thread. |
 
 ---
 
@@ -268,7 +280,10 @@ Full description in [ARCHITECTURE.md](ARCHITECTURE.md).
 | Write a crash test | [TESTING.md §6](TESTING.md#6-crash-and-fault-injection) |
 | Work out what to monitor, or why it will not open | [OPERATIONS.md](OPERATIONS.md) |
 | Add something to the read path | [TESTING.md §7](TESTING.md#7-benchmarks) first — the budgets are build failures |
-| Pick up the next work item | [PLAN.md](PLAN.md) |
+| Pick up the next work item | [PROGRESS.md §5](PROGRESS.md#5-the-backlog-in-the-order-that-buys-the-most), then [PLAN.md](PLAN.md) for its definition |
+| Know whether something is already built | [PROGRESS.md](PROGRESS.md) |
+| Know how it behaves on a large graph | [reports/SCALE.md](reports/SCALE.md) |
+| Decide whether to put something in native code | [NATIVE_FFM.md §1](NATIVE_FFM.md#1-why-native-at-all) — and read the N4 measurement first |
 | Find the current source | `src/main/java/io/metaloom/graph/core/` |
 
 ---
@@ -306,7 +321,8 @@ Full description in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## 8. Progress Assessment
 
-Overall project status. Per-phase detail lives in [PLAN.md](PLAN.md).
+Overall project status. The full done/pending checklist is [PROGRESS.md](PROGRESS.md); per-phase
+deliverables and exit criteria are in [PLAN.md](PLAN.md).
 
 - [x] PoC: FFM memory-mapped record storage for nodes and relationships
 - [x] PoC: id-carries-offset concept (`GraphUUID`)
@@ -318,7 +334,8 @@ Overall project status. Per-phase detail lives in [PLAN.md](PLAN.md).
 - [x] Phase 2 — Record stores and catalog
 - [x] Phase 3 — Adjacency and traversal
 - [x] Phase 4 — WAL, recovery, checkpoints (redo-only, no-steal)
-- [~] Phase 5 — Transactions: ACID, single-writer serialisable; **no MVCC**
+- [~] Phase 5 — Transactions: ACID, serialised writers, **snapshot isolation for readers** with a
+      horizon, a retention budget and vacuum; **no concurrent writers**
 - [~] Phase 6 — Native layer: libc via FFM works; the Rust crate is written but never compiled
 - [x] Phase 7 — Indexes
 - [x] Phase 8 — Compaction and space reclamation
@@ -327,5 +344,5 @@ Overall project status. Per-phase detail lives in [PLAN.md](PLAN.md).
 
 ---
 
-_Git HEAD revision: `c016a41`_
-_Last updated: 2026-08-13 (synced with the Phase 0 to 9 implementation)_
+_Git HEAD revision: `364b5f7`_
+_Last updated: 2026-08-14_

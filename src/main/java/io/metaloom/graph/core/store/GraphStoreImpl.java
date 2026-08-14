@@ -25,6 +25,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.metaloom.graph.core.api.CompactionOptions;
+import io.metaloom.graph.core.api.ConstraintViolationException;
 import io.metaloom.graph.core.api.CompactionReport;
 import io.metaloom.graph.core.api.Direction;
 import io.metaloom.graph.core.api.Edge;
@@ -32,7 +33,11 @@ import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.GraphStoreException;
 import io.metaloom.graph.core.api.GraphStoreOptions;
 import io.metaloom.graph.core.api.IoStats;
+import io.metaloom.graph.core.api.IsolationLevel;
 import io.metaloom.graph.core.api.Properties;
+import io.metaloom.graph.core.api.ReadTransaction;
+import io.metaloom.graph.core.api.SnapshotStats;
+import io.metaloom.graph.core.api.SnapshotTooOldException;
 import io.metaloom.graph.core.api.StoreClosedException;
 import io.metaloom.graph.core.api.StoreMetrics;
 import io.metaloom.graph.core.api.StoreStats;
@@ -48,6 +53,7 @@ import io.metaloom.graph.core.maintenance.MaintenanceRunner;
 import io.metaloom.graph.core.metrics.IoCounters;
 import io.metaloom.graph.core.nativelib.NativeLib;
 import io.metaloom.graph.core.page.OverlayHolder;
+import io.metaloom.graph.core.page.PageOverlay;
 import io.metaloom.graph.core.segment.Geometry;
 import io.metaloom.graph.core.segment.SegmentFile;
 import io.metaloom.graph.core.segment.SegmentSet;
@@ -57,7 +63,10 @@ import io.metaloom.graph.core.store.blob.BlobStore;
 import io.metaloom.graph.core.store.node.NodeStore;
 import io.metaloom.graph.core.store.prop.PropertyStore;
 import io.metaloom.graph.core.store.rel.RelStore;
+import io.metaloom.graph.core.txn.PageVersions;
+import io.metaloom.graph.core.txn.Snapshot;
 import io.metaloom.graph.core.txn.TransactionImpl;
+import io.metaloom.graph.core.txn.TransactionManager;
 import io.metaloom.graph.core.wal.WalManager;
 
 /**
@@ -82,6 +91,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	private final IndexCatalog indexes;
 	private final WalManager wal;
 	private final OverlayHolder overlays = new OverlayHolder();
+	private final TransactionManager transactions;
 	private final IoCounters counters;
 
 	private final FileChannel lockChannel;
@@ -102,15 +112,25 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	private final StampedLock applyLock = new StampedLock();
 
 	private TransactionImpl currentTransaction;
+
+	/**
+	 * The LSN of the newest commit whose pages are in the mapping, which is what a new read view is fixed at.
+	 * <p>
+	 * Written under the apply lock and read without it, so it is volatile. It is deliberately not {@code durableLsn}:
+	 * durability and visibility are different instants, and a view must be fixed at what it can actually see.
+	 */
+	private volatile long appliedLsn;
+
 	private long nextTxnId;
 	private long lastCheckpointLsn;
 	private boolean closed;
 
 	private GraphStoreImpl(Path path, Geometry geometry, Manifest manifest, Catalog catalog,
 		Map<Kind, SegmentSet> segmentSets, WalManager wal, FileChannel lockChannel, FileLock lock,
-		IoCounters counters) {
+		IoCounters counters, long retainedVersionBytes) {
 		this.path = path;
 		this.counters = counters;
+		this.transactions = new TransactionManager(retainedVersionBytes);
 		this.geometry = geometry;
 		this.manifest = manifest;
 		this.catalog = catalog;
@@ -119,6 +139,10 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		this.lockChannel = lockChannel;
 		this.lock = lock;
 		this.nextTxnId = manifest.nextTxnId();
+		// Everything the log had is already in the mapping by the time the store is constructed — recovery ran first.
+		// A view opened before the first commit of this session must therefore be fixed here, not at zero, or it would
+		// consider every page it reads to predate it.
+		this.appliedLsn = wal.lastCommitLsn();
 
 		this.nodes = new NodeStore(segmentSets.get(Kind.NODE));
 		this.rels = new RelStore(segmentSets.get(Kind.REL));
@@ -129,6 +153,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 		for (SegmentSet set : segmentSets.values()) {
 			set.overlays(overlays);
+			set.snapshots(transactions.holder());
 			set.counters(counters);
 		}
 		wal.counters(counters);
@@ -177,11 +202,11 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				counters.recovered(System.nanoTime() - recoveryStart, counters.snapshot().pageApplies());
 			}
 			wal = new WalManager(path, options.walSegmentBytes(), resumeLsn, sets, options.walSyncMode(),
-				options.walSyncIntervalMillis());
+				options.walSyncIntervalMillis(), options.ioEngine());
 
 			logger.debug("Opened graph store {} with {} at LSN {}", path, geometry, resumeLsn);
-			GraphStoreImpl store =
-				new GraphStoreImpl(path, geometry, manifest, catalog, sets, wal, lockChannel, lock, counters);
+			GraphStoreImpl store = new GraphStoreImpl(path, geometry, manifest, catalog, sets, wal, lockChannel, lock,
+				counters, options.retainedVersionBytes());
 			if (resumeLsn != manifest.checkpointLsn()) {
 				// A recovery happened: checkpoint immediately so the next open replays nothing.
 				store.checkpoint();
@@ -250,14 +275,96 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			WalManager.CommitBatch batch = wal.logCommit(txn.id(), txn.overlay());
 			long stamp = applyLock.writeLock();
 			try {
+				retainVersions(batch);
 				wal.apply(batch);
+				appliedLsn = batch.commitLsn();
 			} finally {
 				applyLock.unlockWrite(stamp);
 			}
+			// Outside the apply lock: reclamation only reads the active set and unlinks dead chain entries, and it can
+			// walk every versioned page, which is far too long to hold readers out for.
+			transactions.vacuum(batch.commitLsn());
 			return batch.commitLsn();
 		} finally {
 			endTransaction();
 		}
+	}
+
+	/**
+	 * Keeps what this commit is about to overwrite, on behalf of readers that began before it.
+	 *
+	 * <p>
+	 * Called with the apply lock held and <em>before</em> {@link WalManager#apply}, which is the only ordering that
+	 * works: the before-image is by definition the mapping as it stands now, and a reader must never be able to observe
+	 * the new mapping without the chain entry that undoes it.
+	 * </p>
+	 *
+	 * <p>
+	 * The guard is the whole performance story. With no snapshot open there is nothing to retain, so a store that never
+	 * opens one never allocates a byte here and commit is exactly as fast as it was before MVCC existed.
+	 * </p>
+	 */
+	private void retainVersions(WalManager.CommitBatch batch) {
+		if (!transactions.needsVersions()) {
+			return;
+		}
+		PageVersions versions = transactions.versions();
+		for (WalManager.PageWrite write : batch.writes()) {
+			versions.record(PageOverlay.key(write.kind(), write.segmentNumber(), write.pageIndex()),
+				batch.commitLsn(), write.mappedPage(), write.offset(), write.length());
+		}
+	}
+
+	@Override
+	public ReadTransaction beginRead() {
+		return beginRead(IsolationLevel.SNAPSHOT);
+	}
+
+	@Override
+	public ReadTransaction beginRead(IsolationLevel level) {
+		checkOpen();
+		// The read lock is what makes the pair (LSN, registration) atomic against a commit. Without it a commit could
+		// land between reading the LSN and joining the active set, and the view would be fixed at an LSN whose
+		// before-images nobody was asked to keep.
+		long stamp = applyLock.readLock();
+		try {
+			return transactions.begin(level, appliedLsn, System.nanoTime());
+		} finally {
+			applyLock.unlockRead(stamp);
+		}
+	}
+
+	@Override
+	public SnapshotStats snapshotStats() {
+		checkOpen();
+		PageVersions versions = transactions.versions();
+		return new SnapshotStats(transactions.activeCount(), transactions.oldestActiveLsn(appliedLsn),
+			transactions.oldestActiveAgeNanos(System.nanoTime()) / 1_000_000L, versions.retainedBytes(),
+			versions.entryCount(), versions.pageCount(), transactions.abandonedCount());
+	}
+
+	@Override
+	public <T> T inTransaction(TransactionalWork<T> work, int attempts) throws IOException {
+		checkOpen();
+		if (attempts < 1) {
+			throw new IllegalArgumentException("attempts must be at least 1");
+		}
+		GraphStoreException last = null;
+		for (int attempt = 1; attempt <= attempts; attempt++) {
+			try (Transaction txn = begin()) {
+				T result = work.run();
+				txn.commit();
+				return result;
+			} catch (SnapshotTooOldException | ConstraintViolationException e) {
+				// Retrying either of these repeats the same failure: one is about a reader that no longer exists, the
+				// other about data that has not changed. Neither is contention.
+				throw e;
+			} catch (GraphStoreException e) {
+				last = e;
+				logger.debug("Transaction attempt {} of {} failed, retrying", attempt, attempts, e);
+			}
+		}
+		throw last;
 	}
 
 	@Override
@@ -306,6 +413,12 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	 */
 	private <T> T read(Supplier<T> op) {
 		checkOpen();
+		Snapshot snapshot = transactions.holder().current();
+		if (snapshot != null) {
+			// Once per operation rather than once per page: a view the horizon has passed is wrong everywhere, not
+			// only on the pages it has yet to touch.
+			snapshot.checkAlive();
+		}
 		if (writerLock.isHeldByCurrentThread() && currentTransaction != null) {
 			// Inside a write transaction the overlay already gives a consistent view.
 			return op.get();
@@ -317,6 +430,10 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				if (applyLock.validate(stamp)) {
 					return result;
 				}
+			} catch (Snapshot.NeedsExclusionException e) {
+				// A page has to be rebuilt for this view, and rebuilding reads the mapping and the version chains
+				// together. Fall through to the locked attempt rather than take a lock on every read for the
+				// possibility.
 			} catch (RuntimeException e) {
 				if (applyLock.validate(stamp)) {
 					// Nothing was applied underneath, so the failure is real rather than a torn read.
@@ -326,8 +443,14 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		}
 		long readStamp = applyLock.readLock();
 		try {
+			if (snapshot != null) {
+				snapshot.exclusionHeld(true);
+			}
 			return op.get();
 		} finally {
+			if (snapshot != null) {
+				snapshot.exclusionHeld(false);
+			}
 			applyLock.unlockRead(readStamp);
 		}
 	}
@@ -358,10 +481,17 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			return;
 		}
 		// A maintenance scan is long and rare, so it takes the lock outright rather than gambling on optimism.
+		Snapshot snapshot = transactions.holder().current();
 		long stamp = applyLock.readLock();
 		try {
+			if (snapshot != null) {
+				snapshot.exclusionHeld(true);
+			}
 			unit.run();
 		} finally {
+			if (snapshot != null) {
+				snapshot.exclusionHeld(false);
+			}
 			applyLock.unlockRead(stamp);
 		}
 	}
@@ -377,12 +507,79 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	public long createNode(String label, Properties props) throws IOException {
 		return write(() -> {
 			int labelId = catalog.internLabel(label);
+			Map<Integer, Object> keyed = props == null ? null : toKeyIds(props);
+			checkUnique(keyed, ElementId.NULL);
 			long nodeId = nodes.create(labelId, ElementId.NULL);
 			if (props != null && !props.isEmpty()) {
-				nodes.propBlockId(nodeId, properties.store(toKeyIds(props), nodeId));
+				nodes.propBlockId(nodeId, properties.store(keyed, nodeId));
 			}
-			indexes.onNodeCreated(nodeId, labelId, props == null ? null : toKeyIds(props));
+			indexes.onNodeCreated(nodeId, labelId, keyed);
 			return nodeId;
+		});
+	}
+
+	/**
+	 * Rejects a write that would put two live elements on the same value of a unique key.
+	 * <p>
+	 * The index answers this in one probe, and the candidates it returns are verified against the stored property
+	 * before anything is refused — the index is keyed on a value hash, so an unverified conflict could be a collision
+	 * between two different values. Refusing a legitimate write is as bad as accepting an illegitimate one.
+	 */
+	private void checkUnique(Map<Integer, Object> properties, long excluding) {
+		if (properties == null || properties.isEmpty()) {
+			return;
+		}
+		for (Map.Entry<Integer, Object> entry : properties.entrySet()) {
+			if (entry.getValue() == null || !indexes.isUnique(entry.getKey())) {
+				continue;
+			}
+			for (long other : indexes.conflicts(entry.getKey(), entry.getValue(), excluding)) {
+				if (!nodes.exists(other)) {
+					continue;
+				}
+				Object stored = this.properties.read(nodes.propBlockId(other), entry.getKey());
+				if (java.util.Objects.deepEquals(stored, normalise(entry.getValue()))) {
+					throw new ConstraintViolationException(catalog.key(entry.getKey()), entry.getValue(), other);
+				}
+			}
+		}
+	}
+
+	/**
+	 * Declares a property key unique across live nodes.
+	 * <p>
+	 * Checks the existing data first and refuses rather than declaring something that is already false.
+	 */
+	@Override
+	public void createUniqueConstraint(String key) throws IOException {
+		write(() -> {
+			int keyId = catalog.internKey(key);
+			Map<Object, Long> seen = new java.util.HashMap<>();
+			for (long nodeId : segmentSets.get(Kind.NODE).liveIds()) {
+				Object value = properties.read(nodes.propBlockId(nodeId), keyId);
+				if (value == null) {
+					continue;
+				}
+				Object normalised = value instanceof byte[] bytes ? java.util.Arrays.toString(bytes) : value;
+				Long previous = seen.put(normalised, nodeId);
+				if (previous != null) {
+					throw new ConstraintViolationException(key, value, previous);
+				}
+			}
+			indexes.addUniqueConstraint(keyId);
+			return null;
+		});
+	}
+
+	@Override
+	public List<String> uniqueConstraints() {
+		return read(() -> {
+			int[] keys = indexes.uniqueKeys();
+			List<String> names = new ArrayList<>(keys.length);
+			for (int keyId : keys) {
+				names.add(catalog.key(keyId));
+			}
+			return names;
 		});
 	}
 
@@ -417,6 +614,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			Map<Integer, Object> after = toKeyIds(props);
 			nodes.propBlockId(nodeId, properties.store(after, nodeId));
 			properties.free(old);
+			checkUnique(after, nodeId);
 			indexes.onPropertiesChanged(nodeId, nodes.labelId(nodeId), before, after);
 			return null;
 		});
@@ -610,6 +808,16 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		});
 	}
 
+	/**
+	 * Whether a breadth-first traversal advises the kernel about its next frontier. Off by default; see
+	 * {@link #traverse} and spec/GRAPH_BENCHMARK.md for the measurement that decided it.
+	 */
+	private static final boolean PREFETCH_TRAVERSAL =
+		Boolean.getBoolean("metaloom.graph.prefetch.traversal");
+
+	/** How many queued nodes are advised at a time when prefetching is on. */
+	private static final int PREFETCH_DEPTH = Integer.getInteger("metaloom.graph.prefetch.depth", 64);
+
 	@Override
 	public List<Edge> traverse(long startNodeId, Direction direction, Set<String> types, int maxDepth) {
 		return read(() -> {
@@ -620,12 +828,35 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			visited.add(startNodeId);
 			Deque<long[]> queue = new ArrayDeque<>();
 			queue.add(new long[] { startNodeId, 0 });
+			// The frontier is the one thing a breadth-first walk knows in advance, so it is the one place a mapped data
+			// path can get more than one read in flight: naming the pages of the nodes queued behind this one lets the
+			// kernel fetch them while this level is still being decoded.
+			//
+			// It is off by default, and that is a measured decision rather than caution. Advising costs a syscall per
+			// queued node, and on a store that fits in page cache there is no fault for it to overlap — so it is pure
+			// overhead, measured at 1,967 ns per edge against 701 with it off. That is 2.8x slower, on the only case
+			// this machine can produce: posix_fadvise evicts nothing on its filesystem, so the benefit is
+			// unmeasurable here and only the cost is real. Enabling something whose cost is measured and whose
+			// benefit is not would be exactly backwards.
+			long[] frontier = PREFETCH_TRAVERSAL ? new long[PREFETCH_DEPTH] : null;
 			while (!queue.isEmpty()) {
 				long[] current = queue.poll();
 				long nodeId = current[0];
 				int depth = (int) current[1];
 				if (depth >= maxDepth) {
 					continue;
+				}
+				if (frontier != null) {
+					int ahead = 0;
+					for (long[] queued : queue) {
+						if (ahead == frontier.length) {
+							break;
+						}
+						frontier[ahead++] = queued[0];
+					}
+					if (ahead > 0) {
+						nodes.segments().prefetch(frontier, ahead);
+					}
 				}
 				for (long packed : adjacency.edges(nodeId)) {
 					int before = result.size();
@@ -803,9 +1034,42 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		}
 	}
 
+	/**
+	 * Refuses a maintenance operation that would destroy state an open read view is entitled to see.
+	 *
+	 * <p>
+	 * Both callers below reach past the page-versioning mechanism rather than through it, and neither failure would be
+	 * noisy:
+	 * </p>
+	 *
+	 * <ul>
+	 * <li><b>{@code reclaim()}</b> punches a hole in every all-free page, which makes the filesystem serve zeros for
+	 * it. Reconstruction starts from the mapping and applies the runs that commits overwrote; nothing overwrote the
+	 * bytes a hole zeroed, so the view would read zeros and report a store full of empty records. <b>Silent</b>, and
+	 * indistinguishable from data loss.</li>
+	 * <li><b>{@code compact()}</b> relocates records and unlinks emptied segment files. A view holding a page in a
+	 * retired segment loses the mapping underneath it.</li>
+	 * </ul>
+	 *
+	 * <p>
+	 * Both are rare, deliberate, offline-ish operations — compaction already invalidates every id a caller holds — so
+	 * refusing while a reader is open costs nothing and removes a class of silent wrong answers. The reader is named in
+	 * the message, because "some reader somewhere" is not actionable.
+	 * </p>
+	 */
+	private void refuseWhileViewsAreOpen(String operation) {
+		SnapshotStats stats = snapshotStats();
+		if (stats.openViews() > 0) {
+			throw new GraphStoreException(operation + " cannot run while " + stats.openViews()
+				+ " read view(s) are open; the oldest has been open for " + stats.oldestOpenAgeMillis()
+				+ " ms at LSN " + stats.oldestOpenLsn() + ". Close them first.");
+		}
+	}
+
 	@Override
 	public int reclaim() throws IOException {
 		checkOpen();
+		refuseWhileViewsAreOpen("reclaim()");
 		writerLock.lock();
 		try {
 			int punched = 0;
@@ -826,6 +1090,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	@Override
 	public CompactionReport compact(CompactionOptions options) throws IOException {
 		checkOpen();
+		refuseWhileViewsAreOpen("compact()");
 		long startedAt = System.nanoTime();
 		long storageBefore = stats().storageBytes();
 		double livenessBefore = liveness(options.kinds());
@@ -1062,6 +1327,9 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			return;
 		}
 		closed = true;
+		// Retained versions are heap, not files, so nothing about them survives the store. Releasing them here rather
+		// than waiting for the store to be collected means a closed store holds no memory it does not need.
+		transactions.clear();
 		IOException first = null;
 		try {
 			catalog.force();

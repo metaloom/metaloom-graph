@@ -5,6 +5,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
 import java.util.Arrays;
 import java.util.Random;
 
@@ -13,6 +15,7 @@ import org.junit.jupiter.api.Test;
 
 import io.metaloom.graph.core.store.adj.EdgeCodec;
 import io.metaloom.graph.core.store.adj.PackedEdge;
+import io.metaloom.graph.core.util.VarInt;
 
 /**
  * @see <a href="../../../../../../../../spec/RELATIONSHIP_STORAGE.md">spec/RELATIONSHIP_STORAGE.md</a> section 9
@@ -111,5 +114,88 @@ public class EdgeCodecTest {
 		inflated[0] = (byte) 0x7F; // claim 127 groups
 		assertThrows(IllegalArgumentException.class,
 			() -> EdgeCodec.decode(inflated, 0, inflated.length, new long[edges.length]));
+	}
+
+	/**
+	 * A delta that would move the running location backwards or past the end of the range must be refused.
+	 *
+	 * <p>
+	 * The regression test for a defect found by {@code cargo fuzz run edges_decode} against the Rust decoder, which
+	 * has the same loop. The accumulation was a plain {@code +}: a delta read off a corrupt page with its high bit set
+	 * decodes to a negative long, moves the location <em>backwards</em> onto a perfectly valid one, and the range
+	 * check accepts it. The decoder then reports a neighbour that was never there, with no error anywhere.
+	 * </p>
+	 *
+	 * <p>
+	 * The differential test against the Rust implementation could not have found this, because Rust wrapped the same
+	 * way and the two agreed on the same wrong answer. Comparing two implementations only finds mistakes they do not
+	 * share.
+	 * </p>
+	 */
+	@Test
+	public void testABackwardsDeltaIsRefusedRatherThanAccepted() {
+		// One group, two entries: a valid first location, then a delta with the high bit set.
+		byte[] block = new byte[64];
+		int pos = VarInt.write(block, 0, 1);          // one group
+		pos = VarInt.write(block, pos, 0);            // group key
+		pos = VarInt.write(block, pos, 2);            // two entries
+		pos = VarInt.write(block, pos, 1L << 40);     // first location, in range
+		pos = VarInt.write(block, pos, -1L);          // delta: every bit set
+		final int limit = pos;
+
+		long[] dst = new long[8];
+		assertThrows(IllegalArgumentException.class, () -> EdgeCodec.decode(block, 0, limit, dst),
+			"a delta that is not a valid unsigned varint must be refused, not added");
+
+		try (Arena arena = Arena.ofConfined()) {
+			MemorySegment segment = arena.allocate(block.length);
+			MemorySegment.copy(MemorySegment.ofArray(block), 0, segment, 0, block.length);
+			assertThrows(IllegalArgumentException.class, () -> EdgeCodec.decode(segment, 0, limit, dst),
+				"and the segment path must refuse it identically");
+		}
+	}
+
+	/** A delta large enough to overflow the running location, rather than merely exceed its range. */
+	@Test
+	public void testAnOverflowingDeltaIsRefused() {
+		byte[] block = new byte[64];
+		int pos = VarInt.write(block, 0, 1);
+		pos = VarInt.write(block, pos, 0);
+		pos = VarInt.write(block, pos, 2);
+		pos = VarInt.write(block, pos, 1L << 40);
+		pos = VarInt.write(block, pos, Long.MAX_VALUE);
+		final int limit = pos;
+
+		long[] dst = new long[8];
+		assertThrows(IllegalArgumentException.class, () -> EdgeCodec.decode(block, 0, limit, dst));
+	}
+
+	/**
+	 * A group declaring zero entries must be refused, not silently turned into one.
+	 *
+	 * <p>
+	 * The second defect {@code cargo fuzz run edges_decode} found, and the second one both implementations shared. The
+	 * first entry of a group is written before the loop that iterates {@code 1..count}, so a count of zero still
+	 * emitted an entry — a phantom edge on a store that had none, and an untyped
+	 * {@code ArrayIndexOutOfBoundsException} when the destination happened to be full.
+	 * </p>
+	 */
+	@Test
+	public void testAGroupOfZeroEntriesIsRefused() {
+		byte[] block = new byte[32];
+		int pos = VarInt.write(block, 0, 1);       // one group
+		pos = VarInt.write(block, pos, 0);         // group key
+		pos = VarInt.write(block, pos, 0);         // zero entries, which the encoder never writes
+		pos = VarInt.write(block, pos, 1L << 20);  // a location it should never reach
+		final int limit = pos;
+
+		long[] dst = new long[4];
+		assertThrows(IllegalArgumentException.class, () -> EdgeCodec.decode(block, 0, limit, dst),
+			"a group of zero entries is malformed and must be reported as such");
+
+		// And with a destination exactly full, which is where it used to run off the end.
+		long[] full = new long[0];
+		assertThrows(IllegalArgumentException.class, () -> EdgeCodec.decode(block, 0, limit, full),
+			"the failure must be typed even when the destination has no room at all");
 	}
 }

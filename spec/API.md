@@ -64,17 +64,46 @@ try (Transaction tx = store.begin()) {                 // SNAPSHOT by default
 }
 ```
 
-| Method | Meaning |
-|--------|---------|
-| `store.begin()` | Snapshot isolation |
-| `store.begin(IsolationLevel)` | `READ_COMMITTED`, `SNAPSHOT`, `SERIALIZABLE` |
-| `store.readOnly()` | A snapshot with no write set; cheaper and cannot conflict |
-| `tx.commit()` | Durable per `wal.sync.mode`; throws `TransactionConflictException` on conflict |
-| `tx.rollback()` | Undo; `close()` without `commit()` rolls back |
-| `store.inTransaction(Function<Transaction,T>)` | Auto-retry on conflict, configurable attempts |
+| Method | Meaning | Built |
+|--------|---------|-------|
+| `store.begin()` | A write transaction. One writer at a time; a second waits | **Yes** |
+| `tx.commit()` | Durable per `wal.sync.mode` | **Yes** |
+| `tx.rollback()` | `close()` without `commit()` rolls back | **Yes** |
+| `store.inTransaction(work, attempts)` | Runs the work in a transaction, retrying what retrying can fix | **Yes** |
+| `store.beginRead()` | A `SNAPSHOT` read view over many reads | **Yes** |
+| `store.beginRead(IsolationLevel)` | `SNAPSHOT` or `READ_COMMITTED` | **Yes** |
+| `store.snapshotStats()` | What open views cost right now | **Yes** |
+| `store.begin(IsolationLevel)` | Per-transaction write isolation | No — writers are serialised, so there is one level |
+| `SERIALIZABLE` | SSI conflict tracking | No — nothing to detect; see TRANSACTIONS.md §3 |
 
-A `Transaction` is `AutoCloseable` and **not** thread-safe. Concurrency comes from many
-transactions, not from sharing one.
+Both handles are `AutoCloseable` and **thread-confined**. A read view is published to the thread that
+opened it and using it from another is refused rather than tolerated, because the reconstruction cache
+underneath it is unsynchronised by design.
+
+### 3.1 Read views
+
+A view fixes what every read on the thread sees, so the ordinary API is used unchanged rather than
+duplicated:
+
+```java
+try (ReadTransaction view = store.beginRead()) {
+    List<Edge> edges = store.traverse(start, Direction.OUT, null, 6);
+    // Writers commit freely underneath; this view does not move.
+    for (Edge edge : edges) {
+        Properties props = store.nodeProperties(edge.neighbourId());
+    }
+}
+```
+
+**Close it.** An open view holds back reclamation of everything committed since it began. Past
+`retainedVersionBytes` the store abandons the oldest views and they raise `SnapshotTooOldException`,
+which is a normal outcome to retry rather than a defect.
+
+**A writer never reads through a view**, even on a thread that has one open: inside a write
+transaction, reads see the writer's own uncommitted pages and otherwise the current state. That is
+what stops a writer computing new state from stale input.
+
+`reclaim()` and `compact()` are **refused while any view is open** — see §7.
 
 ---
 
@@ -275,10 +304,14 @@ format.
 - **Cursors must be closed.** They hold prefetch buffers and, for `GLOBAL_NODE` uniqueness, a
   visited set.
 - **`createEdge` gives no id.** If you need to refer to an edge later, use `createRelationship`.
-- **`inTransaction` retries; `begin` does not.** A `TransactionConflictException` from a manual
-  `begin` is the caller's to handle.
-- **Read-only transactions still must be closed**, or vacuum stalls
+- **`inTransaction` retries; `begin` does not.** With writers serialised there is no conflict to
+  retry against today, so what it buys is the retry seam and the refusal to retry a
+  `ConstraintViolationException` or a `SnapshotTooOldException` into the same answer.
+- **Read views must be closed**, or reclamation stalls and the store eventually abandons them
   ([TRANSACTIONS.md §8](TRANSACTIONS.md#8-conventions-and-gotchas)).
+- **A read view is thread-confined**, and using one from another thread is refused rather than
+  tolerated. Open one per thread.
+- **A writer never reads through a view**, even one open on its own thread.
 - **Batch reads reorder.** `tx.nodes(ids)` does not guarantee cursor order matches the input array;
   use `c.id()`. An ordered variant costs a sort of the results.
 
@@ -294,16 +327,18 @@ format.
 - `CursorTest`: assert cursors stream (bounded memory over a 10^7-edge traversal), close cleanly,
   and are safe to abandon mid-iteration.
 - `RetryTest`: `inTransaction` under contention; assert it converges and respects the attempt limit.
-- `ExampleTest`: the README example compiles and runs against a temp store — the documentation is
-  executable, which is the only way it stays true.
+- `UsageExampleTest` (**built**, `src/test/java/io/metaloom/graph/core/example/`): the README example
+  compiles and runs against a temp store, with an assertion behind every claim — the documentation is
+  executable, which is the only way it stays true. It found one defect on its first run: an index
+  lookup after a rolled-back first transaction threw `StaleIdException` on a healthy store, because
+  the catalog page id was cached in memory while the allocation that produced it was discarded.
 
 ---
 
 ## 12. Progress Assessment
 
-The transactional API of sections 3 and 4 is the Phase 5 target. What exists today is the same
-surface **without** transactions: `GraphStore` carries the element and traversal methods directly,
-because a `Transaction` whose `commit()` guaranteed nothing would be a lie.
+`GraphStore` carries the element and traversal methods directly, and a transaction — read or write —
+scopes them for the calling thread rather than duplicating them.
 
 - [x] `GraphStore.open/close` and `GraphStoreOptions`
 - [x] `createNode` / `nodeProperties` / `setNodeProperties` / `deleteNode`
@@ -311,15 +346,20 @@ because a `Transaction` whose `commit()` guaranteed nothing would be a lie.
 - [x] `Properties` typed accessors, absent versus null
 - [x] `neighbours(direction, types)` and breadth-first `traverse(maxDepth)`
 - [x] Maintenance: `checkpoint`, `verify`, `stats`
-- [x] Exception hierarchy per §8
-- [ ] `Transaction` with begin/commit/rollback and `inTransaction` retry (Phase 5)
+- [x] Exception hierarchy per §8, plus `ConstraintViolationException`
+- [x] `createUniqueConstraint` / `uniqueConstraints`, durable across a reopen
+- [x] `Transaction` with begin/commit/rollback, plus auto-commit for a mutation made outside one
+- [x] `UsageExampleTest`: the documented example, executable and asserting
+- [x] `beginRead` / `ReadTransaction` / `IsolationLevel` / `SnapshotStats` / `SnapshotTooOldException`
+- [x] `inTransaction(work, attempts)` with retry, refusing to retry what retrying cannot fix
 - [ ] `NodeView` / `RelationshipView` flyweights with epoch checks
 - [ ] `NodeCursor` batch read with offset sorting (Phase 6)
 - [ ] `EdgeCursor` / `TraversalCursor` streaming with prefetch (Phase 6)
 - [ ] `materialise` for promoting a lightweight edge in place
 - [x] `reclaim` (hole punching) and `compact` with `CompactionOptions` / `CompactionReport`
 - [x] `metrics()` returning `StoreMetrics` / `IoStats`, and throttled `verify` via `VerifyOptions`
-- [ ] `vacuum` (Phase 5), `snapshot` (Phase 6)
+- [x] Vacuum — reclamation at the end of every commit rather than a separate call or a worker thread
+- [ ] `snapshot` (Phase 6): a whole-store reflink clone. `FICLONE` is bound and called by nothing
 - [x] README rewritten against the new API
 
 ---
@@ -342,5 +382,5 @@ because a `Transaction` whose `commit()` guaranteed nothing would be a lie.
 
 ---
 
-_Git HEAD revision: `c016a41`_
-_Last updated: 2026-08-13 (synced with the Phase 0 to 3 implementation)_
+_Git HEAD revision: `364b5f7`_
+_Last updated: 2026-08-14_

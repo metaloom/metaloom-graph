@@ -1,5 +1,6 @@
 package io.metaloom.graph.core.store.adj;
 
+import java.lang.foreign.MemorySegment;
 import java.util.Arrays;
 
 import io.metaloom.graph.core.util.VarInt;
@@ -40,12 +41,26 @@ public final class EdgeCodec {
 			return new byte[] { 0 };
 		}
 		long[] work = Arrays.copyOf(edges, count);
-		// Sorting the raw packed value orders by dir, then type, then location, because of the field order.
-		Arrays.sort(work);
+		sort(work, count);
+		return encodeSorted(work, count);
+	}
 
+	/**
+	 * Encodes an already ordered run.
+	 *
+	 * <p>
+	 * The output buffer is sized at the worst case of nine bytes per entry and trimmed at the end, which allocates
+	 * about five times what the result needs. That was measured against the alternative — a first pass summing
+	 * {@link VarInt#sizeOf} so the buffer could be exact, and a write straight into the mapped page — and the
+	 * allocating version is <b>the faster one, by a factor of two</b> on the block sizes this runs at. Two passes of
+	 * arithmetic cost more than one short-lived array from the nursery, and a byte-at-a-time write into a
+	 * {@code MemorySegment} is bounds-checked where a write into a {@code byte[]} is not.
+	 * </p>
+	 */
+	private static byte[] encodeSorted(long[] sorted, int count) {
 		int groups = 1;
 		for (int i = 1; i < count; i++) {
-			if (PackedEdge.groupKey(work[i]) != PackedEdge.groupKey(work[i - 1])) {
+			if (PackedEdge.groupKey(sorted[i]) != PackedEdge.groupKey(sorted[i - 1])) {
 				groups++;
 			}
 		}
@@ -54,23 +69,70 @@ public final class EdgeCodec {
 		int pos = VarInt.write(out, 0, groups);
 		int i = 0;
 		while (i < count) {
-			int key = PackedEdge.groupKey(work[i]);
+			int key = PackedEdge.groupKey(sorted[i]);
 			int end = i + 1;
-			while (end < count && PackedEdge.groupKey(work[end]) == key) {
+			while (end < count && PackedEdge.groupKey(sorted[end]) == key) {
 				end++;
 			}
 			pos = VarInt.write(out, pos, key);
 			pos = VarInt.write(out, pos, end - i);
-			long previous = PackedEdge.location(work[i]);
+			long previous = PackedEdge.location(sorted[i]);
 			pos = VarInt.write(out, pos, previous);
 			for (int j = i + 1; j < end; j++) {
-				long location = PackedEdge.location(work[j]);
+				long location = PackedEdge.location(sorted[j]);
 				pos = VarInt.write(out, pos, location - previous);
 				previous = location;
 			}
 			i = end;
 		}
 		return Arrays.copyOf(out, pos);
+	}
+
+	/** Encodes a run that is already ordered and already free of tombstones. Used by {@link AdjacencyBlock#rewrite}. */
+	static byte[] encodeOrdered(long[] sorted, int count) {
+		return count == 0 ? new byte[] { 0 } : encodeSorted(sorted, count);
+	}
+
+	/**
+	 * Orders a run of packed edges, exploiting the shape the caller actually has.
+	 *
+	 * <p>
+	 * A block recompresses by decoding its sorted region — which comes back sorted — and appending the raw tail, which
+	 * is short and unordered. So the input here is nearly always one long sorted run followed by a handful of stragglers.
+	 * Sorting the whole thing costs 3.5 ns per entry; sorting the stragglers and merging costs about 0.5. The JDK's
+	 * sort does detect runs, but it still moves every element.
+	 * </p>
+	 *
+	 * <p>
+	 * The merge buffer is the size of the <em>tail</em>, not of the block, which is what keeps this from trading one
+	 * allocation for another.
+	 * </p>
+	 */
+	static void sort(long[] work, int count) {
+		if (count <= 1) {
+			// Nothing to order, and the scan below would start past the end of a zero-length run — which is what a
+			// block holds after its last live entry is tombstoned.
+			return;
+		}
+		int sorted = 1;
+		while (sorted < count && work[sorted] >= work[sorted - 1]) {
+			sorted++;
+		}
+		if (sorted == count) {
+			return;
+		}
+		Arrays.sort(work, sorted, count);
+		if (work[sorted - 1] <= work[sorted]) {
+			return;
+		}
+		long[] tail = Arrays.copyOfRange(work, sorted, count);
+		int left = sorted - 1;
+		int right = tail.length - 1;
+		int target = count - 1;
+		// Backwards, so the prefix is only touched where the merge actually displaces it.
+		while (right >= 0) {
+			work[target--] = left >= 0 && work[left] > tail[right] ? work[left--] : tail[right--];
+		}
 	}
 
 	/** Number of edges an encoded block holds, without materialising them. */
@@ -109,7 +171,11 @@ public final class EdgeCodec {
 			int key = (int) out[0];
 			pos = VarInt.read(src, pos, limit, out);
 			int count = (int) out[0];
-			if (count < 0 || written + count > dst.length) {
+			if (count <= 0 || written + count > dst.length) {
+				// Zero is rejected along with the negatives. The encoder never writes an empty group, and the first
+				// entry below is emitted before the loop that counts — so a zero count still produced one entry, and
+				// on a full destination that was an ArrayIndexOutOfBoundsException rather than a typed failure. Found
+				// by fuzzing the Rust decoder, which had it too.
 				throw new IllegalArgumentException(
 					"Encoded adjacency declares " + count + " entries, which does not fit the destination");
 			}
@@ -118,7 +184,46 @@ public final class EdgeCodec {
 			dst[written++] = rebuild(key, location);
 			for (int j = 1; j < count; j++) {
 				pos = VarInt.read(src, pos, limit, out);
-				location += out[0];
+				location = advance(location, out[0]);
+				dst[written++] = rebuild(key, location);
+			}
+		}
+		return written;
+	}
+
+	/**
+	 * Decodes straight out of a mapped page, with no intermediate byte array.
+	 *
+	 * <p>
+	 * This is the path a traversal takes. Copying the compressed region out of the page first cost an allocation of up
+	 * to a page on every block read, which a walk does once per node it opens. The bytes are already mapped; there is
+	 * no reason to hold a second copy of them.
+	 * </p>
+	 */
+	public static int decode(MemorySegment src, long offset, long limit, long[] dst) {
+		long[] out = new long[1];
+		long pos = VarInt.read(src, offset, limit, out);
+		int groups = (int) out[0];
+		int written = 0;
+		for (int g = 0; g < groups; g++) {
+			pos = VarInt.read(src, pos, limit, out);
+			int key = (int) out[0];
+			pos = VarInt.read(src, pos, limit, out);
+			int count = (int) out[0];
+			if (count <= 0 || written + count > dst.length) {
+				// Zero is rejected along with the negatives. The encoder never writes an empty group, and the first
+				// entry below is emitted before the loop that counts — so a zero count still produced one entry, and
+				// on a full destination that was an ArrayIndexOutOfBoundsException rather than a typed failure. Found
+				// by fuzzing the Rust decoder, which had it too.
+				throw new IllegalArgumentException(
+					"Encoded adjacency declares " + count + " entries, which does not fit the destination");
+			}
+			pos = VarInt.read(src, pos, limit, out);
+			long location = out[0];
+			dst[written++] = rebuild(key, location);
+			for (int j = 1; j < count; j++) {
+				pos = VarInt.read(src, pos, limit, out);
+				location = advance(location, out[0]);
 				dst[written++] = rebuild(key, location);
 			}
 		}
@@ -130,5 +235,33 @@ public final class EdgeCodec {
 			throw new IllegalArgumentException("Decoded adjacency location out of range: " + location);
 		}
 		return ((long) groupKey << 48) | location;
+	}
+
+	/**
+	 * Adds a delta to a running location, refusing anything that could not have been encoded.
+	 *
+	 * <p>
+	 * Found by fuzzing the Rust decoder, which has the same loop and had the same defect. This was
+	 * {@code location += delta}. A delta is read straight off a page, so a corrupt block can carry any 64 bit value:
+	 * one with the high bit set decodes to a <em>negative</em> long and moves the location backwards, landing on a
+	 * perfectly valid location that the range check then accepts. The decoder emits a plausible wrong neighbour id
+	 * and nothing reports a problem.
+	 * </p>
+	 *
+	 * <p>
+	 * The differential test could not have caught it: Rust wrapped the same way on the same input, so the two
+	 * implementations agreed — on the wrong answer. Comparing two implementations only finds the mistakes they do not
+	 * share.
+	 * </p>
+	 */
+	private static long advance(long location, long delta) {
+		if (delta < 0) {
+			throw new IllegalArgumentException("Adjacency delta " + delta + " is not a valid unsigned varint");
+		}
+		long next = location + delta;
+		if (next < location) {
+			throw new IllegalArgumentException("Adjacency locations overflowed at delta " + delta);
+		}
+		return next;
 	}
 }

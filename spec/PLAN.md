@@ -211,29 +211,47 @@ opens corrupt.
 
 Spec: [WAL.md](WAL.md)
 
-- [ ] `WalRecord`: 40-byte header, CRC32C, self-identifying LSN
-- [ ] `WalWriter`: aligned ring buffer, LSN allocation under a short append lock, 4 KiB block flush
-      (buffered I/O initially; `O_DIRECT` arrives with P6)
-- [ ] WAL segment preallocation, rotation, retention and deletion
-- [ ] `durable_lsn` watermark and `awaitDurable`
-- [ ] Group commit with parking
-- [ ] `wal.sync.mode` implementations
-- [ ] Redo handler for every record type in [WAL.md §3](WAL.md#3-record-types)
-- [ ] Undo handlers and CLRs
-- [ ] Three-pass `Recovery` driver
-- [ ] `WriteBackScheduler`: WAL-gated, offset-ordered page write-back — the one place the WAL rule
-      lives
-- [ ] Page checksums maintained on write-back; verification on read
-- [ ] `Checkpointer` (fuzzy) and manifest advance
-- [ ] Corruption detection, `PageCorruptException`, read-only salvage mode
-- [ ] `FaultInjectingIoEngine` and the crash matrix harness
-- [ ] Tests: `WalRecordTest`, `WalWriterTest`, the `RecoveryTest` matrix, `RecoveryIdempotenceTest`,
-      `TornWriteTest`, `LogRetentionTest`, `CheckpointTest`, plus `PageChecksums`, `SlotAccounting`
-      and `WalContinuity` invariant checkers
+- [x] `WalRecord`: 40-byte header, CRC32C, self-identifying LSN
+- [x] `WalWriter`: preallocated segments, LSN allocation under a short append lock, buffered block
+      flush (`O_DIRECT` arrives with P6)
+- [x] WAL segment preallocation, rotation, retention and deletion (`trim`)
+- [x] `durable_lsn` watermark — **`awaitDurable` is not exposed**; a caller cannot wait on it
+- [x] Group commit — on a sync interval rather than by parking committers
+- [x] `wal.sync.mode` implementations (`WalSyncMode`)
+- [x] Redo handler for every record type written
+- [x] `PageOverlay` / `OverlayHolder`: private per-transaction page copies, applied after the fsync —
+      this is what makes the log no-steal and the recovery redo-only
+- [x] Recovery driver — **one pass, redo only**, see below
+- [x] `Checkpointer` and manifest advance
+- [x] Corruption detection and `PageCorruptException`
+- [x] Tests: the `RecoveryTest` matrix, plus `SlotAccounting` inside `InvariantChecker`
+- [ ] Undo handlers and CLRs — **not owed**: uncommitted data cannot reach the data files, so there is
+      nothing to undo
+- [ ] Three-pass `Recovery` driver — **not owed**, for the same reason; one redo pass is sufficient
+- [ ] `WriteBackScheduler`: WAL-gated, offset-ordered page write-back — **not owed**: the overlay
+      applies at commit, after the fsync, so there is no separate write-back to schedule
+- [ ] Page checksums verified on read. The `PageMetadataArray` field exists and is written; nothing
+      checks it on the read path, so a bit flip in a data page is caught by `verify(FULL)` and not
+      before
+- [ ] Read-only salvage mode for a store that will not open
+- [ ] `FaultInjectingIoEngine` and the crash matrix harness — carried into Phase 9, where it is still
+      the largest single gap
+- [ ] `RecoveryIdempotenceTest`, `TornWriteTest`, `LogRetentionTest`, `CheckpointTest`, and
+      `PageChecksums` / `WalContinuity` as standalone checkers
 
 **Exit criteria**: the crash matrix injects every fault type at every I/O index of a fixed workload,
 and every resulting store opens, passes all invariant checkers, and contains exactly the acknowledged
 commits; recovery is idempotent under 100 randomised interruptions.
+
+**Partially met.** Abandon-and-reopen and `kill -9` both hold — every recovered store opens, verifies
+and contains exactly the acknowledged commits — but the **crash matrix does not exist**, so lost,
+torn and reordered writes are untested. The 100 randomised interruptions have not been run either.
+
+**Built as no-steal, force-at-commit redo logging** rather than the ARIES steal/no-force design in
+[WAL.md](WAL.md), because a steal policy cannot be made correct over a `MAP_SHARED` mapping — the
+kernel may write a dirty page at any moment, so an undo record could never be made durable first. The
+full trade table is in [reports/PHASE_STATUS.md §1](reports/PHASE_STATUS.md#1-phase-4--what-was-built).
+Revisiting it requires the direct-I/O engine of Phase 6.
 
 **Fixes**: D2, D10.
 
@@ -253,39 +271,58 @@ commits; recovery is idempotent under 100 randomised interruptions.
 
 **Goal**: ACID with snapshot isolation and concurrent readers and writers.
 
+**Built: snapshot isolation for readers. Not built: concurrent writers.** The reasoning for both is in
+[TRANSACTIONS.md](TRANSACTIONS.md) sections 5 and 6; the short version is that the mechanism differs
+from the plan — visibility is resolved per **page** from in-memory before-images rather than per record
+from an on-disk `UNDO` segment — and that several items below turned out to have nothing to do rather
+than being unfinished.
+
 Spec: [TRANSACTIONS.md](TRANSACTIONS.md)
 
-- [ ] `TransactionManager`: LSN-based timestamps, active set, in-flight capture at begin
-- [ ] `Transaction`: begin, commit, rollback, read-your-writes, `AutoCloseable`
-- [ ] `xmin` placeholder scheme, the recent-commit map, and the lazy `xmin` rewrite pass
-- [ ] Visibility predicate and version-chain walk
-- [ ] `UndoStore` and the 64-byte undo record
-- [ ] Undo-before-overwrite ordering enforced in every store
-- [ ] `LockTable`: striped write-intent map, eager conflict detection
-- [ ] `READ_COMMITTED` and `SNAPSHOT` levels
-- [ ] Optimistic lock-free reads via the PMA `epoch`
-- [ ] `Vacuum` worker: undo reclamation, dead-version reclamation, lazy adjacency mirror cleanup
-- [ ] `SnapshotTooOldException` and the retention horizon
-- [ ] `store.inTransaction` with retry
-- [ ] Tests: `VisibilityTest`, `SnapshotIsolationTest` (the anomaly matrix), `ConflictTest`,
-      `RollbackTest`, `RollbackEqualsRecoveryTest`, `VacuumTest`, `SnapshotTooOldTest`,
-      `LongRunningReaderTest`, plus jcstress harnesses for the visibility and latch protocols, and
-      the `VersionChains` invariant checker
-- [ ] The reference-model differential harness from [TESTING.md §4](TESTING.md#4-property-based-and-invariant-tests)
+- [x] `TransactionManager`: LSN-based timestamps, the active set, the reclamation horizon
+- [x] `Transaction`: begin, commit, rollback, read-your-writes, `AutoCloseable`
+- [x] Visibility predicate and version walk — per page, at the `SegmentFile.readSlice` choke point
+- [x] `PageVersions` in place of `UndoStore`: chains of overwritten byte runs, in memory, reclaimed to
+      the oldest open view. Covers the allocator bitmap, page metadata, adjacency blocks and index
+      pages, none of which has an `xmin` to version
+- [x] `READ_COMMITTED` and `SNAPSHOT` levels
+- [x] Optimistic lock-free reads via the `StampedLock`; a view takes the lock only to rebuild a page
+- [x] Reclamation after every commit, declining in O(1) when nothing is cuttable
+- [x] `SnapshotTooOldException` and the retention budget: past `retainedVersionBytes` the oldest views
+      are abandoned rather than the heap grown
+- [x] `store.inTransaction` with retry
+- [x] Tests: `VisibilityTest`, `SnapshotIsolationTest` (the anomaly matrix), `VacuumTest`,
+      `ConcurrentReaderTest`, `RollbackTest`, `RollbackEqualsRecoveryTest`, `LongRunningReaderTest`
+- [x] The reference-model differential harness — built in Phase 9, and unaffected by this
+- [ ] **Concurrent writers.** Page overlays resolve two writers on one page by last-writer-wins, so
+      this needs record-granular overlays or per-writer allocation arenas with commit-time validation:
+      a rewrite of the write path rather than an addition
+- [ ] `xmin` placeholder scheme, the recent-commit map, the lazy rewrite pass — **not needed**; the
+      fields stay in the layouts, written as zero, and would only be wanted for the concurrent-writer
+      design
+- [ ] `UndoStore` and the 64-byte undo record — as above. Undo does not need to be durable under
+      no-steal: recovery is redo-only and a crash leaves no live snapshots
+- [ ] `LockTable` with eager conflict detection — **nothing to detect** while writers are serialised
+- [ ] `SERIALIZABLE` via SSI — **nothing to detect**: writers are serialised and read the current
+      mapping, so write skew is already unreachable. Measured, not assumed:
+      `SnapshotIsolationTest.testWriteSkewIsPrevented`
 
-**Exit criteria**: the anomaly matrix shows exactly the expected preventions per level; the
-reference-model harness survives 10^7 randomised operations including crashes; 16 concurrent writer
-threads scale without a global lock on the read path.
+**Exit criteria**: the anomaly matrix shows exactly the expected preventions per level — **met**, and
+it shows read-committed exhibiting the anomalies it permits rather than silently behaving like
+snapshot. The reference-model harness — **met** in Phase 9. "16 concurrent writer threads scale
+without a global lock on the read path" — **restated and met as 16 concurrent readers**, each at its
+own instant, against a continuous writer, with no global lock on the read path
+(`ConcurrentReaderTest`). The writer half is not met and is the open item above.
 
-**Fixes**: D6 (ids become stable and generation-checked end to end), D12 (fully), D16.
+**Fixes**: D6, D12, D16.
 
-**Risks**:
-- *Version-chain length under update-heavy workloads* is the classic MVCC failure mode. Vacuum lag is
-  the metric to watch; expose it in `StoreStats` and alarm on it in the soak test.
-- *Eager conflict detection aborts more than commit-time detection would* for workloads with
-  short-lived contention. Accepted deliberately for debuggability; revisit only with evidence.
-- *`SERIALIZABLE` via SSI is a stretch item.* If it slips, ship with `SNAPSHOT` and document the
-  write-skew exposure honestly rather than claiming serializability.
+**Risks**, as they turned out:
+- *Version growth under update-heavy workloads* was the risk to watch, and it is the one that bit:
+  reclamation originally walked every chain on every commit to discover there was nothing to cut,
+  which is quadratic while a view is pinned. Each chain now carries its oldest LSN so vacuum declines
+  in one comparison.
+- *Eager conflict detection aborting more than commit-time detection* — moot; no conflicts arise.
+- *SSI slipping* — it did not slip, it dissolved. See above.
 
 ---
 
@@ -299,19 +336,23 @@ Spec: [NATIVE_FFM.md](NATIVE_FFM.md)
       [NATIVE_FFM.md §2.1](NATIVE_FFM.md#21-rust-crate-structure); `rust-toolchain.toml`; clippy clean
 - [ ] `mlg_version` / `mlg_capabilities`; the Java loader with graceful fallback and the
       `metaloom.graph.native.path` override
-- [ ] `NativeLib` with `static final MethodHandle`s and correct `critical(true)` usage
+- [~] `NativeLib` with `static final MethodHandle`s — built for `fallocate`, `open` and `close`, with
+      an `ENABLED` switch and a recorded unavailability reason; `critical(true)` is not used yet
 - [ ] `NativeBindings` layouts plus the ABI size/offset assertions
 - [ ] N4: `mlg_crc32c`, `mlg_xxh3` with differential tests against the JDK
 - [ ] N4: `mlg_edges_encode/decode`, scalar then SIMD, differential against the Java codec, plus a
       fuzz target
 - [ ] N4: lz4 bindings, wired into `BlobStore`
-- [ ] N3: `fallocate`, `punch_hole`, `madvise`, `statx`, `reflink`
+- [~] N3: `fallocate` and `punch_hole` are built and proven by `NativeReclaimTest` — the one
+      capability the JDK cannot express at all, and what `store.reclaim()` runs on. `madvise`,
+      `statx` and `reflink` are not bound
 - [ ] N2: `O_DIRECT` open and aligned allocation; move the WAL onto it
 - [ ] N1: ring lifecycle, submit read/write/fsync, reap
 - [ ] `DirectIoEngine` and `UringIoEngine`
 - [ ] Cursor prefetch and batch `readNodes` wired onto the ring
-- [ ] Maven `exec-maven-plugin` integration that **skips gracefully when `cargo` is absent** (it is
-      absent in the current dev environment); multi-target build; in-jar packaging
+- [x] Maven `exec-maven-plugin` integration that **skips gracefully when `cargo` is absent** (it is
+      absent in the current dev environment)
+- [ ] Multi-target build and in-jar packaging of the native library
 - [ ] `cargo clippy -D warnings`, `cargo test`, `cargo miri test`, `cargo fuzz` in CI
 - [ ] Delete `native-c-lib/`; rewrite `FFMLibraryTest` as a real binding test that skips when the
       library is missing
@@ -340,21 +381,31 @@ predicted in [SSD_IO.md §4](SSD_IO.md#4-io-engines); zero native allocations le
 
 **Goal**: find elements by something other than their id.
 
-- [ ] `BTree` over `INDEX`-kind pages, Copy-on-Write page updates
-- [ ] `IndexCatalog` in the manifest: definition, state, build progress
-- [ ] Label index: `label_id -> node ids`
-- [ ] Property indexes: `(label_id, key_id, value) -> element ids`, unique and non-unique
-- [ ] Move the dictionaries onto the B+tree
-- [ ] Online index build with a WAL-logged progress marker, resumable after a crash
-- [ ] Index maintenance inside the transaction (an index update is part of the atomic unit)
+- [x] `BTree` over `INDEX`-kind pages, updated through the transaction's page overlay
+- [x] `IndexCatalog` with its roots in the manifest
+- [x] Label index: `label_id -> node ids`
+- [x] Property index: `(key_id, value) -> element ids`, non-unique
+- [x] Index maintenance inside the transaction (an index update is part of the atomic unit)
+- [x] Index rebuild, gated on entries per page rather than on slot liveness (built in Phase 8, because
+      a B+tree that never frees a page reports 100 percent slot liveness and would never be rebuilt)
+- [x] Tests: `IndexTest`, plus the index-vs-scan differential inside `ReferenceModelTest`
+- [ ] Unique property indexes
+- [ ] Move the dictionaries onto the B+tree — they are an append-only file plus an on-heap map
+- [ ] Online index build with a WAL-logged progress marker, resumable after a crash; a build is one
+      transaction today
 - [ ] Optional string intern table for property dedup
-- [ ] B+tree adjacency for extreme supernodes
+- [ ] B+tree adjacency for extreme supernodes — the chain tier is the ceiling
 - [ ] Vector index hook (delegating to an external ANN index rather than implementing one)
-- [ ] Tests: B+tree property tests, concurrent split/merge under jcstress, crash-during-build,
-      index-vs-scan differential (an indexed query must return exactly what a full scan returns)
+- [ ] Concurrent split/merge under jcstress; crash-during-build test
 
 **Exit criteria**: an indexed lookup on a 10^8-element store costs at most 4 device reads; the
 index-vs-scan differential passes on randomised data; a crash mid-build resumes.
+
+**Partially met.** The index-vs-scan differential passes on randomised data —
+`ReferenceModelTest` asserts an indexed query returns exactly what a full scan returns, through
+insertions, deletions and a compaction. The device-read bound is **unmeasured**: it needs the
+device-level counting that arrives with Phase 6's `IoEngine`. A crash mid-build cannot resume,
+because there is no resumable build.
 
 **Risks**: B+tree concurrency is a well-known hard problem; use a proven protocol (Blink-tree or
 latch coupling with optimistic descent) rather than inventing one.
@@ -441,6 +492,8 @@ verified.
 - [x] Operational documentation: [OPERATIONS.md](OPERATIONS.md) — sizing, tuning, monitoring, backup,
       disaster recovery, what every exception means, and an explicit list of what is missing
 - [x] Security review of the format parsers ([reports/PHASE_STATUS.md](reports/PHASE_STATUS.md) §6)
+- [x] `UsageExampleTest`: the documented example as an executable, asserting test, so the README and
+      [API.md](API.md) cannot drift from the code
 - [~] API stability review ([reports/API_REVIEW.md](reports/API_REVIEW.md)) — done; the review
       **recommends against** a 1.0 freeze, with reasons
 - [ ] `FaultInjectingIoEngine` and the crash matrix (lost, torn, reordered, failing writes)
@@ -465,6 +518,7 @@ documentation exists. The week of nightly crash loops does not.
 | The reference-model differential harness | 2: an invariant checker that reported corruption on a healthy store, and materialised self-loops that read back as two outgoing edges |
 | The concurrency scaling curve | 2: a synchronized dictionary and a shared counter on the read path, together costing **63x** aggregate read throughput at 32 threads |
 | The reads-per-operation budgets | 3 redundant record reads on the hottest paths, worth 12 percent single threaded |
+| The executable usage example | 1: an indexed lookup after a rolled-back *first* transaction threw `StaleIdException` on a healthy store |
 
 The scaling one is worth stating plainly because it inverts the usual intuition about measurement:
 read throughput at 32 threads went from **4.4M ops/s to 280M**, and the entire gain came from
@@ -533,10 +587,11 @@ second copy of the data.
 - [~] Phase 9 — Budgets, differential harness, hostile input, scaling, soak, kill -9 loop, gates, CI, operations doc; **no JMH, no crash matrix, no executed power-loss test**
 - [x] Phase 10 — Built, measured, and recommended against adopting, with the numbers to say why
 
-Per-phase detail and the reasons for every gap are in
+The full done/pending checklist, including the backlog in priority order, is
+[PROGRESS.md](PROGRESS.md). The reasons for every gap are in
 [reports/PHASE_STATUS.md](reports/PHASE_STATUS.md).
 
 ---
 
-_Git HEAD revision: `c016a41`_
-_Last updated: 2026-08-13 (synced with the Phase 0 to 10 implementation)_
+_Git HEAD revision: `364b5f7`_
+_Last updated: 2026-08-14_

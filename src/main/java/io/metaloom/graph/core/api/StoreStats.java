@@ -11,8 +11,9 @@ package io.metaloom.graph.core.api;
  *            live node records
  * @param relationshipCount
  *            live relationship records (lightweight edges have none)
- * @param adjacencyBlockCount
- *            live adjacency blocks
+ * @param adjacencyCellCount
+ *            live adjacency cells. A block is a run of one or more, so this is an upper bound on the block count and
+ *            an exact measure of the space adjacency occupies
  * @param propertyCellCount
  *            live property cells
  * @param blobExtentCount
@@ -34,7 +35,7 @@ package io.metaloom.graph.core.api;
 public record StoreStats(
 	long nodeCount,
 	long relationshipCount,
-	long adjacencyBlockCount,
+	long adjacencyCellCount,
 	long propertyCellCount,
 	long blobExtentCount,
 	long indexPageCount,

@@ -23,7 +23,7 @@ import io.metaloom.graph.core.util.Layouts;
  */
 public final class Manifest implements AutoCloseable {
 
-	public static final int FORMAT_VERSION = 1;
+	public static final int FORMAT_VERSION = 2;
 	private static final long MAGIC = 0x004E414D5347_4C4DL;
 	private static final int COPY_BYTES = 4096;
 

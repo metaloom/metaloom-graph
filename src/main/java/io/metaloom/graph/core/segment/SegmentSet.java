@@ -18,6 +18,7 @@ import io.metaloom.graph.core.id.Kind;
 import io.metaloom.graph.core.id.StaleIdException;
 import io.metaloom.graph.core.metrics.IoCounters;
 import io.metaloom.graph.core.page.OverlayHolder;
+import io.metaloom.graph.core.txn.SnapshotHolder;
 import io.metaloom.graph.core.util.Layouts;
 
 /**
@@ -54,6 +55,7 @@ public final class SegmentSet implements AutoCloseable {
 	private int[] lowestFreeHint = new int[8];
 
 	private OverlayHolder overlays;
+	private SnapshotHolder snapshots;
 	private IoCounters counters;
 
 	public SegmentSet(Path storeDir, Kind kind, Geometry geometry) throws IOException {
@@ -115,6 +117,14 @@ public final class SegmentSet implements AutoCloseable {
 		}
 	}
 
+	/** Routes reads through the store's snapshot holder, so an open view sees the store as it was when it began. */
+	public void snapshots(SnapshotHolder snapshots) {
+		this.snapshots = snapshots;
+		for (SegmentFile segment : segments) {
+			segment.snapshots(snapshots);
+		}
+	}
+
 	/** Points every segment, present and future, at the store's counters. */
 	public void counters(IoCounters counters) {
 		this.counters = counters;
@@ -165,6 +175,7 @@ public final class SegmentSet implements AutoCloseable {
 		// header never reached disk would fail to open after a crash.
 		segment.force();
 		segment.overlays(overlays);
+		segment.snapshots(snapshots);
 		segments.add(segment);
 		return segment;
 	}
@@ -479,6 +490,47 @@ public final class SegmentSet implements AutoCloseable {
 	/** Resolves an id to its record slice for writing. */
 	public MemorySegment mutable(long id) {
 		return resolve(id, true);
+	}
+
+	/**
+	 * Asks the kernel to start fetching the pages these ids live on, without waiting for any of them.
+	 *
+	 * <p>
+	 * This is the prefetch capability of {@link io.metaloom.graph.core.io.IoEngine#prefetch} applied to a set of
+	 * records. On a memory mapped data path a reader never issues a read — it touches an address and takes a page
+	 * fault — so the only way to have several of those in flight at once is to name the pages before the walk reaches
+	 * them. A traversal knows its next frontier one level in advance, which is exactly the information needed.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>Purely advisory, in both directions.</b> The kernel may ignore it; a page may be resident already; an id may
+	 * be stale. None of those is an error and none changes what a later read returns, so every failure here is
+	 * swallowed rather than reported. A prefetch that threw would turn a performance hint into a correctness hazard.
+	 * </p>
+	 *
+	 * @return how many ids were successfully advised, which is diagnostic only
+	 */
+	public int prefetch(long[] ids, int count) {
+		int advised = 0;
+		for (int i = 0; i < count; i++) {
+			long id = ids[i];
+			if (ElementId.isNull(id) || ElementId.kindCode(id) != kind.code()) {
+				continue;
+			}
+			try {
+				int number = ElementId.segment(id);
+				if (number >= segments.size()) {
+					continue;
+				}
+				SegmentFile file = segments.get(number);
+				if (file.prefetchRecord(geometry.byteOffset(kind, ElementId.slot(id)), geometry.stride(kind))) {
+					advised++;
+				}
+			} catch (RuntimeException e) {
+				// A stale or malformed id is not worth failing a hint over.
+			}
+		}
+		return advised;
 	}
 
 	/**

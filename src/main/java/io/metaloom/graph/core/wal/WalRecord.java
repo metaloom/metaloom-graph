@@ -43,6 +43,14 @@ public final class WalRecord {
 	public static final int TYPE_CHECKPOINT_BEGIN = 3;
 	public static final int TYPE_CHECKPOINT_END = 4;
 	public static final int TYPE_SEGMENT_CREATE = 5;
+	/**
+	 * Filler to the next device block boundary. Carries no meaning and redo skips it.
+	 * <p>
+	 * Exists because {@code O_DIRECT} can only write whole aligned blocks. A commit that ends part way through a block
+	 * has to round up, and the bytes it rounds over must still parse as the log is a gapless stream addressed by byte
+	 * offset — so they are a record rather than a gap. See {@link WalWriter}.
+	 */
+	public static final int TYPE_PADDING = 6;
 
 	private WalRecord() {
 	}

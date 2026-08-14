@@ -48,11 +48,11 @@ The PoC satisfies R1 only, and only for a single file per kind. See
 | 0 | `NULL` | — | — | — | Reserved. `NULL_ID == 0L`. |
 | 1 | `NODE` | 64 B | 2^24 | 1 GiB | [FILE_FORMAT.md §5](FILE_FORMAT.md#5-node-record) |
 | 2 | `REL` | 64 B | 2^24 | 1 GiB | [FILE_FORMAT.md §6](FILE_FORMAT.md#6-relationship-record) |
-| 3 | `ADJ` | `PAGE_SIZE` | `4 GiB / PAGE_SIZE` | 4 GiB | [RELATIONSHIP_STORAGE.md](RELATIONSHIP_STORAGE.md) |
+| 3 | `ADJ` | 512 B | 8,388,608 | 4 GiB | [RELATIONSHIP_STORAGE.md](RELATIONSHIP_STORAGE.md) — a block is a run of cells, so an `ADJ` id names a run, not a page |
 | 4 | `PROP` | 32 B | 2^24 | 512 MiB | [PROPERTY_STORAGE.md](PROPERTY_STORAGE.md) |
 | 5 | `BLOB` | `PAGE_SIZE` | `4 GiB / PAGE_SIZE` | 4 GiB | [PROPERTY_STORAGE.md §6](PROPERTY_STORAGE.md#6-blob-store) |
 | 6 | `INDEX` | `PAGE_SIZE` | `4 GiB / PAGE_SIZE` | 4 GiB | Phase 7 |
-| 7 | `UNDO` | 64 B | 2^24 | 1 GiB | [TRANSACTIONS.md §5](TRANSACTIONS.md#5-undo-segments-and-version-chains) |
+| 7 | `UNDO` | 64 B | 2^24 | 1 GiB | **Reserved and unused.** Snapshot isolation keeps before-images per page in memory instead, because undo does not need to be durable under no-steal — [TRANSACTIONS.md §5.1](TRANSACTIONS.md#51-what-was-built). The code is held for the record-level design in [§5.2](TRANSACTIONS.md#52-the-record-level-design-retained), which concurrent writers would need |
 | 8..15 | reserved | — | — | — | Do not use without bumping the format version |
 
 Slots per segment is `min(2^24, SEGMENT_CAPACITY / stride)` with `SEGMENT_CAPACITY = 4 GiB`. For
@@ -318,5 +318,5 @@ Property-based tests belong here; see [TESTING.md §4](TESTING.md#4-property-bas
 
 ---
 
-_Git HEAD revision: `c016a41`_
-_Last updated: 2026-08-13 (synced with the Phase 0 to 3 implementation)_
+_Git HEAD revision: `364b5f7`_
+_Last updated: 2026-08-14_

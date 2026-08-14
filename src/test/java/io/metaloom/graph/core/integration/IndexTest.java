@@ -147,6 +147,33 @@ public class IndexTest {
 		}
 	}
 
+	/**
+	 * A rolled back transaction that would have created the index must leave no trace of it.
+	 * <p>
+	 * The catalog page is allocated lazily by the first write, so the very first transaction against a fresh store
+	 * creates it — and a rollback frees it again while the in-memory pointer to it survives. Every indexed lookup
+	 * afterwards used to fail with a {@code StaleIdException} on a perfectly healthy store, which reads as corruption
+	 * and is not.
+	 */
+	@Test
+	public void testIndexLookupsWorkAfterAnInitialRollback() throws Exception {
+		try (GraphStore store = stores.open()) {
+			try (Transaction txn = store.begin()) {
+				store.createNode("Person", Properties.of().set("name", "rolled back"));
+				// No commit.
+			}
+
+			assertTrue(store.nodesByLabel("Person").isEmpty());
+			assertTrue(store.nodesByProperty("name", "rolled back").isEmpty());
+
+			// And the index still builds correctly afterwards.
+			long kept = store.createNode("Person", Properties.of().set("name", "kept"));
+			assertEquals(List.of(kept), store.nodesByLabel("Person"));
+			assertEquals(List.of(kept), store.nodesByProperty("name", "kept"));
+			store.verify();
+		}
+	}
+
 	@Test
 	public void testTreeStaysShallow() throws Exception {
 		try (GraphStore store = stores.open()) {

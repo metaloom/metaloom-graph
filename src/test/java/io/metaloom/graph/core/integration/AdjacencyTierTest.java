@@ -40,12 +40,63 @@ public class AdjacencyTierTest {
 			store.createEdge(a, "T", b);
 			assertEquals(0, impl.adjacencyStore().blockCount(a),
 				"A degree one node must not touch the adjacency store");
-			assertEquals(0, store.stats().adjacencyBlockCount());
+			assertEquals(0, store.stats().adjacencyCellCount());
 
 			store.createEdge(a, "T", c);
 			assertEquals(0, impl.adjacencyStore().blockCount(a), "Two edges still fit inline");
-			assertEquals(0, store.stats().adjacencyBlockCount());
+			assertEquals(0, store.stats().adjacencyCellCount());
 			assertEquals(2, store.neighbours(a, Direction.OUT).size());
+		}
+	}
+
+	/**
+	 * The middle of the degree range must not cost a page.
+	 * <p>
+	 * This is the regression test for the defect measured in spec/reports/SCALE.md: a node with three edges — one more
+	 * than the two that fit inline — used to be given a whole 8 KiB block, and on a random graph of mean degree 4 that
+	 * is most of the nodes and most of the store. The tiering is now inline, then a 512 byte cell that doubles as it
+	 * fills, then a page, then a chain.
+	 */
+	@Test
+	public void testASmallDegreeCostsASmallBlock() throws Exception {
+		try (GraphStore store = stores.open()) {
+			long[] spokes = new long[600];
+			long hub = store.createNode("Hub");
+			try (io.metaloom.graph.core.api.Transaction txn = store.begin()) {
+				for (int i = 0; i < spokes.length; i++) {
+					spokes[i] = store.createNode("N");
+				}
+				txn.commit();
+			}
+
+			// Two edges stay inline and cost no adjacency at all.
+			store.createEdge(hub, "T", spokes[0]);
+			store.createEdge(hub, "T", spokes[1]);
+			assertEquals(0, store.stats().adjacencyCellCount(), "degree two is inline");
+
+			// The third is what used to cost 8192 bytes.
+			store.createEdge(hub, "T", spokes[2]);
+			assertEquals(1, store.stats().adjacencyCellCount(),
+				"a node of degree three must cost one 512 byte cell, not a page");
+
+			// And the block grows with the node rather than jumping straight to a page.
+			int[] degrees = { 20, 60, 150, 400 };
+			long previous = 1;
+			for (int degree : degrees) {
+				try (io.metaloom.graph.core.api.Transaction txn = store.begin()) {
+					for (int i = (int) previous + 2; i < degree; i++) {
+						store.createEdge(hub, "T", spokes[i]);
+					}
+					txn.commit();
+				}
+				long cells = store.stats().adjacencyCellCount();
+				assertTrue(cells <= 16, "one node's block must never exceed a page, got " + cells + " cells");
+				assertTrue(cells * 512 >= 64, "a block must at least hold its own header");
+				System.out.printf("degree %4d -> %2d cells (%.2f bytes per directed entry)%n",
+					degree, cells, cells * 512.0 / degree);
+				previous = degree;
+			}
+			store.verify(io.metaloom.graph.core.api.VerifyLevel.FULL);
 		}
 	}
 

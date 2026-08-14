@@ -19,6 +19,8 @@ import io.metaloom.graph.core.metrics.IoCounters;
 import io.metaloom.graph.core.nativelib.NativeLib;
 import io.metaloom.graph.core.page.OverlayHolder;
 import io.metaloom.graph.core.page.PageOverlay;
+import io.metaloom.graph.core.txn.Snapshot;
+import io.metaloom.graph.core.txn.SnapshotHolder;
 import io.metaloom.graph.core.util.Crc;
 
 /**
@@ -46,6 +48,13 @@ public final class SegmentFile implements AutoCloseable {
 	private final FileChannel channel;
 	private final Arena arena;
 	private final MemorySegment mapped;
+
+	/**
+	 * The engine used for advice only, never for reading or writing — those go through the mapping directly.
+	 * <p>
+	 * Stateless and shared: {@code prefetch} holds nothing between calls, so one instance serves every segment file.
+	 */
+	private static final io.metaloom.graph.core.io.IoEngine PREFETCH = new io.metaloom.graph.core.io.MmapIoEngine();
 	private final Superblock superblock;
 	private final FreeSlotBitmap freeSlots;
 	private final PageMetadataArray pageMeta;
@@ -57,6 +66,9 @@ public final class SegmentFile implements AutoCloseable {
 
 	/** Publishes the active transaction's overlay, but only to the thread that owns it. */
 	private OverlayHolder overlays;
+
+	/** Publishes the calling thread's open read view, if it has one. Null until a store wires one in. */
+	private SnapshotHolder snapshots;
 
 	/** Never null: a segment with no store behind it counts into a throwaway instance rather than branching. */
 	private IoCounters counters = new IoCounters();
@@ -121,6 +133,10 @@ public final class SegmentFile implements AutoCloseable {
 		this.overlays = overlays;
 	}
 
+	public void snapshots(SnapshotHolder snapshots) {
+		this.snapshots = snapshots;
+	}
+
 	public void counters(IoCounters counters) {
 		this.counters = counters;
 	}
@@ -143,14 +159,46 @@ public final class SegmentFile implements AutoCloseable {
 	}
 
 	/**
+	 * Advises the kernel that a record's bytes are about to be read.
+	 * <p>
+	 * Advisory and best effort: a range outside the mapping, or a kernel that declines, is a false rather than a
+	 * failure. The overlay is deliberately not consulted — a page a transaction has already copied is in memory by
+	 * definition, and there is nothing to fetch.
+	 */
+	public boolean prefetchRecord(long fileOffset, long length) {
+		if (fileOffset < 0 || length <= 0 || fileOffset + length > mapped.byteSize()) {
+			return false;
+		}
+		return PREFETCH.prefetch(mapped, fileOffset, length);
+	}
+
+	/**
 	 * A slice for reading. Inside a transaction this returns the private copy of the page when the transaction has
 	 * already written to it, so a writer always sees its own uncommitted changes.
 	 */
 	public MemorySegment readSlice(long fileOffset, long length) {
 		PageOverlay overlay = overlay();
 		if (overlay != null) {
+			// This thread is the writer. It reads its own uncommitted pages, and otherwise the mapping as it stands
+			// now — never through a read view, even if the same thread has one open.
+			//
+			// That is not a convenience, it is the only safe answer. A writer decides what to write from what it
+			// reads: allocating a slot, appending to an adjacency block, splitting an index page. Reading any of that
+			// through a view fixed in the past would compute the new state from stale input and overwrite everything
+			// committed since, which is a lost update the engine has no way to detect afterwards.
 			int pageIndex = pageIndexOf(fileOffset);
 			MemorySegment page = overlay.peek(PageOverlay.key(kind, segmentNumber, pageIndex));
+			if (page != null) {
+				return page.asSlice(fileOffset - (long) pageIndex * pageSize, length);
+			}
+			return mapped.asSlice(fileOffset, length);
+		}
+		// A view fixed before the last commit reads a reconstruction; everything else reads the mapping untouched.
+		Snapshot snapshot = snapshots == null ? null : snapshots.versioned();
+		if (snapshot != null) {
+			int pageIndex = pageIndexOf(fileOffset);
+			MemorySegment page = snapshot.pageAsOf(PageOverlay.key(kind, segmentNumber, pageIndex),
+				() -> mappedPage(pageIndex), pageSize);
 			if (page != null) {
 				return page.asSlice(fileOffset - (long) pageIndex * pageSize, length);
 			}

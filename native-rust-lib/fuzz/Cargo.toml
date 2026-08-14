@@ -1,0 +1,28 @@
+[package]
+name = "metaloom-graph-native-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.metaloom-graph-native]
+path = ".."
+
+[[bin]]
+name = "edges_decode"
+path = "fuzz_targets/edges_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lz4_decompress"
+path = "fuzz_targets/lz4_decompress.rs"
+test = false
+doc = false
+bench = false

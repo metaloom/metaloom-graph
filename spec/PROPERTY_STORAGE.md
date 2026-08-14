@@ -78,8 +78,10 @@ Property blocks are rewritten wholesale:
 2. Apply the change in memory.
 3. If the new size fits the same cell count, write in place under the page latch.
 4. Otherwise allocate a new block, write it, point the element's `prop_block_id` at it, free the old
-   block. Under MVCC the old block is retained until no snapshot needs it — see
-   [TRANSACTIONS.md §5](TRANSACTIONS.md#5-undo-segments-and-version-chains).
+   block. **The old block does not need to be retained for open snapshots**: an older reader resolves
+   the `PROP` page as of its own LSN, which still holds the old block's bytes and the bitmap bit that
+   says its cells are allocated. That falls out of versioning the page rather than the record — see
+   [TRANSACTIONS.md §5.1](TRANSACTIONS.md#51-what-was-built).
 
 Rewriting looks wasteful until you count: a typical block is 1 to 4 cells, so a rewrite is 32 to 128
 bytes, which is less than the cost of the metadata that per-property mutability would require.
@@ -279,5 +281,5 @@ Compression (lz4 by default above 4 KiB) is applied per blob, in native code.
 
 ---
 
-_Git HEAD revision: `c016a41`_
-_Last updated: 2026-08-13 (synced with the Phase 0 to 3 implementation)_
+_Git HEAD revision: `364b5f7`_
+_Last updated: 2026-08-14_

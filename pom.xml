@@ -21,7 +21,9 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.github.repository>jotschi/graph-storage-ffm-poc</project.github.repository>
         <!-- Tags excluded from the default surefire run. See spec/TESTING.md -->
-        <excluded.test.groups>slow,bench,crash,fuzz</excluded.test.groups>
+        <excluded.test.groups>slow,bench,crash,fuzz,huge</excluded.test.groups>
+        <!-- Set to the cargo offline flag on a machine with a warm registry and no network. -->
+        <cargo.offline.flag></cargo.offline.flag>
     </properties>
 
     <dependencies>
@@ -74,6 +76,52 @@
                 <artifactId>exec-maven-plugin</artifactId>
                 <version>3.1.0</version>
                 <executions>
+                    <!--
+                        The crate's own tests and lints. They run in `mvn test`, not only in CI, because a Rust
+                        change that breaks the codec would otherwise be caught by the Java differential test with a
+                        far worse error message — or, if the shared object failed to rebuild, not at all.
+                    -->
+                    <execution>
+                        <id>test-native</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>sh</executable>
+                            <workingDirectory>${project.basedir}</workingDirectory>
+                            <arguments>
+                                <argument>-c</argument>
+                                <argument>if command -v cargo >/dev/null 2>&amp;1; then cargo test --release --manifest-path native-rust-lib/Cargo.toml ${cargo.offline.flag} &amp;&amp; cargo clippy --release --all-targets --manifest-path native-rust-lib/Cargo.toml ${cargo.offline.flag} -- -D warnings; else echo "[native] cargo not found, skipping the Rust tests"; fi</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                    <!--
+                        Packages the built shared object into the jar under its platform classifier, so that a consumer
+                        who puts this jar on their path gets the native layer without building Rust. The search paths
+                        NativeCapabilities tries first are relative to the working directory, which only ever works in
+                        a build tree.
+
+                        One target, deliberately: cross-compiling to aarch64 or macOS needs toolchains this environment
+                        does not have, and the resource layout is per-classifier precisely so adding one later is a
+                        build change and not a code change. A jar built here declares what it contains and nothing more.
+                    -->
+                    <execution>
+                        <id>package-native</id>
+                        <phase>process-classes</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <executable>sh</executable>
+                            <workingDirectory>${project.basedir}</workingDirectory>
+                            <arguments>
+                                <argument>-c</argument>
+                                <argument>if [ -f native-rust-lib/target/release/libmetaloom_graph_native.so ]; then mkdir -p target/classes/native/${os.detected.classifier} &amp;&amp; cp native-rust-lib/target/release/libmetaloom_graph_native.so target/classes/native/${os.detected.classifier}/ &amp;&amp; echo "[native] packaged for ${os.detected.classifier}"; else echo "[native] nothing built, the jar will carry no library"; fi</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
                     <execution>
                         <id>build-native</id>
                         <phase>generate-resources</phase>
@@ -85,7 +133,7 @@
                             <workingDirectory>${project.basedir}</workingDirectory>
                             <arguments>
                                 <argument>-c</argument>
-                                <argument>if command -v cargo >/dev/null 2>&amp;1; then cargo build --release --manifest-path native-rust-lib/Cargo.toml; else echo "[native] cargo not found, skipping the Rust layer (pure-Java fallback in use)"; fi</argument>
+                                <argument>if command -v cargo >/dev/null 2>&amp;1; then cargo build --release --manifest-path native-rust-lib/Cargo.toml ${cargo.offline.flag}; else echo "[native] cargo not found, skipping the Rust layer (pure-Java fallback in use)"; fi</argument>
                             </arguments>
                         </configuration>
                     </execution>
@@ -118,25 +166,35 @@
         <profile>
             <id>slow</id>
             <properties>
-                <excluded.test.groups>bench,crash,fuzz</excluded.test.groups>
+                <excluded.test.groups>bench,crash,fuzz,huge</excluded.test.groups>
             </properties>
         </profile>
         <profile>
             <id>bench</id>
             <properties>
-                <excluded.test.groups>slow,crash,fuzz</excluded.test.groups>
+                <excluded.test.groups>slow,crash,fuzz,huge</excluded.test.groups>
             </properties>
         </profile>
         <profile>
             <id>crash</id>
             <properties>
-                <excluded.test.groups>slow,bench,fuzz</excluded.test.groups>
+                <excluded.test.groups>slow,bench,fuzz,huge</excluded.test.groups>
             </properties>
         </profile>
+        <!--
+            `huge` is excluded from all-tests as well, on purpose: GraphScaleBenchmark builds a store measured in
+            tens of gigabytes and takes minutes. It is opt-in only, never part of "run everything".
+        -->
         <profile>
             <id>all-tests</id>
             <properties>
-                <excluded.test.groups></excluded.test.groups>
+                <excluded.test.groups>huge</excluded.test.groups>
+            </properties>
+        </profile>
+        <profile>
+            <id>huge</id>
+            <properties>
+                <excluded.test.groups>slow,bench,crash,fuzz</excluded.test.groups>
             </properties>
         </profile>
     </profiles>

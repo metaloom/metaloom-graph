@@ -7,7 +7,14 @@ import io.metaloom.graph.core.id.ElementId;
 import io.metaloom.graph.core.util.Layouts;
 
 /**
- * One page of adjacency, holding a compressed sorted region and a raw tail.
+ * One adjacency block: a run of consecutive {@link io.metaloom.graph.core.id.Kind#ADJ_CELL_BYTES} cells holding a
+ * compressed sorted region and a raw tail.
+ *
+ * <p>
+ * A block spans one cell when it is created and doubles as it fills, up to a whole page. It never straddles a page,
+ * so the run from its first cell to the end of its page is always safe to acquire — which is how the whole block is
+ * read in a single acquisition despite its variable length.
+ * </p>
  *
  * <pre>
  * Header, 64 bytes:
@@ -19,7 +26,8 @@ import io.metaloom.graph.core.util.Layouts;
  * 30  2  gen
  * 32  4  sorted_count
  * 36  1  flags
- * 37  3  reserved
+ * 37  1  cells          -- allocation units this block spans; 0 marks a continuation cell
+ * 38  2  reserved
  * 40  8  min_location
  * 48  8  max_location
  * 56  8  type_bitmap
@@ -29,9 +37,9 @@ import io.metaloom.graph.core.util.Layouts;
  * </pre>
  *
  * Appends go to the raw tail, which costs one 8 byte write. When the tail meets the sorted region the block
- * recompresses everything into the sorted region, which typically reclaims most of the page; only when compression can
- * no longer make room is the block full. This is what lets a page hold thousands of edges rather than the 1016 a raw
- * layout would fit.
+ * recompresses everything, which typically reclaims most of the space; only when compression can no longer make room
+ * is the block full — and then it either grows to a larger run or, at page size, chains. This is what lets a page hold
+ * thousands of edges rather than the 1016 a raw layout would fit.
  *
  * @see <a href="../../../../../../../../../spec/RELATIONSHIP_STORAGE.md">spec/RELATIONSHIP_STORAGE.md</a> section 5
  */
@@ -49,26 +57,49 @@ public final class AdjacencyBlock {
 	private static final int OFF_TAIL_COUNT = 28;
 	private static final int OFF_SORTED_COUNT = 32;
 	private static final int OFF_FLAGS = 36;
+	private static final int OFF_CELLS = 37;
 	private static final int OFF_MIN_LOCATION = 40;
 	private static final int OFF_MAX_LOCATION = 48;
 	private static final int OFF_TYPE_BITMAP = 56;
 
 	private final MemorySegment page;
-	private final int pageSize;
+	private final int capacityBytes;
 
-	public AdjacencyBlock(MemorySegment page, int pageSize) {
+	/**
+	 * @param page
+	 *            the block's own bytes, exactly {@code capacityBytes} of them
+	 * @param capacityBytes
+	 *            {@code cells * Kind.ADJ_CELL_BYTES}
+	 */
+	public AdjacencyBlock(MemorySegment page, int capacityBytes) {
 		this.page = page;
-		this.pageSize = pageSize;
+		this.capacityBytes = capacityBytes;
 	}
 
-	public void initialise(long nodeId) {
+	/** The declared cell count of a block, read from its first cell. Zero marks a continuation cell of a larger run. */
+	public static int cellsOf(MemorySegment firstCell) {
+		return Byte.toUnsignedInt(firstCell.get(Layouts.BYTE, OFF_CELLS));
+	}
+
+	public int cells() {
+		return cellsOf(page);
+	}
+
+	public int capacityBytes() {
+		return capacityBytes;
+	}
+
+	public void initialise(long nodeId, int cells) {
+		page.set(Layouts.BYTE, OFF_CELLS, (byte) cells);
 		page.set(Layouts.LONG, OFF_NODE_ID, nodeId);
 		page.set(Layouts.LONG, OFF_NEXT, ElementId.NULL);
 		page.set(Layouts.LONG, OFF_XMIN, 0L);
 		page.set(Layouts.INT, OFF_SORTED_BYTES, 0);
 		page.set(Layouts.SHORT, OFF_TAIL_COUNT, (short) 0);
 		page.set(Layouts.INT, OFF_SORTED_COUNT, 0);
-		page.set(Layouts.INT, OFF_FLAGS, 0);
+		// A byte, not an int: flags used to be written four bytes wide, which reached across the reserved bytes
+		// beside it and would now erase the cell count on every initialise and every markFull.
+		page.set(Layouts.BYTE, OFF_FLAGS, (byte) 0);
 		page.set(Layouts.LONG, OFF_MIN_LOCATION, Long.MAX_VALUE);
 		page.set(Layouts.LONG, OFF_MAX_LOCATION, Long.MIN_VALUE);
 		page.set(Layouts.LONG, OFF_TYPE_BITMAP, 0L);
@@ -108,7 +139,7 @@ public final class AdjacencyBlock {
 	}
 
 	public boolean isFull() {
-		return (page.get(Layouts.INT, OFF_FLAGS) & FLAG_FULL) != 0;
+		return (page.get(Layouts.BYTE, OFF_FLAGS) & FLAG_FULL) != 0;
 	}
 
 	public long minLocation() {
@@ -138,7 +169,7 @@ public final class AdjacencyBlock {
 	}
 
 	public int freeBytes() {
-		return pageSize - HEADER_BYTES - sortedBytes() - tailCount() * ENTRY_BYTES;
+		return capacityBytes - HEADER_BYTES - sortedBytes() - tailCount() * ENTRY_BYTES;
 	}
 
 	/** Appends one entry to the raw tail. Returns false if there is no room; the caller then compacts or moves on. */
@@ -150,7 +181,7 @@ public final class AdjacencyBlock {
 		if (tail >= 0xFFFF) {
 			return false;
 		}
-		page.set(Layouts.LONG, pageSize - (long) (tail + 1) * ENTRY_BYTES, edge);
+		page.set(Layouts.LONG, capacityBytes - (long) (tail + 1) * ENTRY_BYTES, edge);
 		page.set(Layouts.SHORT, OFF_TAIL_COUNT, (short) (tail + 1));
 		observe(edge);
 		return true;
@@ -179,10 +210,10 @@ public final class AdjacencyBlock {
 		int sorted = sortedCount();
 		int tail = tailCount();
 		int bytes = sortedBytes();
-		int payloadBytes = pageSize - HEADER_BYTES;
+		int payloadBytes = capacityBytes - HEADER_BYTES;
 		if (bytes < 0 || bytes > payloadBytes) {
 			throw new PageCorruptException("Adjacency block declares a " + bytes
-				+ " byte compressed region, which does not fit a " + pageSize + " byte page");
+				+ " byte compressed region, which does not fit a " + capacityBytes + " byte block");
 		}
 		// The sorted region is compressed, so the number of entries it decodes to is far larger than the number of
 		// raw entries the page would hold — that is the whole point of the codec. The real bound is one byte per
@@ -199,16 +230,17 @@ public final class AdjacencyBlock {
 		long[] result = new long[sorted + tail];
 		int written = 0;
 		if (sorted > 0) {
-			byte[] encoded = new byte[bytes];
-			MemorySegment.copy(page, HEADER_BYTES, MemorySegment.ofArray(encoded), 0, bytes);
-			written = EdgeCodec.decode(encoded, 0, bytes, result);
+			// Decoded straight out of the mapped page. Measured against copying the region into a byte array first and
+			// decoding that: the two are within noise of each other on block sizes from 400 entries up, and this one
+			// does not allocate up to a page on every block read — which a walk does once per node it opens.
+			written = EdgeCodec.decode(page, HEADER_BYTES, (long) HEADER_BYTES + bytes, result);
 			if (written != sorted) {
 				throw new PageCorruptException(
 					"Adjacency block declares " + sorted + " sorted entries but decoded " + written);
 			}
 		}
 		for (int i = 0; i < tail; i++) {
-			result[written++] = page.get(Layouts.LONG, pageSize - (long) (i + 1) * ENTRY_BYTES);
+			result[written++] = page.get(Layouts.LONG, capacityBytes - (long) (i + 1) * ENTRY_BYTES);
 		}
 		return result;
 	}
@@ -221,42 +253,49 @@ public final class AdjacencyBlock {
 		return rewrite(readAll());
 	}
 
-	/** Replaces the block's contents. Returns false if the given entries do not fit. */
+	/**
+	 * Replaces the block's contents. Returns false if the given entries do not fit, having changed nothing.
+	 *
+	 * <p>
+	 * The entries are compacted in place, ordered, encoded, and copied in only once the result is known to fit. The
+	 * fit check has to come before the page is touched: an encode that ran out of room half way would leave the
+	 * compressed region overwritten and the header still describing what used to be there.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>This method consumes {@code entries}</b>: it reorders them and squeezes out tombstones in place, and it does
+	 * so before discovering whether they fit, so the array is disturbed even when this returns false. Callers that
+	 * keep the array — {@link AdjacencyStore#rewriteBlock}, which retries with progressively fewer entries — must
+	 * hand over a copy.
+	 * </p>
+	 */
 	public boolean rewrite(long[] entries) {
-		long[] live = entries;
+		// Squeeze the tombstones out in place. The array belongs to the caller's read, which is finished with it.
 		int count = 0;
 		for (long edge : entries) {
 			if (!PackedEdge.isTombstone(edge)) {
-				count++;
+				entries[count++] = edge;
 			}
 		}
-		if (count != entries.length) {
-			live = new long[count];
-			int i = 0;
-			for (long edge : entries) {
-				if (!PackedEdge.isTombstone(edge)) {
-					live[i++] = edge;
-				}
-			}
-		}
-		byte[] encoded = EdgeCodec.encode(live, live.length);
-		if (HEADER_BYTES + encoded.length > pageSize) {
+		EdgeCodec.sort(entries, count);
+		byte[] encoded = EdgeCodec.encodeOrdered(entries, count);
+		if (HEADER_BYTES + encoded.length > capacityBytes) {
 			return false;
 		}
 		MemorySegment.copy(MemorySegment.ofArray(encoded), 0, page, HEADER_BYTES, encoded.length);
 		page.set(Layouts.INT, OFF_SORTED_BYTES, encoded.length);
-		page.set(Layouts.INT, OFF_SORTED_COUNT, live.length);
+		page.set(Layouts.INT, OFF_SORTED_COUNT, count);
 		page.set(Layouts.SHORT, OFF_TAIL_COUNT, (short) 0);
 		page.set(Layouts.LONG, OFF_MIN_LOCATION, Long.MAX_VALUE);
 		page.set(Layouts.LONG, OFF_MAX_LOCATION, Long.MIN_VALUE);
 		page.set(Layouts.LONG, OFF_TYPE_BITMAP, 0L);
-		for (long edge : live) {
-			observe(edge);
+		for (int i = 0; i < count; i++) {
+			observe(entries[i]);
 		}
 		return true;
 	}
 
 	public void markFull() {
-		page.set(Layouts.INT, OFF_FLAGS, page.get(Layouts.INT, OFF_FLAGS) | FLAG_FULL);
+		page.set(Layouts.BYTE, OFF_FLAGS, (byte) (page.get(Layouts.BYTE, OFF_FLAGS) | FLAG_FULL));
 	}
 }

@@ -135,7 +135,7 @@ public class BulkBenchmark {
 			int size = store.neighbours(hub, Direction.OUT).size();
 			long elapsed = System.nanoTime() - start;
 			System.out.printf("supernode scan: %d neighbours in %d ms, %d blocks%n",
-				size, TimeUnit.NANOSECONDS.toMillis(elapsed), store.stats().adjacencyBlockCount());
+				size, TimeUnit.NANOSECONDS.toMillis(elapsed), store.stats().adjacencyCellCount());
 			System.out.println("stats: " + store.stats());
 		}
 	}

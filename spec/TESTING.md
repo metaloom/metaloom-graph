@@ -3,7 +3,7 @@
 A storage engine is only as good as its evidence. This file defines how the project proves that it
 does not lose data.
 
-The suite today is 127 tests running in about twenty seconds, plus benchmarks, a soak, a scaling
+The suite today is 240 tests running in about forty seconds, plus benchmarks, a soak, a scaling
 harness and a `kill -9` loop behind profiles and scripts. The PoC suite it replaced had one red test,
 three unbounded benchmarks living in the unit suite, and two tests that passed for reasons unrelated
 to what they asserted ([CURRENT_STATE.md §5](CURRENT_STATE.md#5-test-reality-check)).
@@ -17,10 +17,31 @@ to what they asserted ([CURRENT_STATE.md §5](CURRENT_STATE.md#5-test-reality-ch
 | `ScalingTest` | 2 — a synchronized dictionary and a shared counter, together costing 63x aggregate read throughput |
 | `ReadBudgetTest` | 3 redundant record reads on the hottest paths |
 | `CompactionCrashTest`, `RecoveryTest` | 2 — a stale superblock after replay, an fsync per commit with nothing to sync |
+| `UsageExampleTest` | 1 — an indexed lookup after a rolled-back *first* transaction threw `StaleIdException` on a healthy store |
+| `GraphScaleBenchmark` | 1, and the largest: a node with degree 3 cost a whole 8 KiB adjacency block, worth 59 of 61 GiB on a mean-degree-4 graph. Fixed; the same graph is now 6.2 GiB and loads 3.9x faster ([reports/SCALE.md](reports/SCALE.md)) |
+| The cell-based adjacency change itself | 1 — `flags` was declared one byte and written four, silently owning the reserved bytes beside it |
+| `UniqueConstraintTest` | 1 — the unique-key array was placed at offset 28 of the index catalog page, over the generation field `Kind.INDEX` keeps at 30, which made every id naming that page stale |
+| `DeviceReadBudgetTest`'s own self-check | 1, in the measurement rather than the engine: `posix_fadvise` is accepted and evicts nothing on an overlay filesystem, so the first version reported a warm cache as 0.15 cold device reads |
+| `cargo clippy -D warnings` | 5 — every `extern "C"` entry point dereferencing a caller pointer was safe-by-signature |
+| The corrected CRC32C benchmark | 1, in a published number rather than the code: "200x slower" compared a hardware intrinsic against a bitwise loop. It is 7.8x |
+| Running `cargo test` in a loop | 1 — both ring tests built their temp file path from the pid alone, so they shared it across threads of one process and one truncated the file the other was reading. Failed about one run in five |
+| `CodecProfileBenchmark` | 2, both in changes that looked like optimisations: a SWAR varint decoder 2.3x *slower* than the loop it replaced, and an allocation-free encoder 2.3x *slower* than the allocating one |
+| `SupernodeBenchmark` | 0 so far, and it is the gate that would catch a quadratic term in adjacency growth before a user does |
+| `cargo fuzz run edges_decode` | **2, within seconds of the target existing, and both were in *both* implementations** — a silently wrapping delta accumulation that turned a corrupt block into a plausible wrong neighbour id, and a zero-entry group that still wrote an entry. Neither was findable by the Rust-versus-Java differential test, because Java shared both defects and the two agreed on the wrong answer |
+| `cargo +nightly miri test` | 0 so far. It needed an `ffi_tests` module to be worth running at all: the existing tests exercise safe internals, and undefined behaviour lives in the entry points where a caller's pointer becomes a slice |
+| `CrashMatrixTest` | 1 — recovery against data files older than its log threw a raw `IllegalStateException` rather than a typed store failure, so a caller could not distinguish "this store is damaged" from "this code has a bug". Found on the matrix's first meaningful run |
+| `RollbackTest` | **1, and it was a false alarm on healthy data** — `verify(FULL)` bounded a blob's extent-chain walk at `segmentCount() * slotsPerPage() + 1`. A BLOB extent is page sized, so that is 2 on a single-segment store: every blob past about 16 KiB was reported as a chain that "does not terminate", with its remaining extents reported as orphaned on top. Nothing caught it because no test had ever written a blob and then run `verify(FULL)`. Reporting corruption that is not there is worse than missing some: it sends somebody hunting, and it made full verification unusable on any store holding real blobs |
+| `LongRunningReaderTest` | 1 — reclamation walked every version chain on every commit to discover there was nothing to cut, which is quadratic while a reader is pinned. The test did not fail, it *did not finish*, which is the failure mode a shorter test would have reported as merely slow |
 
 The pattern is worth naming: **every one of these came from a test that compared the engine against
 something outside it** — a model, a counter, a corrupt file, a thread count — rather than from a test
 that asserted what its author already believed.
+
+The fuzzer rows sharpen that into something more specific. A differential test compares two
+implementations, and therefore finds only the mistakes they do not share. Both decoders here were
+written from the same format description by the same person, so they shared their bugs; it took an
+oracle that knew nothing about either — "this must not panic and must not write past its buffer" — to
+find them.
 
 ---
 
@@ -49,15 +70,21 @@ src/test/java/io/metaloom/graph/core/
   unit/          per-class tests, no filesystem beyond a temp dir
   property/      jqwik property-based tests
   integration/   whole-store scenarios
+  example/       UsageExampleTest — the documented API, executable, so it cannot rot
+  nativelib/     NativeCodecTest, IoEngineTest, UringIoEngineTest — the crate and the IO engines
+  txn/           snapshot isolation: visibility, the anomaly matrix, vacuum, rollback, long readers
   concurrency/   jcstress and custom harnesses
   crash/         fault-injection recovery tests
   invariant/     the checkers themselves plus their tests
-  bench/         JMH benchmarks (separate source root or module)
+  bench/         BulkBenchmark, CodecProfileBenchmark and SupernodeBenchmark (tagged `bench`);
+                 GraphScaleBenchmark and GraphTraversalBenchmark (tagged `huge`, opt-in only)
   fixture/       graph generators, temp store rule, deterministic RNG
 ```
 
-JUnit 5 tags: `@Tag("unit")`, `@Tag("slow")`, `@Tag("crash")`, `@Tag("fuzz")`, `@Tag("bench")`.
-The default Surefire configuration excludes `slow`, `crash`, `fuzz` and `bench`.
+JUnit 5 tags: `@Tag("unit")`, `@Tag("slow")`, `@Tag("crash")`, `@Tag("fuzz")`, `@Tag("bench")`,
+`@Tag("huge")`. The default configuration excludes all but `unit`; **`huge` is excluded from
+`-Pall-tests` as well**, because it writes gigabytes and runs for minutes. It is opt-in only, via
+`-Phuge`.
 
 ---
 
@@ -72,13 +99,43 @@ mvn test -Dmetaloom.graph.native.enabled=false   # force the pure-Java path
 
 mvn test -Pslow -Dtest=SoakTest -Dsoak.seconds=43200   # the twelve hour soak
 tools/kill9-loop.sh 20 3                               # the kill -9 loop
+
+# 10M nodes + 20M relationships: 11 to 25 minutes depending on the host, 6.1 GiB.
+# Every run measured so far, and what moved between them: GRAPH_BENCHMARK.md
+mvn test -Phuge -Dtest=GraphScaleBenchmark
+mvn test -Phuge -Dtest=GraphScaleBenchmark -Dgraph.scale.nodes=1000000 -Dgraph.scale.edges=2000000
+
+# Read side: random access by id, a 30,000 relationship walk, a 30,000 hop chain. ~3 minutes.
+mvn test -Phuge -Dtest=GraphTraversalBenchmark
+
+# One node with 20,000 relationships, with gates asserting it does not degrade. Runs in -Pbench.
+mvn test -Pbench -Dtest=SupernodeBenchmark
+mvn test -Pbench -Dtest=SupernodeBenchmark -Dgraph.supernode.degree=200000
+
+# Where the time inside a block read and write goes, which is how the SIMD question was settled.
+mvn test -Pbench -Dtest=CodecProfileBenchmark
+
+# The two checks on the Rust crate that cannot run inside `mvn test`: miri for undefined behaviour in
+# the FFI entry points, and libFuzzer against the decoders. Needs a nightly toolchain and cargo-fuzz.
+tools/verify-native.sh          # miri, then 60 seconds per fuzz target
+tools/verify-native.sh 600      # a longer fuzz run
+```
+
+**Installing the two of them**, which the dev container now does at build time:
+
+```bash
+sudo apt-get install -y rustup     # replaces the Debian cargo/rustc packages
+rustup toolchain install stable  --profile minimal --component clippy rustfmt rust-src
+rustup toolchain install nightly --profile minimal --component miri rust-src
+rustup default stable
+cargo install cargo-fuzz --locked
 ```
 
 CI runs `mvn test` twice, once with native enabled and once disabled, and asserts both pass; see
 [.github/workflows/ci.yml](../.github/workflows/ci.yml). It also runs the slow profile with a one
-minute soak, the `kill -9` loop, the performance gates, and — for the first time anywhere — a
-`cargo build` and `cargo test` of the Rust crate, which has never been compiled in the development
-environment.
+minute soak, the `kill -9` loop, the performance gates, and a `cargo build` and `cargo test` of the
+Rust crate. `NativeCodecTest` checks the built library against the Java reference and skips when it
+is absent, which is the normal state of a machine without `cargo`.
 
 The PoC suite is gone: its bulk loops became `bench/BulkBenchmark`, its FFM exploration tests were
 deleted along with the code they exercised, and the traversal it could not perform is covered by
@@ -167,7 +224,21 @@ Three levels, weakest to strongest:
 state, reopen from the same directory. Catches missing WAL records and bad recovery logic. Fast
 enough to run per record type in the default suite.
 
-**Level 2 — simulated device faults.** A `FaultInjectingIoEngine` decorator that can, at a chosen
+**Level 2 — simulated device faults.** *Built. `CrashMatrixTest` and `WalFaultTest`.*
+
+The six faults split into two kinds, and the split decides how each is produced:
+
+- **Four are disk states**: a lost, torn, corrupt or reordered write leaves bytes that differ from
+  what the engine wrote, and those bytes can be produced directly. `CrashMatrixTest` writes a serial
+  workload, locates every record in the log by scanning it, and applies every fault to every record —
+  then restores the data files to a pre-workload snapshot so that recovery has to rebuild from the log,
+  reopens, and checks the five post-conditions below.
+- **Two are behaviours**: a write that fails, and a write that succeeds followed by an fsync that
+  fails. Neither is a state a file can be in, so they need an engine that misbehaves while the log is
+  being written. That is what `FaultInjectingIoEngine` is, and it is a test fixture — nothing in the
+  engine should be able to ask for a broken device.
+
+A `FaultInjectingIoEngine` decorator that can, at a chosen
 operation index:
 
 - drop a write entirely (lost write),
@@ -313,13 +384,19 @@ diagnostic artefact and deleting it on failure is the most frustrating thing a t
 - [x] Reads-per-operation budgets and write amplification, enforced as build failures
 - [x] Hostile and corrupt input against every format parser (`HostileInputTest`)
 - [x] Concurrency scaling curve to 32 threads, with the bottleneck identified at each knee
+- [x] **Snapshot isolation** (`...core.txn`, 43 cases): the visibility matrix across every kind of
+      state the engine holds, the anomaly matrix at both levels *including the anomalies read-committed
+      is supposed to permit*, reclamation and the retention budget, sixteen concurrent views against a
+      continuous writer, rollback to byte-identical files, rollback-equals-recovery with a control, and
+      a reader held across 60,000 commits
 - [x] Soak harness with leak and growth detection, at a configurable duration
 - [x] `kill -9` loop harness (`tools/kill9-loop.sh`, `CrashWorkload`) with acknowledgement checking
 - [x] Performance gates in `-Pbench`, throughput floors and exact structural ceilings
 - [x] Dual-run CI (native on/off), plus slow, crash, gates and a Rust build
 - [ ] Graph fixture generators (chain, star, scale-free, grid)
 - [ ] The remaining invariant checkers as standalone classes
-- [ ] `FaultInjectingIoEngine` and the crash matrix (lost, torn, reordered and failing writes)
+- [x] `FaultInjectingIoEngine` and the crash matrix (lost, torn, corrupt, reordered and failing writes,
+      and a failing fsync) — `CrashMatrixTest`, `WalFaultTest`
 - [ ] A real JMH suite; the annotation processor is not available offline
 - [ ] The twelve hour soak and a week of nightly crash loops, both executed
 - [ ] The manual power-loss test, executed and recorded (procedure in [OPERATIONS.md §8](OPERATIONS.md#8-the-manual-power-loss-test))
@@ -333,12 +410,14 @@ diagnostic artefact and deleting it on failure is the most frustrating thing a t
 | `TempStore` | `...core.fixture` | JUnit extension: isolated store dir, retain on failure |
 | `GraphGenerators` | `...core.fixture` | Deterministic graph shapes |
 | `ReferenceGraph` | `...core.fixture` | In-memory model for differential testing |
-| `FaultInjectingIoEngine` | `...core.crash` | Lost, torn, corrupt, reordered and failing I/O |
+| `FaultInjectingIoEngine` | `...core.fixture` | Lost, torn, corrupt, reordered and failing I/O |
 | `CountingIoEngine` | `...core.io` | Device-operation counters for IOP budgets |
 | `InvariantChecker` | `...core.invariant` | Interface; nine implementations per §5 |
-| `CrashMatrix` | `...core.crash` | Generates and runs the fault matrix |
+| `CrashMatrixTest` | `...core.crash` | Generates and runs the fault matrix |
+| `VisibilityTest`, `SnapshotIsolationTest` | `...core.txn` | What a view may and may not see, and the anomaly matrix |
+| `VacuumTest`, `LongRunningReaderTest` | `...core.txn` | Reclamation, the horizon, and what a long reader costs |
 
 ---
 
-_Git HEAD revision: `c016a41`_
-_Last updated: 2026-08-13 (synced with the Phase 0 to 3 implementation)_
+_Git HEAD revision: `364b5f7`_
+_Last updated: 2026-08-14_
