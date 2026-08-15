@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 #
-# Starts the server over a small fixed demo graph — what the Playwright suite drives, and the shortest way to see the
-# UI without having a store of your own.
+# Starts the server over a generated demo graph — an air route network — and is what the Playwright suite drives.
 #
-#   tools/demo-server.sh [store-directory] [port]
+#   tools/demo-server.sh [store-directory] [port] [size]
 #
-# The store is seeded on first use and reused afterwards, so a second run starts against the same graph. Delete the
-# directory to start over.
+# size is tiny | small | medium | large, or a number of airports; small is the default. The store is seeded on first
+# use and reused afterwards, so a second run starts against the same graph. Delete the directory to start over.
+#
+# This runs the shipped server with its shipped --demo flag rather than anything test-only, so what the browser suite
+# drives is the same thing a user gets.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STORE="${1:-$ROOT/graph-server/target/demo-store}"
 PORT="${2:-8080}"
+SIZE="${3:-small}"
 
 # exec:java runs in the module directory, not in the caller's, so a relative store path would land somewhere the
 # caller did not mean — graph-server/graph-server/target/… on the first attempt at this.
@@ -22,12 +25,14 @@ esac
 
 # exec:java runs what is already compiled. Compiling here rather than failing with ClassNotFoundException means the
 # script works from a clean checkout, which is what a first-time reader will have.
-if [ ! -d "$ROOT/graph-server/target/test-classes" ]; then
+if [ ! -d "$ROOT/graph-server/target/classes" ]; then
     echo "[demo] compiling first"
-    mvn -o -q -f "$ROOT/pom.xml" -pl graph-server -am -DskipTests test-compile
+    mvn -o -q -f "$ROOT/pom.xml" -pl graph-server -am -DskipTests package
 fi
 
+# Vert.x copies classpath resources into .vertx/file-cache-* and serves the copy, so a server left running across a UI
+# rebuild keeps serving the previous bundle. Off here because this script is the development and test loop, where that
+# is a trap rather than a saving.
 exec mvn -o -q -f "$ROOT/pom.xml" -pl graph-server exec:java \
-    -Dexec.classpathScope=test \
-    -Dexec.mainClass=io.metaloom.graph.server.DemoServer \
-    -Dexec.args="$STORE $PORT"
+    -Dvertx.disableFileCaching=true \
+    -Dexec.args="--demo --demo-size=$SIZE $STORE $PORT"

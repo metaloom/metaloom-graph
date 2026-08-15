@@ -3,13 +3,20 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
 /**
  * The browser UI against a real server, a real Cypher engine and a real store.
  *
- * The demo graph these assertions name is seeded by DemoServer: four people, two companies, two products, a node with
- * two labels, a node with none, a label that is not a bare identifier, two relationships between one pair, a
- * self-relationship, and three lightweight edges. Every awkward case the UI has to draw is in there on purpose.
+ * The graph is the one the shipped `--demo` flag generates — an air route network of 58 real airports, seeded by
+ * `tools/demo-server.sh`, which is the same command a person uses to look at the UI. Every awkward case the browser
+ * has to draw is in it because the domain has one: a hub carries two labels, a freight airline carries a label with a
+ * space in it, `IN_CITY` is a lightweight edge with no record, two airlines fly the same pair, and one sightseeing
+ * flight returns to the airport it left.
+ *
+ * The counts below are exact because the generator is seeded, so the same size always produces the same graph.
  */
 
-const PEOPLE = 'MATCH (n:Person) RETURN n';
-const PEOPLE_AND_FRIENDS = 'MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a, r, b';
+const HUBS = 'MATCH (h:Hub) RETURN h';
+/** Heathrow to three named airports — five lines, because one of the pairs is flown by two airlines. */
+const FROM_HEATHROW = "MATCH (a:Airport)-[r:ROUTE_TO]->(b:Airport)\n"
+  + "WHERE a.code = 'LHR' AND b.code IN ['CDG', 'AMS', 'DUB']\nRETURN a, r, b";
+const LONDON = "MATCH (a:Airport)-[r:IN_CITY]->(c:City) WHERE c.name = 'London' RETURN a, r, c";
 
 test.beforeEach(async ({ page }) => {
   await page.goto('/');
@@ -27,6 +34,7 @@ function nodes(page: Page): Locator {
   return page.locator('g.node');
 }
 
+/** Matches on the caption and on the title, so a long name truncated in the circle is still findable. */
 function nodeNamed(page: Page, caption: string): Locator {
   return page.locator('g.node').filter({ hasText: caption }).first();
 }
@@ -46,47 +54,82 @@ function linkHits(page: Page): Locator {
   return page.locator('path.linkHit');
 }
 
-/** The computed fill of a node's circle, as the browser resolves it — 'rgb(r, g, b)'. */
+/** The computed fill of a node's circle, as the browser resolves it. */
 async function fillOf(node: Locator): Promise<string> {
   return node.locator('circle').evaluate(element => getComputedStyle(element).fill);
+}
+
+async function swatchOf(locator: Locator): Promise<string> {
+  return locator.evaluate(element => getComputedStyle(element).backgroundColor);
+}
+
+/** The node's transform once the force layout has stopped moving it. */
+async function settled(node: Locator): Promise<string> {
+  let previous = '';
+  await expect.poll(async () => {
+    const current = (await node.getAttribute('transform')) ?? '';
+    const stable = current !== '' && current === previous;
+    previous = current;
+    return stable;
+  }, { timeout: 20_000, intervals: [250] }).toBe(true);
+  return previous;
 }
 
 // ------------------------------------------------------------------ the store, in the sidebar
 
 test.describe('sidebar', () => {
   test('lists the labels and relationship types in the store, with counts', async ({ page }) => {
-    // These counts come from a scan of the store, not from the query — the sidebar describes the store, and it has to
+    // These counts come from a scan of the store, not from a query — the sidebar describes the store, and it has to
     // be right before a single query has run.
     const labels = page.getByTestId('labels');
-    await expect(labels.locator('li[data-label="Person"]')).toContainText('4');
-    await expect(labels.locator('li[data-label="Company"]')).toContainText('2');
-    await expect(labels.locator('li[data-label="Product"]')).toContainText('2');
-    // A node with two labels is counted under both.
-    await expect(labels.locator('li[data-label="Employee"]')).toContainText('1');
+    await expect(labels.locator('li[data-label="Airport"]')).toContainText('58');
+    await expect(labels.locator('li[data-label="City"]')).toContainText('55');
+    await expect(labels.locator('li[data-label="Country"]')).toContainText('39');
+    // A hub is :Airport:Hub, and is counted under both.
+    await expect(labels.locator('li[data-label="Hub"]')).toContainText('6');
 
     const types = page.getByTestId('relationshipTypes');
-    await expect(types.locator('li[data-type="KNOWS"]')).toContainText('4');
-    await expect(types.locator('li[data-type="WORKS_AT"]')).toContainText('3');
-    // Lightweight edges have no relationship record at all, and must still be counted.
-    await expect(types.locator('li[data-type="BOUGHT"]')).toContainText('3');
+    await expect(types.locator('li[data-type="ROUTE_TO"]')).toContainText('361');
+    // IN_CITY is a lightweight edge with no relationship record, so a count taken from the record store would miss
+    // every one of these.
+    await expect(types.locator('li[data-type="IN_CITY"]')).toContainText('58');
+    await expect(types.locator('li[data-type="HUB_AT"]')).toContainText('9');
 
-    await expect(page.getByTestId('unlabelled')).toContainText('1 node carries no label');
+    // Every node in the demo graph is labelled, so the footnote about unlabelled ones must not appear at all.
+    await expect(page.getByTestId('unlabelled')).toHaveCount(0);
+  });
+
+  test('the summary agrees with the list under it', async ({ page }) => {
+    // It did not, once: the summary came from /api/stats, which counts relationship *records*, while the list counts
+    // adjacency entries. With 113 lightweight edges in the demo graph that is 370 above a list adding up to 483, and
+    // the reader is left to work out which number is lying.
+    await expect(page.getByTestId('store-summary')).toContainText('159 nodes');
+    await expect(page.getByTestId('store-summary')).toContainText('483 relationships');
+
+    const counts = await page.locator('[data-testid="relationshipTypes"] .count').allTextContents();
+    expect(counts.reduce((total, text) => total + Number(text.replace(/\D/g, '')), 0)).toBe(483);
   });
 
   test('clicking a label runs a query for it', async ({ page }) => {
-    await page.getByTestId('labels').locator('li[data-label="Company"] button').click();
-    await expect(page.getByTestId('query-input')).toHaveValue(/MATCH \(n:Company\)/);
-    await expect(nodes(page)).toHaveCount(2);
+    await page.getByTestId('labels').locator('li[data-label="Hub"] button').click();
+    await expect(page.getByTestId('query-input')).toHaveValue(/MATCH \(n:Hub\)/);
+    await expect(nodes(page)).toHaveCount(6);
+  });
+
+  test('clicking a relationship type runs a query for it', async ({ page }) => {
+    await page.getByTestId('relationshipTypes').locator('li[data-type="HUB_AT"] button').click();
+    await expect(page.getByTestId('query-input')).toHaveValue(/\[r:HUB_AT\]/);
+    await expect(links(page)).toHaveCount(9);
   });
 
   test('a label that is not an identifier is quoted before it becomes a query', async ({ page }) => {
-    // 'Legacy System' has a space in it. Pasted into a query unquoted it is a syntax error, so the UI has to
-    // backtick it — and this is the only place that rule is exercised.
-    await page.getByTestId('labels').locator('li[data-label="Legacy System"] button').click();
-    await expect(page.getByTestId('query-input')).toHaveValue(/MATCH \(n:`Legacy System`\)/);
+    // 'Cargo Carrier' has a space in it. Pasted into a query unquoted it is a syntax error, so the UI has to backtick
+    // it — and this is the only place that rule is exercised.
+    await page.getByTestId('labels').locator('li[data-label="Cargo Carrier"] button').click();
+    await expect(page.getByTestId('query-input')).toHaveValue(/MATCH \(n:`Cargo Carrier`\)/);
     await expect(page.getByTestId('error')).toHaveCount(0);
     await expect(nodes(page)).toHaveCount(1);
-    await expect(nodes(page)).toContainText('Mainframe');
+    await expect(nodes(page)).toContainText('Beacon');
   });
 });
 
@@ -94,23 +137,23 @@ test.describe('sidebar', () => {
 
 test.describe('cypher', () => {
   test('runs a query and reports what it drew', async ({ page }) => {
-    // Four KNOWS relationships over four people, one of which is Dave knowing himself.
-    await run(page, PEOPLE_AND_FRIENDS);
-    await expect(page.getByTestId('status')).toHaveText(/\d+ rows in \d+ ms · 4 nodes, 4 relationships/);
+    await run(page, FROM_HEATHROW);
+    await expect(page.getByTestId('status')).toHaveText(/5 rows in \d+ ms · 4 nodes, 5 relationships/);
     await expect(nodes(page)).toHaveCount(4);
-    await expect(links(page)).toHaveCount(4);
+    // Five lines over four nodes: one of these pairs is flown by two airlines.
+    await expect(links(page)).toHaveCount(5);
   });
 
   test('a self-relationship is drawn as a loop rather than a line of no length', async ({ page }) => {
-    await run(page, 'MATCH (a:Person)-[r]->(a) RETURN a, r');
+    // The sightseeing flight, which leaves and returns to the same airport.
+    await run(page, 'MATCH (a:Airport)-[r:ROUTE_TO]->(a) RETURN a, r');
     await expect(nodes(page)).toHaveCount(1);
     await expect(links(page)).toHaveCount(1);
-    const shape = await links(page).first().getAttribute('d');
-    expect(shape).toContain('Q');
+    expect(await links(page).first().getAttribute('d')).toContain('Q');
   });
 
   test('a syntax error is shown with the engine caret, not as a failed request', async ({ page }) => {
-    await run(page, 'MATCH (n:Person) WHERE n.age > > 30 RETURN n');
+    await run(page, 'MATCH (a:Airport) WHERE a.runways > > 2 RETURN a');
     const error = page.getByTestId('error');
     await expect(error).toContainText('syntax');
     // The caret line is the part that says *where*, and it only means anything in a monospace block.
@@ -118,25 +161,33 @@ test.describe('cypher', () => {
   });
 
   test('a write is refused as read-only', async ({ page }) => {
-    await run(page, 'CREATE (n:Person {name: "Mallory"}) RETURN n');
+    await run(page, 'CREATE (a:Airport {code: "ZZZ"}) RETURN a');
     await expect(page.getByTestId('error')).toContainText('read-only');
   });
 
   test('a result with nothing renderable goes to the table', async ({ page }) => {
-    // Otherwise the answer to `RETURN n.name` is an empty canvas, which looks like a failure.
-    await run(page, 'MATCH (n:Person) RETURN n.name AS name ORDER BY name');
+    // Otherwise the answer to `RETURN a.code` is an empty canvas, which looks like a failure.
+    await run(page, 'MATCH (a:Airport) RETURN a.code AS code ORDER BY code LIMIT 4');
     await expect(page.getByTestId('tab-table')).toHaveClass(/active/);
     const rows = page.locator('table.results tbody tr');
     await expect(rows).toHaveCount(4);
-    await expect(rows.first()).toContainText('Alice');
+    await expect(rows.first()).toContainText('AKL');
+  });
+
+  test('aggregation over the demo graph answers a real question', async ({ page }) => {
+    // The point of the demo domain: the queries mean something. Heathrow is the busiest hub in this graph.
+    await run(page, 'MATCH (h:Hub)-[:ROUTE_TO]->() RETURN h.code AS hub, count(*) AS routes ORDER BY routes DESC');
+    const rows = page.locator('table.results tbody tr');
+    await expect(rows).toHaveCount(6);
+    await expect(rows.first()).toContainText('LHR');
+    await expect(rows.first()).toContainText('46');
   });
 
   test('a 64-bit id is shown exactly, not rounded', async ({ page }) => {
     // A JavaScript number is a double, so an id near 2^60 loses its low bits. Ids cross as strings for this reason;
     // an id ending in a suspiciously round …000 here is that defect coming back.
-    await run(page, 'MATCH (n:Person) RETURN id(n) AS i ORDER BY i LIMIT 1');
-    const cell = page.locator('table.results tbody tr td').first();
-    const text = (await cell.textContent())?.trim() ?? '';
+    await run(page, 'MATCH (a:Airport) RETURN id(a) AS i ORDER BY i LIMIT 1');
+    const text = (await page.locator('table.results tbody tr td').first().textContent())?.trim() ?? '';
     expect(text).toMatch(/^\d{16,}$/);
     expect(BigInt(text) > 1n << 53n).toBe(true);
   });
@@ -146,41 +197,36 @@ test.describe('cypher', () => {
 
 test.describe('nodes', () => {
   test('are drawn with a caption taken from a property', async ({ page }) => {
-    await run(page, PEOPLE);
-    await expect(nodes(page)).toHaveCount(4);
-    for (const name of ['Alice', 'Bob', 'Carol', 'Dave']) {
+    await run(page, HUBS);
+    await expect(nodes(page)).toHaveCount(6);
+    for (const name of ['Heathrow', 'Dubai International', 'Sydney Kingsford Smith']) {
       await expect(nodeNamed(page, name)).toBeVisible();
     }
   });
 
   test('selecting one shows its labels and properties', async ({ page }) => {
-    await run(page, PEOPLE);
-    await nodeNamed(page, 'Alice').click();
+    await run(page, HUBS);
+    await nodeNamed(page, 'Heathrow').click();
 
     const inspector = page.getByTestId('inspector');
-    // Alice carries two labels, which the storage format holds inline in the node record.
-    await expect(inspector.locator('.chip')).toHaveText(['Person', 'Employee']);
-    await expect(inspector.locator('tr[data-property="name"]')).toContainText('Alice');
-    await expect(inspector.locator('tr[data-property="age"]')).toContainText('34');
-    await expect(inspector.locator('tr[data-property="city"]')).toContainText('Bonn');
-    await expect(inspector.locator('tr[data-property="active"]')).toContainText('true');
+    // Heathrow is a hub, so it carries two labels — held inline in the node record.
+    await expect(inspector.locator('.chip')).toHaveText(['Airport', 'Hub']);
+    await expect(inspector.locator('tr[data-property="code"]')).toContainText('LHR');
+    await expect(inspector.locator('tr[data-property="name"]')).toContainText('Heathrow');
+    await expect(inspector.locator('tr[data-property="latitude"]')).toContainText('51.5');
+    await expect(inspector.locator('tr[data-property="international"]')).toContainText('true');
     // The id is what a user pastes back into a query, so it is shown in full.
     await expect(inspector.locator('tr[data-property="id"] td')).toHaveText(/^\d{16,}$/);
   });
 
-  test('a node with no label says so rather than showing nothing', async ({ page }) => {
-    await run(page, 'MATCH (n) WHERE n.name = "Anonymous" RETURN n');
-    await nodeNamed(page, 'Anonymous').click();
-    await expect(page.getByTestId('inspector').locator('.chip')).toHaveText(['no label']);
-  });
-
   test('the inspector walks to the other end of a relationship', async ({ page }) => {
-    await run(page, PEOPLE_AND_FRIENDS);
-    await nodeNamed(page, 'Alice').click();
+    await run(page, FROM_HEATHROW);
+    await nodeNamed(page, 'Heathrow').click();
     const inspector = page.getByTestId('inspector');
-    await expect(inspector.locator('.incident li')).toHaveCount(2);
-    await inspector.locator('.incident li button').filter({ hasText: 'Bob' }).click();
-    await expect(inspector.locator('tr[data-property="name"]')).toContainText('Bob');
+    await expect(inspector.locator('.incident li')).toHaveCount(5);
+
+    await inspector.locator('.incident li button').filter({ hasText: 'Schiphol' }).first().click();
+    await expect(inspector.locator('tr[data-property="code"]')).toContainText('AMS');
   });
 });
 
@@ -188,36 +234,40 @@ test.describe('nodes', () => {
 
 test.describe('relationships', () => {
   test('carry their type as a label on the line', async ({ page }) => {
-    await run(page, 'MATCH (a:Person)-[r:WORKS_AT]->(c:Company) RETURN a, r, c');
-    await expect(page.locator('text.linkLabel')).toHaveCount(3);
-    await expect(page.locator('text.linkLabel').first()).toHaveText('WORKS_AT');
+    await run(page, LONDON);
+    await expect(page.locator('text.linkLabel')).toHaveCount(2);
+    await expect(page.locator('text.linkLabel').first()).toHaveText('IN_CITY');
   });
 
   test('selecting one shows its properties', async ({ page }) => {
-    await run(page, 'MATCH (a:Person)-[r:KNOWS]->(b:Person) WHERE a.name = "Alice" RETURN a, r, b');
+    await run(page, "MATCH (a:Airport)-[r:ROUTE_TO]->(b:Airport) WHERE a.code = 'LHR' AND b.code = 'CDG' RETURN a, r, b");
     await linkHits(page).first().click();
+
     const inspector = page.getByTestId('inspector');
-    await expect(inspector.locator('.chip').first()).toHaveText('KNOWS');
-    await expect(inspector.locator('tr[data-property="since"]')).toContainText('2019');
-    await expect(inspector.locator('.endpoints')).toContainText('Alice');
-    await expect(inspector.locator('.endpoints')).toContainText('Bob');
+    await expect(inspector.locator('.chip').first()).toHaveText('ROUTE_TO');
+    // London to Paris is about 350 km, and the demo computes its distances from real coordinates.
+    await expect(inspector.locator('tr[data-property="distanceKm"]')).toContainText('350');
+    await expect(inspector.locator('tr[data-property="flightNumber"]')).toBeVisible();
+    await expect(inspector.locator('.endpoints')).toContainText('Heathrow');
+    await expect(inspector.locator('.endpoints')).toContainText('Charles de Gaulle');
   });
 
   test('a lightweight edge is drawn dashed and says why it has no properties', async ({ page }) => {
-    // It lives entirely in the adjacency list: no relationship record, so no id and nowhere to put a property. An
-    // empty property table would look like data loss.
-    await run(page, 'MATCH (a)-[r:BOUGHT]->(b) RETURN a, r, b');
+    // IN_CITY lives entirely in the adjacency list: no relationship record, so no id and nowhere to put a property.
+    // An empty property table would look like data loss.
+    await run(page, LONDON);
     await expect(links(page).first()).toHaveAttribute('stroke-dasharray', /\d/);
     await linkHits(page).first().click();
+
     const inspector = page.getByTestId('inspector');
-    await expect(inspector.locator('.chip')).toContainText(['BOUGHT', 'lightweight']);
+    await expect(inspector.locator('.chip')).toContainText(['IN_CITY', 'lightweight']);
     await expect(inspector).toContainText('no relationship record');
   });
 
   test('two relationships between the same pair are drawn apart', async ({ page }) => {
-    // Alice KNOWS Bob and Alice MENTORS Bob. Drawn as two straight lines they would be one line on screen, and the
-    // user would see a graph that is missing an edge.
-    await run(page, 'MATCH (a:Person)-[r]->(b:Person) WHERE a.name = "Alice" AND b.name = "Bob" RETURN a, r, b');
+    // Heathrow to Frankfurt is flown by two airlines. Drawn as two straight lines they would be one line on screen,
+    // and the user would see a graph that is missing an edge.
+    await run(page, "MATCH (a:Airport)-[r:ROUTE_TO]->(b:Airport) WHERE a.code = 'LHR' AND b.code = 'FRA' RETURN a, r, b");
     await expect(links(page)).toHaveCount(2);
     const shapes = await links(page).evaluateAll(paths => paths.map(path => path.getAttribute('d') ?? ''));
     expect(shapes[0]).not.toBe(shapes[1]);
@@ -226,7 +276,7 @@ test.describe('relationships', () => {
 
   test('a relationship whose far end was not returned is not drawn', async ({ page }) => {
     // D3 would otherwise invent a vertex for the missing end, putting a node on the canvas the query never returned.
-    await run(page, 'MATCH (a:Person)-[r:KNOWS]->(b) WHERE a.name = "Alice" RETURN a, r');
+    await run(page, "MATCH (a:Airport)-[r:ROUTE_TO]->(b:Airport) WHERE a.code = 'LHR' AND b.code = 'CDG' RETURN r, b");
     await expect(nodes(page)).toHaveCount(1);
     await expect(links(page)).toHaveCount(0);
   });
@@ -236,35 +286,33 @@ test.describe('relationships', () => {
 
 test.describe('colours', () => {
   test('are per label, and the same in the sidebar as on the canvas', async ({ page }) => {
-    await run(page, 'MATCH (n) WHERE n:Person OR n:Product RETURN n');
+    await run(page, LONDON);
 
-    const alice = await fillOf(nodeNamed(page, 'Alice'));
-    const bob = await fillOf(nodeNamed(page, 'Bob'));
-    const widget = await fillOf(nodeNamed(page, 'Widget'));
+    const heathrow = await fillOf(nodeNamed(page, 'Heathrow'));
+    const gatwick = await fillOf(nodeNamed(page, 'Gatwick'));
+    const london = await fillOf(nodeNamed(page, 'London'));
 
-    expect(alice).toBe(bob);
-    expect(alice).not.toBe(widget);
+    expect(heathrow).toBe(gatwick);
+    expect(heathrow).not.toBe(london);
 
     // The legend swatch and the circle are coloured by two different components that share no state — only the hash
     // of the label name. If they ever disagree the legend is lying about the picture.
-    const swatch = page.locator('li[data-label="Person"] .swatch');
-    expect(await swatch.evaluate(element => getComputedStyle(element).backgroundColor)).toBe(alice);
+    expect(await swatchOf(page.locator('li[data-label="Airport"] .swatch'))).toBe(heathrow);
+    expect(await swatchOf(page.locator('li[data-label="City"] .swatch'))).toBe(london);
   });
 
   test('a relationship line matches its type in the legend', async ({ page }) => {
-    await run(page, 'MATCH (a:Person)-[r:WORKS_AT]->(c) RETURN a, r, c');
+    await run(page, FROM_HEATHROW);
     const stroke = await links(page).first().evaluate(element => getComputedStyle(element).stroke);
-    const swatch = page.locator('li[data-type="WORKS_AT"] .swatch');
-    expect(await swatch.evaluate(element => getComputedStyle(element).backgroundColor)).toBe(stroke);
+    expect(await swatchOf(page.locator('li[data-type="ROUTE_TO"] .swatch'))).toBe(stroke);
   });
 
   test('a node with two labels takes the colour of the first', async ({ page }) => {
-    await run(page, PEOPLE);
-    const alice = await fillOf(nodeNamed(page, 'Alice'));
-    const personSwatch = page.locator('li[data-label="Person"] .swatch');
-    const employeeSwatch = page.locator('li[data-label="Employee"] .swatch');
-    expect(await personSwatch.evaluate(element => getComputedStyle(element).backgroundColor)).toBe(alice);
-    expect(await employeeSwatch.evaluate(element => getComputedStyle(element).backgroundColor)).not.toBe(alice);
+    // Heathrow is :Airport:Hub. One circle can only be one colour, and the inspector shows the rest.
+    await run(page, HUBS);
+    const heathrow = await fillOf(nodeNamed(page, 'Heathrow'));
+    expect(await swatchOf(page.locator('li[data-label="Airport"] .swatch'))).toBe(heathrow);
+    expect(await swatchOf(page.locator('li[data-label="Hub"] .swatch'))).not.toBe(heathrow);
   });
 });
 
@@ -272,70 +320,72 @@ test.describe('colours', () => {
 
 test.describe('replace and merge', () => {
   test('replace shows only the latest result', async ({ page }) => {
-    await run(page, PEOPLE);
-    await expect(nodes(page)).toHaveCount(4);
-    await run(page, 'MATCH (n:Company) RETURN n');
-    await expect(nodes(page)).toHaveCount(2);
+    await run(page, HUBS);
+    await expect(nodes(page)).toHaveCount(6);
+    await run(page, LONDON);
+    await expect(nodes(page)).toHaveCount(3);
   });
 
   test('merge adds to the canvas and keeps what was there', async ({ page }) => {
-    await run(page, PEOPLE);
-    await expect(nodes(page)).toHaveCount(4);
+    await run(page, LONDON);
+    await expect(nodes(page)).toHaveCount(3);
 
     await page.getByTestId('mode-merge').click();
-    await run(page, 'MATCH (n:Company) RETURN n');
-    await expect(nodes(page)).toHaveCount(6);
-    await expect(nodeNamed(page, 'Alice')).toBeVisible();
-    await expect(nodeNamed(page, 'Acme')).toBeVisible();
+    await run(page, HUBS);
+    // Heathrow is in both results and must not be drawn twice: 3 + 6 - 1.
+    await expect(nodes(page)).toHaveCount(8);
+    await expect(nodeNamed(page, 'Gatwick')).toBeVisible();
+    await expect(nodeNamed(page, 'Sydney Kingsford Smith')).toBeVisible();
   });
 
   test('merge joins up a relationship whose ends came from different queries', async ({ page }) => {
     // The server cannot draw a relationship whose far end is not in the same result, but it does send it. This is
-    // what makes it possible to build a picture one query at a time.
-    await run(page, 'MATCH (a:Person) WHERE a.name = "Alice" RETURN a');
+    // what makes it possible to build a picture one query at a time — here, one flight at a time.
+    await run(page, "MATCH (a:Airport) WHERE a.code = 'LHR' RETURN a");
     await expect(links(page)).toHaveCount(0);
 
     await page.getByTestId('mode-merge').click();
-    await run(page, 'MATCH (a:Person)-[r:KNOWS]->(b) WHERE a.name = "Alice" RETURN r, b');
+    await run(page, "MATCH (a:Airport)-[r:ROUTE_TO]->(b:Airport) WHERE a.code = 'LHR' AND b.code = 'CDG' RETURN r, b");
     await expect(nodes(page)).toHaveCount(2);
     await expect(links(page)).toHaveCount(1);
-    await expect(page.locator('text.linkLabel').first()).toHaveText('KNOWS');
+    await expect(page.locator('text.linkLabel').first()).toHaveText('ROUTE_TO');
   });
 
   test('a node seen twice stays where it is', async ({ page }) => {
     // The reason merge reuses node objects rather than rebuilding them: the layout would otherwise forget every
     // position and the whole picture would jump on each query.
-    await run(page, PEOPLE);
-    const alice = nodeNamed(page, 'Alice');
-    await expect(alice).toBeVisible();
-    const before = await alice.getAttribute('transform');
+    await run(page, HUBS);
+    const heathrow = nodeNamed(page, 'Heathrow');
+    await expect(heathrow).toBeVisible();
+    // Both positions are read from a settled layout. Comparing against a moving one measures the simulation still
+    // running, not the thing this test is about, and fails at whatever threshold is chosen.
+    const before = await settled(heathrow);
 
     await page.getByTestId('mode-merge').click();
-    await run(page, 'MATCH (n:Person) WHERE n.name = "Alice" RETURN n');
-    await expect(nodes(page)).toHaveCount(4);
-    // The simulation is still nudging things, so this is about staying put, not about being pixel-identical.
-    expect(distance(before, await alice.getAttribute('transform'))).toBeLessThan(80);
+    await run(page, "MATCH (a:Airport) WHERE a.code = 'LHR' RETURN a");
+    await expect(nodes(page)).toHaveCount(6);
+    expect(distance(before, await settled(heathrow))).toBeLessThan(40);
   });
 
   test('hiding a node takes its relationships with it, and a later query brings them back', async ({ page }) => {
     // The canvas is a view, not the store: hiding is a UI action and the read-only server could not delete anything
     // even if it were asked to.
-    await run(page, PEOPLE_AND_FRIENDS);
-    await expect(links(page)).toHaveCount(4);
-    await nodeNamed(page, 'Bob').click();
+    await run(page, FROM_HEATHROW);
+    await expect(links(page)).toHaveCount(5);
+    await nodeNamed(page, 'Heathrow').click();
     await page.getByTestId('hide-node').click();
 
     await expect(nodes(page)).toHaveCount(3);
-    await expect(links(page)).toHaveCount(2, { timeout: 10_000 });
+    await expect(links(page)).toHaveCount(0);
 
     await page.getByTestId('mode-merge').click();
-    await run(page, 'MATCH (n:Person) WHERE n.name = "Bob" RETURN n');
+    await run(page, "MATCH (a:Airport) WHERE a.code = 'LHR' RETURN a");
     await expect(nodes(page)).toHaveCount(4);
-    await expect(links(page)).toHaveCount(4);
+    await expect(links(page)).toHaveCount(5);
   });
 
   test('clear empties the canvas', async ({ page }) => {
-    await run(page, PEOPLE);
+    await run(page, HUBS);
     await page.getByRole('button', { name: 'Clear', exact: true }).click();
     await expect(nodes(page)).toHaveCount(0);
     await expect(page.locator('.canvasEmpty')).toBeVisible();

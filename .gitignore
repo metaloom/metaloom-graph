@@ -8,3 +8,4 @@ target
 native-rust-lib/fuzz/target/
 native-rust-lib/fuzz/corpus/
 native-rust-lib/fuzz/artifacts/
+/data

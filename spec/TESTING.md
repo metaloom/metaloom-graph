@@ -78,8 +78,8 @@ src/test/java/io/metaloom/graph/core/
 graph-cypher/src/test/java/io/metaloom/graph/cypher/
                  parser, null semantics, execution, the versus-API differential, variable-length paths
 graph-server/src/test/java/io/metaloom/graph/server/
-                 the HTTP contract, the two result shapes the UI needs, and DemoServer — the seeded
-                 graph the browser suite drives
+                 the HTTP contract, the two result shapes the UI needs, the command line, and
+                 demo/DemoDataTest — the generated air route graph the browser suite drives
 graph-server/src/main/frontend/src/model/*.test.ts
                  the UI's rules that are logic rather than appearance: what a merge does to node
                  identity, and that a label's colour is a function of its name. Run by `mvn test`

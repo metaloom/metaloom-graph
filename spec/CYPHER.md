@@ -223,8 +223,9 @@ property equality → a label scan → a full node scan. So
 
 ```bash
 java -jar graph-server/target/graph-server-0.0.1-SNAPSHOT.jar /path/to/store 8080
+java -jar graph-server/target/graph-server-0.0.1-SNAPSHOT.jar --demo /tmp/demo 8080   # §8.3
 mvn -o -pl graph-server exec:java -Dexec.args="/path/to/store 8080"   # from the reactor
-tools/demo-server.sh                                                  # a seeded demo graph on 8080
+tools/demo-server.sh                                                  # the demo graph on 8080
 ```
 
 The jar is shaded: server, engine, query language, Vert.x, Netty, logging and the UI bundle in one
@@ -294,6 +295,47 @@ Three decisions worth recording:
   merge mode a link whose far end arrives two queries later is drawn then — which is what makes it
   possible to build a picture one query at a time. Held links are capped, newest kept.
 
+### 8.3 Demo data
+
+`--demo` fills an **empty** store with a generated graph and then serves it. `--demo-size` takes `tiny`, `small`
+(the default), `medium`, `large`, or a number of airports.
+
+| Size | Airports | Nodes | Relationships | Seed |
+|---|---|---|---|---|
+| `tiny` | 12 | 37 | 93 | 55 ms |
+| `small` | 58 | 159 | 483 | 55 ms |
+| `medium` | 400 | 860 | 4,893 | 150 ms |
+| `large` | 3,000 | 6,060 | 29,581 | 360 ms |
+
+**Only into an empty store.** Seeding on top of existing data would work — the generator deletes nothing — and that is
+why it is refused: invented routes silently mixed into somebody's real graph is not a mistake they would notice
+quickly. A store with nodes in it is left alone and logged about, so the flag is safe to leave in a start script. It
+is the one write path in an otherwise read-only application, it is opt-in, and it runs before the server binds.
+
+The domain is an **air route network**: `(:Airport)-[:ROUTE_TO {airline, flightNumber, distanceKm, durationMinutes,
+weeklyFlights}]->(:Airport)`, with `(:Airport)-[:IN_CITY]->(:City)-[:IN_COUNTRY]->(:Country)` and
+`(:Airline)-[:HUB_AT {since}]->(:Airport)`. It was chosen because it needs no explanation — so the demo teaches the
+query language rather than the dataset — and because it contains every awkward shape the engine and the browser have
+to handle without a single one of them being contrived:
+
+| In the domain | Which exercises |
+|---|---|
+| A hub is `:Airport:Hub` | The node record's inline label slots |
+| A freight airline is a `` `Cargo Carrier` `` | A label that has to be quoted to become a query |
+| `IN_CITY`, `IN_COUNTRY` carry nothing | Lightweight edges: 16 bytes, no record, no id |
+| Two airlines fly one pair | Parallel relationships, which must be drawn apart rather than on top of each other |
+| A sightseeing flight returns to its airport | A self-relationship |
+| A hub has 46 routes, a spoke has 3 | The supernode end of the adjacency tiers |
+
+**Airport names, codes and coordinates are real**, rounded to a tenth of a degree, and route distances are computed
+from them with a haversine — so `ORDER BY r.distanceKm DESC` gives an answer that matches the world, and
+`DemoDataTest` checks London to Paris against 350 km. **The airlines and every route are invented.** Past the 58 real
+airports the generator invents those too, in invented countries with ISO 3166-1 user-assigned codes, rather than
+inventing plausible-looking facts about real places.
+
+It is seeded, so a size always produces the same graph — which is what lets the browser suite name Heathrow and
+expect an answer.
+
 **No authentication.** The query language cannot write, but it reads everything. Bind to localhost
 unless something else provides access control.
 
@@ -310,9 +352,11 @@ unless something else provides access control.
 | `VarLengthPathTest` | 8 | §3.2, against a graph where the difference shows |
 | `CypherSnapshotTest` | 4 | §4: views closed, joined, and a query atomic against a live writer |
 | `GraphServerTest` | 18 | The HTTP contract, both result shapes, the schema scan and its cache, and the id-precision regression |
+| `DemoDataTest` | 10 | §8.3: the graph is connected as claimed, its distances match the world, and it is the same every time |
+| `GraphServerOptionsTest` | 8 | The command line, so an ignored flag fails a test rather than starting a server that does the wrong thing |
 | `model/graph.test.ts` | 12 | The merge rule: node identity across results, held links, and that every change advances the version |
 | `model/colors.test.ts` | 5 | A colour is a function of a name, and the demo graph's labels do not collide |
-| `e2e/graph-browser.spec.ts` | 27 | The UI in a browser against a real server — see §9.1 |
+| `e2e/graph-browser.spec.ts` | 29 | The UI in a browser against a real server — see §9.1 |
 
 `CypherVersusApiTest` is the one that matters. [TESTING.md](TESTING.md) opens by observing that every
 defect this project has found came from a test comparing the engine against **something outside it**.
@@ -325,7 +369,8 @@ parallel edges, self-loops, and a mix of materialised and lightweight relationsh
 
 `npm run e2e` in `graph-server/src/main/frontend`, opt-in because it needs a browser and starts a
 server. There are no mocks: Playwright drives Chromium against `tools/demo-server.sh`, which is the
-same command a human uses to look at the UI, over a store on disk seeded by `DemoServer`. That graph
+same command a human uses to look at the UI, over a store on disk filled by the shipped `--demo` flag (§8.3). That
+graph
 is deliberately awkward — a node with two labels, a node with none, a label with a space in it, two
 relationships between one pair, a self-relationship, and three lightweight edges — because each one is
 a case the UI has to get right and would otherwise only be exercised by hand.
@@ -342,7 +387,7 @@ Writing it found four defects that the Java tests could not have:
 The suite also caught a harness defect worth naming: Vert.x copies classpath resources into
 `.vertx/file-cache-*` and serves the copy, so a server left running across a UI rebuild serves the
 previous bundle. Every assertion in the first run failed against markup that no longer existed.
-`DemoServer` disables that cache.
+`tools/demo-server.sh` now starts the server with that cache off.
 
 ---
 

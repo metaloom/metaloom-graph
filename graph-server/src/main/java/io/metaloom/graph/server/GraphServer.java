@@ -15,6 +15,7 @@ import io.metaloom.graph.cypher.Cypher;
 import io.metaloom.graph.cypher.CypherResult;
 import io.metaloom.graph.cypher.exec.CypherTypeException;
 import io.metaloom.graph.cypher.parse.CypherSyntaxException;
+import io.metaloom.graph.server.demo.DemoData;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpServer;
@@ -28,8 +29,9 @@ import io.vertx.ext.web.handler.StaticHandler;
  * An HTTP front end: a Cypher endpoint and the browser UI that uses it.
  *
  * <pre>
- * java -jar graph-server-0.0.1-SNAPSHOT.jar /path/to/store 8080   # the shaded jar, everything included
- * mvn -pl graph-server exec:java -Dexec.args="/path/to/store"     # from the reactor
+ * java -jar graph-server-0.0.1-SNAPSHOT.jar /path/to/store 8080          # the shaded jar, everything included
+ * java -jar graph-server-0.0.1-SNAPSHOT.jar --demo /tmp/demo 8080        # with a graph to look at
+ * mvn -pl graph-server exec:java -Dexec.args="--demo /tmp/demo"          # from the reactor
  * </pre>
  *
  * <h2>Threading</h2>
@@ -80,17 +82,51 @@ public final class GraphServer implements AutoCloseable {
 	}
 
 	public static void main(String[] args) throws Exception {
-		if (args.length < 1) {
-			System.err.println("usage: GraphServer <store-directory> [port]");
-			System.err.println("The store is opened read-write but the query language is read-only.");
+		GraphServerOptions options;
+		try {
+			options = GraphServerOptions.parse(args);
+		} catch (GraphServerOptions.HelpRequested help) {
+			System.out.println(GraphServerOptions.usage());
+			return;
+		} catch (IllegalArgumentException invalid) {
+			System.err.println(invalid.getMessage());
+			System.err.println();
+			System.err.println(GraphServerOptions.usage());
 			System.exit(2);
+			return;
 		}
-		int port = args.length > 1 ? Integer.parseInt(args[1]) : 8080;
-		GraphStore store = GraphStore.open(Path.of(args[0]));
+
+		GraphStore store = GraphStore.open(options.store());
+		seedIfAsked(store, options);
+
 		GraphServer server = new GraphServer(Vertx.vertx(), store, true);
-		server.listen(port).toCompletionStage().toCompletableFuture().join();
-		logger.info("Graph server on http://localhost:{} over store {}", port, args[0]);
+		int port = server.listen(options.port()).toCompletionStage().toCompletableFuture().join();
+		logger.info("Graph server on http://localhost:{} over store {}", port, options.store());
 		Runtime.getRuntime().addShutdownHook(new Thread(server::closeQuietly));
+	}
+
+	/**
+	 * The one write path in this application, and it is opt-in and runs once.
+	 *
+	 * <p>
+	 * <b>Only into an empty store.</b> Seeding on top of existing data would work — nothing in the generator deletes
+	 * anything — and that is exactly why it is refused: invented routes silently mixed into somebody's real graph is
+	 * not a mistake they would notice quickly. A store that already has nodes is left alone and told about, which
+	 * also makes {@code --demo} safe to leave in a start script.
+	 * </p>
+	 */
+	private static void seedIfAsked(GraphStore store, GraphServerOptions options) throws IOException {
+		if (!options.demo()) {
+			return;
+		}
+		if (!DemoData.isEmpty(store)) {
+			logger.info("--demo: {} already holds {} nodes, leaving it alone",
+				options.store(), store.stats().nodeCount());
+			return;
+		}
+		logger.info("--demo: generating an air route network of {} airports in {}",
+			options.demoAirports(), options.store());
+		DemoData.seed(store, options.demoAirports());
 	}
 
 	public Future<Integer> listen(int port) {

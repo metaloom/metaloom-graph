@@ -54,9 +54,9 @@ shades a single runnable jar.
 
 ```bash
 mvn clean install             # everything, including the native layer
-mvn test -Dnative.skip=true   # the pure-Java fallback: 359 tests, 23 skipped rather than 3
+mvn test -Dnative.skip=true   # the pure-Java fallback: 377 tests, 23 skipped rather than 3
 mvn -o -Poffline install      # warm cargo registry, no network
-mvn test                      # 359 tests, 0 failures, 3 skipped — plus the UI's 17 and 12 Rust tests
+mvn test                      # 377 tests, 0 failures, 3 skipped — plus the UI's 17 and 12 Rust tests
 mvn test -Pbench              # benchmarks, the structural gates, and the supernode gates
 mvn test -Pcrash              # kill -9, compaction crash injection, and the crash matrix
 mvn test -Pslow               # the soak harness and the long-running reader
@@ -68,8 +68,9 @@ tools/kill9-loop.sh 100       # the crash loop, one iteration per store
 tools/verify-native.sh        # cargo miri, then cargo fuzz on both targets
 
 java -jar graph-server/target/graph-server-0.0.1-SNAPSHOT.jar /path/to/store 8080   # the graph browser
-tools/demo-server.sh                     # the same, over a seeded demo graph
-cd graph-server/src/main/frontend && npm run e2e   # 27 Playwright cases against that server
+java -jar graph-server/target/graph-server-0.0.1-SNAPSHOT.jar --demo /tmp/demo 8080 # with a graph in it
+tools/demo-server.sh [dir] [port] [size]           # the same, from the reactor
+cd graph-server/src/main/frontend && npm run e2e   # 29 Playwright cases against that server
 ```
 
 In MetaLoom: `mvn test -pl loom/services/graphstore` — **23 tests**, and

@@ -10,7 +10,7 @@ SSD. The defining design constraint:
 
 ## Status
 
-Durable, transactional, indexed, compacting, hardened, with snapshot isolation for readers, a read-only openCypher subset and a browser UI. 359 Java tests, 17 in the UI and 12 in the Rust crate, plus 27 browser cases on demand.
+Durable, transactional, indexed, compacting, hardened, with snapshot isolation for readers, a read-only openCypher subset and a browser UI. 377 Java tests, 17 in the UI and 12 in the Rust crate, plus 29 browser cases on demand.
 
 | | |
 |---|---|
@@ -135,7 +135,34 @@ and joins the caller's view if there already is one.
 
 ```bash
 java -jar graph-server/target/graph-server-0.0.1-SNAPSHOT.jar /data/mygraph 8080
-tools/demo-server.sh          # or: a seeded demo graph, if you have no store yet
+
+# Nothing to look at yet? --demo fills an empty store with an air route network.
+java -jar graph-server/target/graph-server-0.0.1-SNAPSHOT.jar --demo /tmp/demo 8080
+java -jar graph-server/target/graph-server-0.0.1-SNAPSHOT.jar --demo-size=large /tmp/big 8080
+tools/demo-server.sh          # the same thing from the reactor
+```
+
+| `--demo-size` | Airports | Nodes | Relationships | Seed time |
+|---|---|---|---|---|
+| `tiny` | 12 | 37 | 93 | 55 ms |
+| `small` *(default)* | 58 | 159 | 483 | 55 ms |
+| `medium` | 400 | 860 | 4,893 | 150 ms |
+| `large` | 3,000 | 6,060 | 29,581 | 360 ms |
+
+Any number works too — `--demo-size=250`. **`--demo` only ever writes into an empty store**; one that already has
+nodes is left alone and said so, which makes the flag safe to leave in a start script.
+
+The demo graph is airports in cities in countries, airlines with hubs, and routes carrying a distance, a duration and
+a flight number. Airport names, codes and coordinates are real, so distances come out about right and
+`ORDER BY r.distanceKm DESC` answers a real question; **everything else — the airlines, every route, every
+frequency — is generated.** Past 58 airports the generator invents them outright rather than inventing facts about
+real places.
+
+```cypher
+MATCH (a:Airport)-[r:ROUTE_TO]->(b:Airport) WHERE a.code = 'LHR' RETURN a, r, b
+MATCH (h:Hub)-[:ROUTE_TO]->() RETURN h.code AS hub, count(*) AS routes ORDER BY routes DESC
+MATCH p = (a:Airport)-[:ROUTE_TO*1..3]->(b:Airport)
+WHERE a.code = 'AKL' AND b.code = 'HEL' RETURN p LIMIT 5
 ```
 
 | | |
@@ -170,7 +197,7 @@ during `mvn clean`. `graph-server` drives `npm` on the same terms — install, b
 jar.
 
 ```bash
-mvn test              # 359 tests across three modules, the UI's own 17, and the Rust crate's 12
+mvn test              # 377 tests across three modules, the UI's own 17, and the Rust crate's 12
 mvn test -Pslow       # adds the scaling curve, the soak and the long-running reader
 mvn test -Pbench      # adds the benchmarks and the performance gates
 mvn test -Pall-tests  # everything
@@ -181,7 +208,7 @@ mvn test -Phuge -Dtest=GraphScaleBenchmark   # 10M nodes + 20M edges: 11 min, 6.
 
 | Flag | |
 |---|---|
-| `-Dnative.skip=true` | Build with no native layer at all, even where `cargo` is present, **and do not load one that an earlier build left behind**. The whole suite passes on the pure-Java path — 359 tests, 23 skipped rather than 3 — and this is how that is checked. |
+| `-Dnative.skip=true` | Build with no native layer at all, even where `cargo` is present, **and do not load one that an earlier build left behind**. The whole suite passes on the pure-Java path — 377 tests, 23 skipped rather than 3 — and this is how that is checked. |
 | `-Dui.skip=true` | Build with no browser UI, even where `npm` is present. The API is unaffected and the index page says the bundle is missing. |
 | `-Poffline` | Passes cargo's and npm's offline flags, for warm caches with no network. Pairs with `mvn -o`. |
 | `-DskipTests` | Skips the Rust and UI tests too, not only the Java ones. |

@@ -38,10 +38,13 @@ export function Sidebar(props: Props) {
           </button>
         </header>
 
-        {stats && (
-          <p className="storeSummary">
-            {stats.nodes.toLocaleString()} nodes · {stats.relationships.toLocaleString()} relationships ·{' '}
-            {formatBytes(stats.storageBytes)}
+        {schema && (
+          // Counts from the scan, not from /api/stats. Stats counts relationship *records*, and a lightweight edge
+          // has none — so the summary would say 370 above a list of types adding up to 483, and the reader would be
+          // left to work out which number was lying. Only the byte count comes from stats.
+          <p className="storeSummary" data-testid="store-summary">
+            {schema.nodeCount.toLocaleString()} nodes · {schema.relationshipCount.toLocaleString()} relationships
+            {stats ? ` · ${formatBytes(stats.storageBytes)}` : ''}
           </p>
         )}
 

@@ -7,7 +7,8 @@ const PORT = Number(process.env.E2E_PORT ?? 8099);
  *
  * <h3>No mocks</h3>
  *
- * The browser talks to a Vert.x server running the actual Cypher engine over a store on disk, seeded by DemoServer.
+ * The browser talks to a Vert.x server running the actual Cypher engine over a store on disk, filled by the shipped
+ * `--demo` flag.
  * Everything these tests are about — that a syntax error carries a caret, that a lightweight edge has no properties,
  * that a 64-bit id survives the trip — is a property of the whole path. A mocked API would assert that the UI renders
  * the fixture someone wrote for it, which is the one thing that cannot be wrong.
