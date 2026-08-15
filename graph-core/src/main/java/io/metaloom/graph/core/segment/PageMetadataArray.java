@@ -15,8 +15,16 @@ import io.metaloom.graph.core.util.Layouts;
  * 20  2  live_count
  * 22  2  flags
  * 24  4  free_hint
- * 28  4  reserved
+ * 28  2  gen_floor
+ * 30  2  reserved
  * </pre>
+ *
+ * <p>
+ * <b>{@code gen_floor} is here rather than in the page because the page is exactly what gets destroyed.</b> Hole
+ * punching returns an all-free page's blocks to the filesystem, after which it reads as zeros — including the
+ * generation counter inside every record on it, which is the engine's dangling-id detector. The metadata array is a
+ * separate region and is never punched, so it is the one place a floor can survive.
+ * </p>
  *
  * @see <a href="../../../../../../../../spec/FILE_FORMAT.md">spec/FILE_FORMAT.md</a> section 3.3
  */
@@ -30,6 +38,7 @@ public final class PageMetadataArray {
 	private static final int OFF_LIVE_COUNT = 20;
 	private static final int OFF_FLAGS = 22;
 	private static final int OFF_FREE_HINT = 24;
+	private static final int OFF_GEN_FLOOR = 28;
 
 	private final SegmentFile file;
 	private final long base;
@@ -106,5 +115,34 @@ public final class PageMetadataArray {
 
 	public void freeHint(int page, int value) {
 		file.writeSlice(offset(page, OFF_FREE_HINT), 4).set(Layouts.INT, 0, value);
+	}
+
+	/**
+	 * The generation no slot on this page may be handed out below.
+	 *
+	 * <p>
+	 * Zero on a page that has never been punched, which is every page in a store with no native layer — the record's
+	 * own counter is then the whole story and this costs a read that always returns zero.
+	 * </p>
+	 */
+	public int genFloor(int page) {
+		return Short.toUnsignedInt(file.readSlice(offset(page, OFF_GEN_FLOOR), 2).get(Layouts.SHORT, 0));
+	}
+
+	/**
+	 * Raises the floor, never lowers it.
+	 *
+	 * <p>
+	 * Monotonic because a page can be punched more than once, and because a page punched twice may hold slots that
+	 * were reused in between and slots that were not. Taking the maximum of the old floor and what the records say is
+	 * the only rule that covers both: the reused slots carry their real counters, and the untouched ones carry the
+	 * zeros the first punch left, whose history lives only here.
+	 * </p>
+	 */
+	public void raiseGenFloor(int page, int value) {
+		int capped = Math.min(value, 0xFFFF);
+		if (capped > genFloor(page)) {
+			file.writeSlice(offset(page, OFF_GEN_FLOOR), 2).set(Layouts.SHORT, 0, (short) capped);
+		}
 	}
 }

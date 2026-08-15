@@ -76,6 +76,7 @@ GRAPH_STORAGE_CONTEXT.md (this file)
         ├─ TRANSACTIONS.md ........... ACID, snapshot isolation, page versions, CoW
         ├─ CYPHER.md ................. the openCypher subset, the server and the UI
         ├─ WIRE.md ................... the binary streaming port, its codec and the Java client
+        ├─ DATABASES.md .............. several stores under one root: layout, naming, selection
         ├─ WAL.md .................... write-ahead log, recovery, checkpoints
         ├─ SSD_IO.md ................. I/O strategy, seek avoidance, alignment
         ├─ NATIVE_FFM.md ............. the Java <-> native boundary
@@ -99,6 +100,7 @@ GRAPH_STORAGE_CONTEXT.md (this file)
 | [RELATIONSHIP_STORAGE.md](RELATIONSHIP_STORAGE.md) | Inline edges, adjacency blocks, edge compression, lightweight edges, traversal cost model | Node record layout |
 | [PROPERTY_STORAGE.md](PROPERTY_STORAGE.md) | Property blocks, key and label dictionaries, value typing, inline vs blob, string dedup | Relationship storage |
 | [CYPHER.md](CYPHER.md) | The read-only openCypher subset: grammar, null semantics, where it differs from the engine, the planner's costs, and the Vert.x HTTP server with its React and D3 graph browser | The public API; the binary streaming port (WIRE.md) |
+| [DATABASES.md](DATABASES.md) | Several databases under one root: the directory layout, why a name is validated by allow-list, lazy opening, create and drop, and how a database is selected from each front end | The storage format; the frame layout (WIRE.md) |
 | [WIRE.md](WIRE.md) | The binary streaming port: the frame, the value codec, the server's four bounds on a slow reader, the memory multiplication, and the Java client | The query language (CYPHER.md), the HTTP route and the browser UI |
 | [TRANSPORT_DECISION.md](TRANSPORT_DECISION.md) | History, not specification: the measured trial that chose framed TCP over gRPC, with its criteria committed before its numbers, and what building the winner for real then changed | What the protocol *is* (WIRE.md) |
 | [TRANSACTIONS.md](TRANSACTIONS.md) | ACID guarantees, snapshot isolation, the anomaly matrix, per-page version chains, the reclamation horizon and budget, where Copy-on-Write genuinely applies. Also why `SERIALIZABLE`, `LockTable` and `xmin` are *not* built rather than unfinished | WAL record format |

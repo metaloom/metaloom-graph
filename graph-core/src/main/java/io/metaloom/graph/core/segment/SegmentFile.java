@@ -22,6 +22,7 @@ import io.metaloom.graph.core.page.PageOverlay;
 import io.metaloom.graph.core.txn.Snapshot;
 import io.metaloom.graph.core.txn.SnapshotHolder;
 import io.metaloom.graph.core.util.Crc;
+import io.metaloom.graph.core.util.Layouts;
 
 /**
  * One {@code .seg} file: mapped once, sliced many times.
@@ -344,6 +345,14 @@ public final class SegmentFile implements AutoCloseable {
 	 * read back as zeros, which is a valid empty page (invariant I6). This is the cheap half of space reclamation and
 	 * should be preferred over compaction, which does break ids.
 	 *
+	 * <p>
+	 * <b>The generation counters on the page are saved before they are destroyed.</b> A punched page reads as zeros,
+	 * and the generation of each slot lives inside its record — so without this the counters restart at 1 and an id
+	 * from before the delete becomes byte-for-byte identical to one handed out afterwards. That is worse than an id
+	 * being broken: the stale id resolves, silently, to somebody else's record. The floor goes in the page metadata
+	 * array, which is a separate region and is not punched.
+	 * </p>
+	 *
 	 * @return the number of pages punched
 	 */
 	public int reclaimEmptyPages() throws IOException {
@@ -358,6 +367,9 @@ public final class SegmentFile implements AutoCloseable {
 			if (pageMeta.liveCount(page) != 0 || pageMeta.checksum(page) == 0) {
 				continue;
 			}
+			// Read before punching, obviously, but also before the punch is attempted: a floor raised for a page that
+			// then failed to punch costs one wasted generation and nothing else, while the reverse loses the history.
+			pageMeta.raiseGenFloor(page, highestGenOnPage(page));
 			if (NativeLib.punchHole(path, dataStart + (long) page * pageSize, pageSize)) {
 				// The page now reads as zeros, so its checksum has to follow or verify() would fail.
 				pageMeta.checksum(page, Crc.crc32c(mapped, dataStart + (long) page * pageSize, pageSize));
@@ -365,7 +377,37 @@ public final class SegmentFile implements AutoCloseable {
 				punched++;
 			}
 		}
+		// Deliberately no force() here, and the reason is worth recording because the obvious change is wrong. A punch
+		// takes effect immediately and the metadata describing it does not, so crashing in between loses both the
+		// checksum fix-up and the floor. But force() calls flushChecksums(), which walks `dirtyPages` and then clears
+		// it — and Compactor calls reclaim() outside runWrite(), so a foreground writer's dirty marks get discarded
+		// by another thread and its pages never receive a correct checksum. Adding a second force() here made that
+		// race measurably more likely (CompactionTest, intermittently). The durability gap is real, pre-existing, and
+		// belongs with the locking fix rather than in front of it.
 		return punched;
+	}
+
+	/**
+	 * The largest generation any slot on this page carries.
+	 *
+	 * <p>
+	 * Every slot, not the live ones — there are none, the page is all-free — and the counter of a freed slot is
+	 * exactly what has to survive. A record kind with no generation field would read whatever sits at that offset,
+	 * which is why this is driven by {@link Kind#genOffset()} rather than by a per-store assumption.
+	 * </p>
+	 */
+	private int highestGenOnPage(int page) {
+		int recordsPerPage = geometry.recordsPerPage(kind);
+		int firstSlot = page * recordsPerPage;
+		int genOffset = kind.genOffset();
+		int highest = 0;
+		for (int i = 0; i < recordsPerPage; i++) {
+			int gen = Short.toUnsignedInt(record(firstSlot + i).get(Layouts.SHORT, genOffset));
+			if (gen > highest) {
+				highest = gen;
+			}
+		}
+		return highest;
 	}
 
 	/** Flushes the mapping and the file metadata. */

@@ -27,14 +27,27 @@ public enum WireError {
 	TIMEOUT(3),
 	/** The store refused: a closed store, a snapshot too old, a corrupt page. */
 	STORE(4),
-	/** Every stream slot is taken. Fail fast rather than queue — see {@code WireServerOptions}. */
+	/**
+	 * The server declined to spend more: every stream slot is taken, or it is shedding load to protect the store's
+	 * reclamation horizon. Fail fast rather than queue — see {@code WireServerOptions}.
+	 */
 	OVERLOADED(5),
 	/** The peer sent something that is not this protocol. The connection closes; other connections are unaffected. */
 	PROTOCOL(6),
 	/** The client speaks a version this server does not. */
 	UNSUPPORTED_VERSION(7),
 	/** The client asked for this stream to stop, and it has. */
-	CANCELLED(8);
+	CANCELLED(8),
+	/**
+	 * The client named a database this server does not have.
+	 *
+	 * <p>
+	 * Its own code because it is the one handshake failure a caller can fix without changing anything about its build:
+	 * list the databases, or create the one it wanted. Folding it into {@link #PROTOCOL} would say "your client is
+	 * wrong" about a typo.
+	 * </p>
+	 */
+	NO_SUCH_DATABASE(9);
 
 	private final int code;
 

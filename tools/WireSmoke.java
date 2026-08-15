@@ -49,7 +49,9 @@ public class WireSmoke {
 	static final int COMPLETE = 7;
 	static final int ERROR = 8;
 
-	static final int PROTOCOL_VERSION = 1;
+	static final int PROTOCOL_VERSION = 2;
+	/** Empty: whichever database the server calls its default. Hard-coding "default" would query the wrong one. */
+	static final String DATABASE = "";
 	static final String CYPHER = "MATCH (a:Airport)-[r:ROUTE_TO]->(b) RETURN a.code, b.code LIMIT 5";
 	static final int EXPECTED_ROWS = 5;
 
@@ -65,7 +67,7 @@ public class WireSmoke {
 
 			// HELLO, and wait for WELCOME before sending anything else — a client that queried straight
 			// away would meet a version mismatch as frames it could not read.
-			out.write(frame(HELLO, 0, le().putInt(PROTOCOL_VERSION).array()));
+			out.write(frame(HELLO, 0, helloPayload(PROTOCOL_VERSION, DATABASE)));
 			out.flush();
 			Frame welcome = read(in);
 			if (welcome.type != WELCOME) {
@@ -75,6 +77,7 @@ public class WireSmoke {
 			int version = limits.getInt();
 			int maxFrame = limits.getInt();
 			int maxStreams = limits.getInt();
+			String database = readString(limits);
 			if (version != PROTOCOL_VERSION) {
 				fail("server speaks protocol " + version + ", this smoke test speaks " + PROTOCOL_VERSION);
 			}
@@ -107,7 +110,7 @@ public class WireSmoke {
 			if (rows != EXPECTED_ROWS) {
 				fail("expected " + EXPECTED_ROWS + " rows from the demo graph, got " + rows);
 			}
-			System.out.println("[wire] " + rows + " rows over the binary port; protocol " + version
+			System.out.println("[wire] " + rows + " rows from database '" + database + "'; protocol " + version
 				+ ", max frame " + maxFrame + ", max streams " + maxStreams);
 		}
 	}
@@ -117,8 +120,26 @@ public class WireSmoke {
 	record Frame(int type, int streamId, byte[] payload) {
 	}
 
-	static ByteBuffer le() {
-		return ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
+	/** Version, then the database name as a codec string. */
+	static byte[] helloPayload(int version, String database) {
+		byte[] utf8 = database.getBytes(StandardCharsets.UTF_8);
+		ByteBuffer buffer = ByteBuffer.allocate(4 + 2 + utf8.length).order(ByteOrder.LITTLE_ENDIAN);
+		buffer.putInt(version);
+		buffer.put((byte) 0x04);            // STRING, size class 0
+		buffer.put((byte) utf8.length);
+		buffer.put(utf8);
+		return buffer.array();
+	}
+
+	/** A short codec string, which is all the handshake ever carries. */
+	static String readString(ByteBuffer buffer) {
+		int tag = buffer.get() & 0xFF;
+		if (tag != 0x04) {
+			fail("expected a short string in WELCOME, got tag " + tag);
+		}
+		byte[] utf8 = new byte[buffer.get() & 0xFF];
+		buffer.get(utf8);
+		return new String(utf8, StandardCharsets.UTF_8);
 	}
 
 	static byte[] frame(int type, int streamId, byte[] payload) {

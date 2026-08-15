@@ -27,7 +27,8 @@ to the framing; it also names the one thing the losing arm did better, which sha
 | **Default port** | 8081, bound to **127.0.0.1**. HTTP stays on 8080 |
 | **Surface** | Read-only Cypher. There is no write path and no schema call |
 | **Security** | **None.** No authentication, no transport security. §7 |
-| **Protocol version** | 1. Negotiated on connect; a mismatch is an error, not a hang |
+| **Protocol version** | 2. Negotiated on connect; a mismatch is an error, not a hang |
+| **Database** | Chosen per connection at `HELLO` — see [DATABASES.md](DATABASES.md) |
 | **Client dependencies** | `graph-protocol` and vertx-core. **Not** graph-core, **not** graph-cypher, no FFM, no native library — asserted by `ClientDependencyTest` |
 
 **What it bounds and what it does not**, stated plainly because the distinction is easy to overclaim:
@@ -67,8 +68,8 @@ connection itself.
 
 | Frame | Direction | Payload |
 |---|---|---|
-| `HELLO` 1 | client | `i32` protocol version |
-| `WELCOME` 2 | server | `i32` version, `i32` max frame bytes, `i32` max concurrent streams |
+| `HELLO` 1 | client | `i32` protocol version, value: database name (`""` = the server's default) |
+| `WELCOME` 2 | server | `i32` version, `i32` max frame bytes, `i32` max concurrent streams, value: the database it resolved |
 | `QUERY` 3 | client | value: query text, value: parameter map, `i64` deadline millis (0 = the server's own) |
 | `CANCEL` 4 | client | empty |
 | `COLUMNS` 5 | server | value: list of column names |
@@ -85,9 +86,15 @@ the empty case wrongly.
 
 ### Version negotiation
 
-The client sends `HELLO` and **waits** before sending anything else; the server answers `WELCOME` or
-`ERROR(UNSUPPORTED_VERSION)` and closes. A client that started querying without waiting would meet a
-version mismatch as a stream of frames it could not read, with no explanation.
+The client sends `HELLO` — its version and the database it wants — and **waits** before sending
+anything else; the server answers `WELCOME` or an `ERROR` carrying `UNSUPPORTED_VERSION` or
+`NO_SUCH_DATABASE`, and closes. A client that started querying without waiting would meet a version
+mismatch as a stream of frames it could not read, with no explanation.
+
+**The database is fixed for the connection.** A stream therefore never has to say which database it
+belongs to, and the server resolves the store once instead of per query. That is not only simplicity:
+a read view belongs to one store, and a connection that could change store mid-flight would be a
+connection whose open views outlive their subject. Two databases at once means two connections.
 
 The server's limits travel in `WELCOME` rather than being assumed by the client, because they are
 configurable — a client that hard-coded them would either refuse frames the server is entitled to send
@@ -201,7 +208,7 @@ Four bounds, each sufficient alone:
 | Bounded concurrency | `maxConcurrentStreams`, refused rather than queued |
 | A hard wall-clock deadline | No client behaviour extends it. It is also the bound on view age, because the view is opened and closed inside the query |
 | No unbounded park | Every wait for a writable socket is against the deadline |
-| A retention watchdog | Polls `snapshotStats().retainedBytes()` and abandons the **oldest** stream past a soft limit — so the server gives up before the *store* has to, and the client gets a typed error naming the reason instead of a `SnapshotTooOldException` surfacing somewhere else |
+| A retention watchdog | Polls `snapshotStats().retainedBytes()` **per database** and abandons that database's oldest stream past a soft limit — so the server gives up before the *store* has to, and the client gets a typed error naming the reason instead of a `SnapshotTooOldException` surfacing somewhere else. Per database and not summed: retention belongs to one store's version chain, and a reader must not be abandoned because a different database is holding pages |
 
 A client may ask for a **shorter** deadline than the server's and never a longer one. Otherwise the
 server's bound on view age would be whatever the most optimistic client asked for, which is not a
@@ -301,6 +308,7 @@ oracle rather than only a round-trip test — see §8.
 | `FrameReaderTest` | Reassembly against the delivery patterns TCP actually produces: a frame split at every byte boundary, three frames in one chunk, a header claiming two gigabytes |
 | `WireServerTest` | The mechanics — overload, cancel, deadline against a client that stopped reading, an oversized frame taking one connection and not the server, and `openViews() == 0` after every test |
 | `WireServerOptionsTest` | The multiplication in §5, enforced |
+| `WireServerTest` (databases) | Two connections to two databases from one process seeing different data; an unknown database and a name that is not a name both refused at the handshake |
 | `ClientDependencyTest` | Fails if graph-core or graph-cypher ever reaches the client's classpath. Checked by **loading**, not by reading a pom, because a transitive arrival would pass a pom check |
 
 **Why a fuzz oracle and not only a differential test.** [TESTING.md](TESTING.md) §0 records the finding:

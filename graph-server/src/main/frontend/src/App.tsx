@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
-import { ApiError, fetchSchema, fetchStats, runQuery, type QueryResult, type Schema, type Stats } from './api';
+import {
+  ApiError, createDatabase, dropDatabase, fetchDatabases, fetchSchema, fetchStats, runQuery,
+  type DatabaseList, type QueryResult, type Schema, type Stats
+} from './api';
 import { applyResult, clear, emptyGraph, removeNode, type GraphData, type MergeMode } from './model/graph';
+import { DatabasePicker } from './components/DatabasePicker';
 import { GraphView } from './components/GraphView';
 import { QueryBar } from './components/QueryBar';
 import { ResultTable } from './components/ResultTable';
@@ -24,13 +28,15 @@ export function App() {
   const [status, setStatus] = useState<string | null>(null);
   const [tab, setTab] = useState<'graph' | 'table'>('graph');
   const [fitKey, setFitKey] = useState(0);
+  const [databases, setDatabases] = useState<DatabaseList | null>(null);
+  const [database, setDatabase] = useState('');
 
-  const loadSchema = useCallback(async (refresh: boolean) => {
+  const loadSchema = useCallback(async (name: string, refresh: boolean) => {
     setSchemaLoading(true);
     setSchemaError(null);
     try {
-      setSchema(await fetchSchema(refresh));
-      setStats(await fetchStats());
+      setSchema(await fetchSchema(name, refresh));
+      setStats(await fetchStats(name));
     } catch (failure) {
       setSchemaError(failure instanceof Error ? failure.message : String(failure));
     } finally {
@@ -38,9 +44,64 @@ export function App() {
     }
   }, []);
 
+  const loadDatabases = useCallback(async (): Promise<DatabaseList | null> => {
+    try {
+      const list = await fetchDatabases();
+      setDatabases(list);
+      return list;
+    } catch (failure) {
+      setSchemaError(failure instanceof Error ? failure.message : String(failure));
+      return null;
+    }
+  }, []);
+
   useEffect(() => {
-    void loadSchema(false);
-  }, [loadSchema]);
+    // The default comes from the server rather than being assumed to be 'default'. A server started with
+    // --database=sales would otherwise open a picker showing one database and querying another.
+    void (async () => {
+      const list = await loadDatabases();
+      const initial = list?.default ?? '';
+      setDatabase(initial);
+      await loadSchema(initial, false);
+    })();
+  }, [loadDatabases, loadSchema]);
+
+  /**
+   * Switching database clears the canvas.
+   *
+   * Not caution — an element id is only unique within a store, so two databases can hand back the same id for
+   * different nodes. Merging their graphs would draw one circle for two records, with nothing on screen to say so.
+   */
+  const selectDatabase = useCallback(async (name: string) => {
+    setDatabase(name);
+    setGraph(emptyGraph);
+    setResult(null);
+    setSelected(null);
+    setStatus(null);
+    setError(null);
+    await loadSchema(name, false);
+    await loadDatabases();
+  }, [loadSchema, loadDatabases]);
+
+  const addDatabase = useCallback(async (name: string) => {
+    try {
+      await createDatabase(name);
+      await loadDatabases();
+      await selectDatabase(name);
+    } catch (failure) {
+      setError(failure instanceof ApiError ? failure : new ApiError('transport', String(failure)));
+    }
+  }, [loadDatabases, selectDatabase]);
+
+  const removeDatabase = useCallback(async (name: string) => {
+    try {
+      await dropDatabase(name);
+      const list = await loadDatabases();
+      await selectDatabase(list?.default ?? '');
+    } catch (failure) {
+      setError(failure instanceof ApiError ? failure : new ApiError('transport', String(failure)));
+    }
+  }, [loadDatabases, selectDatabase]);
 
   /**
    * Runs a query and folds its result into the canvas.
@@ -55,7 +116,7 @@ export function App() {
     setRunning(true);
     setError(null);
     try {
-      const response = await runQuery(text);
+      const response = await runQuery(text, database);
       setResult(response);
       const next = applyResult(graph, response.graph, into);
       setGraph(next);
@@ -80,7 +141,7 @@ export function App() {
     } finally {
       setRunning(false);
     }
-  }, [graph]);
+  }, [graph, database]);
 
   const runCurrent = useCallback(() => void run(query, mode), [run, query, mode]);
 
@@ -94,6 +155,15 @@ export function App() {
       <header className="topBar">
         <h1>Graph browser</h1>
         <span className="subtitle">openCypher, read-only</span>
+        <span className="spacer" />
+        <DatabasePicker
+          databases={databases}
+          current={database}
+          busy={running || schemaLoading}
+          onSelect={name => void selectDatabase(name)}
+          onCreate={name => void addDatabase(name)}
+          onDrop={name => void removeDatabase(name)}
+        />
       </header>
 
       <div className="body">
@@ -101,7 +171,7 @@ export function App() {
           schema={schema}
           schemaError={schemaError}
           schemaLoading={schemaLoading}
-          onRefreshSchema={() => void loadSchema(true)}
+          onRefreshSchema={() => void loadSchema(database, true)}
           onPickLabel={label => pick(`MATCH (n:${escapeName(label)})\nRETURN n\nLIMIT 100`)}
           onPickType={type => pick(`MATCH (a)-[r:${escapeName(type)}]->(b)\nRETURN a, r, b\nLIMIT 100`)}
           stats={stats}

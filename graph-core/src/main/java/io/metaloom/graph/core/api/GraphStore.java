@@ -231,6 +231,14 @@ public interface GraphStore extends AutoCloseable {
 	 * of nothing.
 	 * </p>
 	 *
+	 * <p>
+	 * <b>Ids deleted before the call stay stale afterwards</b>, which is a stronger promise than "no id breaks" and
+	 * the one that actually matters. A punched page reads as zeros including the generation counter inside each
+	 * record, so the slots would restart at generation 1 and hand out ids identical to deleted ones — resolving to
+	 * the new records with no error rather than failing as stale. The counters are saved into the page metadata
+	 * array, which is never punched, before the punch destroys them.
+	 * </p>
+	 *
 	 * @return the number of pages reclaimed
 	 * @throws GraphStoreException
 	 *             if a read view is open

@@ -78,6 +78,8 @@ src/test/java/io/metaloom/graph/core/
 
 graph-cypher/src/test/java/io/metaloom/graph/cypher/
                  parser, null semantics, execution, the versus-API differential, variable-length paths
+  integration/   ...and GraphDatabasesTest — several stores under one root, whose traversal cases are
+                 the security test for the whole multi-database feature
 graph-protocol/src/test/java/io/metaloom/graph/protocol/
                  the wire value codec round-tripped, frame reassembly against the delivery patterns
                  TCP actually produces, and WireDecoderHostileInputTest — the non-differential oracle
@@ -88,6 +90,8 @@ graph-client/src/test/java/io/metaloom/graph/client/
 graph-server/src/test/java/io/metaloom/graph/server/
                  the HTTP contract, the two result shapes the UI needs, the command line, and
                  demo/DemoDataTest — the generated air route graph the browser suite drives
+                 DatabaseRoutesTest — listing, ?database= reaching a different store, 400 vs 404,
+                 create, and drop refused without the flag
   wire/          the binary port: WireVersusEmbeddedTest compares 27 queries in process against over
                  the wire cell by cell; WireServerTest covers overload, cancel, a deadline against a
                  client that stopped reading, and openViews() == 0 after every test

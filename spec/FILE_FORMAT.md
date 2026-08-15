@@ -162,8 +162,32 @@ offset size field
 20     2    live_count       live records in the page
 22     2    flags            DIRTY_ON_DISK, COMPRESSED, ALL_FREE, ...
 24     4    free_hint        first free slot-in-page, or 0xFFFFFFFF
-28     4    crc32c           of PMA entry bytes 0..27
+28     2    gen_floor        no slot on this page is handed out below this generation
+30     2    reserved
 ```
+
+**`gen_floor` is what survives a hole punch.** A slot's generation counter lives *inside* its record,
+on the data page, and hole punching (§9) returns an all-free page's blocks to the filesystem —
+after which the page, and every counter on it, reads as zeros. Without a floor the slots restart at
+generation 1 and the allocator hands out an id byte-for-byte identical to one deleted earlier; nothing
+throws, and the stale id resolves to the new record. That is strictly worse than an id being broken,
+because it is silent. The PMA is a separate region and is never punched, so it is the one place the
+history can live: `reclaimEmptyPages` raises the floor to the highest generation on the page before it
+punches, and `SegmentSet.claim` falls back to it when the record's own counter reads zero.
+
+**Not a maximum against a live counter.** Once a floor reached `MAX_GEN`, `max(recordGen, gen_floor)`
+would put every wrapped counter on the page straight back to 4095 and pin it there, so
+delete-then-recreate would return the identical id every time. The floor is a recovery for a counter
+that has been destroyed, not a lower bound on a working one.
+
+The floor is monotonic. A page can be punched more than once, and a page punched twice may hold slots
+that were reused in between — carrying real counters — beside slots that were not, carrying the zeros
+the first punch left. Only the maximum of the old floor and the current records covers both.
+
+**No format bump.** These two bytes were reserved and are zero in every store written before them, so
+an old store read by new code takes `max(gen, 0)` and behaves exactly as it did. A new store read by
+old code is also fine; it simply loses the protection. (The earlier `crc32c of PMA entry bytes 0..27`
+at offset 28 was specified and never implemented, so nothing had to be moved to make room.)
 
 **Why out of line.** Putting an LSN and a checksum inside each page is the textbook approach, and it
 is what forces engines to say "a page holds *up to* N records" and to keep a slot directory. Moving
@@ -366,6 +390,22 @@ compaction again simply continues from wherever it stopped.
 `fallocate(FALLOC_FL_PUNCH_HOLE)` returns its blocks to the filesystem and issues TRIM to the SSD,
 without moving anything and without breaking a single id. Compaction is only needed when free space
 is *scattered within* pages. Prefer hole punching; run compaction rarely.
+
+It does, however, destroy the generation counters of the slots on the page, because they live inside
+the records it zeroes. That is why the PMA carries `gen_floor` (§3.3): without it, "without breaking a
+single id" would have been true and useless, since the ids that survive intact would start naming
+different records. The floor is raised before the punch, from the records that are about to be zeroed.
+
+**Two known gaps, both pre-existing and both about the same missing lock.** A punch takes effect
+immediately and the PMA writes describing it — the checksum fix-up and the floor — go to the mapping
+and do not, so a crash in between leaves a page of zeros whose recorded checksum describes its old
+contents. `verify()` then reports a healthy store as corrupt. The obvious remedy, forcing after the
+punch, is worse: `force()` calls `flushChecksums()`, which walks the segment's dirty-page set **and
+then clears it**, and `Compactor` calls `reclaim()` outside `runWrite()` — so it discards a concurrent
+foreground writer's dirty marks and those pages never get a correct checksum at all. That is a
+measurable flake in `CompactionTest`, not a theoretical one. For the same reason, compaction can punch
+a page a foreground writer is allocating into. `GraphStore.reclaim()` takes the writer lock;
+`Compactor` does not, and should.
 
 ### 9.1 Where this departs from the original design
 

@@ -78,6 +78,65 @@ code, .mono, pre {
   font-size: 12px;
 }
 
+/* The database picker sits at the right of the top bar, where a browser's own address is. */
+.database-picker {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.database-picker label {
+  color: var(--muted);
+}
+
+.database-picker select,
+.database-picker input {
+  background: var(--bg);
+  color: inherit;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 3px 6px;
+  font: inherit;
+  font-size: 12px;
+}
+
+.database-picker input {
+  width: 11rem;
+}
+
+.database-picker button {
+  background: var(--bg);
+  color: inherit;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.database-picker button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* The one control in this UI that destroys anything, coloured like it. */
+.database-picker button.danger {
+  border-color: #7d3b3b;
+  color: #e59a9a;
+}
+
+.database-create {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.database-problem {
+  color: #e59a9a;
+}
+
 .body {
   display: flex;
   flex: 1;

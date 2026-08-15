@@ -133,21 +133,42 @@ and joins the caller's view if there already is one.
 hold or a query that has to be stoppable. `Cypher.query` *is* `stream` with a sink that collects, so
 the two cannot drift apart.
 
+## Several databases
+
+A server is pointed at a **root**, and each database is a directory under it — its own segments, WAL,
+dictionaries and lock. Selectable from the browser UI, from the HTTP routes with `?database=`, and
+from the client at connect time: [spec/DATABASES.md](spec/DATABASES.md).
+
+```
+/data/graphs/
+  default/     MANIFEST  seg/  wal/  dict/  LOCK
+  sales/       MANIFEST  seg/  wal/  dict/  LOCK
+```
+
+A name arrives from a port with no authentication and becomes a path component, so it is checked
+against an allow-list — letters, digits, `-` and `_` — rather than a search for the sequences known to
+be dangerous. Nothing is created implicitly: asking for a database that is not there is an error, not
+a create.
+
 ## Over the network
 
-Two ports over one store. HTTP on 8080 serves the browser UI and `/api/query`, which builds a whole
+Two ports over the same root. HTTP on 8080 serves the browser UI and `/api/query`, which builds a whole
 result as JSON — right for a browser drawing two hundred nodes. The binary port streams rows as the
 engine produces them, which is the one to use for anything larger:
 [spec/WIRE.md](spec/WIRE.md).
 
 ```java
-try (GraphClient client = GraphClient.connect("localhost", 8081);
+try (GraphClient client = GraphClient.connect("localhost", 8081, "sales");
      RowStream rows = client.query("MATCH (a:Airport) RETURN a.code, a.name")) {
     for (Row row : rows) {
         System.out.println(row.string("a.code") + " " + row.string("a.name"));
     }
 }
 ```
+
+The database is fixed for the connection: a read view belongs to one store, so a connection that could
+change store mid-flight would be one whose open views outlive their subject. Two databases at once
+means two connections.
 
 The client depends on the protocol module and Vert.x — not on the storage engine, not on the query
 engine, and so not on FFM or the native library. A million rows cost it one batch of memory at a time;

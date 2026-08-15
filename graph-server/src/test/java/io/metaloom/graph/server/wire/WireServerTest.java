@@ -1,6 +1,7 @@
 package io.metaloom.graph.server.wire;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -24,10 +25,12 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 
 import io.metaloom.graph.client.ClientOptions;
 import io.metaloom.graph.client.GraphClient;
+import io.metaloom.graph.client.GraphClientException;
 import io.metaloom.graph.client.QueryFailedException;
 import io.metaloom.graph.client.QueryOptions;
 import io.metaloom.graph.client.Row;
 import io.metaloom.graph.client.RowStream;
+import io.metaloom.graph.core.api.GraphDatabases;
 import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.Properties;
 import io.metaloom.graph.core.api.Transaction;
@@ -65,13 +68,15 @@ public class WireServerTest {
 	@RegisterExtension
 	TempStore stores = new TempStore();
 
+	private GraphDatabases databases;
 	private GraphStore store;
 	private WireServer server;
 	private int port;
 
 	@BeforeEach
 	public void start() throws Exception {
-		store = stores.open();
+		databases = GraphDatabases.open(stores.path().resolve("root"));
+		store = databases.database(GraphDatabases.DEFAULT_NAME);
 		try (Transaction txn = store.begin()) {
 			store.createNode(List.of("Person"), Properties.of().set("name", "Alice").set("age", 34L));
 			for (int i = 0; i < DOCUMENTS; i++) {
@@ -86,16 +91,16 @@ public class WireServerTest {
 		if (server != null) {
 			server.close();
 		}
-		if (store != null) {
+		if (databases != null) {
 			// Every stream opens a read view and every view must be closed by the thread that opened it. A view left
 			// open holds back reclamation for as long as it lives, so this is the assertion that matters most.
 			assertEquals(0, store.snapshotStats().openViews(), "a read view outlived its query");
-			store.close();
+			databases.close();
 		}
 	}
 
 	private void listen(WireServerOptions options) {
-		server = new WireServer(store, options.withPort(0));
+		server = new WireServer(databases, GraphDatabases.DEFAULT_NAME, options.withPort(0));
 		port = server.listen().toCompletionStage().toCompletableFuture().join();
 	}
 
@@ -136,11 +141,72 @@ public class WireServerTest {
 	}
 
 	@Test
+	public void testTheConnectionIsBoundToTheDatabaseItAskedFor() throws Exception {
+		listen();
+		databases.create("sales");
+		try (Transaction txn = databases.database("sales").begin()) {
+			databases.database("sales").createNode("Widget", Properties.of().set("name", "Widget"));
+			txn.commit();
+		}
+
+		// Two connections, two databases, from one process. The default sees Alice and not Widget; sales the reverse.
+		try (GraphClient onDefault = connect();
+			GraphClient onSales = GraphClient.connect("127.0.0.1", port, "sales")) {
+
+			assertEquals("default", onDefault.database());
+			assertEquals("sales", onSales.database(), "WELCOME echoes what the server resolved");
+
+			try (RowStream stream = onDefault.query("MATCH (n:Person) RETURN n.name")) {
+				assertTrue(stream.hasNext());
+				assertEquals("Alice", stream.next().string("n.name"));
+			}
+			try (RowStream stream = onSales.query("MATCH (n:Person) RETURN n.name")) {
+				assertEquals(false, stream.hasNext(), "sales has no Person; the connections are genuinely separate");
+			}
+			try (RowStream stream = onSales.query("MATCH (n:Widget) RETURN n.name")) {
+				assertTrue(stream.hasNext());
+				assertEquals("Widget", stream.next().string("n.name"));
+			}
+		}
+		awaitIdle();
+	}
+
+	@Test
+	public void testAnEmptyNameMeansTheServersDefault() {
+		// A client that hard-coded 'default' would query the wrong data on a server started with --database=sales.
+		listen();
+		try (GraphClient client = GraphClient.connect("127.0.0.1", port, GraphClient.DEFAULT_DATABASE)) {
+			assertEquals("default", client.database());
+		}
+	}
+
+	@Test
+	public void testAnUnknownDatabaseIsRefusedAtTheHandshake() {
+		listen();
+		GraphClientException thrown = assertThrows(GraphClientException.class,
+			() -> GraphClient.connect("127.0.0.1", port, "nope"));
+		assertInstanceOf(QueryFailedException.class, thrown);
+		assertEquals(WireError.NO_SUCH_DATABASE, ((QueryFailedException) thrown).error());
+		assertTrue(thrown.getMessage().contains("nope"), thrown.getMessage());
+		assertServerStillWorks();
+	}
+
+	@Test
+	public void testADatabaseNameThatIsNotANameIsRefusedBeforeItBecomesAPath() {
+		listen();
+		QueryFailedException thrown = assertThrows(QueryFailedException.class,
+			() -> GraphClient.connect("127.0.0.1", port, "../escaped"));
+		assertEquals(WireError.NO_SUCH_DATABASE, thrown.error());
+		assertServerStillWorks();
+	}
+
+	@Test
 	public void testAnIncompatibleVersionGetsAnErrorRatherThanAHang() throws Exception {
 		listen();
 		try (RawConnection raw = new RawConnection(port)) {
-			WireValueCodec.Writer hello = new WireValueCodec.Writer(8);
+			WireValueCodec.Writer hello = new WireValueCodec.Writer(32);
 			hello.i32(Protocol.VERSION + 99);
+			WireValueCodec.encode(hello, "");
 			raw.write(Frames.frame(Frames.HELLO, Frames.CONNECTION_STREAM, hello));
 
 			RawFrame answer = raw.read();

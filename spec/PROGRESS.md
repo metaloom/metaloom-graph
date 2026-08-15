@@ -36,10 +36,11 @@ not**, in one place.
 | 11 — Query language | **Done** for a read-only openCypher subset, in its own module, with a single-jar Vert.x server and a React and D3 graph browser | [CYPHER.md](CYPHER.md); `CypherVersusApiTest`, `NullSemanticsTest`, `e2e/graph-browser.spec.ts` |
 | 12 — GraalVM native image | **Done** — the server builds to a 38 MB standalone binary, FFM and all, behind `-Pgraalvm` | [GRAALVM.md](GRAALVM.md); `ForeignDowncallMetadataTest`, `tools/native-image.sh` |
 | 13 — Binary streaming port | **Done** for stage 1: a framed TCP protocol and a Java client that stream rows as the engine produces them. The *executor* still materialises — see below | [WIRE.md](WIRE.md), [TRANSPORT_DECISION.md](TRANSPORT_DECISION.md); `WireVersusEmbeddedTest`, `WireServerTest`, `WireDecoderHostileInputTest` |
+| 14 — Several databases | **Done** — one directory per database under a root, selectable from the client, the HTTP routes and the browser UI | [DATABASES.md](DATABASES.md); `GraphDatabasesTest`, `DatabaseRoutesTest` |
 
 **The engine is usable today** for a single-writer embedded workload: durable, crash-safe,
 transactional, indexed, compacting, with snapshot isolation for readers, a read-only Cypher query
-language, a browser UI and a streaming binary port — and it holds its answers against a reference
+language, a browser UI, a streaming binary port and several databases under one root — and it holds its answers against a reference
 model, against real SQL, against its own Java API, and now over its own wire. It is **not** usable
 where concurrent writers, Cypher *writes*, an online backup or an authenticated network are
 requirements. None of those exists and none is faked.
@@ -246,6 +247,49 @@ that a steal policy cannot be made correct over a `MAP_SHARED` mapping.
       ([OPERATIONS.md §9.1](OPERATIONS.md)). The binary port binds loopback for that reason
 - [ ] The trial harness was never committed, so its numbers are recorded but not reproducible from this
       repository
+
+### Phase 8.1 — Deletion and reuse, corrected
+
+- [x] **Hole punching no longer resurrects deleted ids.** The generation counter of a slot lives inside
+      its record, so punching an all-free page zeroed every counter on it and the allocator handed the
+      *same* id back out; a caller holding the deleted id then read the new record with no error.
+      `gen_floor` in the page metadata array — a region that is never punched — carries the history
+      across. [ID_ENCODING.md §4](ID_ENCODING.md), [FILE_FORMAT.md §3.3](FILE_FORMAT.md),
+      `NativeReclaimTest`
+- [ ] **`Compactor` calls `set.reclaim()` outside `runWrite()`**, and two things follow from it.
+      `force()` there calls `flushChecksums()`, which clears the segment's dirty-page set and so
+      discards a concurrent foreground writer's marks, leaving its pages with stale checksums — an
+      intermittent `CompactionTest` failure, reproduced. And a page can be punched while a writer is
+      allocating into it. `GraphStore.reclaim()` takes the writer lock; compaction should too. Until
+      that lands, the punch path deliberately does **not** force, so the checksum fix-up and the floor
+      are only as durable as the next checkpoint
+- [ ] **The free ring does not survive a restart.** It is in-memory, is never rebuilt from the bitmap,
+      and `allocate()` only scans the bitmap once the active segment's bump cursor is exhausted — and
+      only ever looks at the newest segment. So holes below the high water mark, and every hole in a
+      sealed segment, are unreachable after a reopen until `compact()` runs. Measured: delete slot 3,
+      reopen, next insert gets slot 10
+
+### Phase 14 — Several databases
+
+- [x] **`GraphDatabases`**: a root holding one directory per database, each a complete independent
+      store. The engine needed no change — the `LOCK` file was already per store
+- [x] **Names are checked against an allow-list**, not a deny-list, because one arrives from an
+      unauthenticated port and becomes a path component. `GraphDatabasesTest` fires traversal,
+      absolute paths, NUL, percent-encoding and Unicode at it and then asserts nothing was created
+      anywhere
+- [x] **Stores open lazily and stay open**: a root of fifty databases with one in use costs one open
+      store. `GET /api/databases` reports counts only for the ones already open, for the same reason
+- [x] **Nothing is created implicitly.** A typo that quietly makes a database is a typo that fills a
+      disk
+- [x] **Dropping is opt-in** (`--allow-drop`, 403 otherwise) and refuses the last database. It is the
+      only route in the server that destroys data
+- [x] **Protocol version 2**: the database is chosen per connection at `HELLO` and echoed in
+      `WELCOME`. A read view belongs to one store, so a connection cannot change store mid-flight
+- [x] A picker in the browser UI, which **clears the canvas on switch** — an element id is only unique
+      within a store, so merging two databases' graphs would draw one circle for two records
+- [ ] **No cross-database query**, and none planned: the engine has no notion of a second store
+- [ ] **No per-database authentication**, because there is no authentication at all. Anything that can
+      reach the port can reach every database under the root
 
 ---
 

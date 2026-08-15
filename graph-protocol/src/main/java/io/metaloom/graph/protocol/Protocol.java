@@ -6,10 +6,21 @@ package io.metaloom.graph.protocol;
  * <h2>Negotiation</h2>
  *
  * <p>
- * The client sends {@link Frames#HELLO} with its version and waits; the server answers {@link Frames#WELCOME} with its
- * own version and its limits, or an {@link Frames#ERROR} carrying {@link WireError#UNSUPPORTED_VERSION} and closes.
- * A client that connected and started sending queries without waiting would get a stream of frames it could not read
- * and no explanation, which is the failure mode a handshake exists to replace.
+ * The client sends {@link Frames#HELLO} with its version and the database it wants, and waits; the server answers
+ * {@link Frames#WELCOME} with its own version, its limits and the database it resolved, or an {@link Frames#ERROR}
+ * carrying {@link WireError#UNSUPPORTED_VERSION} or {@link WireError#NO_SUCH_DATABASE} and closes. A client that
+ * connected and started sending queries without waiting would get a stream of frames it could not read and no
+ * explanation, which is the failure mode a handshake exists to replace.
+ * </p>
+ *
+ * <h2>The database is per connection</h2>
+ *
+ * <p>
+ * Chosen once, at the handshake, and fixed for the life of the connection — so a stream never has to say which
+ * database it belongs to and the server resolves the store once instead of per query. Querying two databases at once
+ * means two connections, which is the same shape a JDBC URL has and the same shape the read view wants: a view belongs
+ * to one store, and a connection that could change store mid-flight would be a connection whose open views outlive
+ * their subject.
  * </p>
  *
  * <p>
@@ -23,15 +34,15 @@ package io.metaloom.graph.protocol;
 public final class Protocol {
 
 	/**
-	 * Version 1.
+	 * Version 2: {@link Frames#HELLO} carries a database name and {@link Frames#WELCOME} echoes the resolved one.
 	 *
 	 * <p>
-	 * There is no compatibility range yet because there is nothing to be compatible with: exactly one version has ever
-	 * existed. When a second appears, this is where the accepted range goes, and the handshake is already the place it
-	 * would be enforced.
+	 * A bump rather than an extension, and the handshake is why that costs nothing: a version 1 client meets a clean
+	 * {@link WireError#UNSUPPORTED_VERSION} naming both numbers instead of a stream of frames it cannot read. Nothing
+	 * had shipped on version 1, so there is no range to accept — when there is, this is where it goes.
 	 * </p>
 	 */
-	public static final int VERSION = 1;
+	public static final int VERSION = 2;
 
 	/** Not 8080, so the binary port and the HTTP port can both run over one store without an argument about it. */
 	public static final int DEFAULT_PORT = 8081;

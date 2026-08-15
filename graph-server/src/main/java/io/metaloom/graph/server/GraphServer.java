@@ -5,11 +5,13 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.metaloom.graph.core.api.GraphDatabases;
 import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.GraphStoreException;
 import io.metaloom.graph.core.api.StoreStats;
@@ -28,6 +30,7 @@ import io.metaloom.graph.server.wire.WireServerOptions;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpServer;
+import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.RoutingContext;
@@ -81,30 +84,41 @@ public final class GraphServer implements AutoCloseable {
 	private static final Logger logger = LoggerFactory.getLogger(GraphServer.class);
 
 	private final Vertx vertx;
-	private final GraphStore store;
-	private final boolean ownsStore;
-	private final SchemaScanner schema;
+	private final GraphDatabases databases;
+	private final String defaultDatabase;
+	private final boolean ownsDatabases;
+	/** One scanner per database, made on first use. A scan is cached, and the cache is per store. */
+	private final Map<String, SchemaScanner> schemas = new ConcurrentHashMap<>();
+	/** Whether DELETE /api/databases/{name} exists at all. Off unless an operator asked for it. */
+	private final boolean allowDrop;
 	/** Past this, a query is abandoned rather than allowed to hold a worker thread and a read view indefinitely. */
 	private final long queryTimeoutMillis;
 	private HttpServer server;
 	/** Set by {@link #main} when the binary port is on, so that one shutdown hook closes both front ends. */
 	private WireServer wire;
 
-	public GraphServer(GraphStore store) {
-		this(store, GraphServerOptions.DEFAULT_QUERY_TIMEOUT_MILLIS);
+	public GraphServer(GraphDatabases databases) {
+		this(databases, GraphDatabases.DEFAULT_NAME);
+	}
+
+	public GraphServer(GraphDatabases databases, String defaultDatabase) {
+		this(Vertx.vertx(), databases, defaultDatabase, false,
+			GraphServerOptions.DEFAULT_QUERY_TIMEOUT_MILLIS, false);
 	}
 
 	/** @param queryTimeoutMillis how long one query may run, or 0 for no limit */
-	public GraphServer(GraphStore store, long queryTimeoutMillis) {
-		this(Vertx.vertx(), store, false, queryTimeoutMillis);
+	public GraphServer(GraphDatabases databases, String defaultDatabase, long queryTimeoutMillis, boolean allowDrop) {
+		this(Vertx.vertx(), databases, defaultDatabase, false, queryTimeoutMillis, allowDrop);
 	}
 
-	private GraphServer(Vertx vertx, GraphStore store, boolean ownsStore, long queryTimeoutMillis) {
+	private GraphServer(Vertx vertx, GraphDatabases databases, String defaultDatabase, boolean ownsDatabases,
+		long queryTimeoutMillis, boolean allowDrop) {
 		this.vertx = vertx;
-		this.store = store;
-		this.ownsStore = ownsStore;
+		this.databases = databases;
+		this.defaultDatabase = defaultDatabase;
+		this.ownsDatabases = ownsDatabases;
 		this.queryTimeoutMillis = queryTimeoutMillis;
-		this.schema = new SchemaScanner(store);
+		this.allowDrop = allowDrop;
 	}
 
 	public static void main(String[] args) throws Exception {
@@ -122,18 +136,34 @@ public final class GraphServer implements AutoCloseable {
 			return;
 		}
 
-		GraphStore store = GraphStore.open(options.store());
-		seedIfAsked(store, options);
+		GraphDatabases databases;
+		try {
+			databases = GraphDatabases.open(options.root());
+		} catch (GraphStoreException refused) {
+			// The one-store-per-directory layout is gone, and a directory holding a store is not a root of them.
+			// Refused with the commands to fix it rather than migrated: moving somebody's data on their behalf, on a
+			// disk that might be full, is not a decision a start-up path gets to make.
+			System.err.println(refused.getMessage());
+			System.exit(2);
+			return;
+		}
+		if (!databases.exists(options.database())) {
+			databases.create(options.database());
+			logger.info("Created database '{}'", options.database());
+		}
+		seedIfAsked(databases.database(options.database()), options);
 
-		// One Vert.x for both front ends. They serve the same store over the same process and there is nothing to be
+		// One Vert.x for both front ends. They serve the same databases in the same process and there is nothing to be
 		// gained from two sets of event loops competing for the same cores.
 		Vertx vertx = Vertx.vertx();
-		GraphServer server = new GraphServer(vertx, store, true, options.queryTimeoutMillis());
+		GraphServer server = new GraphServer(vertx, databases, options.database(), true,
+			options.queryTimeoutMillis(), options.allowDrop());
 		int port = server.listen(options.port()).toCompletionStage().toCompletableFuture().join();
-		logger.info("Graph server on http://localhost:{} over store {}", port, options.store());
+		logger.info("Graph server on http://localhost:{} over {} ({} database(s), default '{}')",
+			port, options.root(), databases.names().size(), options.database());
 
 		if (options.wire()) {
-			WireServer wire = new WireServer(vertx, store, WireServerOptions.defaults()
+			WireServer wire = new WireServer(vertx, databases, options.database(), WireServerOptions.defaults()
 				.withPort(options.wirePort())
 				.withMaxConcurrentStreams(options.maxConcurrentStreams())
 				.withQueryTimeoutMillis(options.queryTimeoutMillis()));
@@ -160,12 +190,12 @@ public final class GraphServer implements AutoCloseable {
 			return;
 		}
 		if (!DemoData.isEmpty(store)) {
-			logger.info("--demo: {} already holds {} nodes, leaving it alone",
-				options.store(), store.stats().nodeCount());
+			logger.info("--demo: database '{}' already holds {} nodes, leaving it alone",
+				options.database(), store.stats().nodeCount());
 			return;
 		}
-		logger.info("--demo: generating an air route network of {} airports in {}",
-			options.demoAirports(), options.store());
+		logger.info("--demo: generating an air route network of {} airports in database '{}'",
+			options.demoAirports(), options.database());
 		DemoData.seed(store, options.demoAirports());
 	}
 
@@ -176,6 +206,11 @@ public final class GraphServer implements AutoCloseable {
 		router.post("/api/query").handler(this::query);
 		router.get("/api/stats").handler(this::stats);
 		router.get("/api/schema").handler(this::schema);
+		// Plural for the collection, and the name in the path for one of them. Everything else takes ?database=,
+		// because scoping a query to a database is a parameter of the query rather than a different resource.
+		router.get("/api/databases").handler(this::listDatabases);
+		router.put("/api/databases/:name").handler(this::createDatabase);
+		router.delete("/api/databases/:name").handler(this::dropDatabase);
 
 		if (uiIsBundled()) {
 			// Cached in production, never in a build tree: an edited UI file should show up on reload.
@@ -208,6 +243,13 @@ public final class GraphServer implements AutoCloseable {
 			return;
 		}
 		Map<String, Object> parameters = body.getJsonObject("parameters", new JsonObject()).getMap();
+		GraphStore store;
+		try {
+			store = storeFor(context);
+		} catch (RuntimeException e) {
+			respondToFailure(context, e);
+			return;
+		}
 
 		// Parsed here, on the event loop, because parsing is pure and cheap and running is neither. A syntax error is
 		// much the most common failure and now costs no worker thread and no read view.
@@ -275,6 +317,10 @@ public final class GraphServer implements AutoCloseable {
 			// spending on this one. Retrying a narrower query is the useful advice, so the engine's message —
 			// which names the budget — is passed through rather than replaced.
 			case QueryAbortedException aborted -> fail(context, 503, "timeout", aborted.getMessage());
+			// 404 and not 409: the name is wrong, so listing or creating is the next step. A 409 would say the store
+			// refused and invite a retry that cannot work.
+			case NoSuchDatabaseException missing -> fail(context, 404, "database", missing.getMessage());
+			case IllegalArgumentException invalid -> fail(context, 400, "database", invalid.getMessage());
 			case GraphStoreException store -> fail(context, 409, "store", store.getMessage());
 			default -> {
 				logger.error("Query failed", error);
@@ -293,15 +339,32 @@ public final class GraphServer implements AutoCloseable {
 	 */
 	private void schema(RoutingContext context) {
 		boolean refresh = "true".equals(context.request().getParam("refresh"));
-		vertx.<JsonObject>executeBlocking(() -> schema.schema(refresh), false)
+		SchemaScanner scanner;
+		try {
+			scanner = scannerFor(context);
+		} catch (RuntimeException e) {
+			respondToFailure(context, e);
+			return;
+		}
+		vertx.<JsonObject>executeBlocking(() -> scanner.schema(refresh), false)
 			.onSuccess(context::json)
 			.onFailure(error -> respondToFailure(context, error));
 	}
 
 	private void stats(RoutingContext context) {
+		GraphStore store;
+		String name;
+		try {
+			name = nameFor(context);
+			store = storeFor(context);
+		} catch (RuntimeException e) {
+			respondToFailure(context, e);
+			return;
+		}
 		vertx.<JsonObject>executeBlocking(() -> {
 			StoreStats stats = store.stats();
 			return new JsonObject()
+				.put("database", name)
 				.put("nodes", stats.nodeCount())
 				.put("relationships", stats.relationshipCount())
 				.put("labels", stats.labelCount())
@@ -313,6 +376,117 @@ public final class GraphServer implements AutoCloseable {
 				// why it is worth being able to ask — and in a GraalVM binary it is the only way to find out.
 				.put("nativeLayer", NativeCapabilities.status());
 		}, false).onSuccess(context::json)
+			.onFailure(error -> respondToFailure(context, error));
+	}
+
+	// ---------------------------------------------------------------- databases
+
+	/**
+	 * Which database this request is about.
+	 *
+	 * <p>
+	 * A parameter rather than a path segment, because scoping a query to a database is a property of the query and not
+	 * a different resource — {@code /api/query?database=sales} rather than {@code /api/databases/sales/query}. The
+	 * collection at {@code /api/databases} is the exception, because there it genuinely is the resource.
+	 * </p>
+	 */
+	private String nameFor(RoutingContext context) {
+		String requested = context.request().getParam("database");
+		return requested == null || requested.isBlank() ? defaultDatabase : requested;
+	}
+
+	private GraphStore storeFor(RoutingContext context) {
+		return lookup(nameFor(context));
+	}
+
+	private SchemaScanner scannerFor(RoutingContext context) {
+		String name = nameFor(context);
+		GraphStore store = lookup(name);
+		// One scanner per database and not per request: a scan is O(nodes + edges) and its whole value is the cache
+		// in front of it, which a fresh scanner would throw away every time the sidebar refreshed.
+		return schemas.computeIfAbsent(name, ignored -> new SchemaScanner(store));
+	}
+
+	private GraphStore lookup(String name) {
+		try {
+			return databases.database(name);
+		} catch (GraphStoreException e) {
+			// A legal name that is not there: 404, and listing or creating is the next step.
+			throw new NoSuchDatabaseException(e.getMessage());
+		} catch (IOException e) {
+			throw new GraphStoreException("Could not open database '" + name + "': " + e.getMessage());
+		}
+		// An IllegalArgumentException propagates and becomes a 400. The distinction is worth keeping: 400 says the
+		// name is not a name, 404 says there is no such database, and a UI reacts to those differently — one is a
+		// typo in a field, the other is a database somebody dropped.
+	}
+
+	/**
+	 * Every database under the root, with the counts a picker wants to show.
+	 *
+	 * <p>
+	 * The counts come from stores that are already open; a database nobody has touched is listed without them rather
+	 * than opened to find out. Listing a root of fifty databases should not map fifty sets of segment files.
+	 * </p>
+	 */
+	private void listDatabases(RoutingContext context) {
+		vertx.<JsonObject>executeBlocking(() -> {
+			JsonArray array = new JsonArray();
+			for (String name : databases.names()) {
+				JsonObject entry = new JsonObject()
+					.put("name", name)
+					.put("default", name.equals(defaultDatabase))
+					.put("open", databases.isOpen(name));
+				if (databases.isOpen(name)) {
+					StoreStats stats = databases.database(name).stats();
+					entry.put("nodes", stats.nodeCount()).put("relationships", stats.relationshipCount());
+				}
+				array.add(entry);
+			}
+			return new JsonObject()
+				.put("databases", array)
+				.put("default", defaultDatabase)
+				.put("allowDrop", allowDrop);
+		}, false).onSuccess(context::json).onFailure(error -> respondToFailure(context, error));
+	}
+
+	private void createDatabase(RoutingContext context) {
+		String name = context.pathParam("name");
+		vertx.<JsonObject>executeBlocking(() -> {
+			GraphDatabases.validate(name);
+			databases.create(name);
+			logger.info("Created database '{}'", name);
+			return new JsonObject().put("name", name).put("created", true);
+		}, false).onSuccess(created -> context.response().setStatusCode(201)
+			.putHeader("content-type", "application/json").end(created.encode()))
+			.onFailure(error -> respondToFailure(context, error));
+	}
+
+	/**
+	 * Deletes a database and everything in it.
+	 *
+	 * <p>
+	 * <b>Off unless {@code --allow-drop} was given.</b> This is the only route in the server that destroys data, on a
+	 * port with no authentication, and the query language it sits beside cannot delete a single node. Making it
+	 * opt-in is the least that difference deserves.
+	 * </p>
+	 */
+	private void dropDatabase(RoutingContext context) {
+		String name = context.pathParam("name");
+		if (!allowDrop) {
+			fail(context, 403, "forbidden", "This server was started without --allow-drop, so it will not delete a"
+				+ " database. Stop it and remove the directory, or restart it with the flag.");
+			return;
+		}
+		vertx.<JsonObject>executeBlocking(() -> {
+			GraphDatabases.validate(name);
+			if (!databases.drop(name)) {
+				throw new NoSuchDatabaseException("No database '" + name + "'");
+			}
+			schemas.remove(name);
+			logger.warn("Dropped database '{}' and everything in it", name);
+			return new JsonObject().put("name", name).put("dropped", true);
+		}, false).onSuccess(dropped -> context.json(dropped))
 			.onFailure(error -> respondToFailure(context, error));
 	}
 
@@ -361,8 +535,8 @@ public final class GraphServer implements AutoCloseable {
 			server.close().toCompletionStage().toCompletableFuture().join();
 		}
 		vertx.close().toCompletionStage().toCompletableFuture().join();
-		if (ownsStore) {
-			store.close();
+		if (ownsDatabases) {
+			databases.close();
 		}
 	}
 

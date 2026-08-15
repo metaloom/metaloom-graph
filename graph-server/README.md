@@ -1,7 +1,9 @@
 # graph-server
 
-Two front ends over one store: an HTTP port with a Cypher endpoint and a browser UI, and a binary port
-that streams rows as the engine produces them.
+Two front ends over a **root of databases**: an HTTP port with a Cypher endpoint and a browser UI, and
+a binary port that streams rows as the engine produces them. Each database is a directory under the
+root — [spec/DATABASES.md](../spec/DATABASES.md). A directory that is itself a store is refused at
+startup, with the two commands that move it into a root.
 
 ```bash
 java -jar target/graph-server-0.0.1-SNAPSHOT.jar /path/to/store 8080
@@ -12,8 +14,12 @@ mvn -pl graph-server exec:java -Dexec.args="--demo /tmp/demo 8080"
 
 | | | |
 |---|---|---|
-| HTTP | 8080, all interfaces | The UI and `/api/query`, which builds the whole result as JSON |
-| Binary | 8081, **loopback** | Streaming Cypher for `graph-client`. `--no-wire` turns it off, `--wire-port=` moves it |
+| HTTP | 8080, all interfaces | The UI and `/api/query`, which builds the whole result as JSON. `?database=` picks one |
+| Binary | 8081, **loopback** | Streaming Cypher for `graph-client`, one database per connection. `--no-wire` turns it off, `--wire-port=` moves it |
+
+`--database=<name>` sets the default and creates it at startup. `--allow-drop` enables
+`DELETE /api/databases/<name>`, which is off by default because it is the only route that destroys
+data.
 
 The binary port is the one for a result that does not fit in a browser: rows encode and flush in
 batches, a slow consumer becomes backpressure rather than heap, and a query can be cancelled or given

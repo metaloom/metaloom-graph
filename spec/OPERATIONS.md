@@ -14,7 +14,8 @@ Design rationale lives in the other files; [GRAPH_STORAGE_CONTEXT.md](GRAPH_STOR
 
 | | |
 |---|---|
-| **Deployment** | Embedded in a JVM process is the primary shape. `graph-server` also puts two ports over one store: HTTP on 8080 (browser UI, `/api/query`, whole results as JSON) and a binary streaming port on loopback:8081 ([WIRE.md](WIRE.md)). **Neither is authenticated** — see §9. |
+| **Deployment** | Embedded in a JVM process is the primary shape. `graph-server` also puts two ports over a **root of databases**: HTTP on 8080 (browser UI, `/api/query`, whole results as JSON) and a binary streaming port on loopback:8081 ([WIRE.md](WIRE.md)). **Neither is authenticated** — see §9. |
+| **Databases** | One directory per database under the root, each a complete independent store ([DATABASES.md](DATABASES.md)). Sizing below is **per database**. |
 | **Concurrency** | One writer process, enforced by a `LOCK` file. One writer *thread*, enforced by a lock. Readers are unlimited and scale (measured to 10x at 32 threads). |
 | **Durability** | A commit is on the device when the call returns, under the default sync mode. |
 | **Failure domain** | The store directory. There is no replication, no failover and no backup mechanism inside the engine. |
@@ -266,8 +267,13 @@ What that does **not** cover:
 | Binary | 8081, **loopback only** | Streaming Cypher ([WIRE.md](WIRE.md)). Loopback because a new unauthenticated port should not default to every interface |
 
 Both are **read-only**: the query language has no write clauses, so neither port can modify a store however it is
-addressed. Both can read **every byte** of one. Treat exposing either as equivalent to handing out the store
-directory, because that is what it is.
+addressed. Both can read **every byte** of one — and of **every database under the root**, because there is no
+per-database authentication either. Treat exposing either as equivalent to handing out the root directory, because that
+is what it is.
+
+The one exception to read-only is `DELETE /api/databases/{name}`, which deletes a database and everything in it. It
+returns 403 unless the server was started with `--allow-drop`, and off is the default: it is the only route that
+destroys data, and it sits beside a query language that cannot delete a single node.
 
 - `--no-wire` turns the binary port off; `--wire-port=<n>` moves it. There is no flag to bind the binary port to
   another interface, deliberately — putting it somewhere reachable should require thinking about what is in front of

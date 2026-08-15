@@ -14,6 +14,7 @@ import java.util.concurrent.locks.LockSupport;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.metaloom.graph.core.api.GraphDatabases;
 import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.GraphStoreException;
 import io.metaloom.graph.cypher.Cypher;
@@ -111,7 +112,8 @@ public final class WireServer implements AutoCloseable {
 
 	private final Vertx vertx;
 	private final boolean ownsVertx;
-	private final GraphStore store;
+	private final GraphDatabases databases;
+	private final String defaultDatabase;
 	private final WireServerOptions options;
 	private final WorkerExecutor workers;
 	private final Semaphore permits;
@@ -121,23 +123,25 @@ public final class WireServer implements AutoCloseable {
 
 	private NetServer server;
 
-	public WireServer(GraphStore store) {
-		this(Vertx.vertx(), true, store, WireServerOptions.defaults());
+	public WireServer(GraphDatabases databases, String defaultDatabase) {
+		this(Vertx.vertx(), true, databases, defaultDatabase, WireServerOptions.defaults());
 	}
 
-	public WireServer(GraphStore store, WireServerOptions options) {
-		this(Vertx.vertx(), true, store, options);
+	public WireServer(GraphDatabases databases, String defaultDatabase, WireServerOptions options) {
+		this(Vertx.vertx(), true, databases, defaultDatabase, options);
 	}
 
 	/** For a caller that already runs a Vert.x instance — the HTTP server, for one. */
-	public WireServer(Vertx vertx, GraphStore store, WireServerOptions options) {
-		this(vertx, false, store, options);
+	public WireServer(Vertx vertx, GraphDatabases databases, String defaultDatabase, WireServerOptions options) {
+		this(vertx, false, databases, defaultDatabase, options);
 	}
 
-	private WireServer(Vertx vertx, boolean ownsVertx, GraphStore store, WireServerOptions options) {
+	private WireServer(Vertx vertx, boolean ownsVertx, GraphDatabases databases, String defaultDatabase,
+		WireServerOptions options) {
 		this.vertx = vertx;
 		this.ownsVertx = ownsVertx;
-		this.store = store;
+		this.databases = databases;
+		this.defaultDatabase = defaultDatabase;
 		this.options = options;
 		this.permits = new Semaphore(options.maxConcurrentStreams());
 		// A pool of its own, sized to the permit count so an admitted query never waits for a thread — and, more to
@@ -223,23 +227,31 @@ public final class WireServer implements AutoCloseable {
 	 */
 	private void checkRetention() {
 		try {
-			long retained = store.snapshotStats().retainedBytes();
-			if (retained < options.retentionSoftLimitBytes()) {
-				return;
-			}
-			Stream oldest = null;
-			for (Stream stream : running.values()) {
-				if (oldest == null || stream.startedNanos - oldest.startedNanos < 0) {
-					oldest = stream;
+			// Per database, not summed. Retention is a property of one store's version chain, and a reader on a
+			// busy database must not be abandoned because a different one is holding pages.
+			for (GraphStore store : databases.openDatabases()) {
+				long retained = store.snapshotStats().retainedBytes();
+				if (retained < options.retentionSoftLimitBytes()) {
+					continue;
 				}
-			}
-			if (oldest != null) {
-				logger.warn("Retention is at {} bytes, over the {} byte limit: abandoning the oldest stream, open {} ms",
-					retained, options.retentionSoftLimitBytes(),
-					TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - oldest.startedNanos));
-				oldest.abortReason = "the server abandoned this query: it was the oldest open read view and the store"
-					+ " was retaining " + retained + " bytes to keep it readable";
-				oldest.abortCode = WireError.OVERLOADED;
+				Stream oldest = null;
+				for (Stream stream : running.values()) {
+					if (stream.connection.store != store) {
+						continue;
+					}
+					if (oldest == null || stream.startedNanos - oldest.startedNanos < 0) {
+						oldest = stream;
+					}
+				}
+				if (oldest != null) {
+					logger.warn("Retention on '{}' is at {} bytes, over the {} byte limit: abandoning the oldest"
+						+ " stream, open {} ms", oldest.connection.database, retained,
+						options.retentionSoftLimitBytes(),
+						TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - oldest.startedNanos));
+					oldest.abortReason = "the server abandoned this query: it was the oldest open read view and the"
+						+ " database was retaining " + retained + " bytes to keep it readable";
+					oldest.abortCode = WireError.OVERLOADED;
+				}
 			}
 		} catch (RuntimeException e) {
 			logger.warn("The retention watchdog failed; streams are still bounded by their deadlines", e);
@@ -262,6 +274,9 @@ public final class WireServer implements AutoCloseable {
 		private final Map<Integer, Stream> streams = new ConcurrentHashMap<>();
 		private volatile boolean open = true;
 		private boolean greeted;
+		/** Resolved once, at HELLO, and fixed for the life of the connection. See {@link Protocol}. */
+		private GraphStore store;
+		private String database;
 
 		Connection(NetSocket socket) {
 			this.socket = socket;
@@ -302,7 +317,8 @@ public final class WireServer implements AutoCloseable {
 		}
 
 		private void hello(Buffer payload) {
-			int version = new WireValueCodec.Reader(payload.getBytes()).i32();
+			WireValueCodec.Reader reader = new WireValueCodec.Reader(payload.getBytes());
+			int version = reader.i32();
 			if (version != Protocol.VERSION) {
 				fail(Frames.CONNECTION_STREAM, WireError.UNSUPPORTED_VERSION,
 					"This server speaks protocol version " + Protocol.VERSION + " and the client asked for "
@@ -312,11 +328,34 @@ public final class WireServer implements AutoCloseable {
 				socket.close();
 				return;
 			}
+			String requested = WireValueCodec.expect(WireValueCodec.decode(reader), String.class,
+				"the database name");
+			String resolved = requested.isEmpty() ? defaultDatabase : requested;
+			try {
+				// Resolved here, on the event loop, and held. It is a map lookup after the first time; the first time
+				// opens a store, which is why the whole connection pays for it once rather than every query doing so.
+				store = databases.database(resolved);
+			} catch (IllegalArgumentException | GraphStoreException e) {
+				// A name that is not a name and a name that is not a database are the same thing to a client: it
+				// asked for something that is not there, and listing the databases is the next step either way.
+				fail(Frames.CONNECTION_STREAM, WireError.NO_SUCH_DATABASE, e.getMessage(), 0, 0);
+				open = false;
+				socket.close();
+				return;
+			} catch (java.io.IOException e) {
+				fail(Frames.CONNECTION_STREAM, WireError.STORE, "Could not open '" + resolved + "': " + e.getMessage(),
+					0, 0);
+				open = false;
+				socket.close();
+				return;
+			}
+			database = resolved;
 			greeted = true;
-			WireValueCodec.Writer welcome = new WireValueCodec.Writer(16);
+			WireValueCodec.Writer welcome = new WireValueCodec.Writer(64);
 			welcome.i32(Protocol.VERSION);
 			welcome.i32(Frames.MAX_FRAME_BYTES);
 			welcome.i32(options.maxConcurrentStreams());
+			WireValueCodec.encode(welcome, resolved);
 			socket.write(Frames.frame(Frames.WELCOME, Frames.CONNECTION_STREAM, welcome));
 		}
 
@@ -458,7 +497,7 @@ public final class WireServer implements AutoCloseable {
 		void run(Ast.Query parsed, Map<String, Object> parameters) {
 			BatchingSink sink = new BatchingSink(this);
 			try {
-				Cypher.stream(store, parsed, parameters, sink, this::abortReason);
+				Cypher.stream(connection.store, parsed, parameters, sink, this::abortReason);
 				sink.flush();
 				complete(sink.rowsSent);
 			} catch (QueryAbortedException e) {

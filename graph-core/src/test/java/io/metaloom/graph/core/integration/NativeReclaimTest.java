@@ -1,6 +1,8 @@
 package io.metaloom.graph.core.integration;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
@@ -8,7 +10,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Tag;
@@ -19,6 +23,7 @@ import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.Properties;
 import io.metaloom.graph.core.api.Transaction;
 import io.metaloom.graph.core.fixture.TempStore;
+import io.metaloom.graph.core.id.ElementId;
 import io.metaloom.graph.core.nativelib.NativeLib;
 
 /**
@@ -96,6 +101,154 @@ public class NativeReclaimTest {
 			long fresh = store.createNode("Fresh", Properties.of().set("k", "v"));
 			assertTrue(store.nodeExists(fresh));
 			assertEquals("v", store.nodeProperties(fresh).getString("k"));
+			store.verify();
+		}
+	}
+
+	/**
+	 * A punched page must not restart its generation counters.
+	 *
+	 * <p>
+	 * This is the one thing hole punching can get wrong that no other assertion here would notice. The generation of
+	 * a slot lives <em>inside</em> its record, on the data page, and punching returns that page's blocks to the
+	 * filesystem — so it reads back as zeros, counters included. Left alone, the slot restarts at generation 1 and the
+	 * next allocation hands out an id byte-for-byte identical to one deleted earlier. Nothing throws. The stale id
+	 * simply resolves, to somebody else's record.
+	 * </p>
+	 *
+	 * <p>
+	 * That is strictly worse than an id being broken, and it is the failure {@code StaleIdException} exists to
+	 * prevent, so the counters are saved into the page metadata array — a separate region, never punched — before the
+	 * punch destroys them.
+	 * </p>
+	 *
+	 * @see <a href="../../../../../../../../spec/ID_ENCODING.md">spec/ID_ENCODING.md</a> section 4
+	 */
+	@Test
+	public void testAPunchedPageDoesNotHandOutADeletedIdAgain() throws Exception {
+		assumeTrue(NativeLib.isAvailable(), "without the native layer nothing is punched and there is nothing to test");
+		try (GraphStore store = stores.open()) {
+			// Exactly one page: 8 KiB / 64 byte node record. A partly live page cannot be punched, so filling it and
+			// emptying it completely is what puts the test on the path it is about.
+			int perPage = 128;
+			List<Long> before = new ArrayList<>();
+			try (Transaction txn = store.begin()) {
+				for (int i = 0; i < perPage; i++) {
+					before.add(store.createNode("N", Properties.of().set("i", i)));
+				}
+				txn.commit();
+			}
+			try (Transaction txn = store.begin()) {
+				for (long id : before) {
+					store.deleteNode(id);
+				}
+				txn.commit();
+			}
+			assertTrue(store.reclaim() > 0, "the emptied page should have been punched");
+
+			// Refill the same slots and collect what the allocator hands out.
+			Set<Long> after = new HashSet<>();
+			try (Transaction txn = store.begin()) {
+				for (int i = 0; i < perPage; i++) {
+					after.add(store.createNode("M", Properties.of().set("i", i)));
+				}
+				txn.commit();
+			}
+
+			for (long stale : before) {
+				assertFalse(after.contains(stale),
+					"the id " + ElementId.toString(stale) + " was deleted and has been handed out again; a caller"
+						+ " holding it now reads a different record with no error");
+				assertFalse(store.nodeExists(stale),
+					"the deleted id " + ElementId.toString(stale) + " resolves again after its page was punched");
+			}
+			store.verify();
+		}
+	}
+
+	/**
+	 * A floor at the top of the range must not pin the slot there.
+	 *
+	 * <p>
+	 * The generation counter wraps from 4095 to 1, which
+	 * <a href="../../../../../../../../spec/ID_ENCODING.md">ID_ENCODING.md §4</a> documents as a one-in-4095
+	 * detector rather than a guarantee. A floor applied as {@code max(recordGen, floor)} would turn that into a
+	 * certainty: {@code free()} wraps the record to 1, the maximum puts it straight back to 4095, and every
+	 * delete-then-recreate on the page returns the identical id forever. So the floor is consulted only when the
+	 * counter is <em>gone</em> — zero, which is what a punch leaves — and never against a live one.
+	 * </p>
+	 */
+	@Test
+	public void testAFloorAtTheTopOfTheRangeStillWraps() throws Exception {
+		assumeTrue(NativeLib.isAvailable(), "without the native layer nothing is punched and there is nothing to test");
+		try (GraphStore store = stores.open()) {
+			// The floor has to land on exactly MAX_GEN, or the pinning does not bite and this proves nothing.
+			// free() writes (gen % MAX_GEN) + 1, so the record reaches 4095 by deleting an id whose own generation
+			// is 4094. One node, so the page stays punchable; one transaction, so this is cheap cycles and not
+			// thousands of commits.
+			boolean reachedTheTop = false;
+			try (Transaction txn = store.begin()) {
+				for (int i = 0; i < 4 * ElementId.MAX_GEN && !reachedTheTop; i++) {
+					long id = store.createNode("N", Properties.of().set("i", i));
+					reachedTheTop = ElementId.gen(id) == ElementId.MAX_GEN - 1;
+					store.deleteNode(id);
+				}
+				txn.commit();
+			}
+			assertTrue(reachedTheTop, "the slot's counter never reached the top of its range");
+			assertTrue(store.reclaim() > 0, "the emptied page should have been punched");
+
+			// Two cycles after the punch must produce two different ids. With a maximum they would be identical
+			// whenever the floor had reached the top of the range.
+			long first;
+			long second;
+			try (Transaction txn = store.begin()) {
+				first = store.createNode("M", Properties.of().set("i", 1));
+				store.deleteNode(first);
+				second = store.createNode("M", Properties.of().set("i", 2));
+				txn.commit();
+			}
+			assertEquals(ElementId.slot(first), ElementId.slot(second), "the test needs both to land on one slot");
+			assertNotEquals(first, second,
+				"the slot is pinned at generation " + ElementId.gen(first)
+					+ "; delete-then-recreate returns the same id every time");
+			store.verify();
+		}
+	}
+
+	/** The floor has to outlive the process, or the first reopen after a punch reintroduces the collision. */
+	@Test
+	public void testTheGenerationFloorSurvivesAReopen() throws Exception {
+		assumeTrue(NativeLib.isAvailable(), "without the native layer nothing is punched and there is nothing to test");
+		Path dir = stores.path();
+		List<Long> before = new ArrayList<>();
+		try (GraphStore store = GraphStore.open(dir, TempStore.options())) {
+			try (Transaction txn = store.begin()) {
+				for (int i = 0; i < 128; i++) {
+					before.add(store.createNode("N", Properties.of().set("i", i)));
+				}
+				txn.commit();
+			}
+			try (Transaction txn = store.begin()) {
+				for (long id : before) {
+					store.deleteNode(id);
+				}
+				txn.commit();
+			}
+			assertTrue(store.reclaim() > 0);
+		}
+		try (GraphStore store = GraphStore.open(dir, TempStore.options())) {
+			Set<Long> after = new HashSet<>();
+			try (Transaction txn = store.begin()) {
+				for (int i = 0; i < 128; i++) {
+					after.add(store.createNode("M", Properties.of().set("i", i)));
+				}
+				txn.commit();
+			}
+			for (long stale : before) {
+				assertFalse(after.contains(stale),
+					"after a reopen the id " + ElementId.toString(stale) + " was handed out a second time");
+			}
 			store.verify();
 		}
 	}

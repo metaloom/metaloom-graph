@@ -18,6 +18,7 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 import io.metaloom.graph.client.GraphClient;
 import io.metaloom.graph.client.Row;
 import io.metaloom.graph.client.RowStream;
+import io.metaloom.graph.core.api.GraphDatabases;
 import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.Properties;
 import io.metaloom.graph.core.api.Transaction;
@@ -103,15 +104,17 @@ public class WireVersusEmbeddedTest {
 	@RegisterExtension
 	TempStore stores = new TempStore();
 
+	private GraphDatabases databases;
 	private GraphStore store;
 	private WireServer server;
 	private GraphClient client;
 
 	@BeforeEach
 	public void start() throws Exception {
-		store = stores.open();
+		databases = GraphDatabases.open(stores.path().resolve("root"));
+		store = databases.database(GraphDatabases.DEFAULT_NAME);
 		seed(store);
-		server = new WireServer(store, WireServerOptions.defaults().withPort(0));
+		server = new WireServer(databases, GraphDatabases.DEFAULT_NAME, WireServerOptions.defaults().withPort(0));
 		int port = server.listen().toCompletionStage().toCompletableFuture().join();
 		client = GraphClient.connect("127.0.0.1", port);
 	}
@@ -127,8 +130,8 @@ public class WireVersusEmbeddedTest {
 			assertEquals(0, server.runningStreams(), "a stream was still running after the test finished");
 			server.close();
 		}
-		if (store != null) {
-			store.close();
+		if (databases != null) {
+			databases.close();
 		}
 	}
 

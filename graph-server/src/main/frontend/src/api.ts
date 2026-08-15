@@ -52,7 +52,25 @@ export interface Schema {
   cached: boolean;
 }
 
+export interface DatabaseSummary {
+  name: string;
+  /** True for the one a request that names none gets. */
+  default: boolean;
+  /** Whether the server has this store open. Counts are only present when it does. */
+  open: boolean;
+  nodes?: number;
+  relationships?: number;
+}
+
+export interface DatabaseList {
+  databases: DatabaseSummary[];
+  default: string;
+  /** False unless the server was started with --allow-drop, in which case the UI must not offer to drop. */
+  allowDrop: boolean;
+}
+
 export interface Stats {
+  database: string;
   nodes: number;
   relationships: number;
   labels: number;
@@ -102,8 +120,33 @@ async function parse<T>(response: Response): Promise<T> {
   return body as T;
 }
 
-export async function runQuery(query: string, parameters: Record<string, unknown> = {}): Promise<QueryResult> {
-  const response = await fetch('api/query', {
+/**
+ * Which database every request below is about.
+ *
+ * The name is a query parameter rather than part of the path because scoping a query to a database is a property of
+ * the query, not a different resource. The collection at api/databases is the exception, because there it is.
+ *
+ * An empty name means "whatever the server calls its default". The UI never hard-codes 'default': a server started
+ * with --database=sales would then have a picker that silently queried a database nobody chose.
+ */
+function scoped(path: string, database: string, extra?: string): string {
+  const params = new URLSearchParams();
+  if (database) {
+    params.set('database', database);
+  }
+  if (extra) {
+    params.set(extra, 'true');
+  }
+  const query = params.toString();
+  return query ? `${path}?${query}` : path;
+}
+
+export async function runQuery(
+  query: string,
+  database = '',
+  parameters: Record<string, unknown> = {}
+): Promise<QueryResult> {
+  const response = await fetch(scoped('api/query', database), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ query, parameters })
@@ -111,10 +154,22 @@ export async function runQuery(query: string, parameters: Record<string, unknown
   return parse<QueryResult>(response);
 }
 
-export async function fetchSchema(refresh = false): Promise<Schema> {
-  return parse<Schema>(await fetch(`api/schema${refresh ? '?refresh=true' : ''}`));
+export async function fetchSchema(database = '', refresh = false): Promise<Schema> {
+  return parse<Schema>(await fetch(scoped('api/schema', database, refresh ? 'refresh' : undefined)));
 }
 
-export async function fetchStats(): Promise<Stats> {
-  return parse<Stats>(await fetch('api/stats'));
+export async function fetchStats(database = ''): Promise<Stats> {
+  return parse<Stats>(await fetch(scoped('api/stats', database)));
+}
+
+export async function fetchDatabases(): Promise<DatabaseList> {
+  return parse<DatabaseList>(await fetch('api/databases'));
+}
+
+export async function createDatabase(name: string): Promise<void> {
+  await parse<unknown>(await fetch(`api/databases/${encodeURIComponent(name)}`, { method: 'PUT' }));
+}
+
+export async function dropDatabase(name: string): Promise<void> {
+  await parse<unknown>(await fetch(`api/databases/${encodeURIComponent(name)}`, { method: 'DELETE' }));
 }

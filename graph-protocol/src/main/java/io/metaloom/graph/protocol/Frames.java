@@ -25,6 +25,11 @@ import io.vertx.core.buffer.Buffer;
  * the header rather than in each payload: the dispatcher has to route a frame before it has decoded anything.
  * </p>
  *
+ * <p>
+ * A stream id does <b>not</b> name a database. That is fixed for the connection at {@link #HELLO} — see
+ * {@link Protocol}.
+ * </p>
+ *
  * <h2>Payloads</h2>
  *
  * <p>
@@ -35,8 +40,8 @@ import io.vertx.core.buffer.Buffer;
  * <table>
  * <caption>Frame payloads</caption>
  * <tr><th>Frame</th><th>Direction</th><th>Payload</th></tr>
- * <tr><td>{@link #HELLO}</td><td>client</td><td>{@code i32} protocol version</td></tr>
- * <tr><td>{@link #WELCOME}</td><td>server</td><td>{@code i32} version, {@code i32} max frame bytes, {@code i32} max concurrent streams</td></tr>
+ * <tr><td>{@link #HELLO}</td><td>client</td><td>{@code i32} protocol version, value: database name ({@code ""} = the server's default)</td></tr>
+ * <tr><td>{@link #WELCOME}</td><td>server</td><td>{@code i32} version, {@code i32} max frame bytes, {@code i32} max concurrent streams, value: the database it resolved</td></tr>
  * <tr><td>{@link #QUERY}</td><td>client</td><td>value: query text, value: parameter map, {@code i64} deadline millis (0 = the server's own)</td></tr>
  * <tr><td>{@link #CANCEL}</td><td>client</td><td>empty</td></tr>
  * <tr><td>{@link #COLUMNS}</td><td>server</td><td>value: list of column names</td></tr>

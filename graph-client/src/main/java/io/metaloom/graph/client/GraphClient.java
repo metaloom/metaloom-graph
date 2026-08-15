@@ -103,8 +103,14 @@ public final class GraphClient implements AutoCloseable {
 	private volatile Welcome server;
 	private volatile boolean closed;
 
-	/** What the server said about itself, so the client does not have to assume. */
-	public record Welcome(int version, int maxFrameBytes, int maxConcurrentStreams) {
+	/**
+	 * What the server said about itself, so the client does not have to assume.
+	 *
+	 * @param database
+	 *            the database this connection is bound to. Worth echoing rather than assuming: a client that sent
+	 *            {@code ""} asked for the server's default and has no other way to find out which one that was
+	 */
+	public record Welcome(int version, int maxFrameBytes, int maxConcurrentStreams, String database) {
 	}
 
 	private GraphClient(Vertx vertx, boolean ownsVertx, NetClient netClient, NetSocket socket, ClientOptions options) {
@@ -115,9 +121,25 @@ public final class GraphClient implements AutoCloseable {
 		this.options = options;
 	}
 
+	/** Connects to the server's default database. */
 	public static GraphClient connect(String host, int port) {
-		return connect(host, port, ClientOptions.defaults());
+		return connect(host, port, DEFAULT_DATABASE, ClientOptions.defaults());
 	}
+
+	/** Connects to a named database. */
+	public static GraphClient connect(String host, int port, String database) {
+		return connect(host, port, database, ClientOptions.defaults());
+	}
+
+	/**
+	 * The empty name, meaning "whichever database the server calls its default".
+	 *
+	 * <p>
+	 * A client that hard-coded {@code "default"} instead would break the moment a server was started with
+	 * {@code --database=} something else, and it would break by querying the wrong data rather than by failing.
+	 * </p>
+	 */
+	public static final String DEFAULT_DATABASE = "";
 
 	/**
 	 * Connects and completes the version handshake.
@@ -128,9 +150,13 @@ public final class GraphClient implements AutoCloseable {
 	 * </p>
 	 */
 	public static GraphClient connect(String host, int port, ClientOptions options) {
+		return connect(host, port, DEFAULT_DATABASE, options);
+	}
+
+	public static GraphClient connect(String host, int port, String database, ClientOptions options) {
 		Vertx vertx = Vertx.vertx();
 		try {
-			return connect(vertx, true, host, port, options);
+			return connect(vertx, true, host, port, database, options);
 		} catch (RuntimeException e) {
 			vertx.close();
 			throw e;
@@ -139,10 +165,15 @@ public final class GraphClient implements AutoCloseable {
 
 	/** For a caller that already runs a Vert.x instance and would rather not have a second one. */
 	public static GraphClient connect(Vertx vertx, String host, int port, ClientOptions options) {
-		return connect(vertx, false, host, port, options);
+		return connect(vertx, false, host, port, DEFAULT_DATABASE, options);
 	}
 
-	private static GraphClient connect(Vertx vertx, boolean ownsVertx, String host, int port, ClientOptions options) {
+	public static GraphClient connect(Vertx vertx, String host, int port, String database, ClientOptions options) {
+		return connect(vertx, false, host, port, database, options);
+	}
+
+	private static GraphClient connect(Vertx vertx, boolean ownsVertx, String host, int port, String database,
+		ClientOptions options) {
 		long timeoutMillis = options.connectTimeout().toMillis();
 		NetClient netClient = vertx.createNetClient(new NetClientOptions()
 			.setConnectTimeout((int) Math.min(timeoutMillis, Integer.MAX_VALUE))
@@ -165,7 +196,7 @@ public final class GraphClient implements AutoCloseable {
 		}
 
 		GraphClient client = new GraphClient(vertx, ownsVertx, netClient, socket, options);
-		client.start();
+		client.start(database);
 		try {
 			client.server = client.handshake.get(timeoutMillis, TimeUnit.MILLISECONDS);
 		} catch (InterruptedException e) {
@@ -185,7 +216,7 @@ public final class GraphClient implements AutoCloseable {
 		return client;
 	}
 
-	private void start() {
+	private void start(String database) {
 		socket.closeHandler(v -> connectionLost(new GraphClientException("The server closed the connection")));
 		socket.exceptionHandler(t -> connectionLost(new GraphClientException("The connection failed", t)));
 		FrameReader.attach(socket, this::onFrame, malformed -> {
@@ -193,14 +224,27 @@ public final class GraphClient implements AutoCloseable {
 			socket.close();
 		});
 
-		WireValueCodec.Writer hello = new WireValueCodec.Writer(8);
+		WireValueCodec.Writer hello = new WireValueCodec.Writer(64);
 		hello.i32(Protocol.VERSION);
+		WireValueCodec.encode(hello, database == null ? DEFAULT_DATABASE : database);
 		socket.write(Frames.frame(Frames.HELLO, Frames.CONNECTION_STREAM, hello));
 	}
 
 	/** What the server told us about itself in its WELCOME. */
 	public Welcome server() {
 		return server;
+	}
+
+	/**
+	 * The database this connection is bound to, as the server resolved it.
+	 *
+	 * <p>
+	 * Fixed for the life of the connection. Querying a second database means a second {@code connect} — see
+	 * {@link Protocol}.
+	 * </p>
+	 */
+	public String database() {
+		return server.database();
 	}
 
 	// ---------------------------------------------------------------- queries
@@ -266,7 +310,12 @@ public final class GraphClient implements AutoCloseable {
 		switch (type) {
 			case Frames.WELCOME -> {
 				WireValueCodec.Reader reader = new WireValueCodec.Reader(payload.getBytes());
-				handshake.complete(new Welcome(reader.i32(), reader.i32(), reader.i32()));
+				int version = reader.i32();
+				int maxFrame = reader.i32();
+				int maxStreams = reader.i32();
+				String resolved = WireValueCodec.expect(WireValueCodec.decode(reader), String.class,
+					"the resolved database name");
+				handshake.complete(new Welcome(version, maxFrame, maxStreams, resolved));
 			}
 			case Frames.COLUMNS -> {
 				RowStream stream = streams.get(streamId);

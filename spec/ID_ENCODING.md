@@ -175,7 +175,22 @@ Rules:
   can never match a live id (which always has `gen >= 1`).
 - **Freeing** a slot increments its generation and writes the record's `LIVE` flag to 0. The
   incremented generation is persisted with the free, under the WAL.
-- **Reuse** hands out `encode(kind, seg, slot, gen)` with the already-incremented value.
+- **Reuse** hands out `encode(kind, seg, slot, gen)` with the already-incremented value, or the page's
+  `gen_floor` when that is higher — see the next rule.
+- **Hole punching** would otherwise destroy the counter, because it lives inside the record on the page
+  whose blocks are being returned. A punched page reads as zeros, so its slots would restart at 1 and
+  the allocator would hand out an id byte-for-byte identical to one deleted earlier — which then
+  resolves, silently, to the new record. `reclaimEmptyPages` therefore raises `gen_floor` in the page
+  metadata array ([FILE_FORMAT.md §3.3](FILE_FORMAT.md#33-page-metadata-array)) to the highest
+  generation on the page before punching it, and `claim` uses it **when the record's own counter is
+  zero** — which is exactly what a punch leaves behind. The PMA is a separate region and is never
+  punched.
+
+  Not `max(recordGen, gen_floor)`, which is the obvious form and is wrong. Once a floor reached 4095,
+  the maximum would put every wrapped counter on that page straight back to 4095, and
+  delete-then-recreate would return the identical id *every* time — turning the one-in-4095 above into
+  a certainty. `NativeReclaimTest` covers all three: the collision without a floor, the collision after
+  a reopen, and the pinning that the naive floor would cause.
 - The counter **wraps** from 4095 to 1. A wrap makes an id from 4095 reuse cycles ago
   indistinguishable from a current one. Two mitigations, both cheap:
   - The free-slot allocator is **FIFO, not LIFO** — a freed slot goes to the tail of the segment's

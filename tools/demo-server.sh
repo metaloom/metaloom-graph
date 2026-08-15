@@ -2,7 +2,9 @@
 #
 # Starts the server over a generated demo graph — an air route network — and is what the Playwright suite drives.
 #
-#   tools/demo-server.sh [store-directory] [port] [size]
+#   tools/demo-server.sh [root-directory] [port] [size]
+#
+# The directory is a root holding one subdirectory per database; --demo seeds the default one.
 #
 # size is tiny | small | medium | large, or a number of airports; small is the default. The store is seeded on first
 # use and reused afterwards, so a second run starts against the same graph. Delete the directory to start over.

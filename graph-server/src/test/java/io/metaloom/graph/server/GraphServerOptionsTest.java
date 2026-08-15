@@ -25,9 +25,9 @@ import io.metaloom.graph.server.demo.DemoData;
 public class GraphServerOptionsTest {
 
 	@Test
-	public void testTheStoreAndPortArePositional() {
+	public void testTheRootAndPortArePositional() {
 		GraphServerOptions options = GraphServerOptions.parse(new String[] { "/data/mygraph", "9000" });
-		assertEquals(Path.of("/data/mygraph"), options.store());
+		assertEquals(Path.of("/data/mygraph"), options.root());
 		assertEquals(9000, options.port());
 		assertFalse(options.demo(), "demo data is never the default: it writes");
 	}
@@ -68,7 +68,7 @@ public class GraphServerOptionsTest {
 	public void testAMistakeIsNamed() {
 		// Every one of these prints the message and the usage rather than a stack trace: the user's command is wrong,
 		// not the server.
-		assertMessage("A store directory is required", new String[] {});
+		assertMessage("A root directory is required", new String[] {});
 		assertMessage("Unknown option '--demoo'", new String[] { "--demoo", "/data/g" });
 		assertMessage("Port must be a number", new String[] { "/data/g", "http" });
 		assertMessage("Port must be between", new String[] { "/data/g", "70000" });
@@ -129,6 +129,26 @@ public class GraphServerOptionsTest {
 	}
 
 	@Test
+	public void testTheDefaultDatabaseIsNamedAndValidated() {
+		assertEquals("default", GraphServerOptions.parse(new String[] { "/data/g" }).database());
+		assertEquals("sales", GraphServerOptions.parse(new String[] { "--database=sales", "/data/g" }).database());
+		// The name becomes a path. A usage error printed with the usage text beats a stack trace out of the storage
+		// layer, so it is checked here rather than at open time.
+		assertThrows(IllegalArgumentException.class,
+			() -> GraphServerOptions.parse(new String[] { "--database=../escaped", "/data/g" }));
+		assertThrows(IllegalArgumentException.class,
+			() -> GraphServerOptions.parse(new String[] { "--database=", "/data/g" }));
+	}
+
+	@Test
+	public void testDroppingIsOffUnlessAskedFor() {
+		// The only route that destroys data, on a port with no authentication, beside a query language that cannot
+		// delete a single node. Off is the only defensible default.
+		assertFalse(GraphServerOptions.parse(new String[] { "/data/g" }).allowDrop());
+		assertTrue(GraphServerOptions.parse(new String[] { "--allow-drop", "/data/g" }).allowDrop());
+	}
+
+	@Test
 	public void testHelpIsARequestRatherThanAMistake() {
 		// So that `--help` can print the usage and exit zero.
 		assertThrows(GraphServerOptions.HelpRequested.class,
@@ -144,5 +164,7 @@ public class GraphServerOptionsTest {
 		assertTrue(usage.contains("--max-streams"), "and the factor an operator has to multiply");
 		assertTrue(usage.contains("authentication"),
 			"a server with two unauthenticated ports should say so where somebody will read it");
+		assertTrue(usage.contains("--database"), "and the flag that picks which database a request gets");
+		assertTrue(usage.contains("--allow-drop"), "and the one that turns on the only route that deletes data");
 	}
 }

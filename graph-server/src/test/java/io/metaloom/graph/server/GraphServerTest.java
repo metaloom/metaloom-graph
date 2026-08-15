@@ -22,6 +22,7 @@ import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
+import io.metaloom.graph.core.api.GraphDatabases;
 import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.Properties;
 import io.metaloom.graph.core.api.Transaction;
@@ -43,6 +44,7 @@ public class GraphServerTest {
 	@RegisterExtension
 	TempStore stores = new TempStore();
 
+	private GraphDatabases databases;
 	private GraphStore store;
 	private GraphServer server;
 	private HttpClient client;
@@ -50,7 +52,10 @@ public class GraphServerTest {
 
 	@BeforeEach
 	public void start() throws Exception {
-		store = stores.open();
+		// A root of databases now, not one store. The default is made by open(); the tests that care about several
+		// databases make their own.
+		databases = GraphDatabases.open(stores.path().resolve("root"));
+		store = databases.database(GraphDatabases.DEFAULT_NAME);
 		try (Transaction txn = store.begin()) {
 			long alice = store.createNode(java.util.List.of("Person", "Employee"),
 				Properties.of().set("name", "Alice").set("age", 34L));
@@ -60,7 +65,8 @@ public class GraphServerTest {
 			store.createEdge(alice, "BOUGHT", widget);
 			txn.commit();
 		}
-		server = new GraphServer(store);
+		server = new GraphServer(databases, GraphDatabases.DEFAULT_NAME,
+			GraphServerOptions.DEFAULT_QUERY_TIMEOUT_MILLIS, true);
 		// Port zero: the OS picks a free one, so the test cannot collide with anything already listening.
 		int port = server.listen(0).toCompletionStage().toCompletableFuture().join();
 		client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
@@ -72,8 +78,8 @@ public class GraphServerTest {
 		if (server != null) {
 			server.close();
 		}
-		if (store != null) {
-			store.close();
+		if (databases != null) {
+			databases.close();
 		}
 	}
 
@@ -112,7 +118,7 @@ public class GraphServerTest {
 			txn.commit();
 		}
 
-		try (GraphServer strict = new GraphServer(store, 1)) {
+		try (GraphServer strict = new GraphServer(databases, GraphDatabases.DEFAULT_NAME, 1, true)) {
 			int port = strict.listen(0).toCompletionStage().toCompletableFuture().join();
 			HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/api/query"))
 				.header("content-type", "application/json")
@@ -137,7 +143,7 @@ public class GraphServerTest {
 	@Test
 	public void testAGenerousBudgetDoesNotTruncateAResult() throws Exception {
 		// The inverse, so the test above cannot pass by the deadline always firing.
-		try (GraphServer relaxed = new GraphServer(store, 60_000)) {
+		try (GraphServer relaxed = new GraphServer(databases, GraphDatabases.DEFAULT_NAME, 60_000, true)) {
 			int port = relaxed.listen(0).toCompletionStage().toCompletableFuture().join();
 			HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/api/query"))
 				.header("content-type", "application/json")

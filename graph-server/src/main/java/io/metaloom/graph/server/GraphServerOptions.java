@@ -2,6 +2,7 @@ package io.metaloom.graph.server;
 
 import java.nio.file.Path;
 
+import io.metaloom.graph.core.api.GraphDatabases;
 import io.metaloom.graph.protocol.Protocol;
 import io.metaloom.graph.server.demo.DemoData;
 
@@ -13,8 +14,9 @@ import io.metaloom.graph.server.demo.DemoData;
  * a server: an argument mistake that only shows up as a server bound to the wrong port is a bad way to find out.
  * </p>
  *
- * @param store
- *            the store directory, created if it does not exist
+ * @param root
+ *            the root directory, created if it does not exist. It holds <b>one subdirectory per database</b>; pointing
+ *            it at a directory that is itself a store is refused, with the commands to move it
  * @param port
  *            the HTTP port to bind, 0 for any free one
  * @param demo
@@ -30,9 +32,14 @@ import io.metaloom.graph.server.demo.DemoData;
  * @param maxConcurrentStreams
  *            queries the binary port will run at once. <b>Multiplied by the write queue size, this is the memory the
  *            server may hold for clients that have stopped reading</b>; see {@code WireServerOptions}
+ * @param database
+ *            the database a request that does not name one gets, created at startup if it is not there
+ * @param allowDrop
+ *            whether {@code DELETE /api/databases/{name}} exists. Off by default: it is the only route that
+ *            destroys data, on a port with no authentication, beside a query language that cannot delete a node
  */
-public record GraphServerOptions(Path store, int port, boolean demo, int demoAirports, long queryTimeoutMillis,
-	boolean wire, int wirePort, int maxConcurrentStreams) {
+public record GraphServerOptions(Path root, int port, boolean demo, int demoAirports, long queryTimeoutMillis,
+	boolean wire, int wirePort, int maxConcurrentStreams, String database, boolean allowDrop) {
 
 	static final int DEFAULT_PORT = 8080;
 
@@ -67,6 +74,8 @@ public record GraphServerOptions(Path store, int port, boolean demo, int demoAir
 		boolean wire = true;
 		int wirePort = Protocol.DEFAULT_PORT;
 		int streams = DEFAULT_MAX_CONCURRENT_STREAMS;
+		String database = GraphDatabases.DEFAULT_NAME;
+		boolean allowDrop = false;
 		int positional = 0;
 
 		for (String argument : args) {
@@ -83,6 +92,13 @@ public record GraphServerOptions(Path store, int port, boolean demo, int demoAir
 				wirePort = parsePort(argument.substring("--wire-port=".length()));
 			} else if (argument.startsWith("--max-streams=")) {
 				streams = parseStreams(argument.substring("--max-streams=".length()));
+			} else if (argument.startsWith("--database=")) {
+				database = argument.substring("--database=".length());
+				// Validated here rather than at open time, so a typo is a usage error printed with the usage text
+				// instead of a stack trace from somewhere inside the storage layer.
+				GraphDatabases.validate(database);
+			} else if (argument.equals("--allow-drop")) {
+				allowDrop = true;
 			} else if (argument.equals("--help") || argument.equals("-h")) {
 				throw new HelpRequested();
 			} else if (argument.startsWith("-")) {
@@ -99,7 +115,7 @@ public record GraphServerOptions(Path store, int port, boolean demo, int demoAir
 		}
 
 		if (store == null) {
-			throw new IllegalArgumentException("A store directory is required");
+			throw new IllegalArgumentException("A root directory is required");
 		}
 		// Zero means "any free port" for both, and two of them would collide on nothing — but a fixed port given
 		// twice is a mistake that would otherwise surface as "address already in use" from whichever bound second.
@@ -107,7 +123,8 @@ public record GraphServerOptions(Path store, int port, boolean demo, int demoAir
 			throw new IllegalArgumentException("The HTTP port and the binary port are both " + port
 				+ "; give --wire-port a different one or --no-wire");
 		}
-		return new GraphServerOptions(store, port, demo, airports, queryTimeout, wire, wirePort, streams);
+		return new GraphServerOptions(store, port, demo, airports, queryTimeout, wire, wirePort, streams, database,
+			allowDrop);
 	}
 
 	private static int parseStreams(String argument) {
@@ -162,10 +179,19 @@ public record GraphServerOptions(Path store, int port, boolean demo, int demoAir
 
 	static String usage() {
 		return """
-			usage: graph-server [options] <store-directory> [http-port]
+			usage: graph-server [options] <root-directory> [http-port]
 
-			  --demo                Seed the store with a demo graph, but only if it is empty.
-			                        The store is opened read-write; the query language is not.
+			The root holds one subdirectory per database. A directory that is itself a store is
+			refused, with the two commands that move it into a root.
+
+			  --database=<name>     The database a request that does not name one gets. Created at
+			                        startup if it is not there. Letters, digits, '-' and '_'.
+			                        (default: %s)
+			  --allow-drop          Enable DELETE /api/databases/<name>, which deletes a database and
+			                        everything in it. Off by default: it is the only route that
+			                        destroys data, and the port has no authentication.
+			  --demo                Seed the default database with a demo graph, but only if it is
+			                        empty. The store is opened read-write; the query language is not.
 			  --demo-size=<size>    How much demo data. Implies --demo.
 			                        tiny | small | medium | large, or a number of airports.
 			                        tiny=%d  small=%d  medium=%d  large=%d   (default: small)
@@ -190,7 +216,8 @@ public record GraphServerOptions(Path store, int port, boolean demo, int demoAir
 			The demo graph is an air route network: airports in cities in countries, airlines with
 			hubs, and routes between airports carrying distance, duration and flight number. See
 			spec/CYPHER.md for queries to try.
-			""".formatted(DemoData.TINY, DemoData.SMALL, DemoData.MEDIUM, DemoData.LARGE,
-				DEFAULT_QUERY_TIMEOUT_MILLIS, Protocol.DEFAULT_PORT, DEFAULT_MAX_CONCURRENT_STREAMS);
+			""".formatted(GraphDatabases.DEFAULT_NAME, DemoData.TINY, DemoData.SMALL, DemoData.MEDIUM,
+				DemoData.LARGE, DEFAULT_QUERY_TIMEOUT_MILLIS, Protocol.DEFAULT_PORT,
+				DEFAULT_MAX_CONCURRENT_STREAMS);
 	}
 }

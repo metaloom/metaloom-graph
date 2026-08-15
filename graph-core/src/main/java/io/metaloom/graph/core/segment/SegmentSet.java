@@ -286,15 +286,30 @@ public final class SegmentSet implements AutoCloseable {
 		}
 		// Read the generation before clearing: free() left the advanced value in the record, and zeroing first would
 		// wipe it and make every reused slot look like generation 1.
+		int page = geometry.pageOfSlot(kind, slot);
 		int gen = readGen(segment, slot);
-		gen = gen == 0 ? 1 : gen;
+		if (gen == 0) {
+			// Zero means the counter is gone, not that it was never set. Hole punching returns an all-free page's
+			// blocks to the filesystem and the generation lives inside the record, so a punched page reads as zeros
+			// and the page's floor is the only surviving memory of what these slots reached. Without it the slot
+			// restarts at 1 and hands out an id byte-for-byte identical to one deleted earlier, which then resolves
+			// to the new record instead of failing as stale.
+			//
+			// Only when it is zero, never as a maximum against a live counter. A floor that overrode a real value
+			// would pin every slot on the page once the floor reached MAX_GEN: free() wraps the record to 1, the
+			// maximum would put it straight back to 4095, and delete-then-recreate would return the same id every
+			// time — a certainty rather than the one-in-4095 the wrap is documented to be.
+			gen = segment.pageMeta().genFloor(page);
+		}
+		// The floor field is wider than the id can carry, so clamp rather than let encode() mask a large value down
+		// to zero — which is NULL, and would be a genuinely confusing thing to hand out.
+		gen = gen == 0 || gen > ElementId.MAX_GEN ? 1 : gen;
 
 		MemorySegment run = segment.recordsForWrite(slot, count);
 		run.fill((byte) 0);
 		writeGen(segment, slot, gen);
 
 		segment.superblock().liveCountDelta(count);
-		int page = geometry.pageOfSlot(kind, slot);
 		segment.pageMeta().liveCountDelta(page, count);
 		segment.pageMeta().bumpEpoch(page);
 		segment.markDirty(slot);

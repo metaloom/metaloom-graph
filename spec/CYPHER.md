@@ -235,15 +235,21 @@ file. `Enable-Native-Access: ALL-UNNAMED` is in its manifest — an uber jar can
 module descriptor, so the narrow `--enable-native-access=io.metaloom.graph.core` grant is not available
 to it. Run the reactor jars to keep the narrow one.
 
-This is one of **two** front ends over one store. The other is the binary streaming port, on loopback
-8081 by default, which pushes rows as the engine produces them instead of building a whole result:
-[WIRE.md](WIRE.md). `--no-wire` turns it off. What follows is the HTTP one.
+This is one of **two** front ends over a **root of databases**. The other is the binary streaming port,
+on loopback 8081 by default, which pushes rows as the engine produces them instead of building a whole
+result: [WIRE.md](WIRE.md). `--no-wire` turns it off. What follows is the HTTP one.
+
+Every route below takes `?database=<name>`, and without one it uses the server's default —
+[DATABASES.md](DATABASES.md). A query runs against exactly one database; there is no cross-database
+query and the engine has no notion of a second store.
 
 | Route | |
 |---|---|
 | `POST /api/query` | `{"query": "...", "parameters": {...}}` → columns, rows, and a `graph` of nodes and links |
 | `GET /api/schema` | Labels and relationship types with live counts. `?refresh=true` forces a rescan |
-| `GET /api/stats` | Node and relationship counts, labels, storage bytes, open views |
+| `GET /api/stats` | Node and relationship counts, labels, storage bytes, open views, and which database answered |
+| `GET /api/databases` | Every database under the root, which is the default, and whether dropping is enabled |
+| `PUT /api/databases/{name}` | Creates one. `DELETE` drops it, and only with `--allow-drop` |
 | `GET /` | The UI |
 
 One result serves both views: the table is the rows, and the graph is built by walking every value in
