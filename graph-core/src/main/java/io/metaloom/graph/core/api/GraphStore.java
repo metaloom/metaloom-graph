@@ -65,6 +65,24 @@ public interface GraphStore extends AutoCloseable {
 	boolean hasReadTransaction();
 
 	/**
+	 * Whether this thread already holds a write transaction.
+	 *
+	 * <p>
+	 * Unlike {@link #beginRead()}, {@link #begin()} does <b>not</b> refuse to nest, and a nested transaction is not a
+	 * caught mistake but a silent one: the inner transaction publishes its own page overlay, and committing it clears
+	 * the overlay while the outer transaction is still live, after which the outer transaction's writes go straight to
+	 * the mapping — unlogged, and past the point where a rollback could take them back.
+	 * </p>
+	 *
+	 * <p>
+	 * So a library that opens a transaction on the caller's behalf has to be able to ask whether it should. Mutating
+	 * methods join the caller's transaction on their own; this is for a caller that needs to know whether to begin one
+	 * and therefore whether it owns the commit.
+	 * </p>
+	 */
+	boolean hasWriteTransaction();
+
+	/**
 	 * Runs the work in a write transaction, committing it, and retrying up to {@code attempts} times if the store
 	 * reports contention.
 	 *
@@ -111,6 +129,32 @@ public interface GraphStore extends AutoCloseable {
 	List<String> nodeLabels(long nodeId);
 
 	boolean nodeHasLabel(long nodeId, String label);
+
+	/**
+	 * Adds a label to a node that already exists, returning false when it already carried it.
+	 *
+	 * <p>
+	 * The label set is stored in the node record's three inline slots and spills into a property block beyond that, so
+	 * crossing the boundary in either direction allocates or frees that block. The label index carries an entry per
+	 * label, and only the difference is rewritten.
+	 * </p>
+	 *
+	 * <p>
+	 * A duplicate is dropped rather than refused, matching {@link #createNode(List)}: {@code :Person} added twice is a
+	 * caller's redundancy, and storing it twice would put two index entries on one node and leave one behind on delete.
+	 * </p>
+	 */
+	boolean addNodeLabel(long nodeId, String label) throws IOException;
+
+	/**
+	 * Removes a label from a node, returning false when it did not carry it.
+	 *
+	 * <p>
+	 * A node may end up with no labels at all; that is a legal node and {@link #nodeLabels} returns an empty list for
+	 * it. Removing the last label does not delete the node.
+	 * </p>
+	 */
+	boolean removeNodeLabel(long nodeId, String label) throws IOException;
 
 	Properties nodeProperties(long nodeId);
 

@@ -78,12 +78,17 @@ src/test/java/io/metaloom/graph/core/
 
 graph-cypher/src/test/java/io/metaloom/graph/cypher/
                  parser, null semantics, execution, the versus-API differential, variable-length paths
+                 CypherWriteVersusApiTest — the write half of the differential, with verify(FULL) as a
+                 second oracle entirely outside the query layer
+                 CypherWriteTest, CypherWriteTransactionTest — every write clause, and where a write
+                 query's transaction comes from
   integration/   ...and GraphDatabasesTest — several stores under one root, whose traversal cases are
                  the security test for the whole multi-database feature
 graph-protocol/src/test/java/io/metaloom/graph/protocol/
                  the wire value codec round-tripped, frame reassembly against the delivery patterns
-                 TCP actually produces, and WireDecoderHostileInputTest — the non-differential oracle
-                 for the decoder, which is untrusted input on the same terms a store file is
+                 TCP actually produces, QuerySummaryTest for the COMPLETE payload, and
+                 WireDecoderHostileInputTest — the non-differential oracle for the decoder, which is
+                 untrusted input on the same terms a store file is
 graph-client/src/test/java/io/metaloom/graph/client/
                  ClientDependencyTest — fails by *loading* if graph-core or graph-cypher ever reaches
                  the client's classpath
@@ -447,5 +452,5 @@ diagnostic artefact and deleting it on failure is the most frustrating thing a t
 
 ---
 
-_Git HEAD revision: `364b5f7`_
-_Last updated: 2026-08-14_
+_Git HEAD revision: `e4601d1`_
+_Last updated: 2026-08-15_

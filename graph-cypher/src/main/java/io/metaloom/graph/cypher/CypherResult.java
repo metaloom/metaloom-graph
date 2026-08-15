@@ -25,14 +25,32 @@ public final class CypherResult implements Iterable<CypherRow> {
 
 	private final List<String> columns;
 	private final List<List<Object>> rows;
+	private final CypherStats stats;
 
 	public CypherResult(List<String> columns, List<List<Object>> rows) {
+		this(columns, rows, CypherStats.NONE);
+	}
+
+	public CypherResult(List<String> columns, List<List<Object>> rows, CypherStats stats) {
 		this.columns = List.copyOf(columns);
 		this.rows = rows;
+		this.stats = stats == null ? CypherStats.NONE : stats;
 	}
 
 	public List<String> columns() {
 		return columns;
+	}
+
+	/**
+	 * What the query changed, all zeros for a read.
+	 *
+	 * <p>
+	 * For a write query with no RETURN this is the whole result — {@link #isEmpty()} is true and nothing else here
+	 * says that three nodes were created.
+	 * </p>
+	 */
+	public CypherStats stats() {
+		return stats;
 	}
 
 	public int size() {

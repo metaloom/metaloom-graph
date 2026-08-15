@@ -10,19 +10,19 @@ SSD. The defining design constraint:
 
 ## Status
 
-Durable, transactional, indexed, compacting, hardened, with snapshot isolation for readers, a read-only openCypher subset and a browser UI. 377 Java tests, 17 in the UI and 12 in the Rust crate, plus 29 browser cases on demand.
+Durable, transactional, indexed, compacting, hardened, with snapshot isolation for readers, an openCypher subset that reads and writes, and a browser UI. 563 Java tests, 17 in the UI and 12 in the Rust crate, plus 30 browser cases on demand.
 
 | | |
 |---|---|
 | **Durability** | Write-ahead log. Every commit is fsynced *before* it touches a data file, so uncommitted data cannot reach disk and recovery is a single redo pass. |
-| **Query language** | A read-only openCypher subset — `MATCH` with variable-length paths, `WHERE`, `RETURN`, `WITH`, `UNWIND`, aggregation, parameters — in its own module, plus a single-jar Vert.x server and a React and D3 graph browser. [spec/CYPHER.md](spec/CYPHER.md) |
+| **Query language** | An openCypher subset — `MATCH` with variable-length paths, `WHERE`, `RETURN`, `WITH`, `UNWIND`, aggregation, parameters, and `CREATE` / `SET` / `REMOVE` / `DELETE` — in its own module, plus a single-jar Vert.x server and a React and D3 graph browser. Writes are off on both ports unless the server is started with `--allow-write`. [spec/CYPHER.md](spec/CYPHER.md) |
 | **Transactions** | `begin` / `commit` / `rollback`, plus auto-commit for single operations. |
 | **Isolation** | One writer at a time; many concurrent readers. `store.beginRead()` gives a reader **MVCC snapshot isolation** — a view fixed at one instant across many reads, while the writer keeps committing. Reads take no lock and scale to 10x at 32 threads; writes are flat by design. **No concurrent writers.** |
 | **Indexes** | Label and property B+trees, unique constraints, and an index-versus-scan differential test. |
 | **Space reclamation** | Two halves. `reclaim()` punches all-free pages and breaks no ids. `compact()` relocates records to close holes within pages, rewrites every internal reference, and pulls the high water marks down; it is the one operation that invalidates ids. A store churned to a tenth of its slots comes back to 0.95 liveness. |
 | **Native layer** | Rust via FFM, with `cargo test` and `clippy -D warnings` inside `mvn test`. **io_uring is 12.4x** over a `pread` loop on 64 scattered reads — the one capability the JVM cannot approach. The hot-loop codecs are not: 1.38x on edges, 7.8x *slower* on CRC32C. |
 | **Hardening** | Reads-per-operation and write-amplification budgets enforced as build failures; a differential harness against an in-memory model across crashes and compaction; every format parser tested against corrupt and hostile input; a `kill -9` loop that checks acknowledged commits. |
-| **Not there** | No concurrent writers, no Cypher writes, no backup mechanism, no repair tool. [spec/OPERATIONS.md](spec/OPERATIONS.md) says so plainly. |
+| **Not there** | No concurrent writers, no `MERGE`, no backup mechanism, no repair tool, no authentication on either port. [spec/OPERATIONS.md](spec/OPERATIONS.md) says so plainly. |
 | **Adjacency sizing** | A block is a run of 512 byte cells that doubles as the node fills, so degree 3 costs 512 bytes rather than a page. Fixing this took a 10M-node random graph from 61 GiB to 6.2 GiB and its load from 43 to 11 minutes. [spec/reports/SCALE.md](spec/reports/SCALE.md) has the before and after. |
 
 What is done and what is left, as one checklist: [spec/PROGRESS.md](spec/PROGRESS.md). The reason for
@@ -110,7 +110,7 @@ try (GraphStore store = GraphStore.open(Path.of("/data/mygraph"))) {
 
 ## Querying
 
-A read-only openCypher subset, in a module that depends on the storage engine's public API and nothing
+An openCypher subset, in a module that depends on the storage engine's public API and nothing
 inside it. Full grammar, null semantics and limits: [spec/CYPHER.md](spec/CYPHER.md).
 
 ```java
@@ -126,12 +126,29 @@ for (CypherRow row : result) {
 }
 ```
 
-Each query runs inside a snapshot read view, so it sees one consistent state however long it takes —
+Each **read** runs inside a snapshot read view, so it sees one consistent state however long it takes —
 and joins the caller's view if there already is one.
 
 `Cypher.stream` is the same execution path with a sink instead of a list, for a result too large to
 hold or a query that has to be stoppable. `Cypher.query` *is* `stream` with a sink that collects, so
 the two cannot drift apart.
+
+A **write** runs in one transaction instead, joining the caller's if there is one, and commits before
+it delivers a single row — so nothing can arrive from a transaction that then rolls back. It reports
+what it changed, which for a query with no `RETURN` is the whole result:
+
+```java
+try (Transaction txn = store.begin()) {
+    Cypher.query(store, "CREATE (n:Person {name: $name})", Map.of("name", "Ada"));
+    CypherStats stats = Cypher.query(store, "MATCH (n:Person) SET n.seen = true").stats();
+    System.out.println(stats.summary());     // 1 property set
+    txn.commit();                            // both queries, or neither
+}
+```
+
+**Both servers refuse writes unless started with `--allow-write`**; embedded callers are unaffected.
+Neither port has authentication, so that default is the difference between handing out a copy of the
+data and handing out the ability to delete it.
 
 ## Several databases
 
@@ -252,7 +269,7 @@ during `mvn clean`. `graph-server` drives `npm` on the same terms — install, b
 jar.
 
 ```bash
-mvn test              # 445 tests across five modules, the UI's own 17, and the Rust crate's 12
+mvn test              # 563 tests across five modules, the UI's own 17, and the Rust crate's 12
 mvn test -Pslow       # adds the scaling curve, the soak and the long-running reader
 mvn test -Pbench      # adds the benchmarks and the performance gates
 mvn test -Pall-tests  # everything
@@ -263,7 +280,7 @@ mvn test -Phuge -Dtest=GraphScaleBenchmark   # 10M nodes + 20M edges: 11 min, 6.
 
 | Flag | |
 |---|---|
-| `-Dnative.skip=true` | Build with no native layer at all, even where `cargo` is present, **and do not load one that an earlier build left behind**. The whole suite passes on the pure-Java path — 445 tests, 23 skipped rather than 3 — and this is how that is checked. |
+| `-Dnative.skip=true` | Build with no native layer at all, even where `cargo` is present, **and do not load one that an earlier build left behind**. The whole suite passes on the pure-Java path — 563 tests, 23 skipped rather than 3 — and this is how that is checked. |
 | `-Dui.skip=true` | Build with no browser UI, even where `npm` is present. The API is unaffected and the index page says the bundle is missing. |
 | `-Poffline` | Passes cargo's and npm's offline flags, for warm caches with no network. Pairs with `mvn -o`. |
 | `-DskipTests` | Skips the Rust and UI tests too, not only the Java ones. |

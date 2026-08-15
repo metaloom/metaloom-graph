@@ -29,12 +29,31 @@ export interface ApiGraph {
   danglingLinks: ApiLink[];
 }
 
+/**
+ * What a query changed.
+ *
+ * Absent on a read, and absent on a write that matched nothing — so its presence means the store moved, which is
+ * exactly the question the sidebar has to answer before deciding to refetch.
+ */
+export interface QueryStats {
+  nodesCreated: number;
+  nodesDeleted: number;
+  relationshipsCreated: number;
+  relationshipsDeleted: number;
+  propertiesSet: number;
+  labelsAdded: number;
+  labelsRemoved: number;
+  /** Rendered by the server, so a status line and a log line say the same thing. */
+  summary: string;
+}
+
 export interface QueryResult {
   columns: string[];
   rows: unknown[][];
   rowCount: number;
   elapsedMillis: number;
   graph: ApiGraph;
+  stats?: QueryStats;
 }
 
 export interface NamedCount {
@@ -67,6 +86,8 @@ export interface DatabaseList {
   default: string;
   /** False unless the server was started with --allow-drop, in which case the UI must not offer to drop. */
   allowDrop: boolean;
+  /** False unless the server was started with --allow-write, in which case every write comes back 403. */
+  allowWrite: boolean;
 }
 
 export interface Stats {

@@ -11,7 +11,7 @@
     </parent>
 
     <name>Graph Client</name>
-    <description>A Java client that streams a read-only Cypher result off the binary port</description>
+    <description>A Java client that streams a Cypher result off the binary port</description>
 
     <!--
         graph-protocol and Vert.x, and that is the whole list. No graph-core, no graph-cypher, no FFM and no native

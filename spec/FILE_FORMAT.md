@@ -252,6 +252,9 @@ offset size field                 notes
 24     4    label_id_2            second label, 0 = absent
 28     4    label_id_3            third label, 0 = absent
 32     8    label_overflow_id     PROP block holding labels four and beyond, or NULL_ID
+                                 Written at create and whenever addNodeLabel/removeNodeLabel crosses
+                                 the three-slot boundary, which frees the old block before allocating
+                                 the new one so a node never holds two
 40     8    inline_edge[0]        packed edge, see RELATIONSHIP_STORAGE.md §3
 48     8    inline_edge[1]
 56     4    degree_out
@@ -589,5 +592,5 @@ records returns wrong answers rather than slow ones.
 
 ---
 
-_Git HEAD revision: `c016a41`_
-_Last updated: 2026-08-13 (synced with the Phase 0 to 8 implementation)_
+_Git HEAD revision: `e4601d1`_
+_Last updated: 2026-08-15_

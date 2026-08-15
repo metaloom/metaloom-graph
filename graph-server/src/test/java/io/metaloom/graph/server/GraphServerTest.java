@@ -3,6 +3,7 @@ package io.metaloom.graph.server;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.net.URI;
@@ -295,11 +296,103 @@ public class GraphServerTest {
 		assertTrue(json.getString("message").contains("^"), "the caret line is what makes the message usable");
 	}
 
+	// ---------------------------------------------------------------- writes
+
 	@Test
-	public void testAWriteQueryIsRefusedAsReadOnly() throws Exception {
+	public void testAWriteQueryIsRefusedWithoutTheFlag() throws Exception {
+		// 403 rather than 400: the query is fine, the server declines. The message names the flag, because "not
+		// allowed" without saying what would allow it is a dead end.
 		HttpResponse<String> response = post("CREATE (n:Person) RETURN n");
-		assertEquals(400, response.statusCode());
-		assertTrue(new JsonObject(response.body()).getString("message").contains("read-only"));
+		assertEquals(403, response.statusCode());
+		JsonObject json = new JsonObject(response.body());
+		assertEquals("readonly", json.getString("error"));
+		assertTrue(json.getString("message").contains("--allow-write"), json.getString("message"));
+		assertEquals(3, store.stats().nodeCount(), "and nothing was written");
+
+		assertFalse(new JsonObject(get("/api/databases").body()).getBoolean("allowWrite"),
+			"the UI has to be told, or it offers an editor whose every write comes back 403");
+	}
+
+	@Test
+	public void testAWriteQueryRunsWithTheFlag() throws Exception {
+		restartAllowingWrites();
+
+		HttpResponse<String> response = post("CREATE (n:City {name: 'Bonn'}) RETURN n.name AS name");
+		assertEquals(200, response.statusCode(), response.body());
+		JsonObject json = new JsonObject(response.body());
+		assertEquals("Bonn", json.getJsonArray("rows").getJsonArray(0).getString(0));
+
+		JsonObject stats = json.getJsonObject("stats");
+		assertEquals(1, stats.getLong("nodesCreated"));
+		assertEquals(1, stats.getLong("labelsAdded"));
+		assertEquals(1, stats.getLong("propertiesSet"));
+		assertTrue(stats.getString("summary").contains("1 node created"), stats.getString("summary"));
+		assertEquals(1, store.nodesByLabel("City").size());
+
+		assertTrue(new JsonObject(get("/api/databases").body()).getBoolean("allowWrite"));
+	}
+
+	@Test
+	public void testAReadResponseCarriesNoStatsAtAll() throws Exception {
+		restartAllowingWrites();
+
+		// The key is absent rather than present and zeroed, so a read response is exactly what it was before writes
+		// existed — and a client can use its presence to mean "something changed".
+		assertNull(new JsonObject(post("MATCH (n) RETURN n").body()).getJsonObject("stats"));
+		assertNull(new JsonObject(post("MATCH (n:Nothing) SET n.x = 1").body()).getJsonObject("stats"),
+			"a write query that matched nothing changed nothing");
+	}
+
+	@Test
+	public void testAWriteInvalidatesTheSchemaCache() throws Exception {
+		restartAllowingWrites();
+
+		// Warm the cache, so the label below has to get past a scan that has already run.
+		assertEquals(200, get("/api/schema").statusCode());
+		assertTrue(new JsonObject(get("/api/schema").body()).getBoolean("cached"), "the second read must be cached");
+
+		post("CREATE (n:Invented)");
+
+		JsonObject schema = new JsonObject(get("/api/schema").body());
+		assertFalse(schema.getBoolean("cached"), "a write must throw the cached scan away");
+		boolean found = false;
+		for (int i = 0; i < schema.getJsonArray("labels").size(); i++) {
+			found |= "Invented".equals(schema.getJsonArray("labels").getJsonObject(i).getString("name"));
+		}
+		assertTrue(found, "the new label must be in the sidebar, not sixty seconds later");
+	}
+
+	@Test
+	public void testAConstraintViolationIsA409AndNamesTheKey() throws Exception {
+		store.createUniqueConstraint("email");
+		restartAllowingWrites();
+
+		assertEquals(200, post("CREATE (n:Person {email: 'a@b.c'})").statusCode());
+		HttpResponse<String> response = post("CREATE (n:Person {email: 'a@b.c'})");
+
+		assertEquals(409, response.statusCode(), response.body());
+		JsonObject json = new JsonObject(response.body());
+		assertEquals("constraint", json.getString("error"));
+		assertTrue(json.getString("message").contains("email"), json.getString("message"));
+		assertEquals(1, store.nodesByProperty("email", "a@b.c").size(), "and the second one was not created");
+	}
+
+	@Test
+	public void testADeleteThatTheLanguageRefusesIsA400() throws Exception {
+		restartAllowingWrites();
+
+		HttpResponse<String> response = post("MATCH (n:Person {name: 'Alice'}) DELETE n");
+		assertEquals(400, response.statusCode(), response.body());
+		assertEquals("type", new JsonObject(response.body()).getString("error"));
+		assertTrue(new JsonObject(response.body()).getString("message").contains("DETACH DELETE"));
+	}
+
+	/** Restarts the server with writes on, keeping the same databases and the same seeded store. */
+	private void restartAllowingWrites() throws Exception {
+		server.close();
+		server = new GraphServer(databases, GraphDatabases.DEFAULT_NAME,
+			GraphServerOptions.DEFAULT_QUERY_TIMEOUT_MILLIS, true, true);
+		base = "http://localhost:" + server.listen(0).toCompletionStage().toCompletableFuture().join();
 	}
 
 	@Test

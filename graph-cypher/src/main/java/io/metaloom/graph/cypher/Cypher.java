@@ -1,11 +1,14 @@
 package io.metaloom.graph.cypher;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
 import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.ReadTransaction;
+import io.metaloom.graph.core.api.Transaction;
 import io.metaloom.graph.cypher.ast.Ast;
 import io.metaloom.graph.cypher.exec.GraphAccess;
 import io.metaloom.graph.cypher.exec.QueryExecutor;
@@ -79,7 +82,7 @@ public final class Cypher {
 	public static CypherResult query(GraphStore store, Ast.Query parsed, Map<String, Object> parameters) {
 		Collector collector = new Collector();
 		stream(store, parsed, parameters, collector);
-		return new CypherResult(collector.columns, collector.rows);
+		return new CypherResult(collector.columns, collector.rows, collector.stats);
 	}
 
 	/**
@@ -126,6 +129,10 @@ public final class Cypher {
 	 */
 	public static void stream(GraphStore store, Ast.Query parsed, Map<String, Object> parameters, RowSink sink,
 		QueryAbort abort) {
+		if (parsed.isWrite()) {
+			write(store, parsed, parameters, sink, abort);
+			return;
+		}
 		// Joins the caller's view when there is one. Opening a second would be refused, and closing theirs at the end
 		// of this query would be worse than being refused.
 		ReadTransaction view = store.hasReadTransaction() ? null : store.beginRead();
@@ -133,21 +140,75 @@ public final class Cypher {
 			QueryExecutor.Result result = new QueryExecutor(new GraphAccess(store, abort), parameters).run(parsed);
 			// Inside the try, so the sink sees every row while the view it was read under is still open. A sink that
 			// stops early simply ends the loop; that is an outcome, and the finally still closes the view.
-			sink.columns(result.columns());
-			for (List<Object> row : result.rows()) {
-				String reason = abort.abortReason();
-				if (reason != null) {
-					throw new QueryAbortedException(reason);
-				}
-				if (!sink.row(row)) {
-					return;
-				}
-			}
+			deliver(result, sink, abort);
 		} finally {
 			if (view != null) {
 				view.close();
 			}
 		}
+	}
+
+	/**
+	 * Runs a query that changes the store, in one transaction, committing before it delivers a single row.
+	 *
+	 * <p>
+	 * <b>No read view.</b> A writer reads the current mapping rather than a view — that is what prevents a lost update
+	 * — so a view here would be ignored by the storage layer while still costing this thread a liveness check on every
+	 * operation, which an abandoned view can fail. The transaction's own overlay is what makes the query's reads
+	 * consistent, and it is also what makes them see the query's own writes.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>Nothing is streamed.</b> The rows are produced, the transaction commits, and only then does the sink see
+	 * anything. A sink that had already received rows when the commit failed would have been handed a result from a
+	 * transaction that no longer exists — and on the far side of a socket those rows cannot be recalled. So a write
+	 * query's result is materialised, which is a real cost and is stated in spec/CYPHER.md rather than implied away by
+	 * the name of this method.
+	 * </p>
+	 *
+	 * <p>
+	 * A caller who opened the transaction keeps it: the query joins it, commits nothing, and its writes become durable
+	 * when the caller commits. That is what makes several queries into one atomic unit.
+	 * </p>
+	 */
+	private static void write(GraphStore store, Ast.Query parsed, Map<String, Object> parameters, RowSink sink,
+		QueryAbort abort) {
+		if (store.hasReadTransaction()) {
+			throw new CypherWriteException("A write query cannot run inside a read view. The view fixes what reads "
+				+ "see at the instant it opened, and a writer has to read the current state — so this query would "
+				+ "silently not get the isolation the view was opened for. Close the view first.");
+		}
+		// begin() does not refuse to nest, and a nested transaction is not caught but silently ruinous: committing the
+		// inner one clears the overlay, after which the outer one's writes bypass the log entirely.
+		Transaction txn = store.hasWriteTransaction() ? null : store.begin();
+		try {
+			QueryExecutor.Result result = new QueryExecutor(new GraphAccess(store, abort), parameters).run(parsed);
+			if (txn != null) {
+				txn.commit();
+			}
+			deliver(result, sink, abort);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		} finally {
+			// Rolls back when commit() was not reached, which is every failure path including an abort mid-scan.
+			if (txn != null) {
+				txn.close();
+			}
+		}
+	}
+
+	private static void deliver(QueryExecutor.Result result, RowSink sink, QueryAbort abort) {
+		sink.columns(result.columns());
+		for (List<Object> row : result.rows()) {
+			String reason = abort.abortReason();
+			if (reason != null) {
+				throw new QueryAbortedException(reason);
+			}
+			if (!sink.row(row)) {
+				return;
+			}
+		}
+		sink.stats(result.stats());
 	}
 
 	/** Parses without running, for a caller that wants to validate a query or inspect its shape. */
@@ -167,6 +228,7 @@ public final class Cypher {
 
 		private List<String> columns = List.of();
 		private final List<List<Object>> rows = new ArrayList<>();
+		private CypherStats stats = CypherStats.NONE;
 
 		@Override
 		public void columns(List<String> columns) {
@@ -177,6 +239,11 @@ public final class Cypher {
 		public boolean row(List<Object> values) {
 			rows.add(values);
 			return true;
+		}
+
+		@Override
+		public void stats(CypherStats stats) {
+			this.stats = stats;
 		}
 	}
 }

@@ -266,14 +266,27 @@ What that does **not** cover:
 | HTTP | 8080, **all interfaces** | The browser UI and `/api/query`. Predates the note below, which is why it binds everything |
 | Binary | 8081, **loopback only** | Streaming Cypher ([WIRE.md](WIRE.md)). Loopback because a new unauthenticated port should not default to every interface |
 
-Both are **read-only**: the query language has no write clauses, so neither port can modify a store however it is
-addressed. Both can read **every byte** of one — and of **every database under the root**, because there is no
+Both can read **every byte** of one store — and of **every database under the root**, because there is no
 per-database authentication either. Treat exposing either as equivalent to handing out the root directory, because that
 is what it is.
 
-The one exception to read-only is `DELETE /api/databases/{name}`, which deletes a database and everything in it. It
-returns 403 unless the server was started with `--allow-drop`, and off is the default: it is the only route that
-destroys data, and it sits beside a query language that cannot delete a single node.
+**The query language can write, and that is off by default.** `--allow-write` enables `CREATE`, `SET`, `REMOVE` and
+`DELETE` on both ports at once; without it a write query is refused before it reaches a worker thread — 403 over HTTP,
+`READ_ONLY` on the wire. Turning it on hands anything that can reach the port the ability to change and delete data,
+which on an unauthenticated port is the whole population of whatever network it is on. **The flag bounds what a peer
+can do, not who the peer is**; it is a posture, not access control. Embedded Java callers are unaffected either way.
+
+`DELETE /api/databases/{name}` has its **own** flag, `--allow-drop`, also off by default. It stays separate from
+`--allow-write` because it destroys a whole database and its directory in one request — including databases no query
+addressed — and enabling writes is not asking for that.
+
+Two consequences of enabling writes that are easy to miss:
+
+- **Writers serialise on one lock per store, engine-wide.** A long write query blocks every other writer in the
+  process, including whatever else embeds the store. The binary port bounds that wait and reports `OVERLOADED` rather
+  than hanging; the HTTP route does not, beyond its query deadline.
+- **A write query is materialised and commits before its first row is sent.** Peak memory for a write is the whole
+  result, not one batch, whichever port it arrived on.
 
 - `--no-wire` turns the binary port off; `--wire-port=<n>` moves it. There is no flag to bind the binary port to
   another interface, deliberately — putting it somewhere reachable should require thinking about what is in front of
@@ -301,5 +314,5 @@ Stated plainly, because an operations document that implies capabilities the sys
 
 ---
 
-_Git HEAD revision: `c016a41` (plus the Phase 0 to 9 working tree)_
-_Last updated: 2026-08-13_
+_Git HEAD revision: `e4601d1`_
+_Last updated: 2026-08-15 (Cypher writes and --allow-write)_

@@ -26,8 +26,8 @@ import java.util.Map;
  * the query layer renders them as strings and lists first.
  * <li><b>It cannot encode what this wire has to carry.</b> {@code ValueCodec.encodeBytes} escapes anything over 255
  * bytes to the blob store — {@code blobs.store(data)}, a <em>write</em> — and throws {@code IllegalStateException}
- * when there is no blob store. On a read-only wire there is neither one nor the right to write to it, so any string
- * over 255 bytes is simply unencodable. That settles it on its own; the other three merely agree.
+ * when there is no blob store. Encoding a result onto a socket has neither one nor any business allocating one, so any
+ * string over 255 bytes is simply unencodable. That settles it on its own; the other three merely agree.
  * </ol>
  *
  * <h2>The tag byte</h2>

@@ -232,6 +232,43 @@ public final class IndexCatalog {
 		}
 	}
 
+	/**
+	 * Moves a node's label entries from one label set to the other.
+	 *
+	 * <p>
+	 * Only the difference is touched. Removing and reinserting every entry would give the same answer, but it would
+	 * dirty index pages nothing asked about, and a dirtied page is a byte run in the commit and an entry in every open
+	 * reader's version chain — the cost of a relabelling would then depend on how many labels the node already had.
+	 * </p>
+	 *
+	 * <p>
+	 * Both directions are needed and neither is optional: a label left in the tree makes {@code MATCH (n:Gone)} return
+	 * a node that no longer carries it, and a label missing from it makes {@code MATCH (n:Added)} silently miss one.
+	 * </p>
+	 */
+	public void onLabelsChanged(long nodeId, int[] before, int[] after) throws IOException {
+		ensureInitialised();
+		for (int labelId : before) {
+			if (labelId != 0 && !holds(after, labelId)) {
+				tree.remove(labelRoot(), labelId, nodeId);
+			}
+		}
+		for (int labelId : after) {
+			if (labelId != 0 && !holds(before, labelId)) {
+				labelRoot(tree.put(labelRoot(), labelId, nodeId, nodeId));
+			}
+		}
+	}
+
+	private static boolean holds(int[] labelIds, int labelId) {
+		for (int held : labelIds) {
+			if (held == labelId) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	public void onPropertiesChanged(long nodeId, Map<Integer, Object> before,
 		Map<Integer, Object> after) throws IOException {
 		ensureInitialised();

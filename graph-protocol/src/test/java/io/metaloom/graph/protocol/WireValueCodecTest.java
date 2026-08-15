@@ -54,8 +54,8 @@ public class WireValueCodecTest {
 	@Test
 	public void testAStringLongerThanTheStorageCodecCouldCarry() {
 		// The decisive case. ValueCodec escapes anything over 255 bytes to the blob store — a write — and throws
-		// without one, so on a read-only wire it physically cannot encode this. That is why the wire has its own
-		// codec rather than reusing the storage one.
+		// without one, and a value being encoded onto a socket has no blob store to escape to. That is why the wire
+		// has its own codec rather than reusing the storage one.
 		String big = "x".repeat(64 * 1024);
 		assertEquals(big, roundTrip(big));
 	}

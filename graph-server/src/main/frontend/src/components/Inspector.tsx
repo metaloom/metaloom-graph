@@ -36,7 +36,8 @@ export function Inspector({ graph, selected, onSelect, onRemove }: Props) {
       <div className="panel inspector" data-testid="inspector">
         <header>
           <h2>Node</h2>
-          {/* Pruning a crowded canvas. A read-only UI cannot delete anything, so this is about the view alone. */}
+          {/* Pruning a crowded canvas — the view, not the store. Deleting a node is something the query editor can
+              now do, and this button deliberately is not that: hiding is undone by running the query again. */}
           <button className="ghost" data-testid="hide-node" onClick={() => onRemove(node.id)} title="Remove from the canvas">
             Hide
           </button>

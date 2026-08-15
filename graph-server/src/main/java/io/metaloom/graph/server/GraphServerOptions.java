@@ -35,11 +35,16 @@ import io.metaloom.graph.server.demo.DemoData;
  * @param database
  *            the database a request that does not name one gets, created at startup if it is not there
  * @param allowDrop
- *            whether {@code DELETE /api/databases/{name}} exists. Off by default: it is the only route that
- *            destroys data, on a port with no authentication, beside a query language that cannot delete a node
+ *            whether {@code DELETE /api/databases/{name}} exists. Off by default, and separate from
+ *            {@code allowWrite}: it destroys a whole database and its directory in one request, including databases
+ *            no query addressed, and enabling writes is not asking for that
+ * @param allowWrite
+ *            whether a query may change a store at all. Off by default: neither port has authentication, and the
+ *            difference between handing out a copy of the data and handing out the ability to delete it deserves an
+ *            explicit act
  */
 public record GraphServerOptions(Path root, int port, boolean demo, int demoAirports, long queryTimeoutMillis,
-	boolean wire, int wirePort, int maxConcurrentStreams, String database, boolean allowDrop) {
+	boolean wire, int wirePort, int maxConcurrentStreams, String database, boolean allowDrop, boolean allowWrite) {
 
 	static final int DEFAULT_PORT = 8080;
 
@@ -76,6 +81,7 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 		int streams = DEFAULT_MAX_CONCURRENT_STREAMS;
 		String database = GraphDatabases.DEFAULT_NAME;
 		boolean allowDrop = false;
+		boolean allowWrite = false;
 		int positional = 0;
 
 		for (String argument : args) {
@@ -99,6 +105,8 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 				GraphDatabases.validate(database);
 			} else if (argument.equals("--allow-drop")) {
 				allowDrop = true;
+			} else if (argument.equals("--allow-write")) {
+				allowWrite = true;
 			} else if (argument.equals("--help") || argument.equals("-h")) {
 				throw new HelpRequested();
 			} else if (argument.startsWith("-")) {
@@ -124,7 +132,7 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 				+ "; give --wire-port a different one or --no-wire");
 		}
 		return new GraphServerOptions(store, port, demo, airports, queryTimeout, wire, wirePort, streams, database,
-			allowDrop);
+			allowDrop, allowWrite);
 	}
 
 	private static int parseStreams(String argument) {
@@ -187,11 +195,15 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 			  --database=<name>     The database a request that does not name one gets. Created at
 			                        startup if it is not there. Letters, digits, '-' and '_'.
 			                        (default: %s)
+			  --allow-write         Accept CREATE, SET, REMOVE and DELETE queries. Off by default:
+			                        neither port has authentication, so enabling this hands anything
+			                        that can reach the server the ability to change and delete data.
 			  --allow-drop          Enable DELETE /api/databases/<name>, which deletes a database and
-			                        everything in it. Off by default: it is the only route that
-			                        destroys data, and the port has no authentication.
+			                        everything in it. Off by default, and separate from --allow-write:
+			                        it destroys a whole database in one request, including ones no
+			                        query addressed.
 			  --demo                Seed the default database with a demo graph, but only if it is
-			                        empty. The store is opened read-write; the query language is not.
+			                        empty. Independent of --allow-write, which is about queries.
 			  --demo-size=<size>    How much demo data. Implies --demo.
 			                        tiny | small | medium | large, or a number of airports.
 			                        tiny=%d  small=%d  medium=%d  large=%d   (default: small)

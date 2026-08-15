@@ -1,6 +1,7 @@
 package io.metaloom.graph.server.wire;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -28,6 +29,7 @@ import io.metaloom.graph.cypher.CypherResult;
 import io.metaloom.graph.cypher.value.CypherNode;
 import io.metaloom.graph.cypher.value.CypherPath;
 import io.metaloom.graph.cypher.value.CypherRelationship;
+import io.metaloom.graph.protocol.QuerySummary;
 import io.metaloom.graph.protocol.WireNode;
 import io.metaloom.graph.protocol.WirePath;
 import io.metaloom.graph.protocol.WireRelationship;
@@ -54,8 +56,9 @@ import io.metaloom.graph.protocol.WireRelationship;
 public class WireVersusEmbeddedTest {
 
 	/**
-	 * Long enough that the storage codec would have escaped it to the blob store — a write, which a read-only wire has
-	 * no right to do. Carrying it inline is the reason the wire has a codec of its own.
+	 * Long enough that the storage codec would have escaped it to the blob store, which needs a blob store and the
+	 * right to write to one — neither of which a value being encoded onto a socket has. Carrying it inline is the
+	 * reason the wire has a codec of its own.
 	 */
 	private static final String LONG_TEXT = "über-lange Beschreibung ".repeat(64);
 
@@ -114,7 +117,8 @@ public class WireVersusEmbeddedTest {
 		databases = GraphDatabases.open(stores.path().resolve("root"));
 		store = databases.database(GraphDatabases.DEFAULT_NAME);
 		seed(store);
-		server = new WireServer(databases, GraphDatabases.DEFAULT_NAME, WireServerOptions.defaults().withPort(0));
+		server = new WireServer(io.vertx.core.Vertx.vertx(), databases, GraphDatabases.DEFAULT_NAME,
+			WireServerOptions.defaults().withPort(0), true);
 		int port = server.listen().toCompletionStage().toCompletableFuture().join();
 		client = GraphClient.connect("127.0.0.1", port);
 	}
@@ -180,6 +184,116 @@ public class WireVersusEmbeddedTest {
 				}
 			}
 		}
+	}
+
+	/**
+	 * The write arm: the same statement run both ways, against two stores, compared by what it left behind.
+	 *
+	 * <p>
+	 * A write query returns few rows or none, so comparing results the way the read arm does would compare almost
+	 * nothing. What has to agree is the effect — so each statement runs embedded against one store and over the wire
+	 * against another seeded identically, and both the resulting graphs and the reported counters are compared.
+	 * </p>
+	 */
+	@Test
+	public void testEveryWriteHasTheSameEffectBothWays() throws Exception {
+		List<String> writes = List.of(
+			"CREATE (n:City {name: 'Bonn', founded: -12})",
+			"MATCH (p:Person) CREATE (p)-[:LIVES_IN {since: 2020}]->(:City {name: 'Köln'})",
+			"MATCH (p:Person {name: 'Alice'}) SET p.age = 35, p.city = 'Köln', p.tags = ['a', 'b']",
+			"MATCH (p:Person) SET p:Resident",
+			"MATCH (p:Person {name: 'Bob'}) REMOVE p.city, p:Person",
+			"MATCH (p:Person) WHERE p.age IS NULL SET p = {name: p.name, replaced: true}",
+			"MATCH ()-[r:KNOWS]->() SET r.checked = true",
+			"MATCH ()-[r:KNOWS {since: 2019}]->() DELETE r",
+			"MATCH (n:Document) DETACH DELETE n",
+			"MATCH (n:Product) DETACH DELETE n",
+			"MATCH (p:Person) SET p.n = size(p.name) RETURN p.name AS name, p.n AS n ORDER BY name");
+
+		// A second database under the same root, which is the cheapest way to get an independent store — and the
+		// connection is bound to the default one at its handshake, so the two cannot be confused.
+		GraphStore reference = databases.create("reference");
+
+		// The control: the fingerprint has to say something, and has to change when the graph does. Without this the
+		// comparison below could be two empty strings agreeing.
+		reseed(reference);
+		String seeded = fingerprint(reference);
+		assertTrue(seeded.lines().count() >= 5, "the fingerprint must describe the seeded graph");
+		Cypher.query(reference, "MATCH (p:Person {name: 'Alice'}) SET p.age = 99");
+		assertNotEquals(seeded, fingerprint(reference), "a fingerprint that cannot tell two graphs apart proves nothing");
+
+		for (String write : writes) {
+			reseed(reference);
+			reseed(store);
+
+			CypherResult embedded = Cypher.query(reference, write);
+			QuerySummary wire = client.execute(write);
+
+			assertEquals(embedded.stats().nodesCreated(), wire.nodesCreated(), "nodesCreated of: " + write);
+			assertEquals(embedded.stats().nodesDeleted(), wire.nodesDeleted(), "nodesDeleted of: " + write);
+			assertEquals(embedded.stats().relationshipsCreated(), wire.relationshipsCreated(),
+				"relationshipsCreated of: " + write);
+			assertEquals(embedded.stats().relationshipsDeleted(), wire.relationshipsDeleted(),
+				"relationshipsDeleted of: " + write);
+			assertEquals(embedded.stats().propertiesSet(), wire.propertiesSet(), "propertiesSet of: " + write);
+			assertEquals(embedded.stats().labelsAdded(), wire.labelsAdded(), "labelsAdded of: " + write);
+			assertEquals(embedded.stats().labelsRemoved(), wire.labelsRemoved(), "labelsRemoved of: " + write);
+			assertEquals(embedded.size(), wire.rows(), "row count of: " + write);
+
+			// The counters agreeing is not enough: two runs could report the same numbers and leave different graphs.
+			assertEquals(fingerprint(reference), fingerprint(store), "the resulting graph of: " + write);
+			reference.verify(io.metaloom.graph.core.api.VerifyLevel.FULL);
+			store.verify(io.metaloom.graph.core.api.VerifyLevel.FULL);
+		}
+	}
+
+	/** Every node with its labels, properties and outgoing edges, ordered so two stores can be compared as text. */
+	private static String fingerprint(GraphStore store) {
+		List<String> lines = new ArrayList<>();
+		store.forEachNode(id -> {
+			StringBuilder line = new StringBuilder();
+			line.append(new java.util.TreeSet<>(store.nodeLabels(id))).append(' ');
+			java.util.TreeMap<String, Object> properties = new java.util.TreeMap<>();
+			for (String key : store.nodeProperties(id).keys()) {
+				properties.put(key, String.valueOf(store.nodeProperties(id).get(key)));
+			}
+			line.append(properties).append(" ->");
+			List<String> edges = new ArrayList<>();
+			for (io.metaloom.graph.core.api.Edge edge : store.neighbours(id,
+				io.metaloom.graph.core.api.Direction.OUT)) {
+				// By the far end's identity rather than its id: the two stores allocate different ids.
+				edges.add(edge.type() + ":" + store.nodeProperties(edge.neighbourId()).get("name")
+					+ (edge.isMaterialised()
+						? String.valueOf(new java.util.TreeMap<>(
+							store.relationshipProperties(edge.relationshipId()).asMap()))
+						: "[light]"));
+			}
+			java.util.Collections.sort(edges);
+			line.append(edges);
+			lines.add(line.toString());
+		});
+		java.util.Collections.sort(lines);
+		return String.join("\n", lines);
+	}
+
+	/** Empties a store and seeds it again, so each write statement starts from the same graph. */
+	private static void reseed(GraphStore store) throws Exception {
+		try (Transaction txn = store.begin()) {
+			for (long id : allNodes(store)) {
+				// deleteNode cascades, so a node whose relationships went with an earlier one is simply gone.
+				if (store.nodeExists(id)) {
+					store.deleteNode(id);
+				}
+			}
+			txn.commit();
+		}
+		seed(store);
+	}
+
+	private static List<Long> allNodes(GraphStore store) {
+		List<Long> ids = new ArrayList<>();
+		store.forEachNode(ids::add);
+		return ids;
 	}
 
 	@Test

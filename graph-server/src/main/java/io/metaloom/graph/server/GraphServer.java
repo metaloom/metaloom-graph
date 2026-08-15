@@ -11,6 +11,7 @@ import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.metaloom.graph.core.api.ConstraintViolationException;
 import io.metaloom.graph.core.api.GraphDatabases;
 import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.GraphStoreException;
@@ -18,6 +19,7 @@ import io.metaloom.graph.core.api.StoreStats;
 import io.metaloom.graph.core.nativelib.NativeCapabilities;
 import io.metaloom.graph.cypher.Cypher;
 import io.metaloom.graph.cypher.CypherResult;
+import io.metaloom.graph.cypher.CypherStats;
 import io.metaloom.graph.cypher.QueryAbort;
 import io.metaloom.graph.cypher.QueryAbortedException;
 import io.metaloom.graph.cypher.RowSink;
@@ -71,12 +73,19 @@ import io.vertx.ext.web.handler.StaticHandler;
  * where it is and gives the thread and the snapshot back.
  * </p>
  *
- * <h2>Read-only</h2>
+ * <h2>Writes, and why they are off by default</h2>
  *
  * <p>
- * The query language is read-only, so this server cannot modify a store however it is addressed. That is worth
- * knowing before exposing it: it still reads everything, and it has no authentication. Bind it to localhost unless
- * something else is providing access control.
+ * The query language can write, so this server can modify a store — but only when it was started with
+ * {@code --allow-write}. Off is the only defensible default: there is no authentication on this port, it binds every
+ * interface, and the difference between handing out a copy of somebody's data and handing out the ability to delete it
+ * is worth an explicit act. A write query on a server without the flag is refused with 403 before it reaches a worker
+ * thread.
+ * </p>
+ *
+ * <p>
+ * Reading everything is still unauthenticated whatever the flag says. Bind it to localhost unless something else is
+ * providing access control.
  * </p>
  */
 public final class GraphServer implements AutoCloseable {
@@ -91,6 +100,8 @@ public final class GraphServer implements AutoCloseable {
 	private final Map<String, SchemaScanner> schemas = new ConcurrentHashMap<>();
 	/** Whether DELETE /api/databases/{name} exists at all. Off unless an operator asked for it. */
 	private final boolean allowDrop;
+	/** Whether a query may change a store. Off unless an operator asked for it. */
+	private final boolean allowWrite;
 	/** Past this, a query is abandoned rather than allowed to hold a worker thread and a read view indefinitely. */
 	private final long queryTimeoutMillis;
 	private HttpServer server;
@@ -103,22 +114,28 @@ public final class GraphServer implements AutoCloseable {
 
 	public GraphServer(GraphDatabases databases, String defaultDatabase) {
 		this(Vertx.vertx(), databases, defaultDatabase, false,
-			GraphServerOptions.DEFAULT_QUERY_TIMEOUT_MILLIS, false);
+			GraphServerOptions.DEFAULT_QUERY_TIMEOUT_MILLIS, false, false);
 	}
 
 	/** @param queryTimeoutMillis how long one query may run, or 0 for no limit */
 	public GraphServer(GraphDatabases databases, String defaultDatabase, long queryTimeoutMillis, boolean allowDrop) {
-		this(Vertx.vertx(), databases, defaultDatabase, false, queryTimeoutMillis, allowDrop);
+		this(Vertx.vertx(), databases, defaultDatabase, false, queryTimeoutMillis, allowDrop, false);
+	}
+
+	public GraphServer(GraphDatabases databases, String defaultDatabase, long queryTimeoutMillis, boolean allowDrop,
+		boolean allowWrite) {
+		this(Vertx.vertx(), databases, defaultDatabase, false, queryTimeoutMillis, allowDrop, allowWrite);
 	}
 
 	private GraphServer(Vertx vertx, GraphDatabases databases, String defaultDatabase, boolean ownsDatabases,
-		long queryTimeoutMillis, boolean allowDrop) {
+		long queryTimeoutMillis, boolean allowDrop, boolean allowWrite) {
 		this.vertx = vertx;
 		this.databases = databases;
 		this.defaultDatabase = defaultDatabase;
 		this.ownsDatabases = ownsDatabases;
 		this.queryTimeoutMillis = queryTimeoutMillis;
 		this.allowDrop = allowDrop;
+		this.allowWrite = allowWrite;
 	}
 
 	public static void main(String[] args) throws Exception {
@@ -157,7 +174,7 @@ public final class GraphServer implements AutoCloseable {
 		// gained from two sets of event loops competing for the same cores.
 		Vertx vertx = Vertx.vertx();
 		GraphServer server = new GraphServer(vertx, databases, options.database(), true,
-			options.queryTimeoutMillis(), options.allowDrop());
+			options.queryTimeoutMillis(), options.allowDrop(), options.allowWrite());
 		int port = server.listen(options.port()).toCompletionStage().toCompletableFuture().join();
 		logger.info("Graph server on http://localhost:{} over {} ({} database(s), default '{}')",
 			port, options.root(), databases.names().size(), options.database());
@@ -166,7 +183,7 @@ public final class GraphServer implements AutoCloseable {
 			WireServer wire = new WireServer(vertx, databases, options.database(), WireServerOptions.defaults()
 				.withPort(options.wirePort())
 				.withMaxConcurrentStreams(options.maxConcurrentStreams())
-				.withQueryTimeoutMillis(options.queryTimeoutMillis()));
+				.withQueryTimeoutMillis(options.queryTimeoutMillis()), options.allowWrite());
 			int wirePort = wire.listen().toCompletionStage().toCompletableFuture().join();
 			logger.info("Binary streaming port on {}:{} — see graph-client", wire.options().host(), wirePort);
 			server.wire = wire;
@@ -261,6 +278,16 @@ public final class GraphServer implements AutoCloseable {
 			return;
 		}
 
+		// Refused here, on the event loop, for the same reason a syntax error is: the tree already knows whether the
+		// query writes, so a refusal costs no worker thread, no transaction and no writer lock.
+		if (parsed.isWrite() && !allowWrite) {
+			fail(context, 403, "readonly", "This server does not accept write queries. Start it with --allow-write "
+				+ "to enable CREATE, SET, REMOVE and DELETE.");
+			return;
+		}
+
+		String database = nameFor(context);
+
 		// executeBlocking, because a query is bounded by the data rather than by the request. Unordered, so two
 		// queries from one browser do not serialise behind each other.
 		vertx.<JsonObject>executeBlocking(() -> {
@@ -275,7 +302,16 @@ public final class GraphServer implements AutoCloseable {
 			// and its snapshot — which is the thing the timeout exists to prevent.
 			Collector collector = new Collector();
 			Cypher.stream(store, parsed, parameters, collector, deadline);
-			CypherResult result = new CypherResult(collector.columns, collector.rows);
+			CypherResult result = new CypherResult(collector.columns, collector.rows, collector.stats);
+			if (result.stats().containsUpdates()) {
+				// The schema is a 60-second cache over a full scan, so without this the sidebar would keep reporting
+				// labels and counts from before the write for up to a minute — and the UI has no other reason to
+				// re-fetch it.
+				SchemaScanner scanner = schemas.get(database);
+				if (scanner != null) {
+					scanner.invalidate();
+				}
+			}
 			return ResultJson.of(result, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
 		}, false).onSuccess(json -> context.json(json))
 			.onFailure(error -> respondToFailure(context, error));
@@ -286,6 +322,7 @@ public final class GraphServer implements AutoCloseable {
 
 		private List<String> columns = List.of();
 		private final List<List<Object>> rows = new ArrayList<>();
+		private CypherStats stats = CypherStats.NONE;
 
 		@Override
 		public void columns(List<String> columns) {
@@ -296,6 +333,11 @@ public final class GraphServer implements AutoCloseable {
 		public boolean row(List<Object> values) {
 			rows.add(values);
 			return true;
+		}
+
+		@Override
+		public void stats(CypherStats stats) {
+			this.stats = stats;
 		}
 	}
 
@@ -321,6 +363,10 @@ public final class GraphServer implements AutoCloseable {
 			// refused and invite a retry that cannot work.
 			case NoSuchDatabaseException missing -> fail(context, 404, "database", missing.getMessage());
 			case IllegalArgumentException invalid -> fail(context, 400, "database", invalid.getMessage());
+			// 409 and named separately from a generic store failure: a unique constraint is about the data the caller
+			// sent meeting data that is already there, and the message names the key, the value and the node holding
+			// it — which is what makes the next request fixable.
+			case ConstraintViolationException conflict -> fail(context, 409, "constraint", conflict.getMessage());
 			case GraphStoreException store -> fail(context, 409, "store", store.getMessage());
 			default -> {
 				logger.error("Query failed", error);
@@ -446,7 +492,9 @@ public final class GraphServer implements AutoCloseable {
 			return new JsonObject()
 				.put("databases", array)
 				.put("default", defaultDatabase)
-				.put("allowDrop", allowDrop);
+				.put("allowDrop", allowDrop)
+				// The UI has to be told, or it offers an editor whose every write comes back 403.
+				.put("allowWrite", allowWrite);
 		}, false).onSuccess(context::json).onFailure(error -> respondToFailure(context, error));
 	}
 

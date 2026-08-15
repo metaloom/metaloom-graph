@@ -161,6 +161,173 @@ public final class GraphAccess {
 	public record Expansion(CypherRelationship relationship, long neighbourId) {
 	}
 
+	// ---------------------------------------------------------------- writes
+
+	/**
+	 * The write half of the boundary.
+	 *
+	 * <p>
+	 * These run inside a transaction the caller opened — {@code Cypher.stream} does it once per query — and every one
+	 * of them joins it, because the engine's mutating methods join whatever transaction the calling thread holds. So
+	 * nothing here commits, and a failure anywhere unwinds the lot.
+	 * </p>
+	 *
+	 * <p>
+	 * {@link java.io.IOException} becomes {@link java.io.UncheckedIOException} rather than being declared: a disk
+	 * failure is not something a clause handler can do anything about, and threading a checked exception through the
+	 * evaluator would put it in the signature of every expression as well.
+	 * </p>
+	 */
+	public long createNode(List<String> labels, Map<String, Object> properties) {
+		checkAbort();
+		try {
+			return store.createNode(labels, toStore(properties));
+		} catch (java.io.IOException e) {
+			throw new java.io.UncheckedIOException(e);
+		}
+	}
+
+	public long createRelationship(long fromId, String type, long toId, Map<String, Object> properties) {
+		checkAbort();
+		try {
+			return store.createRelationship(fromId, type, toId, toStore(properties));
+		} catch (java.io.IOException e) {
+			throw new java.io.UncheckedIOException(e);
+		}
+	}
+
+	/** Replaces a node's whole property map. One call per element per clause — see {@code setNodeProperties}. */
+	public void setNodeProperties(long nodeId, Map<String, Object> properties) {
+		checkAbort();
+		try {
+			store.setNodeProperties(nodeId, toStore(properties));
+		} catch (java.io.IOException e) {
+			throw new java.io.UncheckedIOException(e);
+		}
+	}
+
+	public void setRelationshipProperties(long relationshipId, Map<String, Object> properties) {
+		checkAbort();
+		try {
+			store.setRelationshipProperties(relationshipId, toStore(properties));
+		} catch (java.io.IOException e) {
+			throw new java.io.UncheckedIOException(e);
+		}
+	}
+
+	public boolean addNodeLabel(long nodeId, String label) {
+		checkAbort();
+		try {
+			return store.addNodeLabel(nodeId, label);
+		} catch (java.io.IOException e) {
+			throw new java.io.UncheckedIOException(e);
+		}
+	}
+
+	public boolean removeNodeLabel(long nodeId, String label) {
+		checkAbort();
+		try {
+			return store.removeNodeLabel(nodeId, label);
+		} catch (java.io.IOException e) {
+			throw new java.io.UncheckedIOException(e);
+		}
+	}
+
+	/** Deletes a node and everything attached to it. The caller decides whether that cascade was asked for. */
+	public void deleteNode(long nodeId) {
+		checkAbort();
+		try {
+			store.deleteNode(nodeId);
+		} catch (java.io.IOException e) {
+			throw new java.io.UncheckedIOException(e);
+		}
+	}
+
+	public void deleteRelationship(long relationshipId) {
+		checkAbort();
+		try {
+			store.deleteRelationship(relationshipId);
+		} catch (java.io.IOException e) {
+			throw new java.io.UncheckedIOException(e);
+		}
+	}
+
+	/** Removes a lightweight edge, which has no id to name it by. False when there was none to remove. */
+	public boolean deleteEdge(long fromId, String type, long toId) {
+		checkAbort();
+		try {
+			return store.deleteEdge(fromId, type, toId);
+		} catch (java.io.IOException e) {
+			throw new java.io.UncheckedIOException(e);
+		}
+	}
+
+	/** Total degree, which is what plain DELETE has to consult before it may remove a node. */
+	public int degree(long nodeId) {
+		checkAbort();
+		return store.degreeOut(nodeId) + store.degreeIn(nodeId);
+	}
+
+	public boolean relationshipExists(long relationshipId) {
+		checkAbort();
+		return store.relationshipExists(relationshipId);
+	}
+
+	/** Re-reads a materialised relationship, which is how a binding is refreshed after a SET touched it. */
+	public CypherRelationship relationship(long relationshipId) {
+		checkAbort();
+		return new CypherRelationship(relationshipId, store.relationshipType(relationshipId),
+			store.relationshipFrom(relationshipId), store.relationshipTo(relationshipId),
+			properties(store.relationshipProperties(relationshipId)));
+	}
+
+	/**
+	 * Brings a Cypher value back into the store's type system, which is the narrower of the two.
+	 *
+	 * <p>
+	 * A property must be a primitive or a list of primitives. A map, a node, a relationship or a path is refused here
+	 * rather than at the storage layer, so the message can name the offending key and say what a property may hold —
+	 * {@code IllegalArgumentException: Unsupported property value type} would be true and unhelpful.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>This is not the exact inverse of {@link #normalise}.</b> Reading renders {@code byte[]}, {@code UUID} and
+	 * {@code Instant} as strings, so writing one back stores a string. {@code SET n.x = n.x} on such a property is
+	 * therefore a type change, and there is no way for the query language to write those three types at all.
+	 * </p>
+	 */
+	private static io.metaloom.graph.core.api.Properties toStore(Map<String, Object> values) {
+		io.metaloom.graph.core.api.Properties properties = io.metaloom.graph.core.api.Properties.of();
+		if (values != null) {
+			for (Map.Entry<String, Object> entry : values.entrySet()) {
+				properties.set(entry.getKey(), storable(entry.getKey(), entry.getValue()));
+			}
+		}
+		return properties;
+	}
+
+	private static Object storable(String key, Object value) {
+		return switch (value) {
+			case null -> null;
+			case Boolean b -> b;
+			case Long l -> l;
+			case Double d -> d;
+			case String s -> s;
+			case List<?> list -> {
+				List<Object> out = new ArrayList<>(list.size());
+				for (Object element : list) {
+					if (element instanceof List<?>) {
+						throw new CypherTypeException("The property '" + key + "' cannot hold a nested list");
+					}
+					out.add(storable(key, element));
+				}
+				yield out;
+			}
+			default -> throw new CypherTypeException("The property '" + key + "' cannot hold a "
+				+ Values.typeName(value) + "; a property must be a number, a string, a boolean or a list of those");
+		};
+	}
+
 	private static Map<String, Object> properties(io.metaloom.graph.core.api.Properties properties) {
 		if (properties == null || properties.isEmpty()) {
 			return Map.of();

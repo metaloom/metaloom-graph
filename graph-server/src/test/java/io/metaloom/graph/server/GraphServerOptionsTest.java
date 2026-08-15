@@ -141,6 +141,16 @@ public class GraphServerOptionsTest {
 	}
 
 	@Test
+	public void testWritingIsOffUnlessAskedFor() {
+		// Both ports, one flag. Off is the only defensible default when neither has authentication.
+		assertFalse(GraphServerOptions.parse(new String[] { "/data/g" }).allowWrite());
+		assertTrue(GraphServerOptions.parse(new String[] { "--allow-write", "/data/g" }).allowWrite());
+		// And the two flags are independent: enabling writes is not asking to be able to delete whole databases.
+		assertFalse(GraphServerOptions.parse(new String[] { "--allow-write", "/data/g" }).allowDrop());
+		assertFalse(GraphServerOptions.parse(new String[] { "--allow-drop", "/data/g" }).allowWrite());
+	}
+
+	@Test
 	public void testDroppingIsOffUnlessAskedFor() {
 		// The only route that destroys data, on a port with no authentication, beside a query language that cannot
 		// delete a single node. Off is the only defensible default.
@@ -166,5 +176,6 @@ public class GraphServerOptionsTest {
 			"a server with two unauthenticated ports should say so where somebody will read it");
 		assertTrue(usage.contains("--database"), "and the flag that picks which database a request gets");
 		assertTrue(usage.contains("--allow-drop"), "and the one that turns on the only route that deletes data");
+		assertTrue(usage.contains("--allow-write"), "and the one that lets a query change a store at all");
 	}
 }

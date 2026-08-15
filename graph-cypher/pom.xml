@@ -11,7 +11,7 @@
     </parent>
 
     <name>Graph Cypher</name>
-    <description>A read-only openCypher subset: lexer, parser, planner and executor over the storage engine</description>
+    <description>An openCypher subset: lexer, parser and executor over the storage engine, reads and writes</description>
 
     <dependencies>
         <!--

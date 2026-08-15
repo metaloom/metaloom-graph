@@ -33,17 +33,17 @@ not**, in one place.
 | 8 — Compaction and reclamation | **Done** except the p99 latency budget | `CompactionTest`, `CompactionCrashTest` |
 | 9 — Hardening | **Partial** — see §4.9; crash matrix **built**, no JMH, long runs not run | `CrashMatrixTest`, `WalFaultTest`; §6 of PHASE_STATUS |
 | 10 — MetaLoom integration | **Done** — built, measured, recommended against adopting | §6 below |
-| 11 — Query language | **Done** for a read-only openCypher subset, in its own module, with a single-jar Vert.x server and a React and D3 graph browser | [CYPHER.md](CYPHER.md); `CypherVersusApiTest`, `NullSemanticsTest`, `e2e/graph-browser.spec.ts` |
+| 11 — Query language | **Done** for an openCypher subset in its own module, reads and writes, with a single-jar Vert.x server and a React and D3 graph browser. `MERGE`, `FOREACH` and `OPTIONAL MATCH` refused by name | [CYPHER.md](CYPHER.md); `CypherVersusApiTest`, `CypherWriteVersusApiTest`, `NullSemanticsTest`, `e2e/graph-browser.spec.ts` |
 | 12 — GraalVM native image | **Done** — the server builds to a 38 MB standalone binary, FFM and all, behind `-Pgraalvm` | [GRAALVM.md](GRAALVM.md); `ForeignDowncallMetadataTest`, `tools/native-image.sh` |
 | 13 — Binary streaming port | **Done** for stage 1: a framed TCP protocol and a Java client that stream rows as the engine produces them. The *executor* still materialises — see below | [WIRE.md](WIRE.md), [TRANSPORT_DECISION.md](TRANSPORT_DECISION.md); `WireVersusEmbeddedTest`, `WireServerTest`, `WireDecoderHostileInputTest` |
 | 14 — Several databases | **Done** — one directory per database under a root, selectable from the client, the HTTP routes and the browser UI | [DATABASES.md](DATABASES.md); `GraphDatabasesTest`, `DatabaseRoutesTest` |
 
 **The engine is usable today** for a single-writer embedded workload: durable, crash-safe,
-transactional, indexed, compacting, with snapshot isolation for readers, a read-only Cypher query
-language, a browser UI, a streaming binary port and several databases under one root — and it holds its answers against a reference
-model, against real SQL, against its own Java API, and now over its own wire. It is **not** usable
-where concurrent writers, Cypher *writes*, an online backup or an authenticated network are
-requirements. None of those exists and none is faked.
+transactional, indexed, compacting, with snapshot isolation for readers, a Cypher query
+language that reads **and writes**, a browser UI, a streaming binary port and several databases under one root — and it
+holds its answers against a reference model, against real SQL, against its own Java API, and now over its own wire. It
+is **not** usable where concurrent writers, `MERGE`, an online backup or an authenticated network are requirements.
+None of those exists and none is faked.
 
 ---
 
@@ -268,6 +268,34 @@ that a steal policy cannot be made correct over a `MAP_SHARED` mapping.
       only ever looks at the newest segment. So holes below the high water mark, and every hole in a
       sealed segment, are unreachable after a reopen until `compact()` runs. Measured: delete slot 3,
       reopen, next insert gets slot 10
+
+### Phase 15 — Cypher writes
+
+- [x] `CREATE`, `SET`, `REMOVE`, `DELETE` and `DETACH DELETE`, with `RETURN` optional for a write and
+      required for a read. `MERGE`, `FOREACH`, `LOAD CSV` and `CALL` still refused at parse time, each
+      by name with a caret
+- [x] `Ast.Query.isWrite()`, so both servers can refuse a write on the event loop and `Cypher.stream`
+      can choose a transaction over a read view without running anything first
+- [x] One transaction per write query, joined when the caller holds one, **committed before the first
+      row is delivered**. A write inside an open read view is refused
+- [x] `GraphStore.hasWriteTransaction`, `addNodeLabel`, `removeNodeLabel`, and
+      `IndexCatalog.onLabelsChanged` — the engine could only set a label set at creation
+- [x] `CypherStats` on the result, `stats` in the HTTP response, and nine counters in the wire's
+      `COMPLETE` frame. Protocol version 3
+- [x] `--allow-write`, off by default, governing both ports; `--allow-drop` re-justified and kept
+      separate
+- [x] `SchemaScanner.invalidate()`, called after a committed write, and the UI refetching the sidebar
+- [x] `WireError.READ_ONLY` and `WireError.CONSTRAINT_VIOLATION`; a write permit per store so the wait
+      for the engine's writer lock has a deadline and a name
+- [ ] **`MERGE`.** The one clause left. Worth recording that it is *easier* here than elsewhere:
+      writers serialise on one lock and a write transaction reads its own writes through the same
+      overlay, so an index probe inside `MERGE` sees rows the same statement created and the
+      lock-and-retry dance other engines need does not arise
+
+**A constraint on the pending Stage 3 lazy executor prefix**: a push pipeline must never carry a write
+clause. The write clauses get openCypher's eager semantics for free from the executor materialising each
+clause — `MATCH (n) CREATE (:Copy)` structurally cannot feed the scan driving it — and a lazy prefix
+would take that away silently.
 
 ### Phase 14 — Several databases
 
@@ -719,5 +747,5 @@ Recorded so nobody re-opens them as oversights:
 
 ---
 
-_Git HEAD revision: `364b5f7`_
-_Last updated: 2026-08-14_
+_Git HEAD revision: `e4601d1`_
+_Last updated: 2026-08-15 (phase 15: Cypher writes)_

@@ -49,7 +49,7 @@ public class WireSmoke {
 	static final int COMPLETE = 7;
 	static final int ERROR = 8;
 
-	static final int PROTOCOL_VERSION = 2;
+	static final int PROTOCOL_VERSION = 3;
 	/** Empty: whichever database the server calls its default. Hard-coding "default" would query the wrong one. */
 	static final String DATABASE = "";
 	static final String CYPHER = "MATCH (a:Airport)-[r:ROUTE_TO]->(b) RETURN a.code, b.code LIMIT 5";

@@ -1,7 +1,7 @@
 # WIRE.md — the binary streaming protocol and the Java client
 
-This is the specification of the **binary port**: how a read-only Cypher result is streamed off a
-socket, and what the Java client does with it.
+This is the specification of the **binary port**: how a Cypher result is streamed off a socket, and
+what the Java client does with it.
 
 **Why it exists.** The HTTP route builds a whole `JsonObject` — every row, plus a graph projection —
 before a byte reaches the caller. That is right for a browser drawing two hundred nodes and useless
@@ -25,9 +25,9 @@ to the framing; it also names the one thing the losing arm did better, which sha
 |---|---|
 | **Modules** | `graph-protocol` (frames, codec, error codes), `graph-client` (the Java client), `io.metaloom.graph.server.wire` (the server) |
 | **Default port** | 8081, bound to **127.0.0.1**. HTTP stays on 8080 |
-| **Surface** | Read-only Cypher. There is no write path and no schema call |
+| **Surface** | Cypher, reads and writes. **Writes off unless the server has `--allow-write`**; §4.1. No schema call |
 | **Security** | **None.** No authentication, no transport security. §7 |
-| **Protocol version** | 2. Negotiated on connect; a mismatch is an error, not a hang |
+| **Protocol version** | 3. Negotiated on connect; a mismatch is an error, not a hang |
 | **Database** | Chosen per connection at `HELLO` — see [DATABASES.md](DATABASES.md) |
 | **Client dependencies** | `graph-protocol` and vertx-core. **Not** graph-core, **not** graph-cypher, no FFM, no native library — asserted by `ClientDependencyTest` |
 
@@ -39,6 +39,7 @@ to the framing; it also names the one thing the losing arm did better, which sha
 | The **client's** memory | **This.** §5 |
 | **Time to first row** | **This.** The first batch goes out after ~64 KiB or 20 ms, not after the last row is found |
 | The executor's intermediate `List<Row>` | **Not this.** The engine is clause-at-a-time over a list, so a query's peak *server* memory is still its widest intermediate result. See [CYPHER.md](CYPHER.md) |
+| A **write** query | **Nothing streams.** Its rows are produced, its transaction commits, and only then does the first byte go out — §4.1 |
 
 `ORDER BY`, `DISTINCT`, aggregation and `UNION` buffer their whole input whatever the protocol does.
 That is semantics, not a limitation waiting to be fixed.
@@ -74,11 +75,18 @@ connection itself.
 | `CANCEL` 4 | client | empty |
 | `COLUMNS` 5 | server | value: list of column names |
 | `ROWS` 6 | server | `i32` row count, then `rows × columns` values |
-| `COMPLETE` 7 | server | `i64` row count, `i64` elapsed micros |
+| `COMPLETE` 7 | server | `QuerySummary`: nine `i64`s — row count, elapsed micros, then nodes created and deleted, relationships created and deleted, properties set, labels added and removed |
 | `ERROR` 8 | server | `i32` error code, value: message, `i32` line, `i32` column |
 
 Everything that is not a fixed-width scalar is a codec value, so there is one decoder to get right and
 one to fuzz rather than a bespoke reader per frame type.
+
+`COMPLETE`'s counters are **fixed fields rather than a codec map**. A map would let one be added
+without a version bump, but this protocol's rule is to bump instead, and a fixed layout is one the
+hostile-input oracle can exhaust where a map is a length field and a loop. Seventy-two bytes once per
+query is not worth a branch. The client reads them all and ignores anything after, which is not a
+compatibility promise — the version is the promise — but refusing bytes it never asked for would be
+gratuitous.
 
 `COLUMNS` always precedes any row **and is always sent**, including for a result with no rows at all —
 a protocol whose header is conditional on there being data is a protocol whose clients special-case
@@ -125,9 +133,11 @@ In increasing order of decisiveness:
    a store format bump and vice versa.
 3. It has no tags for the four types that dominate this wire, and four that can never appear on it.
 4. **It cannot encode what this wire has to carry.** `ValueCodec.encodeBytes` escapes anything over
-   255 bytes to the blob store — `blobs.store(data)`, a *write* — and throws without one. On a
-   read-only wire there is neither a blob store nor the right to write to it, so **any string over 255
-   bytes is unencodable**. That settles it; the other three merely agree.
+   255 bytes to the blob store — `blobs.store(data)`, a *write* — and throws without one. Encoding a
+   value onto a socket has no blob store and no business allocating one, so **any string over 255
+   bytes is unencodable**. That settles it; the other three merely agree. (Write clauses did not change
+   this: a write's *parameters* reach the store through the storage codec, which does have a blob
+   store; a result being encoded outward still does not.)
 
 ### Two encoding decisions worth keeping
 
@@ -208,11 +218,33 @@ Four bounds, each sufficient alone:
 | Bounded concurrency | `maxConcurrentStreams`, refused rather than queued |
 | A hard wall-clock deadline | No client behaviour extends it. It is also the bound on view age, because the view is opened and closed inside the query |
 | No unbounded park | Every wait for a writable socket is against the deadline |
-| A retention watchdog | Polls `snapshotStats().retainedBytes()` **per database** and abandons that database's oldest stream past a soft limit — so the server gives up before the *store* has to, and the client gets a typed error naming the reason instead of a `SnapshotTooOldException` surfacing somewhere else. Per database and not summed: retention belongs to one store's version chain, and a reader must not be abandoned because a different database is holding pages |
+| A retention watchdog | Polls `snapshotStats().retainedBytes()` **per database** and abandons that database's oldest *reading* stream past a soft limit — so the server gives up before the *store* has to, and the client gets a typed error naming the reason instead of a `SnapshotTooOldException` surfacing somewhere else. Per database and not summed: retention belongs to one store's version chain, and a reader must not be abandoned because a different database is holding pages. **Readers only**: a write query opens no view, so abandoning one would roll back its work without releasing a byte |
 
 A client may ask for a **shorter** deadline than the server's and never a longer one. Otherwise the
 server's bound on view age would be whatever the most optimistic client asked for, which is not a
 bound.
+
+### 4.1 Writes, and the lock nobody can see
+
+Write queries are refused with `READ_ONLY` unless the server was started with `--allow-write`, on the
+event loop, before a permit or a worker thread is spent.
+
+**A write query does not stream**, and that is what keeps this port safe rather than a cost it pays.
+Its rows are produced, its transaction commits, and only then does the first byte go out — because a
+client that had already received rows when the commit failed would hold a result from a transaction
+that no longer exists, and bytes on a socket cannot be recalled. The consequence that matters here is
+the second one: the producer parks against a slow client, and **parking while holding the engine's
+single writer lock would freeze every writer in the process**, embedded callers included. By the time
+anything can park, the transaction is closed.
+
+What remains is the wait *for* that lock. `GraphStore.begin()` blocks with no deadline and no message,
+so a second writer would sit inside it past its own budget and have nothing to report when it gave up.
+A **permit per store** puts a bound and a name on a wait that already existed: past it the stream
+answers `OVERLOADED` naming the database. It adds no serialisation — the engine's lock is the thing
+that serialises — and it is keyed per store because that lock is.
+
+`CONSTRAINT_VIOLATION` has its own code rather than folding into `STORE`: it is the one store refusal a
+caller can act on, by sending different data.
 
 ---
 
@@ -290,9 +322,11 @@ That is why the binary port binds **loopback** by default — a new unauthentica
 default to every interface. The HTTP port does not bind loopback and predates this note;
 [OPERATIONS.md §9](OPERATIONS.md) carries the operational form of both.
 
-What the surface actually is: **read-only Cypher over an unauthenticated socket**. It cannot modify a
-store however it is addressed, and it can read every byte of one. Anything beyond a trusted host needs
-something in front of it.
+What the surface actually is: **Cypher over an unauthenticated socket**. It can read every byte of every
+database under the root, and — if the server was started with `--allow-write` — change and delete any of
+it. Without the flag a write is refused with `READ_ONLY` before it reaches a worker thread, which is a
+posture and not a control: it bounds what an unauthenticated peer can do, not who the peer is. Anything
+beyond a trusted host needs something in front of it.
 
 The frame decoder is the part an attacker reaches first, and it is the part with a non-differential
 oracle rather than only a round-trip test — see §8.
@@ -307,6 +341,9 @@ oracle rather than only a round-trip test — see §8.
 | `WireDecoderHostileInputTest` | `@Tag("fuzz")`. Random bytes, every truncation offset, every single-byte corruption, a list claiming 2^31−1 elements in twelve bytes, nesting a million deep. The oracle knows nothing about the format: decode or raise `WireFormatException`, never OOM, never `StackOverflowError`, always terminate, **allocation proportional to input** |
 | `FrameReaderTest` | Reassembly against the delivery patterns TCP actually produces: a frame split at every byte boundary, three frames in one chunk, a header claiming two gigabytes |
 | `WireServerTest` | The mechanics — overload, cancel, deadline against a client that stopped reading, an oversized frame taking one connection and not the server, and `openViews() == 0` after every test |
+| `WireServerTest` (writes) | A write refused without the flag and accepted with it; the counters in `COMPLETE`; a failed write rolled back with the writer lock returned; two connections writing to one database both finishing; and no view *and no held lock* left behind |
+| `WireVersusEmbeddedTest` (writes) | Eleven write statements run embedded against one database and over the wire against another seeded identically, comparing both the counters and a fingerprint of the resulting graph — with a control asserting the fingerprint can tell two graphs apart |
+| `QuerySummaryTest` | The `COMPLETE` payload: round trip, every truncation offset refused, trailing bytes ignored |
 | `WireServerOptionsTest` | The multiplication in §5, enforced |
 | `WireServerTest` (databases) | Two connections to two databases from one process seeing different data; an unknown database and a name that is not a name both refused at the handshake |
 | `ClientDependencyTest` | Fails if graph-core or graph-cypher ever reaches the client's classpath. Checked by **loading**, not by reading a pom, because a transitive arrival would pass a pom check |
@@ -331,6 +368,7 @@ decoder on corrupt input.
 | `graph-protocol/…/WireValueCodec.java` | The codec, on `byte[]` so it can be fuzzed without a transport |
 | `graph-protocol/…/WireNode.java`, `WireRelationship.java`, `WirePath.java` | The element types the client sees |
 | `graph-protocol/…/WireError.java`, `Protocol.java` | Error codes; version and default port |
+| `graph-protocol/…/QuerySummary.java` | The `COMPLETE` payload: how the query went and what it changed |
 | `graph-client/…/GraphClient.java`, `RowStream.java`, `Row.java` | Connect, stream, read |
 | `graph-client/…/ClientOptions.java`, `QueryOptions.java` | The client's two memory bounds; the per-query deadline |
 | `graph-server/…/wire/WireServer.java` | Dispatch, the producer, the four bounds, the watchdog |
@@ -339,5 +377,5 @@ decoder on corrupt input.
 
 ---
 
-_Git HEAD revision: `f9cc6653`_
-_Last updated: 2026-08-15 (written against Vert.x 5.0.11, protocol version 1)_
+_Git HEAD revision: `e4601d1`_
+_Last updated: 2026-08-15 (Vert.x 5.0.11, protocol version 3)_

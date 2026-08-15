@@ -132,8 +132,8 @@ export function DatabasePicker({
           title={`Delete '${current}' and everything in it`}
           disabled={busy}
           onClick={() => {
-            // Typing the name, not an OK button. This deletes a directory, and it is the only thing in this UI that
-            // destroys anything — the query language beside it cannot delete a single node.
+            // Typing the name, not an OK button. This unlinks a whole directory in one request — including databases
+            // no query addressed — which is why it stays behind its own flag even on a server that accepts writes.
             const typed = window.prompt(
               `Deleting '${current}' removes the database and everything in it, permanently.\n\n`
                 + `Type its name to confirm:`

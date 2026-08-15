@@ -10,6 +10,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.LinkedBlockingQueue;
 
 import io.metaloom.graph.protocol.WireFormatException;
+import io.metaloom.graph.protocol.QuerySummary;
 import io.metaloom.graph.protocol.WireValueCodec;
 
 /**
@@ -77,6 +78,7 @@ public final class RowStream implements AutoCloseable, Iterable<Row> {
 	private long rowsRead;
 	private QueryFailedException pending;
 	private boolean pendingObserved;
+	private QuerySummary summary;
 	private boolean closed;
 
 	RowStream(GraphClient client, int streamId) {
@@ -146,6 +148,26 @@ public final class RowStream implements AutoCloseable, Iterable<Row> {
 	/** How many rows have been handed out so far. */
 	public long rowsRead() {
 		return rowsRead;
+	}
+
+	/**
+	 * What the query did, once it has finished.
+	 *
+	 * <p>
+	 * Blocks until the server's terminal frame arrives, draining any rows still to come — so calling it before reading
+	 * the rows discards them. For a write query with no RETURN this is the entire result: there are no rows, and
+	 * nothing else says that three nodes were created.
+	 * </p>
+	 *
+	 * @throws QueryFailedException
+	 *             if the query failed, because there is no summary of a query that did not finish
+	 */
+	public QuerySummary summary() {
+		while (!finished) {
+			take();
+		}
+		report();
+		return summary;
 	}
 
 	@Override
@@ -221,6 +243,7 @@ public final class RowStream implements AutoCloseable, Iterable<Row> {
 			finished = true;
 			rowsLeftInBatch = 0;
 			pending = terminal.error();
+			summary = terminal.summary();
 		}
 	}
 
@@ -270,8 +293,8 @@ public final class RowStream implements AutoCloseable, Iterable<Row> {
 	private record Batch(byte[] payload) {
 	}
 
-	/** A null error means the query completed. */
-	private record Terminal(QueryFailedException error) {
+	/** A null error means the query completed, and then the summary is the server's. */
+	private record Terminal(QueryFailedException error, QuerySummary summary) {
 	}
 
 	void onColumns(List<String> names) {
@@ -282,16 +305,16 @@ public final class RowStream implements AutoCloseable, Iterable<Row> {
 		queue.add(new Batch(payload));
 	}
 
-	void onComplete() {
+	void onComplete(QuerySummary summary) {
 		columnsArrived.complete(List.of());
-		queue.add(new Terminal(null));
+		queue.add(new Terminal(null, summary));
 	}
 
 	void onError(QueryFailedException error) {
 		// A syntax error arrives before any COLUMNS frame, so a caller blocked in columns() has to be woken by the
 		// error rather than left waiting for a header that is never coming.
 		columnsArrived.completeExceptionally(error);
-		queue.add(new Terminal(error));
+		queue.add(new Terminal(error, null));
 	}
 
 	int streamId() {

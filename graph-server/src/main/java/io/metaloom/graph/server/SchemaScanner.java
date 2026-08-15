@@ -81,6 +81,19 @@ final class SchemaScanner {
 		return fresh.copy().put("cached", false);
 	}
 
+	/**
+	 * Throws away the cached scan, so the next request runs a fresh one.
+	 *
+	 * <p>
+	 * Called after a query that changed the store. Without it a write would leave the sidebar reporting labels and
+	 * counts from before it for up to a minute — and since the counts come from the data rather than the dictionary,
+	 * a new label simply would not appear.
+	 * </p>
+	 */
+	synchronized void invalidate() {
+		cached = null;
+	}
+
 	private JsonObject scan() {
 		Map<String, long[]> labels = new HashMap<>();
 		Map<String, long[]> types = new HashMap<>();

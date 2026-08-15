@@ -362,6 +362,13 @@ the kind field already selects the addressing policy. Do not do this speculative
   the rule that prevents a lost update, not a convenience. See §3.
 - **A transaction sees its own writes.** The overlay is consulted before anything else, so
   read-your-writes outranks both the mapping and any view.
+- **A Cypher write query is one transaction**, opened and committed by `Cypher.stream`, or joined when
+  the caller already holds one. It opens **no read view**: a writer reads the current mapping anyway,
+  and a view would only add a liveness check that an abandoned view can fail. A write inside an open
+  read view is refused rather than silently run outside it ([CYPHER.md §4.1](CYPHER.md)).
+- **`begin()` does not refuse to nest, and nesting is silent.** The inner commit clears the published
+  overlay, after which the outer transaction's writes go straight to the mapping — unlogged, and past
+  any rollback. `hasWriteTransaction()` exists so a library can ask rather than find out.
 - **Close read views.** An open view holds every version committed since it began. A forgotten one is
   a memory leak with a name: `snapshotStats()` reports its age and what it is holding, and past
   `retainedVersionBytes` the store abandons it rather than growing.
@@ -441,5 +448,5 @@ worker (reclamation is a call at the end of commit, not a thread).
 
 ---
 
-_Git HEAD revision: `364b5f7`_
-_Last updated: 2026-08-14_
+_Git HEAD revision: `e4601d1`_
+_Last updated: 2026-08-15 (Cypher writes)_

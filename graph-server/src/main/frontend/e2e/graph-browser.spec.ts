@@ -160,9 +160,19 @@ test.describe('cypher', () => {
     await expect(error.locator('pre')).toContainText('^');
   });
 
-  test('a write is refused as read-only', async ({ page }) => {
-    await run(page, 'CREATE (a:Airport {code: "ZZZ"}) RETURN a');
-    await expect(page.getByTestId('error')).toContainText('read-only');
+  test('a write reports what it changed rather than zero rows', async ({ page }) => {
+    // The demo server runs with --allow-write. A CREATE with no RETURN has no rows and no graph, so without the
+    // summary the status line would read "0 rows · 0 nodes on the canvas" — true, and useless.
+    await run(page, 'CREATE (:Ephemeral {marker: "e2e"})');
+    await expect(page.getByTestId('status')).toContainText('1 node created');
+
+    await run(page, 'MATCH (n:Ephemeral) DETACH DELETE n');
+    await expect(page.getByTestId('status')).toContainText('1 node deleted');
+  });
+
+  test('a write the language refuses is shown as an error, not as a silent no-op', async ({ page }) => {
+    await run(page, 'MATCH (a:Airport)-[:ROUTE_TO]->() WITH a LIMIT 1 DELETE a');
+    await expect(page.getByTestId('error')).toContainText('DETACH DELETE');
   });
 
   test('a result with nothing renderable goes to the table', async ({ page }) => {
@@ -368,8 +378,8 @@ test.describe('replace and merge', () => {
   });
 
   test('hiding a node takes its relationships with it, and a later query brings them back', async ({ page }) => {
-    // The canvas is a view, not the store: hiding is a UI action and the read-only server could not delete anything
-    // even if it were asked to.
+    // The canvas is a view, not the store: hiding is a UI action, and deliberately not a delete even though the
+    // query editor beside it can now delete. Running the query again brings the node back.
     await run(page, FROM_HEATHROW);
     await expect(links(page)).toHaveCount(5);
     await nodeNamed(page, 'Heathrow').click();

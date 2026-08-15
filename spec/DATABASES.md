@@ -19,7 +19,7 @@ each store at most once, and closing them together.
 | **Selection, HTTP** | `?database=<name>` on `/api/query`, `/api/schema`, `/api/stats` |
 | **Selection, binary** | **Per connection**, in the `HELLO` frame. Protocol version 2 |
 | **Lifecycle** | `GET /api/databases`, `PUT /api/databases/{name}`, `DELETE /api/databases/{name}` |
-| **Dropping** | Off unless the server was started with `--allow-drop` |
+| **Dropping** | Off unless the server was started with `--allow-drop`, and independent of `--allow-write` |
 | **Default** | `default`, or whatever `--database=` names. Created at startup if absent |
 
 ---
@@ -97,9 +97,14 @@ create. The name reaches this code from an unauthenticated port, and a typo that
 database is a typo that fills a disk.
 
 **Dropping is opt-in.** `DELETE /api/databases/{name}` returns 403 unless the server was started with
-`--allow-drop`, and the response says so. It is the only route in the server that destroys data — the
-query language beside it cannot delete a single node — and it sits on a port with no authentication.
-The UI asks the operator to type the database's name, not to click OK.
+`--allow-drop`, and the response says so. The UI asks the operator to type the database's name, not to
+click OK.
+
+It keeps its own flag now that the query language can delete
+([CYPHER.md §5.1](CYPHER.md)), and the reason changed rather than disappeared: `DETACH DELETE` empties
+a database a query can address, one element at a time, under that query's own deadline. This unlinks a
+whole directory in one request, reaches databases no query named, and is the only route in the server
+that destroys anything. Enabling writes is not asking for that, so `--allow-write` does not imply it.
 
 **The last database cannot be dropped.** A root with none cannot be reopened without one being made,
 and a server holding no database at all has no useful behaviour.
@@ -185,7 +190,10 @@ The initial database comes from `GET /api/databases`, never from a hard-coded `"
   of a second one.
 - There is **no per-database authentication**, because there is no authentication at all
   ([OPERATIONS.md §9.1](OPERATIONS.md)). Anything that can reach the port can reach every database
-  under the root.
+  under the root — and, with `--allow-write`, change every one of them.
+- **`--allow-write` is per server, not per database.** There is no way to open one database for writing
+  and keep another read-only; that would need an identity to attach the distinction to, and there is
+  none.
 
 ---
 
@@ -200,5 +208,5 @@ The initial database comes from `GET /api/databases`, never from a hard-coded `"
 
 ---
 
-_Git HEAD revision: `f9cc6653`_
-_Last updated: 2026-08-15 (written against protocol version 2)_
+_Git HEAD revision: `e4601d1`_
+_Last updated: 2026-08-15 (protocol version 3)_

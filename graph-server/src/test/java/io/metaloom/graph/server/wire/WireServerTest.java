@@ -1,6 +1,7 @@
 package io.metaloom.graph.server.wire;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -37,6 +38,7 @@ import io.metaloom.graph.core.api.Transaction;
 import io.metaloom.graph.core.fixture.TempStore;
 import io.metaloom.graph.protocol.Frames;
 import io.metaloom.graph.protocol.Protocol;
+import io.metaloom.graph.protocol.QuerySummary;
 import io.metaloom.graph.protocol.WireError;
 import io.metaloom.graph.protocol.WireValueCodec;
 import io.vertx.core.buffer.Buffer;
@@ -100,12 +102,21 @@ public class WireServerTest {
 	}
 
 	private void listen(WireServerOptions options) {
-		server = new WireServer(databases, GraphDatabases.DEFAULT_NAME, options.withPort(0));
+		listen(options, false);
+	}
+
+	private void listen(WireServerOptions options, boolean allowWrite) {
+		server = new WireServer(io.vertx.core.Vertx.vertx(), databases, GraphDatabases.DEFAULT_NAME,
+			options.withPort(0), allowWrite);
 		port = server.listen().toCompletionStage().toCompletableFuture().join();
 	}
 
 	private void listen() {
 		listen(WireServerOptions.defaults());
+	}
+
+	private void listenAllowingWrites() {
+		listen(WireServerOptions.defaults(), true);
 	}
 
 	private GraphClient connect() {
@@ -125,6 +136,120 @@ public class WireServerTest {
 		return ClientOptions.defaults()
 			.withReadBufferBytes(64 * 1024)
 			.withSocketReceiveBufferBytes(32 * 1024);
+	}
+
+	// ---------------------------------------------------------------- writes
+
+	@Test
+	public void testAWriteIsRefusedWithoutTheFlag() {
+		listen();
+		try (GraphClient client = connect()) {
+			QueryFailedException thrown = assertThrows(QueryFailedException.class,
+				() -> client.execute("CREATE (n:City {name: 'Bonn'})"));
+			// Its own code: the query is fine and the same text against a server with the flag would run, so a client
+			// should report this rather than retry it.
+			assertEquals(WireError.READ_ONLY, thrown.error());
+			assertTrue(thrown.getMessage().contains("--allow-write"), thrown.getMessage());
+			assertEquals(0, store.nodesByLabel("City").size());
+		}
+	}
+
+	@Test
+	public void testAWriteRunsAndReportsWhatItChanged() {
+		listenAllowingWrites();
+		try (GraphClient client = connect()) {
+			QuerySummary summary = client.execute("CREATE (a:City {name: 'Bonn'})-[:IN]->(b:Country {name: 'DE'})");
+
+			assertEquals(0, summary.rows(), "a query with no RETURN produces none");
+			assertEquals(2, summary.nodesCreated());
+			assertEquals(1, summary.relationshipsCreated());
+			assertEquals(2, summary.propertiesSet());
+			assertEquals(2, summary.labelsAdded());
+			assertTrue(summary.containsUpdates());
+			assertEquals(1, store.nodesByLabel("City").size());
+		}
+	}
+
+	@Test
+	public void testAWriteWithAReturnStreamsItsRowsAndItsSummary() {
+		listenAllowingWrites();
+		try (GraphClient client = connect(); RowStream rows = client.query(
+			"MATCH (n:Person) SET n.age = 35 RETURN n.name AS name, n.age AS age")) {
+
+			assertEquals(List.of("name", "age"), rows.columns());
+			assertTrue(rows.hasNext());
+			Row row = rows.next();
+			assertEquals("Alice", row.string("name"));
+			assertEquals(35L, row.longValue("age"), "the row must carry the value the same query just wrote");
+			assertFalse(rows.hasNext());
+
+			QuerySummary summary = rows.summary();
+			assertEquals(1, summary.rows());
+			assertEquals(1, summary.propertiesSet());
+		}
+	}
+
+	@Test
+	public void testAReadReportsNoUpdates() {
+		listenAllowingWrites();
+		try (GraphClient client = connect()) {
+			QuerySummary summary = client.execute("MATCH (n:Person) RETURN n");
+			assertEquals(1, summary.rows());
+			assertFalse(summary.containsUpdates());
+			assertTrue(summary.elapsedMicros() >= 0);
+		}
+	}
+
+	@Test
+	public void testAFailedWriteRollsBackAndLeavesTheStoreUsable() {
+		listenAllowingWrites();
+		try (GraphClient client = connect()) {
+			// Creates a node, then fails on a property a node cannot hold.
+			assertThrows(QueryFailedException.class,
+				() -> client.execute("MATCH (p:Person) CREATE (c:Copy) SET c.owner = p"));
+			assertEquals(0, store.nodesByLabel("Copy").size(), "the created node must have gone with the failure");
+
+			// And the writer lock came back, which is what the next query proves.
+			assertEquals(1, client.execute("CREATE (n:After)").nodesCreated());
+		}
+	}
+
+	/**
+	 * Two writers on one store, from two connections.
+	 *
+	 * <p>
+	 * The engine serialises them on one lock, so what matters is that both finish and neither hangs — the permit exists
+	 * to bound the wait, not to reject work that can proceed.
+	 * </p>
+	 */
+	@Test
+	public void testTwoConnectionsWritingToOneDatabaseBothSucceed() throws Exception {
+		listenAllowingWrites();
+		try (GraphClient one = connect(); GraphClient two = connect()) {
+			java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(2);
+			try {
+				var first = pool.submit(() -> one.execute("UNWIND range(1, 50) AS i CREATE (:Bulk {i: i})"));
+				var second = pool.submit(() -> two.execute("UNWIND range(1, 50) AS i CREATE (:Bulk {i: i})"));
+				assertEquals(50, first.get(30, java.util.concurrent.TimeUnit.SECONDS).nodesCreated());
+				assertEquals(50, second.get(30, java.util.concurrent.TimeUnit.SECONDS).nodesCreated());
+			} finally {
+				pool.shutdownNow();
+			}
+			assertEquals(100, store.nodesByLabel("Bulk").size());
+		}
+	}
+
+	@Test
+	public void testAWriteLeavesNoViewAndNoLockBehind() throws Exception {
+		listenAllowingWrites();
+		try (GraphClient client = connect()) {
+			client.execute("CREATE (n:City)");
+			assertEquals(0, store.snapshotStats().openViews(), "a write query opens no read view at all");
+			// A leaked write transaction would block every writer in the process, and openViews() cannot see it.
+			try (io.metaloom.graph.core.api.Transaction txn = store.begin()) {
+				txn.rollback();
+			}
+		}
 	}
 
 	// ---------------------------------------------------------------- the handshake

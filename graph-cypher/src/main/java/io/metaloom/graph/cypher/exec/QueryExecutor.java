@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import io.metaloom.graph.cypher.CypherStats;
 import io.metaloom.graph.cypher.ast.Ast;
 import io.metaloom.graph.cypher.func.Functions;
 
@@ -26,14 +27,22 @@ public final class QueryExecutor {
 
 	private final Evaluator evaluator;
 	private final PatternMatcher matcher;
+	private final Writer writer;
 
 	public QueryExecutor(GraphAccess graph, Map<String, Object> parameters) {
 		this.evaluator = new Evaluator(graph, parameters);
 		this.matcher = new PatternMatcher(evaluator);
+		this.writer = new Writer(graph, evaluator);
 	}
 
-	/** The result of one query: the column names, in order, and the rows. */
-	public record Result(List<String> columns, List<List<Object>> rows) {
+	/**
+	 * The result of one query: the column names, in order, the rows, and what the query changed.
+	 *
+	 * @param stats
+	 *            {@link CypherStats#NONE} for a read. A write query is often all counters and no rows, so this is not
+	 *            an addendum to the result — for {@code CREATE (n:Person)} it is the entire result
+	 */
+	public record Result(List<String> columns, List<List<Object>> rows, CypherStats stats) {
 	}
 
 	public Result run(Ast.Query query) {
@@ -50,15 +59,17 @@ public final class QueryExecutor {
 			if (!query.unionAll().get(i - 1)) {
 				combined = distinctRows(combined);
 			}
-			result = new Result(result.columns(), combined);
+			result = new Result(result.columns(), combined, result.stats());
 		}
-		return result;
+		// One Writer serves every part, so the counters are the query's rather than the last part's.
+		return new Result(result.columns(), result.rows(), writer.stats());
 	}
 
 	private Result runSingle(Ast.SingleQuery query) {
 		List<Row> rows = new ArrayList<>();
 		rows.add(new Row());
 		List<String> columns = List.of();
+		boolean returned = false;
 
 		for (Ast.Clause clause : query.clauses()) {
 			switch (clause) {
@@ -99,8 +110,22 @@ public final class QueryExecutor {
 					rows = order(projected.rows(), returnClause.projection(), projected.columns());
 					rows = slice(rows, returnClause.projection());
 					columns = projected.columns();
+					returned = true;
 				}
+				// Each of these consumes the materialised list and produces one, which is what gives the write clauses
+				// openCypher's eager semantics for nothing: a CREATE cannot feed the MATCH that is driving it.
+				case Ast.Create create -> rows = writer.create(create, rows);
+				case Ast.SetClause set -> rows = writer.set(set, rows);
+				case Ast.Remove remove -> rows = writer.remove(remove, rows);
+				case Ast.Delete delete -> rows = writer.delete(delete, rows);
 			}
+		}
+
+		if (!returned) {
+			// A write query with no RETURN. Its result is what it changed, and the counters carry that; projecting the
+			// working rows would report one empty row per element touched, which is a result the query never asked
+			// for. Only a write can reach here — the parser refuses a read that does not end in RETURN.
+			return new Result(List.of(), List.of(), writer.stats());
 		}
 
 		List<List<Object>> output = new ArrayList<>(rows.size());
@@ -111,7 +136,7 @@ public final class QueryExecutor {
 			}
 			output.add(values);
 		}
-		return new Result(columns, output);
+		return new Result(columns, output, writer.stats());
 	}
 
 	// ---------------------------------------------------------------- clauses

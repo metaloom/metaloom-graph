@@ -342,6 +342,12 @@ scopes them for the calling thread rather than duplicating them.
 
 - [x] `GraphStore.open/close` and `GraphStoreOptions`
 - [x] `createNode` / `nodeProperties` / `setNodeProperties` / `deleteNode`
+- [x] `nodeLabels` / `nodeHasLabel` / `addNodeLabel` / `removeNodeLabel` — the last two added for
+      Cypher's `SET n:Label` and `REMOVE n:Label`. They maintain the label index themselves, since
+      `IndexCatalog` had no hook for a changed label set, and they move the set in and out of the
+      record's three inline slots and its overflow block
+- [x] `hasReadTransaction` / `hasWriteTransaction` — the second because `begin()` does **not** refuse
+      to nest and a nested transaction stops being rollbackable without saying so
 - [x] `createEdge` / `createRelationship` / `deleteEdge` / `deleteRelationship`
 - [x] `Properties` typed accessors, absent versus null
 - [x] `neighbours(direction, types)` and breadth-first `traverse(maxDepth)`
@@ -382,5 +388,5 @@ scopes them for the calling thread rather than duplicating them.
 
 ---
 
-_Git HEAD revision: `364b5f7`_
-_Last updated: 2026-08-14_
+_Git HEAD revision: `e4601d1`_
+_Last updated: 2026-08-15 (label mutation added)_

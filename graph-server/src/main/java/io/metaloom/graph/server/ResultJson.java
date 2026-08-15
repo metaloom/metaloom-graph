@@ -8,6 +8,7 @@ import java.util.Set;
 
 import io.metaloom.graph.cypher.CypherResult;
 import io.metaloom.graph.cypher.CypherRow;
+import io.metaloom.graph.cypher.CypherStats;
 import io.metaloom.graph.cypher.value.CypherNode;
 import io.metaloom.graph.cypher.value.CypherPath;
 import io.metaloom.graph.cypher.value.CypherRelationship;
@@ -84,7 +85,7 @@ final class ResultJson {
 			(drawable ? connected : dangling).add(link);
 		}
 
-		return new JsonObject()
+		JsonObject json = new JsonObject()
 			.put("columns", columns)
 			.put("rows", rows)
 			.put("rowCount", result.size())
@@ -93,6 +94,27 @@ final class ResultJson {
 				.put("nodes", new JsonArray(List.copyOf(nodes.values())))
 				.put("links", connected)
 				.put("danglingLinks", dangling));
+
+		// Only when something changed, so every read response is exactly what it was before writes existed — which is
+		// what keeps the existing tests meaning what they meant. A write query that matched nothing reports no stats,
+		// correctly: nothing happened.
+		if (result.stats().containsUpdates()) {
+			json.put("stats", statsJson(result.stats()));
+		}
+		return json;
+	}
+
+	private static JsonObject statsJson(CypherStats stats) {
+		return new JsonObject()
+			.put("nodesCreated", stats.nodesCreated())
+			.put("nodesDeleted", stats.nodesDeleted())
+			.put("relationshipsCreated", stats.relationshipsCreated())
+			.put("relationshipsDeleted", stats.relationshipsDeleted())
+			.put("propertiesSet", stats.propertiesSet())
+			.put("labelsAdded", stats.labelsAdded())
+			.put("labelsRemoved", stats.labelsRemoved())
+			// Rendered once here rather than reassembled in the browser, so the status line and a log line agree.
+			.put("summary", stats.summary());
 	}
 
 	/** Adds any renderable value to the graph, recursing into lists so {@code collect(n)} still draws. */

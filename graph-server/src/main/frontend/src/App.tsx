@@ -29,6 +29,8 @@ export function App() {
   const [tab, setTab] = useState<'graph' | 'table'>('graph');
   const [fitKey, setFitKey] = useState(0);
   const [databases, setDatabases] = useState<DatabaseList | null>(null);
+  /** What the server will accept, not what this page would like: every write is refused without the flag. */
+  const allowWrite = databases?.allowWrite ?? false;
   const [database, setDatabase] = useState('');
 
   const loadSchema = useCallback(async (name: string, refresh: boolean) => {
@@ -128,12 +130,20 @@ export function App() {
       const held = next.pending.length > 0
         ? ` · ${next.pending.length} relationship${next.pending.length === 1 ? '' : 's'} waiting for the other end`
         : '';
-      setStatus(`${response.rowCount} row${response.rowCount === 1 ? '' : 's'} in ${response.elapsedMillis} ms · ${drawn}${held}`);
+      // A write with no RETURN has no rows and no graph, so "0 rows · 0 nodes on the canvas" would be true and tell
+      // the user nothing about the three nodes they just created. What it changed leads instead.
+      const changed = response.stats ? `${response.stats.summary} · ` : '';
+      setStatus(`${changed}${response.rowCount} row${response.rowCount === 1 ? '' : 's'} in ${response.elapsedMillis} ms · ${drawn}${held}`);
       if (response.graph.nodes.length === 0 && response.rowCount > 0) {
         setTab('table');
       } else if (response.graph.nodes.length > 0) {
         setTab('graph');
         setFitKey(key => key + 1);
+      }
+      if (response.stats) {
+        // The sidebar's counts come from a scan of the data, so a write can add a label that was not there before.
+        // The server has already thrown its cached scan away; this is the half that asks for the new one.
+        void loadSchema(database, false);
       }
     } catch (failure) {
       setError(failure instanceof ApiError ? failure : new ApiError('transport', String(failure)));
@@ -141,7 +151,7 @@ export function App() {
     } finally {
       setRunning(false);
     }
-  }, [graph, database]);
+  }, [graph, database, loadSchema]);
 
   const runCurrent = useCallback(() => void run(query, mode), [run, query, mode]);
 
@@ -154,7 +164,9 @@ export function App() {
     <div className="app">
       <header className="topBar">
         <h1>Graph browser</h1>
-        <span className="subtitle">openCypher, read-only</span>
+        <span className="subtitle">
+          openCypher{allowWrite ? '' : ', read-only'}
+        </span>
         <span className="spacer" />
         <DatabasePicker
           databases={databases}

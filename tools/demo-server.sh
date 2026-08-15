@@ -11,6 +11,10 @@
 #
 # This runs the shipped server with its shipped --demo flag rather than anything test-only, so what the browser suite
 # drives is the same thing a user gets.
+#
+# --allow-write is on here and off in the shipped default. This is a local demo of the feature, on a generated graph
+# in a target directory, and the browser suite has to be able to exercise the editor. A real deployment gets the
+# safe default; see spec/OPERATIONS.md section 9.1.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -37,4 +41,4 @@ fi
 # is a trap rather than a saving.
 exec mvn -o -q -f "$ROOT/pom.xml" -pl graph-server exec:java \
     -Dvertx.disableFileCaching=true \
-    -Dexec.args="--demo --demo-size=$SIZE $STORE $PORT"
+    -Dexec.args="--demo --allow-write --demo-size=$SIZE $STORE $PORT"

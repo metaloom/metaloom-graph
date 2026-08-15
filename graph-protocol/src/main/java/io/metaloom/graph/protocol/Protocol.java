@@ -34,15 +34,19 @@ package io.metaloom.graph.protocol;
 public final class Protocol {
 
 	/**
-	 * Version 2: {@link Frames#HELLO} carries a database name and {@link Frames#WELCOME} echoes the resolved one.
+	 * Version 3: {@link Frames#COMPLETE} carries what the query changed, so a write query can report itself.
 	 *
 	 * <p>
-	 * A bump rather than an extension, and the handshake is why that costs nothing: a version 1 client meets a clean
+	 * Version 2 added the database to {@link Frames#HELLO} and {@link Frames#WELCOME}; version 1 had neither.
+	 * </p>
+	 *
+	 * <p>
+	 * A bump rather than an extension, and the handshake is why that costs nothing: an older client meets a clean
 	 * {@link WireError#UNSUPPORTED_VERSION} naming both numbers instead of a stream of frames it cannot read. Nothing
-	 * had shipped on version 1, so there is no range to accept — when there is, this is where it goes.
+	 * has shipped on any version, so there is no range to accept — when there is, this is where it goes.
 	 * </p>
 	 */
-	public static final int VERSION = 2;
+	public static final int VERSION = 3;
 
 	/** Not 8080, so the binary port and the HTTP port can both run over one store without an argument about it. */
 	public static final int DEFAULT_PORT = 8081;

@@ -49,4 +49,17 @@ public interface RowSink {
 	 *         normally — stopping early is an outcome, not an error.
 	 */
 	boolean row(List<Object> values);
+
+	/**
+	 * What the query changed, once, after the last row.
+	 *
+	 * <p>
+	 * After rather than before, because a counter is only final when the query is. Not called at all when a sink
+	 * stopped early by returning {@code false} from {@link #row}: the numbers describe a whole query, and a sink that
+	 * stopped reading has no whole query to be told about. For a write query the store has still been changed by then
+	 * — the commit happens before the first row is delivered — so this reports what happened rather than what will.
+	 * </p>
+	 */
+	default void stats(CypherStats stats) {
+	}
 }

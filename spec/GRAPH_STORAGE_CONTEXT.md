@@ -24,7 +24,7 @@ The defining design constraint is:
 > **An element id decodes arithmetically into the exact file and byte offset of its record.
 > Reading an element by id costs zero index probes and zero extra seeks.**
 
-**Status.** Phases 0 to 10 are implemented to varying depth; 445 tests pass here, plus 23 in the MetaLoom
+**Status.** Phases 0 to 10 are implemented to varying depth; 563 tests pass here, plus 23 in the MetaLoom
 integration. The engine is **durable**
 (write-ahead log, fsync before any data page is touched, redo recovery), **transactional** (commit,
 rollback, auto-commit), **indexed** (label and property B+trees), and it reclaims space both without
@@ -99,7 +99,7 @@ GRAPH_STORAGE_CONTEXT.md (this file)
 | [FILE_FORMAT.md](FILE_FORMAT.md) | Store directory layout, manifest, segment anatomy, page metadata array, free-slot bitmap, node and relationship record layouts, versioning and compaction | Adjacency internals, property internals |
 | [RELATIONSHIP_STORAGE.md](RELATIONSHIP_STORAGE.md) | Inline edges, adjacency blocks, edge compression, lightweight edges, traversal cost model | Node record layout |
 | [PROPERTY_STORAGE.md](PROPERTY_STORAGE.md) | Property blocks, key and label dictionaries, value typing, inline vs blob, string dedup | Relationship storage |
-| [CYPHER.md](CYPHER.md) | The read-only openCypher subset: grammar, null semantics, where it differs from the engine, the planner's costs, and the Vert.x HTTP server with its React and D3 graph browser | The public API; the binary streaming port (WIRE.md) |
+| [CYPHER.md](CYPHER.md) | The openCypher subset, reads and writes: grammar, null semantics, where it differs from the engine, which transaction a query gets, why writes are off by default, the planner's costs, and the Vert.x HTTP server with its React and D3 graph browser | The public API; the binary streaming port (WIRE.md) |
 | [DATABASES.md](DATABASES.md) | Several databases under one root: the directory layout, why a name is validated by allow-list, lazy opening, create and drop, and how a database is selected from each front end | The storage format; the frame layout (WIRE.md) |
 | [WIRE.md](WIRE.md) | The binary streaming port: the frame, the value codec, the server's four bounds on a slow reader, the memory multiplication, and the Java client | The query language (CYPHER.md), the HTTP route and the browser UI |
 | [TRANSPORT_DECISION.md](TRANSPORT_DECISION.md) | History, not specification: the measured trial that chose framed TCP over gRPC, with its criteria committed before its numbers, and what building the winner for real then changed | What the protocol *is* (WIRE.md) |
@@ -355,5 +355,5 @@ deliverables and exit criteria are in [PLAN.md](PLAN.md).
 
 ---
 
-_Git HEAD revision: `364b5f7`_
-_Last updated: 2026-08-14_
+_Git HEAD revision: `e4601d1`_
+_Last updated: 2026-08-15_

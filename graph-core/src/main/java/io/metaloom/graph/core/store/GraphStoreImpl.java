@@ -342,6 +342,13 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	}
 
 	@Override
+	public boolean hasWriteTransaction() {
+		// Deliberately the same test {@link #write} uses to decide whether to join or to open one, so a caller asking
+		// the question and a mutation answering it for itself can never disagree.
+		return writerLock.isHeldByCurrentThread() && currentTransaction != null;
+	}
+
+	@Override
 	public SnapshotStats snapshotStats() {
 		checkOpen();
 		PageVersions versions = transactions.versions();
@@ -581,6 +588,64 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			int labelId = catalog.lookupLabel(label);
 			return labelId != 0 && nodes.hasLabel(nodeId, labelId);
 		});
+	}
+
+	@Override
+	public boolean addNodeLabel(long nodeId, String label) throws IOException {
+		if (label == null) {
+			throw new IllegalArgumentException("A null label for node " + ElementId.toString(nodeId));
+		}
+		return write(() -> {
+			// Read first, so a stale or freed id is refused before a dictionary id is handed out. Interning is not
+			// transactional — the dictionary is appended and flushed immediately — so a label interned for a write that
+			// then fails stays in the dictionary for the life of the store.
+			int[] before = nodes.labels(nodeId);
+			int labelId = catalog.internLabel(label);
+			if (holdsLabel(before, labelId)) {
+				return false;
+			}
+			int[] after = java.util.Arrays.copyOf(before, before.length + 1);
+			after[before.length] = labelId;
+			nodes.labels(nodeId, after);
+			indexes.onLabelsChanged(nodeId, before, after);
+			return true;
+		});
+	}
+
+	@Override
+	public boolean removeNodeLabel(long nodeId, String label) throws IOException {
+		if (label == null) {
+			throw new IllegalArgumentException("A null label for node " + ElementId.toString(nodeId));
+		}
+		return write(() -> {
+			int[] before = nodes.labels(nodeId);
+			// lookupLabel rather than internLabel: removing a label the store has never seen must not mint a dictionary
+			// id for it. Ids are never reclaimed, so that would be a permanent entry describing something that never
+			// existed.
+			int labelId = catalog.lookupLabel(label);
+			if (labelId == 0 || !holdsLabel(before, labelId)) {
+				return false;
+			}
+			int[] after = new int[before.length - 1];
+			int at = 0;
+			for (int held : before) {
+				if (held != labelId) {
+					after[at++] = held;
+				}
+			}
+			nodes.labels(nodeId, after);
+			indexes.onLabelsChanged(nodeId, before, after);
+			return true;
+		});
+	}
+
+	private static boolean holdsLabel(int[] labelIds, int labelId) {
+		for (int held : labelIds) {
+			if (held == labelId) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/**

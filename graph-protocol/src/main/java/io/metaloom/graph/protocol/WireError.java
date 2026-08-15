@@ -47,7 +47,25 @@ public enum WireError {
 	 * wrong" about a typo.
 	 * </p>
 	 */
-	NO_SUCH_DATABASE(9);
+	NO_SUCH_DATABASE(9),
+	/**
+	 * The query would have written and this server does not accept writes.
+	 *
+	 * <p>
+	 * Distinct from {@link #TYPE} because nothing is wrong with the query: the same text against a server started with
+	 * {@code --allow-write} would run. It is a property of the server, so a client should report it rather than retry.
+	 * </p>
+	 */
+	READ_ONLY(10),
+	/**
+	 * A write would have put two live elements on the same value of a unique key.
+	 *
+	 * <p>
+	 * Its own code rather than {@link #STORE} because it is about the data the caller sent meeting data already there —
+	 * the one store refusal that a caller can act on, by sending different data.
+	 * </p>
+	 */
+	CONSTRAINT_VIOLATION(11);
 
 	private final int code;
 

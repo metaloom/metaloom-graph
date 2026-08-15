@@ -31,13 +31,41 @@ public final class Ast {
 	 *            which keeps duplicates
 	 */
 	public record Query(List<SingleQuery> parts, List<Boolean> unionAll) {
+
+		/**
+		 * Whether running this query can change the store.
+		 *
+		 * <p>
+		 * Answered from the tree so a caller can decide <em>before</em> executing: the servers use it to refuse a write
+		 * on the event loop when writes are not enabled, and to choose between a read view and a write transaction. A
+		 * query is a write if any of its union parts is.
+		 * </p>
+		 */
+		public boolean isWrite() {
+			for (SingleQuery part : parts) {
+				if (part.isWrite()) {
+					return true;
+				}
+			}
+			return false;
+		}
 	}
 
-	/** A sequence of reading clauses ending in RETURN. */
+	/** A sequence of clauses, optionally ending in RETURN. */
 	public record SingleQuery(List<Clause> clauses) {
+
+		public boolean isWrite() {
+			for (Clause clause : clauses) {
+				if (clause instanceof Create || clause instanceof SetClause || clause instanceof Remove
+					|| clause instanceof Delete) {
+					return true;
+				}
+			}
+			return false;
+		}
 	}
 
-	public sealed interface Clause permits Match, Unwind, With, Return {
+	public sealed interface Clause permits Match, Unwind, With, Return, Create, SetClause, Remove, Delete {
 	}
 
 	/**
@@ -55,6 +83,70 @@ public final class Ast {
 	}
 
 	public record Return(Projection projection) implements Clause {
+	}
+
+	// ---------------------------------------------------------------- write clauses
+
+	/**
+	 * {@code CREATE (a:Person {name:$n})-[r:KNOWS]->(b)} — runs once per input row.
+	 *
+	 * <p>
+	 * The pattern grammar is shared with MATCH rather than duplicated, so a change to how a node pattern parses reaches
+	 * both. What MATCH permits and CREATE does not — a variable-length range, an undirected relationship, a
+	 * relationship with no type — is refused by the parser with a message naming the reason, because none of the three
+	 * describes a graph that could be built.
+	 * </p>
+	 */
+	public record Create(List<PatternPart> pattern) implements Clause {
+	}
+
+	/**
+	 * {@code SET} — named {@code SetClause} because {@code Set} beside {@code java.util.Set} in an executor that uses
+	 * both would be a genuine hazard rather than a stylistic one.
+	 */
+	public record SetClause(List<SetItem> items) implements Clause {
+	}
+
+	public sealed interface SetItem permits SetProperty, SetPropertiesReplace, SetPropertiesMerge, SetLabels {
+	}
+
+	/** {@code SET n.age = 30}. A null value removes the property, which is Cypher's rule rather than an accident. */
+	public record SetProperty(Expr target, String key, Expr value) implements SetItem {
+	}
+
+	/** {@code SET n = {a:1}} — every existing property is replaced by the map. */
+	public record SetPropertiesReplace(String variable, Expr map) implements SetItem {
+	}
+
+	/** {@code SET n += {a:1}} — the map is merged over what is there. */
+	public record SetPropertiesMerge(String variable, Expr map) implements SetItem {
+	}
+
+	/** {@code SET n:Person:Employee} */
+	public record SetLabels(String variable, List<String> labels) implements SetItem {
+	}
+
+	public record Remove(List<RemoveItem> items) implements Clause {
+	}
+
+	public sealed interface RemoveItem permits RemoveProperty, RemoveLabels {
+	}
+
+	/** {@code REMOVE n.age} */
+	public record RemoveProperty(Expr target, String key) implements RemoveItem {
+	}
+
+	/** {@code REMOVE n:Employee} */
+	public record RemoveLabels(String variable, List<String> labels) implements RemoveItem {
+	}
+
+	/**
+	 * @param detach
+	 *            {@code DETACH DELETE}, which removes a node's relationships first. Without it, deleting a node that
+	 *            still has any is refused — the engine's own delete always cascades, so the refusal is the query
+	 *            language's rule and has to be enforced above it
+	 */
+	public record Delete(List<Expr> targets, boolean detach) implements Clause {
 	}
 
 	/**

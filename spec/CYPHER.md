@@ -1,6 +1,7 @@
 # openCypher — the accepted subset
 
-A **read-only** openCypher subset over the storage engine, plus an HTTP server and a browser UI.
+An openCypher subset over the storage engine, plus an HTTP server and a browser UI. Reads and writes;
+**writes are off by default on both ports** and turned on with `--allow-write` (§5.1).
 Three modules:
 
 | Module | What it is |
@@ -29,11 +30,19 @@ for (CypherRow row : result) {
 
 ```
 Query        := SingleQuery (UNION [ALL] SingleQuery)*
-SingleQuery  := (Match | Unwind | With)* Return
+SingleQuery  := Clause+ [Return]          -- Return is required unless the query writes
+Clause       := Match | Unwind | With | Create | Set | Remove | Delete
 Match        := MATCH Pattern [WHERE Expr]
 Unwind       := UNWIND Expr AS Variable
 With         := WITH Projection [WHERE Expr]
 Return       := RETURN Projection
+Create       := CREATE Pattern
+Set          := SET SetItem (',' SetItem)*
+SetItem      := Variable '.' Key '=' Expr | Variable (':' Label)+
+              | Variable '=' Expr | Variable '+=' Expr
+Remove       := REMOVE RemoveItem (',' RemoveItem)*
+RemoveItem   := Variable '.' Key | Variable (':' Label)+
+Delete       := [DETACH] DELETE Expr (',' Expr)*
 Projection   := [DISTINCT] ('*' | Item (',' Item)*) [ORDER BY SortItem+] [SKIP Expr] [LIMIT Expr]
 Item         := Expr [AS Variable]
 Pattern      := PatternPart (',' PatternPart)*
@@ -115,6 +124,12 @@ MATCH ()-[r:KNOWS]->()  RETURN id(r), type(r), r.since
 nothing else could resolve it, so it would be a value that looks usable and is not. The UI draws these
 edges **dashed** so the difference is visible.
 
+For writes this has two consequences. `SET r.since = …` on one is **refused** — there is nowhere to put
+the value, and materialising it silently would change its identity and rewrite adjacency. `DELETE r`
+**works**, through `deleteEdge(from, type, to)`, which cannot distinguish two parallel lightweight edges
+between the same pair — but they are the same sixteen bytes, so removing either satisfies a request to
+remove one, and two rows asking remove both. `CREATE` never makes one (§5.2).
+
 ### 3.2 `traverse` answers a different question
 
 The engine has a breadth-first walk. It was not reused, and the difference is not cosmetic:
@@ -131,11 +146,13 @@ Relationship uniqueness is also what makes `-[*]-` terminate on a cycle.
 
 ---
 
-## 4. Isolation
+## 4. Isolation, and which transaction a query gets
 
-**Every query runs inside a `SNAPSHOT` read view.** A query is not one read — it scans, expands from
-what it found, then reads properties off the far end — and without a view a writer committing between
-those steps could give it a result that never existed at any instant.
+`Cypher.stream` decides this in one place, from `Ast.Query.isWrite()`.
+
+**A read runs inside a `SNAPSHOT` read view.** A query is not one read — it scans, expands from what
+it found, then reads properties off the far end — and without a view a writer committing between those
+steps could give it a result that never existed at any instant.
 
 If the caller already has a view open, the query **joins** it rather than opening another (views are
 thread-confined and refuse to nest). So several queries inside one `beginRead()` see one consistent
@@ -144,13 +161,120 @@ state, which is how a caller asks for that.
 Consequences worth knowing: a long query holds a view, and an open view refuses `reclaim()` and
 `compact()` and holds back version reclamation ([TRANSACTIONS.md §5](TRANSACTIONS.md#5-version-storage)).
 
+### 4.1 A write runs in one transaction, and opens no view
+
+```java
+try (Transaction txn = store.begin()) {
+    Cypher.query(store, "CREATE (n:Person {name:'Ada'})");
+    Cypher.query(store, "MATCH (n:Person) SET n.seen = true");   // sees the first
+    txn.commit();                                                 // both, or neither
+}
+```
+
+**No read view.** A writer reads the current mapping rather than a view — that is what prevents a lost
+update ([TRANSACTIONS.md §3](TRANSACTIONS.md)) — so a view here would be ignored by the storage layer
+while still costing a liveness check that an abandoned view can fail. The transaction's page overlay is
+what makes the query's reads consistent, and also what makes them see its own writes.
+
+**A write inside an open read view is refused**, with `CypherWriteException`. The caller asked for a
+fixed view and would silently not get it.
+
+**It joins a caller's transaction rather than opening a second.** `GraphStore.begin()` does *not*
+refuse to nest, and a nested transaction is not a caught mistake but a silent one: committing the inner
+one clears the published overlay, after which the outer transaction's writes go straight to the mapping,
+unlogged and past the point a rollback could take them back. `GraphStore.hasWriteTransaction()` was
+added for exactly this question.
+
+**The commit happens before the first row is delivered.** A sink that had already received rows when
+the commit failed would hold a result from a transaction that no longer exists — and on the far side of
+a socket those rows cannot be recalled. So **a write query's result is materialised, not streamed**;
+`Cypher.stream` on a write is streaming in name only. That also removes the binary port's worst hazard:
+the producer parks against a slow client, and parking while holding the engine's single writer lock
+would freeze every writer in the process ([WIRE.md](WIRE.md)).
+
+**One caveat, and it is harmless.** Dictionary interning is not transactional — a label id is appended
+and flushed the moment it is interned — so a rolled-back `CREATE (:Typo)` leaves that id allocated for
+the life of the store. Nothing user-visible follows: ids never change meaning, and `/api/schema` derives
+its counts from the data rather than the dictionary precisely because of this (§8.1).
+
 ---
 
-## 5. What is not built, and why
+## 5. Writing
+
+```
+CREATE (a:Person {name: $name})-[:KNOWS {since: 2020}]->(b:Person {name: 'Bob'})
+MATCH (n:Person) SET n.age = 35, n:Employee, n += {city: 'Bonn'}
+MATCH (n:Person) REMOVE n.age, n:Employee
+MATCH (n:Person)-[r:KNOWS]->() DELETE r
+MATCH (n:Stale) DETACH DELETE n
+```
+
+A write query need not end in `RETURN`; a read must, or it would compute a result and discard it.
+`RETURN` after a write sees the written state — see "rebinding" below.
+
+**Every query reports what it changed**: `CypherResult.stats()`, a `stats` object in the HTTP response
+(present only when something changed), and the `COMPLETE` frame on the binary port. For
+`CREATE (n:Person)` that is the entire result — there are no rows, and nothing else would say a node
+was made. `propertiesSet` counts keys whose value actually differs afterwards, in either direction, so
+writing a key the value it already had counts as nothing.
+
+### 5.1 Writes are off by default
+
+`--allow-write`, and it governs the HTTP route, the binary port and the UI together. Off is the only
+defensible default: neither port has authentication, the HTTP one binds every interface, and the
+difference between handing out a copy of the data and handing out the ability to delete it is worth an
+explicit act. A write without it is **403** over HTTP and `READ_ONLY` on the wire, refused on the event
+loop before a worker thread or a transaction is spent. **Embedded Java callers are unaffected** — the
+flag is a property of the servers, not of the language.
+
+`--allow-drop` stays separate. Dropping destroys a whole database and its directory in one request,
+including databases no query addressed; enabling writes is not asking for that.
+
+### 5.2 Decisions worth knowing
+
+**A created relationship is always materialised** — a real record with an id, so `id(r)` resolves,
+`SET r.since = …` works later, and `DELETE r` names it exactly. The engine's 16-byte lightweight edge
+is cheaper, and creating one silently would produce relationships the query language could not then
+address. The Java API remains the way to make those.
+
+**Eagerness comes free.** The executor is clause-at-a-time over a materialised list, so
+`MATCH (n) CREATE (:Copy)` structurally cannot feed its creations back into the scan driving it. Other
+engines insert explicit Eager operators for this. It also avoids the Halloween problem the engine warns
+about — freeing a slot during a `forEachNode` callback changes the bitmap under the scan. **A lazy
+pipeline must therefore never carry a write clause**; see [PROGRESS.md](PROGRESS.md).
+
+**Bindings are refreshed after a clause writes.** A `CypherNode` is an immutable snapshot taken when the
+variable was bound, so without this `MATCH (n) SET n.age = 30 RETURN n` would return the age from
+before — a wrong answer that throws nothing. Each write clause re-reads what it touched and rewrites the
+bindings in every row, including inside lists and paths.
+
+**Several assignments to one element are one store write.** `setNodeProperties` decodes the whole
+property block, re-encodes the map, allocates a new block, frees the old and diffs both against the
+property index, so `SET n.a = 1, n.b = 2` done twice would do all of that twice and leave a freed block
+behind for every assignment after the first.
+
+**Plain `DELETE` refuses a node that still has relationships**, naming `DETACH DELETE`. The engine's own
+`deleteNode` always cascades, so this rule belongs to the query language and is enforced above it.
+
+**`SET r.x` on a lightweight edge is refused** rather than silently promoting it: it has no property
+storage, and materialising it would change its identity and rewrite adjacency. `DELETE r` on one works,
+through `deleteEdge(from, type, to)` — see §3.1.
+
+**Reading a value out and writing it back is not always a round trip.** `byte[]`, `UUID` and `Instant`
+are rendered as strings on the way out (§ `GraphAccess.normalise`), so `SET n.x = n.x` on such a
+property stores a string. The query language cannot write those three types at all.
+
+**A constraint violation aborts the whole query.** `setNodeProperties` checks uniqueness *after*
+mutating, so a violation leaves a partially applied write; it is never caught and continued.
+
+---
+
+## 5.3 What is not built, and why
 
 | | Reason |
 |---|---|
-| `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE` | Read-only by decision. Writes stay on the Java API |
+| `MERGE` | Match-or-create over a whole pattern, plus `ON CREATE` / `ON MATCH`. Note it would be *easier* here than elsewhere: writers serialise on one lock and a write transaction reads its own writes, so the lock-and-retry dance other engines need does not arise |
+| `FOREACH` | `UNWIND` covers the common case |
 | `OPTIONAL MATCH` | Needs null-padding semantics through the rest of the pipeline |
 | `CASE`, list comprehensions, map projections, pattern comprehensions | Not built |
 | `shortestPath`, `allShortestPaths` | Not built |
@@ -168,10 +292,16 @@ Unexpected '>' in an expression (1:32)
 ```
 
 ```
-CREATE (n:Person) RETURN n
+MERGE (n:Person {name: 'Ada'}) RETURN n
 ^
-CREATE is not supported: this build runs read-only queries. Use the Java API for writes (1:1)
+MERGE is not supported: it needs match-or-create over a whole pattern, with ON CREATE and ON MATCH.
+Use MATCH and CREATE, or the Java API (1:1)
 ```
+
+`CREATE` refuses three patterns MATCH accepts, each with its own reason, because none describes a
+graph that could be built: a variable-length range does not say how many relationships to make, an
+undirected arrow does not say which way one points, and a missing or alternated type does not say what
+to create.
 
 ---
 
@@ -196,6 +326,13 @@ Also added: **`GraphStore.forEachNode`**, the full scan `MATCH (n)` needs. A cal
 list, because materialising eight bytes per live record would make the unindexed case the one that
 runs out of memory.
 
+**For writes, three more.** `SET n:Label` and `REMOVE n:Label` needed `addNodeLabel` / `removeNodeLabel`
+— the engine could only set a label set at creation. The capability existed one layer down
+(`NodeStore.labels(id, int[])`, which rewrites the three inline slots and frees or reallocates the
+overflow block) but nothing called it, and `IndexCatalog` had no `onLabelsChanged` beside its three
+siblings, so a relabelled node would have kept its old label-index entries and gained none. That hook is
+now there and rewrites only the difference. `hasWriteTransaction` is the third, and §4.1 says why.
+
 ---
 
 ## 7. Planning, and what it costs
@@ -218,6 +355,11 @@ property equality → a label scan → a full node scan. So
 - **Only the first label of a pattern drives the scan**; the rest are verified per candidate. The
   rarest would be the better choice, and the store does not expose per-label counts.
 - **No join reordering.** A pattern is expanded left to right from its chosen seed.
+- **A write query is materialised end to end**, and commits before its first row is delivered (§4.1).
+  Nothing about a write streams, and `Cypher.stream` does not change that.
+- **Writers serialise on one lock per store**, engine-wide. A long write query blocks every other
+  writer in the process, including embedded callers. The binary port bounds the wait so it is reported
+  rather than endured ([WIRE.md](WIRE.md)).
 
 ---
 
@@ -245,10 +387,10 @@ query and the engine has no notion of a second store.
 
 | Route | |
 |---|---|
-| `POST /api/query` | `{"query": "...", "parameters": {...}}` → columns, rows, and a `graph` of nodes and links |
+| `POST /api/query` | `{"query": "...", "parameters": {...}}` → columns, rows, a `graph` of nodes and links, and — only when the query changed something — `stats`. A write without `--allow-write` is 403 |
 | `GET /api/schema` | Labels and relationship types with live counts. `?refresh=true` forces a rescan |
 | `GET /api/stats` | Node and relationship counts, labels, storage bytes, open views, and which database answered |
-| `GET /api/databases` | Every database under the root, which is the default, and whether dropping is enabled |
+| `GET /api/databases` | Every database under the root, which is the default, and whether dropping and writing are enabled |
 | `PUT /api/databases/{name}` | Creates one. `DELETE` drops it, and only with `--allow-drop` |
 | `GET /` | The UI |
 
@@ -326,7 +468,8 @@ Three decisions worth recording:
 **Only into an empty store.** Seeding on top of existing data would work — the generator deletes nothing — and that is
 why it is refused: invented routes silently mixed into somebody's real graph is not a mistake they would notice
 quickly. A store with nodes in it is left alone and logged about, so the flag is safe to leave in a start script. It
-is the one write path in an otherwise read-only application, it is opt-in, and it runs before the server binds.
+predates the query language being able to write, it is opt-in, it runs before the server binds, and it is independent
+of `--allow-write`.
 
 The domain is an **air route network**: `(:Airport)-[:ROUTE_TO {airline, flightNumber, distanceKm, durationMinutes,
 weeklyFlights}]->(:Airport)`, with `(:Airport)-[:IN_CITY]->(:City)-[:IN_COUNTRY]->(:Country)` and
@@ -352,8 +495,9 @@ inventing plausible-looking facts about real places.
 It is seeded, so a size always produces the same graph — which is what lets the browser suite name Heathrow and
 expect an answer.
 
-**No authentication.** The query language cannot write, but it reads everything. Bind to localhost
-unless something else provides access control.
+**No authentication.** With `--allow-write` the query language can change and delete data; without it,
+it still reads everything. Bind to localhost unless something else provides access control —
+[OPERATIONS.md §9.1](OPERATIONS.md).
 
 ---
 
@@ -365,14 +509,23 @@ unless something else provides access control.
 | `NullSemanticsTest` | 16 | §2, on its own |
 | `CypherExecutionTest` | 31 | Every clause, end to end |
 | `CypherVersusApiTest` | 12 | **The load-bearing one** — see below |
+| `CypherWriteVersusApiTest` | 7 | Its inverse, and the load-bearing one for writes: run a write in Cypher, verify with the Java API, then `verify(FULL)` |
+| `CypherWriteTest` | 31 | Every write clause end to end, each finishing with `verify(FULL)` |
+| `CypherWriteTransactionTest` | 8 | §4.1: the transaction joined, the read view refused, a failed query leaving the segment files byte-identical, and a concurrent reader's snapshot unmoved |
 | `VarLengthPathTest` | 8 | §3.2, against a graph where the difference shows |
 | `CypherSnapshotTest` | 4 | §4: views closed, joined, and a query atomic against a live writer |
-| `GraphServerTest` | 18 | The HTTP contract, both result shapes, the schema scan and its cache, and the id-precision regression |
+| `GraphServerTest` | 25 | The HTTP contract, both result shapes, the schema scan and its cache, the id-precision regression, and the write flag with its 403 |
 | `DemoDataTest` | 10 | §8.3: the graph is connected as claimed, its distances match the world, and it is the same every time |
-| `GraphServerOptionsTest` | 8 | The command line, so an ignored flag fails a test rather than starting a server that does the wrong thing |
+| `GraphServerOptionsTest` | 15 | The command line, so an ignored flag fails a test rather than starting a server that does the wrong thing |
 | `model/graph.test.ts` | 12 | The merge rule: node identity across results, held links, and that every change advances the version |
 | `model/colors.test.ts` | 5 | A colour is a function of a name, and the demo graph's labels do not collide |
-| `e2e/graph-browser.spec.ts` | 29 | The UI in a browser against a real server — see §9.1 |
+| `e2e/graph-browser.spec.ts` | 30 | The UI in a browser against a real server — see §9.1 |
+
+`CypherWriteVersusApiTest` is the write half, and it has a second oracle the read half does not need:
+`verify(FULL)`. The invariant checkers — bidirectional edges, degree counters, adjacency chains, no
+dangling references, no orphan blocks — are entirely outside the query layer, and they catch what a
+hand-written assertion never would: a relationship recorded on one endpoint and not the other, a degree
+counter that drifted, an index entry pointing at a freed slot.
 
 `CypherVersusApiTest` is the one that matters. [TESTING.md](TESTING.md) opens by observing that every
 defect this project has found came from a test comparing the engine against **something outside it**.
@@ -407,5 +560,5 @@ previous bundle. Every assertion in the first run failed against markup that no 
 
 ---
 
-_Git HEAD revision: `364b5f7`_
-_Last updated: 2026-08-14_
+_Git HEAD revision: `e4601d1`_
+_Last updated: 2026-08-15 (write clauses added)_

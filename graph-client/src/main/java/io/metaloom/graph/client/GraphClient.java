@@ -14,6 +14,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import io.metaloom.graph.protocol.FrameReader;
 import io.metaloom.graph.protocol.Frames;
 import io.metaloom.graph.protocol.Protocol;
+import io.metaloom.graph.protocol.QuerySummary;
 import io.metaloom.graph.protocol.WireError;
 import io.metaloom.graph.protocol.WireFormatException;
 import io.metaloom.graph.protocol.WireValueCodec;
@@ -253,6 +254,37 @@ public final class GraphClient implements AutoCloseable {
 		return query(cypher, Map.of(), QueryOptions.SERVER_DEFAULT);
 	}
 
+	/**
+	 * Runs a query for its effect and returns what it changed.
+	 *
+	 * <pre>{@code
+	 * QuerySummary summary = client.execute("MATCH (n:Stale) DETACH DELETE n");
+	 * System.out.println(summary.nodesDeleted());
+	 * }</pre>
+	 *
+	 * <p>
+	 * Waits for the query to finish and discards any rows. The whole API is otherwise iterator-shaped, which fits a
+	 * result and not a {@code CREATE} with no {@code RETURN} — a caller would have to open a stream, read no rows from
+	 * it, and remember to close it, three steps to say "do this".
+	 * </p>
+	 *
+	 * @throws QueryFailedException
+	 *             if the query failed. Nothing was committed: a write query commits before its first row is sent
+	 */
+	public QuerySummary execute(String cypher) {
+		return execute(cypher, Map.of(), QueryOptions.SERVER_DEFAULT);
+	}
+
+	public QuerySummary execute(String cypher, Map<String, Object> parameters) {
+		return execute(cypher, parameters, QueryOptions.SERVER_DEFAULT);
+	}
+
+	public QuerySummary execute(String cypher, Map<String, Object> parameters, QueryOptions queryOptions) {
+		try (RowStream stream = query(cypher, parameters, queryOptions)) {
+			return stream.summary();
+		}
+	}
+
 	public RowStream query(String cypher, Map<String, Object> parameters) {
 		return query(cypher, parameters, QueryOptions.SERVER_DEFAULT);
 	}
@@ -335,7 +367,7 @@ public final class GraphClient implements AutoCloseable {
 				RowStream stream = streams.remove(streamId);
 				retired.remove(streamId);
 				if (stream != null) {
-					stream.onComplete();
+					stream.onComplete(QuerySummary.read(new WireValueCodec.Reader(payload.getBytes())));
 				}
 			}
 			case Frames.ERROR -> onError(streamId, payload);

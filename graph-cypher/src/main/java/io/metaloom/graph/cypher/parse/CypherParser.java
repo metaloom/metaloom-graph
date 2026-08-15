@@ -57,33 +57,72 @@ public final class CypherParser {
 
 	private Ast.SingleQuery singleQuery() {
 		List<Ast.Clause> clauses = new ArrayList<>();
+		boolean returned = false;
 		while (true) {
 			Token token = peek();
+			if (token.type() == Token.Type.EOF || token.isKeyword("UNION")) {
+				break;
+			}
+			if (returned) {
+				// RETURN ends a query part. Saying so beats "expected UNION or end of input", which describes the
+				// parser's state rather than the mistake — and putting a write clause after RETURN is a real one.
+				throw error(token, describe(token) + " cannot follow RETURN, which ends a query");
+			}
 			if (token.isKeyword("MATCH") || token.isKeyword("OPTIONAL")) {
 				clauses.add(matchClause());
 			} else if (token.isKeyword("UNWIND")) {
 				clauses.add(unwindClause());
 			} else if (token.isKeyword("WITH")) {
 				clauses.add(withClause());
+			} else if (token.isKeyword("CREATE")) {
+				clauses.add(createClause());
+			} else if (token.isKeyword("SET")) {
+				clauses.add(setClause());
+			} else if (token.isKeyword("REMOVE")) {
+				clauses.add(removeClause());
+			} else if (token.isKeyword("DELETE") || token.isKeyword("DETACH")) {
+				clauses.add(deleteClause());
 			} else if (token.isKeyword("RETURN")) {
 				clauses.add(returnClause());
-				break;
-			} else if (isWriteClause(token)) {
-				throw error(token, token.text() + " is not supported: this build runs read-only queries. "
-					+ "Use the Java API for writes");
-			} else if (token.type() == Token.Type.EOF && clauses.isEmpty()) {
-				throw error(token, "Empty query; expected MATCH, UNWIND, WITH or RETURN");
+				returned = true;
 			} else {
-				throw error(token, "Expected MATCH, UNWIND, WITH or RETURN but found " + describe(token));
+				String unsupported = unsupportedClause(token);
+				throw error(token, unsupported != null ? unsupported
+					: "Expected a clause but found " + describe(token));
 			}
 		}
-		return new Ast.SingleQuery(clauses);
+		if (clauses.isEmpty()) {
+			throw error(peek(), "Empty query; expected MATCH, CREATE, UNWIND, WITH or RETURN");
+		}
+		Ast.SingleQuery part = new Ast.SingleQuery(clauses);
+		if (!returned && !part.isWrite()) {
+			// A read with nowhere to put its answer. Refused rather than run, because it looks like a query whose
+			// RETURN was forgotten and running it would report success having produced nothing.
+			throw error(peek(), "A query that does not write must end in RETURN; this one would compute a result "
+				+ "and discard it");
+		}
+		return part;
 	}
 
-	private static boolean isWriteClause(Token token) {
-		return token.type() == Token.Type.KEYWORD && switch (token.text()) {
-			case "CREATE", "MERGE", "SET", "DELETE", "DETACH", "REMOVE", "FOREACH", "LOAD" -> true;
-			default -> false;
+	/**
+	 * The message for a clause this build lexes but does not implement, or null when the token is not one.
+	 *
+	 * <p>
+	 * These words are keywords in the lexer specifically so they can be refused here by name, with a caret, rather than
+	 * parsed as an ordinary identifier and failing later somewhere that cannot say what went wrong.
+	 * </p>
+	 */
+	private static String unsupportedClause(Token token) {
+		if (token.type() != Token.Type.KEYWORD) {
+			return null;
+		}
+		return switch (token.text()) {
+			case "MERGE" -> "MERGE is not supported: it needs match-or-create over a whole pattern, with ON CREATE "
+				+ "and ON MATCH. Use MATCH and CREATE, or the Java API";
+			case "FOREACH" -> "FOREACH is not supported: use UNWIND, which this build does implement";
+			case "LOAD" -> "LOAD CSV is not supported: this build has no file-reading mechanism";
+			case "CALL" -> "CALL is not supported: this build has no procedure mechanism";
+			default -> null;
 		};
 	}
 
@@ -206,6 +245,142 @@ public final class CypherParser {
 			take();
 		}
 		return new Ast.SortItem(expression, ascending);
+	}
+
+	// ---------------------------------------------------------------- write clauses
+
+	private Ast.Create createClause() {
+		expectKeyword("CREATE");
+		List<Ast.PatternPart> pattern = new ArrayList<>();
+		pattern.add(creatablePart());
+		while (peek().isSymbol(",")) {
+			take();
+			pattern.add(creatablePart());
+		}
+		return new Ast.Create(pattern);
+	}
+
+	/**
+	 * A pattern that describes a graph which can actually be built.
+	 *
+	 * <p>
+	 * The pattern grammar is shared with MATCH rather than duplicated, so three shapes MATCH accepts arrive here and
+	 * have to be refused: a variable-length range does not say how many relationships to make, an undirected
+	 * relationship does not say which way it points, and a relationship with no type or a choice of types does not say
+	 * what to create. Each is refused with its own reason, because "invalid pattern" would leave the author guessing
+	 * which of the three it was.
+	 * </p>
+	 */
+	private Ast.PatternPart creatablePart() {
+		Token at = peek();
+		Ast.PatternPart part = patternPart();
+		for (Ast.RelPattern relationship : part.relationships()) {
+			if (relationship.range() != null) {
+				throw error(at, "CREATE cannot take a variable-length pattern: it does not say how many "
+					+ "relationships to create");
+			}
+			if (relationship.direction() == Direction.BOTH) {
+				throw error(at, "CREATE needs a direction on every relationship: write -> or <-");
+			}
+			if (relationship.types().isEmpty()) {
+				throw error(at, "CREATE needs a type on every relationship, as in -[:KNOWS]->");
+			}
+			if (relationship.types().size() > 1) {
+				throw error(at, "CREATE creates one relationship, so it takes one type rather than the choice "
+					+ String.join("|", relationship.types()));
+			}
+		}
+		return part;
+	}
+
+	private Ast.SetClause setClause() {
+		expectKeyword("SET");
+		List<Ast.SetItem> items = new ArrayList<>();
+		items.add(setItem());
+		while (peek().isSymbol(",")) {
+			take();
+			items.add(setItem());
+		}
+		return new Ast.SetClause(items);
+	}
+
+	/**
+	 * One assignment.
+	 *
+	 * <p>
+	 * The target is matched by shape rather than parsed as an expression, because {@code SET n.age = 30} <em>is</em> a
+	 * valid expression — an equality comparison — and parsing it as one would turn an assignment into a predicate that
+	 * silently evaluates to a boolean and writes nothing.
+	 * </p>
+	 */
+	private Ast.SetItem setItem() {
+		Token start = peek();
+		if (start.type() == Token.Type.IDENTIFIER) {
+			Token next = peekAt(1);
+			if (next.isSymbol(":")) {
+				return new Ast.SetLabels(take().text(), labelList());
+			}
+			if (next.isSymbol("=") || next.isSymbol("+=")) {
+				String variable = take().text();
+				boolean merge = take().isSymbol("+=");
+				Expr map = expression();
+				return merge ? new Ast.SetPropertiesMerge(variable, map)
+					: new Ast.SetPropertiesReplace(variable, map);
+			}
+			if (next.isSymbol(".")) {
+				Expr target = new Ast.Variable(take().text());
+				take();
+				String key = propertyKeyName();
+				expectSymbol("=", "a value after the property being set");
+				return new Ast.SetProperty(target, key, expression());
+			}
+		}
+		throw error(start, "Expected a property, a label or a map after SET — as in SET n.age = 30, SET n:Person, "
+			+ "SET n = {age: 30} or SET n += {age: 30} — but found " + describe(start));
+	}
+
+	private Ast.Remove removeClause() {
+		expectKeyword("REMOVE");
+		List<Ast.RemoveItem> items = new ArrayList<>();
+		items.add(removeItem());
+		while (peek().isSymbol(",")) {
+			take();
+			items.add(removeItem());
+		}
+		return new Ast.Remove(items);
+	}
+
+	private Ast.RemoveItem removeItem() {
+		Token start = peek();
+		if (start.type() == Token.Type.IDENTIFIER) {
+			Token next = peekAt(1);
+			if (next.isSymbol(":")) {
+				return new Ast.RemoveLabels(take().text(), labelList());
+			}
+			if (next.isSymbol(".")) {
+				Expr target = new Ast.Variable(take().text());
+				take();
+				return new Ast.RemoveProperty(target, propertyKeyName());
+			}
+		}
+		throw error(start, "Expected a property or a label after REMOVE — as in REMOVE n.age or REMOVE n:Person — "
+			+ "but found " + describe(start));
+	}
+
+	private Ast.Delete deleteClause() {
+		boolean detach = false;
+		if (peek().isKeyword("DETACH")) {
+			take();
+			detach = true;
+		}
+		expectKeyword("DELETE");
+		List<Expr> targets = new ArrayList<>();
+		targets.add(expression());
+		while (peek().isSymbol(",")) {
+			take();
+			targets.add(expression());
+		}
+		return new Ast.Delete(targets, detach);
 	}
 
 	// ---------------------------------------------------------------- patterns

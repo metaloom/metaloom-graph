@@ -46,7 +46,8 @@ import io.vertx.core.buffer.Buffer;
  * <tr><td>{@link #CANCEL}</td><td>client</td><td>empty</td></tr>
  * <tr><td>{@link #COLUMNS}</td><td>server</td><td>value: list of column names</td></tr>
  * <tr><td>{@link #ROWS}</td><td>server</td><td>{@code i32} row count, then {@code rows × columns} values</td></tr>
- * <tr><td>{@link #COMPLETE}</td><td>server</td><td>{@code i64} row count, {@code i64} elapsed micros</td></tr>
+ * <tr><td>{@link #COMPLETE}</td><td>server</td><td>{@link QuerySummary}: nine {@code i64}s — row count, elapsed
+ * micros, then what the query changed</td></tr>
  * <tr><td>{@link #ERROR}</td><td>server</td><td>{@code i32} {@link WireError} code, value: message, {@code i32} line, {@code i32} column</td></tr>
  * </table>
  *

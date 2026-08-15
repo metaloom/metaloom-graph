@@ -154,6 +154,155 @@ public class MultiLabelTest {
 		}
 	}
 
+	// ---------------------------------------------------------------- mutating a label set
+
+	@Test
+	public void testALabelCanBeAddedToAnExistingNodeAndIsIndexed() throws Exception {
+		try (GraphStore store = stores.open()) {
+			long node = store.createNode("Person");
+
+			assertTrue(store.addNodeLabel(node, "Employee"));
+
+			assertEquals(List.of("Person", "Employee"), store.nodeLabels(node), "appended, not reordered");
+			assertTrue(store.nodeHasLabel(node, "Employee"));
+			assertEquals(List.of(node), store.nodesByLabel("Employee"),
+				"an added label that the index does not carry makes MATCH (n:Employee) silently miss the node");
+			assertEquals(List.of(node), store.nodesByLabel("Person"), "and the label it already had is untouched");
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	@Test
+	public void testALabelCanBeRemovedAndLeavesTheIndex() throws Exception {
+		try (GraphStore store = stores.open()) {
+			long alice = store.createNode(List.of("Person", "Employee"));
+			long bob = store.createNode(List.of("Person", "Employee"));
+
+			assertTrue(store.removeNodeLabel(alice, "Employee"));
+
+			assertEquals(List.of("Person"), store.nodeLabels(alice));
+			assertFalse(store.nodeHasLabel(alice, "Employee"));
+			assertEquals(List.of(bob), store.nodesByLabel("Employee"),
+				"a label left in the index returns a node that no longer carries it");
+			assertEquals(2, store.nodesByLabel("Person").size(), "the labels it kept must not have been disturbed");
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	@Test
+	public void testAddingALabelTwiceAndRemovingOneThatIsNotThereAreBothNoOps() throws Exception {
+		try (GraphStore store = stores.open()) {
+			long node = store.createNode("Person");
+
+			assertFalse(store.addNodeLabel(node, "Person"), "already carried");
+			assertFalse(store.removeNodeLabel(node, "Employee"), "carried by nobody, but a real label elsewhere");
+			assertFalse(store.removeNodeLabel(node, "NeverInterned"),
+				"a label the dictionary has never seen must not be minted just to fail to remove it");
+
+			assertEquals(List.of("Person"), store.nodeLabels(node));
+			assertEquals(List.of(node), store.nodesByLabel("Person"),
+				"a duplicate add that stored a second index entry would leave one behind on delete");
+			store.deleteNode(node);
+			assertEquals(List.of(), store.nodesByLabel("Person"));
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	/** The boundary that costs an allocation, crossed in both directions — the fourth label spills and unspills. */
+	@Test
+	public void testCrossingTheInlineBoundaryAllocatesAndFreesTheOverflowBlock() throws Exception {
+		try (GraphStore store = stores.open()) {
+			long node = store.createNode(List.of("A", "B", "C"));
+			assertEquals(0, store.stats().propertyCellCount(), "three labels fit the record");
+
+			assertTrue(store.addNodeLabel(node, "D"));
+			assertEquals(List.of("A", "B", "C", "D"), store.nodeLabels(node));
+			assertTrue(store.stats().propertyCellCount() > 0, "the fourth has to spill");
+
+			assertTrue(store.removeNodeLabel(node, "D"));
+			assertEquals(List.of("A", "B", "C"), store.nodeLabels(node));
+			assertEquals(0, store.stats().propertyCellCount(),
+				"coming back under the limit must free the block, not leave it owned and unreachable");
+
+			// The orphan sweep is the real check: a block freed on paper but still referenced, or referenced and not
+			// freed, is exactly what these checkers exist to find.
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	@Test
+	public void testRemovingAnInlineLabelFromAnOverflowedNodeKeepsTheRest() throws Exception {
+		try (GraphStore store = stores.open()) {
+			List<String> many = new ArrayList<>();
+			for (int i = 0; i < 10; i++) {
+				many.add("L" + i);
+			}
+			long node = store.createNode(many);
+
+			// L1 lives in the record, not in the spill, so the whole set has to be rewritten around it.
+			assertTrue(store.removeNodeLabel(node, "L1"));
+
+			List<String> expected = new ArrayList<>(many);
+			expected.remove("L1");
+			assertEquals(expected, store.nodeLabels(node), "order must survive a removal from the inline slots");
+			assertEquals("L0", store.nodeLabel(node));
+			assertEquals(List.of(), store.nodesByLabel("L1"));
+			assertEquals(List.of(node), store.nodesByLabel("L9"), "a spilled label must still resolve");
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	@Test
+	public void testRemovingTheLastLabelLeavesANodeWithNone() throws Exception {
+		try (GraphStore store = stores.open()) {
+			long node = store.createNode("Person", Properties.of().set("name", "Ada"));
+
+			assertTrue(store.removeNodeLabel(node, "Person"));
+
+			assertEquals(List.of(), store.nodeLabels(node), "a node with no labels is a legal node");
+			assertTrue(store.nodeExists(node), "removing the last label must not delete it");
+			assertEquals("Ada", store.nodeProperty(node, "name"), "and must not touch its properties");
+			assertEquals(List.of(), store.nodesByLabel("Person"));
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	@Test
+	public void testLabelChangesJoinTheCallersTransactionAndRollBackWithIt() throws Exception {
+		try (GraphStore store = stores.open()) {
+			long node = store.createNode("Person");
+
+			try (Transaction txn = store.begin()) {
+				store.addNodeLabel(node, "Employee");
+				store.removeNodeLabel(node, "Person");
+				assertEquals(List.of("Employee"), store.nodeLabels(node), "read-your-writes inside the transaction");
+				txn.rollback();
+			}
+
+			assertEquals(List.of("Person"), store.nodeLabels(node), "rolled back, including the index");
+			assertEquals(List.of(node), store.nodesByLabel("Person"));
+			assertEquals(List.of(), store.nodesByLabel("Employee"),
+				"the index write has to unwind with the record write or the two disagree");
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	@Test
+	public void testMutatedLabelsSurviveAReopen() throws Exception {
+		long node;
+		try (GraphStore store = stores.open()) {
+			node = store.createNode(List.of("A", "B", "C"));
+			store.addNodeLabel(node, "D");
+			store.removeNodeLabel(node, "B");
+		}
+		try (GraphStore reopened = stores.open()) {
+			assertEquals(List.of("A", "C", "D"), reopened.nodeLabels(node));
+			assertEquals(List.of(node), reopened.nodesByLabel("D"));
+			assertEquals(List.of(), reopened.nodesByLabel("B"));
+			reopened.verify(VerifyLevel.FULL);
+		}
+	}
+
 	@Test
 	public void testLabelsSurviveAReopen() throws Exception {
 		long inline;

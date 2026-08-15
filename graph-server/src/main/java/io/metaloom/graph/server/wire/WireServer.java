@@ -14,10 +14,13 @@ import java.util.concurrent.locks.LockSupport;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.metaloom.graph.core.api.ConstraintViolationException;
 import io.metaloom.graph.core.api.GraphDatabases;
 import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.GraphStoreException;
 import io.metaloom.graph.cypher.Cypher;
+import io.metaloom.graph.cypher.CypherStats;
+import io.metaloom.graph.cypher.CypherWriteException;
 import io.metaloom.graph.cypher.QueryAbortedException;
 import io.metaloom.graph.cypher.RowSink;
 import io.metaloom.graph.cypher.ast.Ast;
@@ -26,6 +29,7 @@ import io.metaloom.graph.cypher.parse.CypherSyntaxException;
 import io.metaloom.graph.protocol.FrameReader;
 import io.metaloom.graph.protocol.Frames;
 import io.metaloom.graph.protocol.Protocol;
+import io.metaloom.graph.protocol.QuerySummary;
 import io.metaloom.graph.protocol.WireError;
 import io.metaloom.graph.protocol.WireFormatException;
 import io.metaloom.graph.protocol.WireValueCodec;
@@ -38,7 +42,7 @@ import io.vertx.core.net.NetServerOptions;
 import io.vertx.core.net.NetSocket;
 
 /**
- * The binary port: a read-only Cypher result, streamed as it is produced.
+ * The binary port: a Cypher result, streamed as it is produced.
  *
  * <pre>
  * java -jar graph-server.jar /path/to/store 8080          # HTTP on 8080, binary on 8081
@@ -87,6 +91,27 @@ import io.vertx.core.net.NetSocket;
  * error naming the reason rather than a {@code SnapshotTooOldException} surfacing somewhere else.
  * </ol>
  *
+ * <h2>Writes, and what they do not stream</h2>
+ *
+ * <p>
+ * Write queries are accepted only when the server was started with {@code --allow-write}; a write on a server without
+ * it is refused on the event loop with {@link WireError#READ_ONLY}, before a permit or a worker thread is spent.
+ * </p>
+ *
+ * <p>
+ * <b>A write query does not stream.</b> Its rows are produced, its transaction commits, and only then does the first
+ * byte go out — because a client that had already received rows when the commit failed would hold a result from a
+ * transaction that no longer exists, and bytes on a socket cannot be recalled. That ordering also removes this port's
+ * worst hazard: the producer parks against a slow client, and parking while holding the engine's single writer lock
+ * would freeze every writer in the process. By the time anything can park, the transaction is closed.
+ * </p>
+ *
+ * <p>
+ * The remaining wait is for the writer lock itself, which the engine takes with no deadline and no message. A permit
+ * per store puts a bound on it, so a second writer answers {@link WireError#OVERLOADED} rather than hanging past its
+ * own budget.
+ * </p>
+ *
  * <h2>Cancellation never closes a view from another thread</h2>
  *
  * <p>
@@ -120,29 +145,48 @@ public final class WireServer implements AutoCloseable {
 	private final Map<Long, Stream> running = new ConcurrentHashMap<>();
 	private final AtomicLong nextStreamKey = new AtomicLong();
 	private final ScheduledExecutorService watchdog;
+	/** Whether a query may change a store. Off unless an operator asked for it. */
+	private final boolean allowWrite;
+	/**
+	 * One permit per store, so a writer's wait has a deadline and a name.
+	 *
+	 * <p>
+	 * The engine already serialises writers on one lock per store, and that lock has neither: a second writer waits
+	 * inside {@code begin()} indefinitely, past its own budget, with nothing to report when it gives up. This adds no
+	 * serialisation that was not already there — it puts a bound on the wait and lets the stream answer OVERLOADED
+	 * instead of hanging. Keyed per store because the engine's lock is.
+	 * </p>
+	 */
+	private final Map<GraphStore, Semaphore> writeGates = new ConcurrentHashMap<>();
 
 	private NetServer server;
 
 	public WireServer(GraphDatabases databases, String defaultDatabase) {
-		this(Vertx.vertx(), true, databases, defaultDatabase, WireServerOptions.defaults());
+		this(Vertx.vertx(), true, databases, defaultDatabase, WireServerOptions.defaults(), false);
 	}
 
 	public WireServer(GraphDatabases databases, String defaultDatabase, WireServerOptions options) {
-		this(Vertx.vertx(), true, databases, defaultDatabase, options);
+		this(Vertx.vertx(), true, databases, defaultDatabase, options, false);
 	}
 
 	/** For a caller that already runs a Vert.x instance — the HTTP server, for one. */
 	public WireServer(Vertx vertx, GraphDatabases databases, String defaultDatabase, WireServerOptions options) {
-		this(vertx, false, databases, defaultDatabase, options);
+		this(vertx, false, databases, defaultDatabase, options, false);
+	}
+
+	public WireServer(Vertx vertx, GraphDatabases databases, String defaultDatabase, WireServerOptions options,
+		boolean allowWrite) {
+		this(vertx, false, databases, defaultDatabase, options, allowWrite);
 	}
 
 	private WireServer(Vertx vertx, boolean ownsVertx, GraphDatabases databases, String defaultDatabase,
-		WireServerOptions options) {
+		WireServerOptions options, boolean allowWrite) {
 		this.vertx = vertx;
 		this.ownsVertx = ownsVertx;
 		this.databases = databases;
 		this.defaultDatabase = defaultDatabase;
 		this.options = options;
+		this.allowWrite = allowWrite;
 		this.permits = new Semaphore(options.maxConcurrentStreams());
 		// A pool of its own, sized to the permit count so an admitted query never waits for a thread — and, more to
 		// the point, so a long scan cannot starve /stats and /schema, which share the default worker pool.
@@ -239,6 +283,12 @@ public final class WireServer implements AutoCloseable {
 					if (stream.connection.store != store) {
 						continue;
 					}
+					// Readers only. Retention is held by open read views, and a write query does not open one — it
+					// runs in a transaction and reads the current mapping. Abandoning a writer would roll back its
+					// work without releasing a single retained byte, which is a cost with no benefit.
+					if (stream.writing) {
+						continue;
+					}
 					if (oldest == null || stream.startedNanos - oldest.startedNanos < 0) {
 						oldest = stream;
 					}
@@ -256,6 +306,11 @@ public final class WireServer implements AutoCloseable {
 		} catch (RuntimeException e) {
 			logger.warn("The retention watchdog failed; streams are still bounded by their deadlines", e);
 		}
+	}
+
+	/** The write permit for one store, made on first use. Never removed: a dropped database's entry is one object. */
+	private Semaphore writeGate(GraphStore store) {
+		return writeGates.computeIfAbsent(store, ignored -> new Semaphore(1));
 	}
 
 	// ---------------------------------------------------------------- one connection
@@ -383,6 +438,14 @@ public final class WireServer implements AutoCloseable {
 				return;
 			}
 
+			// Refused on the event loop, like a syntax error: the tree already knows, so this costs no permit, no
+			// worker thread and no writer lock.
+			if (parsed.isWrite() && !allowWrite) {
+				fail(streamId, WireError.READ_ONLY, "This server does not accept write queries. Start it with "
+					+ "--allow-write to enable CREATE, SET, REMOVE and DELETE.", 0, 0);
+				return;
+			}
+
 			// Fail fast rather than queue. A client waiting on a queued query cannot tell a busy server from a stuck
 			// one, and the whole point of the bound is that the server stays predictable when it is at its limit.
 			if (!permits.tryAcquire()) {
@@ -391,7 +454,8 @@ public final class WireServer implements AutoCloseable {
 				return;
 			}
 
-			Stream stream = new Stream(this, streamId, deadlineNanos(requestedDeadline), requestedDeadline);
+			Stream stream = new Stream(this, streamId, deadlineNanos(requestedDeadline), requestedDeadline,
+				parsed.isWrite());
 			streams.put(streamId, stream);
 			running.put(stream.key, stream);
 			workers.executeBlocking(() -> {
@@ -480,6 +544,8 @@ public final class WireServer implements AutoCloseable {
 		private final long budgetMillis;
 		private final long startedNanos = System.nanoTime();
 		private final AtomicLong buffered = new AtomicLong();
+		/** Whether this query changes the store, which decides both the write gate and the watchdog's victim. */
+		private final boolean writing;
 		/** The deadline timer, the cancel handler and the producer's error path all race to end a stream. */
 		private final AtomicBoolean terminated = new AtomicBoolean();
 
@@ -487,19 +553,41 @@ public final class WireServer implements AutoCloseable {
 		private volatile String abortReason;
 		private volatile WireError abortCode = WireError.TIMEOUT;
 
-		Stream(Connection connection, int streamId, long deadlineNanos, long budgetMillis) {
+		Stream(Connection connection, int streamId, long deadlineNanos, long budgetMillis, boolean writing) {
 			this.connection = connection;
 			this.streamId = streamId;
 			this.deadlineNanos = deadlineNanos;
 			this.budgetMillis = budgetMillis;
+			this.writing = writing;
 		}
 
 		void run(Ast.Query parsed, Map<String, Object> parameters) {
 			BatchingSink sink = new BatchingSink(this);
+			Semaphore gate = writing ? writeGate(connection.store) : null;
+			boolean held = false;
 			try {
+				if (gate != null) {
+					// The engine serialises writers on one lock with no deadline and no message, so a second writer
+					// would wait inside store.begin() past this stream's own budget with nothing to report. The
+					// semaphore does not add serialisation — it puts a bound and a name on the wait that already
+					// exists.
+					held = gate.tryAcquire(waitBudgetMillis(), TimeUnit.MILLISECONDS);
+					if (!held) {
+						error(WireError.OVERLOADED, "Another query is writing to database '" + connection.database
+							+ "'; this one gave up waiting for it", 0, 0);
+						return;
+					}
+				}
 				Cypher.stream(connection.store, parsed, parameters, sink, this::abortReason);
 				sink.flush();
-				complete(sink.rowsSent);
+				complete(sink.rowsSent, sink.stats);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				error(WireError.INTERNAL, "Interrupted while waiting to write", 0, 0);
+			} catch (CypherWriteException e) {
+				// Cannot arise here — the server holds no read view — but mapping it keeps the failure legible if the
+				// dispatch above ever changes.
+				error(WireError.INTERNAL, e.getMessage(), 0, 0);
 			} catch (QueryAbortedException e) {
 				// Not a failure of the query and not a failure of the store: the answer was never wrong, it was
 				// abandoned. Which of the three bounds fired decides the code.
@@ -508,12 +596,27 @@ public final class WireServer implements AutoCloseable {
 				error(WireError.SYNTAX, e.getMessage(), e.line(), e.column());
 			} catch (CypherTypeException e) {
 				error(WireError.TYPE, e.getMessage(), 0, 0);
+			} catch (ConstraintViolationException e) {
+				// Before GraphStoreException, which it extends: this is the one store refusal a caller can act on.
+				error(WireError.CONSTRAINT_VIOLATION, e.getMessage(), 0, 0);
 			} catch (GraphStoreException e) {
 				error(WireError.STORE, e.getMessage(), 0, 0);
 			} catch (RuntimeException e) {
 				logger.error("Stream {} failed", streamId, e);
 				error(WireError.INTERNAL, String.valueOf(e.getMessage()), 0, 0);
+			} finally {
+				if (held) {
+					gate.release();
+				}
 			}
+		}
+
+		/** How long to wait for the writer, bounded by this stream's own deadline so the two cannot disagree. */
+		private long waitBudgetMillis() {
+			if (deadlineNanos == 0) {
+				return Long.MAX_VALUE;
+			}
+			return Math.max(0, TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()));
 		}
 
 		/**
@@ -543,13 +646,15 @@ public final class WireServer implements AutoCloseable {
 			write(Frames.COLUMNS, payload);
 		}
 
-		void complete(long rows) {
+		void complete(long rows, CypherStats stats) {
 			if (!terminated.compareAndSet(false, true)) {
 				return;
 			}
-			WireValueCodec.Writer payload = new WireValueCodec.Writer(16);
-			payload.i64(rows);
-			payload.i64(TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - startedNanos));
+			WireValueCodec.Writer payload = new WireValueCodec.Writer(QuerySummary.BYTES);
+			new QuerySummary(rows, TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - startedNanos),
+				stats.nodesCreated(), stats.nodesDeleted(), stats.relationshipsCreated(),
+				stats.relationshipsDeleted(), stats.propertiesSet(), stats.labelsAdded(), stats.labelsRemoved())
+					.write(payload);
 			write(Frames.COMPLETE, payload);
 			release();
 		}
@@ -637,6 +742,7 @@ public final class WireServer implements AutoCloseable {
 		private int batched;
 		private long lastFlushNanos = System.nanoTime();
 		private long rowsSent;
+		private CypherStats stats = CypherStats.NONE;
 
 		BatchingSink(Stream stream) {
 			this.stream = stream;
@@ -654,6 +760,11 @@ public final class WireServer implements AutoCloseable {
 		@Override
 		public void columns(List<String> names) {
 			stream.columns(names);
+		}
+
+		@Override
+		public void stats(CypherStats stats) {
+			this.stats = stats;
 		}
 
 		@Override

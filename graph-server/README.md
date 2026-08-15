@@ -17,9 +17,9 @@ mvn -pl graph-server exec:java -Dexec.args="--demo /tmp/demo 8080"
 | HTTP | 8080, all interfaces | The UI and `/api/query`, which builds the whole result as JSON. `?database=` picks one |
 | Binary | 8081, **loopback** | Streaming Cypher for `graph-client`, one database per connection. `--no-wire` turns it off, `--wire-port=` moves it |
 
-`--database=<name>` sets the default and creates it at startup. `--allow-drop` enables
-`DELETE /api/databases/<name>`, which is off by default because it is the only route that destroys
-data.
+`--database=<name>` sets the default and creates it at startup. `--allow-write` accepts write queries
+on both ports, and `--allow-drop` enables `DELETE /api/databases/<name>`; both are off by default and
+independent of each other — enabling writes is not asking to be able to unlink a whole database.
 
 The binary port is the one for a result that does not fit in a browser: rows encode and flush in
 batches, a slow consumer becomes backpressure rather than heap, and a query can be cancelled or given
@@ -66,10 +66,15 @@ profile exists rather than the build being pure metadata because of one netty su
 be compiled; a jar built without `-Pgraalvm` is not native-image ready. All of it, including the four
 failures that build cleanly and only show up at run time: [spec/GRAALVM.md](../spec/GRAALVM.md).
 
-**Read-only, and unauthenticated — both ports.** The query language cannot write, so neither port can
-modify a store however it is addressed. Either can read all of one. The binary port binds loopback for
-that reason; the HTTP port does not and predates the note. Put something in front of them, or keep
-them on a trusted host. [spec/OPERATIONS.md §9.1](../spec/OPERATIONS.md).
+**Unauthenticated — both ports.** Either can read every byte of every database under the root. The
+binary port binds loopback for that reason; the HTTP port does not and predates the note. Put something
+in front of them, or keep them on a trusted host.
+
+**Writes are off by default.** `--allow-write` enables `CREATE`, `SET`, `REMOVE` and `DELETE` on both
+ports at once; without it a write query is refused before it reaches a worker thread. On a port with no
+authentication that flag is the difference between handing out a copy of the data and handing out the
+ability to delete it, so it is a deliberate act rather than a default. `--allow-drop`, which unlinks a
+whole database, stays separate and off. [spec/OPERATIONS.md §9.1](../spec/OPERATIONS.md).
 
 ## The UI
 

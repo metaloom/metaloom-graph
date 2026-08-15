@@ -28,7 +28,8 @@ embarrassing, because it removes the option of deciding first and choosing the m
 
 ## What is being decided
 
-Which transport carries a streamed, read-only Cypher result to a Java client:
+Which transport carries a streamed Cypher result to a Java client (the language was read-only when this
+was measured; write support came later and streams nothing, so it does not bear on the choice):
 
 | Arm | |
 |---|---|

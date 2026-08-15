@@ -1,6 +1,8 @@
 package io.metaloom.graph.cypher;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -176,21 +178,91 @@ public class CypherParserTest {
 	// ---------------------------------------------------------------- refusals
 
 	@Test
-	public void testAWriteClauseSaysItIsReadOnly() {
-		CypherSyntaxException e = assertThrows(CypherSyntaxException.class,
-			() -> CypherParser.parse("CREATE (n:Person) RETURN n"));
-		assertTrue(e.getMessage().contains("read-only"), e.getMessage());
-		assertEquals(1, e.column(), "and points at the clause");
-	}
-
-	@Test
 	public void testUnsupportedFeaturesAreNamedRatherThanCalledSyntaxErrors() {
 		assertTrue(assertThrows(CypherSyntaxException.class,
 			() -> CypherParser.parse("OPTIONAL MATCH (n) RETURN n")).getMessage().contains("OPTIONAL MATCH"));
 		assertTrue(assertThrows(CypherSyntaxException.class,
 			() -> CypherParser.parse("RETURN CASE WHEN true THEN 1 ELSE 2 END")).getMessage().contains("CASE"));
+	}
+
+	/**
+	 * The write clauses that are still refused, each by name.
+	 *
+	 * <p>
+	 * These words are keywords in the lexer for exactly this reason: refused here they get a caret and a sentence,
+	 * whereas parsed as identifiers they would fail later with a message about the token after them.
+	 * </p>
+	 */
+	@Test
+	public void testTheRemainingWriteClausesAreRefusedByName() {
+		CypherSyntaxException merge = assertThrows(CypherSyntaxException.class,
+			() -> CypherParser.parse("MERGE (n:Person {name: 'Ada'}) RETURN n"));
+		assertTrue(merge.getMessage().contains("MERGE is not supported"), merge.getMessage());
+		assertEquals(1, merge.column(), "and points at the clause");
+
 		assertTrue(assertThrows(CypherSyntaxException.class,
-			() -> CypherParser.parse("MATCH (n) SET n.x = 1 RETURN n")).getMessage().contains("read-only"));
+			() -> CypherParser.parse("MATCH (n) FOREACH (x IN [1] | SET n.x = x)")).getMessage()
+				.contains("FOREACH is not supported"));
+		assertTrue(assertThrows(CypherSyntaxException.class,
+			() -> CypherParser.parse("LOAD CSV FROM 'f.csv' AS row RETURN row")).getMessage()
+				.contains("LOAD CSV is not supported"));
+		assertTrue(assertThrows(CypherSyntaxException.class,
+			() -> CypherParser.parse("CALL db.labels()")).getMessage().contains("CALL is not supported"));
+	}
+
+	// ---------------------------------------------------------------- write clauses
+
+	@Test
+	public void testWriteClausesParseAndTheQueryKnowsItWrites() {
+		for (String query : List.of("CREATE (n:Person {name: 'Ada'})", "MATCH (n) SET n.x = 1",
+			"MATCH (n) REMOVE n:Person", "MATCH (n) DELETE n", "MATCH (n) DETACH DELETE n",
+			"MATCH (n) CREATE (n)-[:R]->(:Other) RETURN n")) {
+			assertTrue(CypherParser.parse(query).isWrite(), query + " must report itself as a write");
+		}
+		assertFalse(CypherParser.parse("MATCH (n) RETURN n").isWrite());
+		assertFalse(CypherParser.parse("RETURN 1 AS x").isWrite());
+	}
+
+	@Test
+	public void testAWriteQueryNeedsNoReturn() {
+		Ast.Query query = CypherParser.parse("CREATE (n:Person)");
+		assertEquals(1, query.parts().get(0).clauses().size());
+		assertInstanceOf(Ast.Create.class, query.parts().get(0).clauses().get(0));
+	}
+
+	@Test
+	public void testTheThreeShapesOfSet() {
+		List<Ast.SetItem> items = ((Ast.SetClause) CypherParser
+			.parse("MATCH (n) SET n.age = 30, n:Person:Employee, n += {a: 1}, n = {b: 2}")
+			.parts().get(0).clauses().get(1)).items();
+
+		assertEquals(4, items.size());
+		// n.age = 30 is also a valid expression — an equality comparison — so parsing it as one would silently turn
+		// the assignment into a predicate that writes nothing.
+		assertInstanceOf(Ast.SetProperty.class, items.get(0));
+		assertEquals("age", ((Ast.SetProperty) items.get(0)).key());
+		assertEquals(List.of("Person", "Employee"), ((Ast.SetLabels) items.get(1)).labels());
+		assertInstanceOf(Ast.SetPropertiesMerge.class, items.get(2));
+		assertInstanceOf(Ast.SetPropertiesReplace.class, items.get(3));
+	}
+
+	@Test
+	public void testCreateRefusesAPatternItCouldNotBuild() {
+		assertTrue(assertThrows(CypherSyntaxException.class,
+			() -> CypherParser.parse("MATCH (a),(b) CREATE (a)-[:R*2]->(b)")).getMessage()
+				.contains("how many relationships"));
+		assertTrue(assertThrows(CypherSyntaxException.class,
+			() -> CypherParser.parse("MATCH (a),(b) CREATE (a)-[:R]-(b)")).getMessage().contains("needs a direction"));
+		assertTrue(assertThrows(CypherSyntaxException.class,
+			() -> CypherParser.parse("MATCH (a),(b) CREATE (a)-[]->(b)")).getMessage().contains("needs a type"));
+		assertTrue(assertThrows(CypherSyntaxException.class,
+			() -> CypherParser.parse("MATCH (a),(b) CREATE (a)-[:R|S]->(b)")).getMessage().contains("one type"));
+	}
+
+	@Test
+	public void testAClauseAfterReturnIsRefused() {
+		assertTrue(assertThrows(CypherSyntaxException.class,
+			() -> CypherParser.parse("MATCH (n) RETURN n DELETE n")).getMessage().contains("cannot follow RETURN"));
 	}
 
 	@Test
@@ -225,8 +297,10 @@ public class CypherParserTest {
 
 	@Test
 	public void testTrailingInputIsRefused() {
+		// RETURN ends a query part, so trailing text is reported as following it rather than as an unexpected token
+		// at some offset — which is the same complaint from the reader's side and a more useful one.
 		assertTrue(assertThrows(CypherSyntaxException.class,
-			() -> CypherParser.parse("RETURN 1 nonsense here")).getMessage().contains("after the end"));
+			() -> CypherParser.parse("RETURN 1 nonsense here")).getMessage().contains("cannot follow RETURN"));
 	}
 
 	@Test
