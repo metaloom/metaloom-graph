@@ -254,8 +254,17 @@ project unbuildable for a contributor who only touches Java.
 
 That path is also reachable deliberately: `mvn test -Dnative.skip=true` turns the native layer off
 even where cargo *is* present, which is how the fallback is actually checked rather than assumed.
-Measured: **355 tests pass, with 19 skipped rather than 3** — the extra 16 are the native-specific
+Measured: **359 tests pass, with 23 skipped rather than 3** — the extra 20 are the native-specific
 tests declining to run, which is the correct behaviour and is visible in the count.
+
+The flag also stops the tests **loading** a library an earlier build left behind, which it did not
+always do. `NativeCapabilities` searches paths relative to the working directory before it searches
+the classpath, so on any machine that had ever built the crate, `-Dnative.skip=true` skipped the build
+and then loaded `native-rust-lib/target/release/libmetaloom_graph_native.so` anyway: the run that was
+meant to prove the pure-Java path exercised the native one. `NativeBindingsTest` caught it by failing
+on a library that was loaded but not packaged. The flag now sets
+`metaloom.graph.native.enabled=false` for surefire as well, and a command-line
+`-Dmetaloom.graph.native.enabled=...` still outranks it.
 
 `-Poffline` passes cargo's offline flag for a warm registry with no network, and `-DskipTests` skips
 the crate's tests along with the Java ones rather than only half of what its name implies.

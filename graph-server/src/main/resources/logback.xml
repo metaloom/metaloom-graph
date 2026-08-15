@@ -1,0 +1,24 @@
+<!--
+    The executable's logging configuration.
+
+    It ships in this module only. graph-core and graph-cypher are libraries and bind nothing, so a consumer embedding
+    the engine keeps their own configuration; `java -jar` has no such consumer, and unconfigured slf4j discards
+    everything — including the store failing to open, which is exactly the message a user needs.
+
+    Netty and Vert.x are pinned to WARN because at INFO they narrate transport setup on every request and bury the
+    engine's own recovery and checkpoint lines, which are the ones worth reading.
+-->
+<configuration>
+    <appender name="console" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level %logger{28} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <logger name="io.netty" level="WARN" />
+    <logger name="io.vertx" level="WARN" />
+
+    <root level="INFO">
+        <appender-ref ref="console" />
+    </root>
+</configuration>

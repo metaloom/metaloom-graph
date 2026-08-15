@@ -78,7 +78,14 @@ src/test/java/io/metaloom/graph/core/
 graph-cypher/src/test/java/io/metaloom/graph/cypher/
                  parser, null semantics, execution, the versus-API differential, variable-length paths
 graph-server/src/test/java/io/metaloom/graph/server/
-                 the HTTP contract and the two result shapes the UI needs
+                 the HTTP contract, the two result shapes the UI needs, and DemoServer — the seeded
+                 graph the browser suite drives
+graph-server/src/main/frontend/src/model/*.test.ts
+                 the UI's rules that are logic rather than appearance: what a merge does to node
+                 identity, and that a label's colour is a function of its name. Run by `mvn test`
+                 through npm, so they are in the same suite as everything else
+graph-server/src/main/frontend/e2e/
+                 Playwright, against the real server over a real store. Opt-in: `npm run e2e`
   concurrency/   jcstress and custom harnesses
   crash/         fault-injection recovery tests
   invariant/     the checkers themselves plus their tests

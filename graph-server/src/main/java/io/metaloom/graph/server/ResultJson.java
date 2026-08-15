@@ -28,7 +28,8 @@ import io.vertx.core.json.JsonObject;
  * <p>
  * Relationships are only drawn when <b>both</b> endpoints are among the collected nodes. An edge to a node the query
  * never returned would otherwise appear as a line to nowhere, and D3's force layout would place a phantom vertex for
- * it.
+ * it. The rest are sent as {@code danglingLinks}: the far end may already be on the canvas from an earlier query, and
+ * the UI's merge mode draws one as soon as both of its ends are there.
  * </p>
  *
  * <h2>Why ids cross as strings</h2>
@@ -72,13 +73,15 @@ final class ResultJson {
 			rows.add(cells);
 		}
 
-		// A link whose far end was never returned would render as a line to a vertex that does not exist.
+		// A link whose far end was never returned would render as a line to a vertex that does not exist — in this
+		// result. The far end may well be on the canvas already from an earlier query, and in merge mode the UI can
+		// then draw it, so these are separated rather than discarded.
 		JsonArray connected = new JsonArray();
+		JsonArray dangling = new JsonArray();
 		for (int i = 0; i < links.size(); i++) {
 			JsonObject link = links.getJsonObject(i);
-			if (nodes.containsKey(link.getString("source")) && nodes.containsKey(link.getString("target"))) {
-				connected.add(link);
-			}
+			boolean drawable = nodes.containsKey(link.getString("source")) && nodes.containsKey(link.getString("target"));
+			(drawable ? connected : dangling).add(link);
 		}
 
 		return new JsonObject()
@@ -88,7 +91,8 @@ final class ResultJson {
 			.put("elapsedMillis", elapsedMillis)
 			.put("graph", new JsonObject()
 				.put("nodes", new JsonArray(List.copyOf(nodes.values())))
-				.put("links", connected));
+				.put("links", connected)
+				.put("danglingLinks", dangling));
 	}
 
 	/** Adds any renderable value to the graph, recursing into lists so {@code collect(n)} still draws. */

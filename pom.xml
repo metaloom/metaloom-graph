@@ -49,8 +49,23 @@
         <native.skip>false</native.skip>
         <!-- Follows native.skip unless the skip-native-tests profile below overrides it. -->
         <native.test.skip>${native.skip}</native.test.skip>
+        <!--
+            Whether the tests may *load* the native layer. Named after the system property the engine itself reads, so
+            that the documented `-Dmetaloom.graph.native.enabled=false` still works: a command line -D outranks a pom
+            property. Turned off along with native.skip by the profile below.
+        -->
+        <metaloom.graph.native.enabled>true</metaloom.graph.native.enabled>
         <!-- Set to cargo's offline flag by -Poffline, for a machine with a warm registry and no network. -->
         <cargo.offline.flag></cargo.offline.flag>
+
+        <!--
+            The browser UI, on the same terms as the native layer: `ui.skip` forces it off where npm is present, and
+            the build skips it by itself where npm is absent. Without it the server still runs and still answers every
+            API route; only the page is missing, and it says so. See graph-server/pom.xml.
+        -->
+        <ui.skip>false</ui.skip>
+        <ui.test.skip>${ui.skip}</ui.test.skip>
+        <npm.offline.flag></npm.offline.flag>
     </properties>
 
     <dependencyManagement>
@@ -139,6 +154,16 @@
                         <include>**/*TestCase.java</include>
                         <include>**/*Benchmark.java</include>
                     </includes>
+                    <systemPropertyVariables>
+                        <!--
+                            Not building the native layer has to mean not using it. The engine looks for the shared
+                            object relative to the working directory before it looks on the classpath, so a crate
+                            built earlier is still found and loaded under -Dnative.skip=true — and the run that was
+                            meant to prove the pure-Java fallback quietly exercised the native path instead.
+                            NativeBindingsTest caught it, by failing on a library that was loaded but not packaged.
+                        -->
+                        <metaloom.graph.native.enabled>${metaloom.graph.native.enabled}</metaloom.graph.native.enabled>
+                    </systemPropertyVariables>
                 </configuration>
             </plugin>
         </plugins>
@@ -159,13 +184,31 @@
             </activation>
             <properties>
                 <native.test.skip>true</native.test.skip>
+                <ui.test.skip>true</ui.test.skip>
             </properties>
         </profile>
-        <!-- A warm cargo registry and no network: mvn -o -Poffline install -->
+        <!--
+            -Dnative.skip=true means the whole pure-Java path: not built, not packaged, and not loaded. Without the
+            last of those the flag proves nothing on a machine that has ever built the crate.
+        -->
+        <profile>
+            <id>no-native-at-runtime</id>
+            <activation>
+                <property>
+                    <name>native.skip</name>
+                    <value>true</value>
+                </property>
+            </activation>
+            <properties>
+                <metaloom.graph.native.enabled>false</metaloom.graph.native.enabled>
+            </properties>
+        </profile>
+        <!-- A warm cargo and npm cache with no network: mvn -o -Poffline install -->
         <profile>
             <id>offline</id>
             <properties>
                 <cargo.offline.flag>--offline</cargo.offline.flag>
+                <npm.offline.flag>--offline</npm.offline.flag>
             </properties>
         </profile>
 

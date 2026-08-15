@@ -11,7 +11,16 @@
     </parent>
 
     <name>Graph Server</name>
-    <description>A Vert.x HTTP server exposing Cypher queries, with a browser UI that renders results with D3</description>
+    <description>A Vert.x HTTP server exposing Cypher queries, with a React and D3 browser UI built into the jar</description>
+
+    <properties>
+        <!--
+            A property rather than a literal in the plugin block below, because plugin configuration wins over a
+            command line -D and would make `-Dexec.mainClass=...` silently start the wrong class. tools/demo-server.sh
+            depends on being able to override it.
+        -->
+        <exec.mainClass>io.metaloom.graph.server.GraphServer</exec.mainClass>
+    </properties>
 
     <dependencies>
         <dependency>
@@ -29,6 +38,16 @@
         <dependency>
             <groupId>io.vertx</groupId>
             <artifactId>vertx-web</artifactId>
+        </dependency>
+        <!--
+            The one runtime dependency this module adds over the library modules. `java -jar` has to log somewhere:
+            without a binding, slf4j discards everything and a failure to open the store is silent. The library modules
+            keep logback test-scoped, as a library should — this is the executable, so it chooses.
+        -->
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <scope>runtime</scope>
         </dependency>
         <dependency>
             <groupId>io.metaloom.graph</groupId>
@@ -52,8 +71,137 @@
                 <artifactId>exec-maven-plugin</artifactId>
                 <version>3.1.0</version>
                 <configuration>
-                    <mainClass>io.metaloom.graph.server.GraphServer</mainClass>
+                    <mainClass>${exec.mainClass}</mainClass>
                 </configuration>
+                <executions>
+                    <!--
+                        The browser UI is a React application under src/main/frontend, bundled by Vite straight into
+                        target/classes/webroot — which is what StaticHandler serves and what ends up inside the jar. No
+                        copy step, and no way for `mvn package` to ship a stale bundle.
+
+                        npm is treated exactly as cargo is: absent means skipped, with a message, never a broken build.
+                        A missing Node toolchain costs the browser UI, not the server — the API still runs and says so
+                        on the index page. `-Dui.skip=true` forces the same path where npm is present.
+
+                        node_modules is NOT removed by `mvn clean`, deliberately. It is this module's dependency
+                        directory, the equivalent of ~/.m2, not build output; clean does not empty the local repository
+                        either. Everything the build generates is under target/ and does go.
+                    -->
+                    <execution>
+                        <id>ui-install</id>
+                        <phase>generate-resources</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${ui.skip}</skip>
+                            <executable>sh</executable>
+                            <workingDirectory>${project.basedir}/src/main/frontend</workingDirectory>
+                            <arguments>
+                                <argument>-c</argument>
+                                <argument>if command -v npm >/dev/null 2>&amp;1; then npm install --no-audit --no-fund ${npm.offline.flag}; else echo "[ui] npm not found, skipping the browser UI (the API is unaffected)"; fi</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                    <!--
+                        process-classes, after the resource copy: the bundle lands in the same directory Maven has just
+                        finished writing to, and Vite empties it first.
+                    -->
+                    <execution>
+                        <id>ui-build</id>
+                        <phase>process-classes</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${ui.skip}</skip>
+                            <executable>sh</executable>
+                            <workingDirectory>${project.basedir}/src/main/frontend</workingDirectory>
+                            <arguments>
+                                <argument>-c</argument>
+                                <argument>if command -v npm >/dev/null 2>&amp;1; then npm run build; else echo "[ui] npm not found, no bundle in this jar"; fi</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                    <!--
+                        The UI's own tests, in `mvn test` alongside the Java ones. What they cover is the merge rule —
+                        which node objects survive a second query — and that is logic, not appearance, so it belongs in
+                        the same suite as everything else rather than in a separate ritual nobody runs.
+                    -->
+                    <execution>
+                        <id>ui-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${ui.test.skip}</skip>
+                            <executable>sh</executable>
+                            <workingDirectory>${project.basedir}/src/main/frontend</workingDirectory>
+                            <arguments>
+                                <argument>-c</argument>
+                                <argument>if command -v npm >/dev/null 2>&amp;1; then npm test; else echo "[ui] npm not found, skipping the UI tests"; fi</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!--
+                One runnable jar: server, engine, query language, Vert.x, Netty and the UI bundle.
+
+                    java -jar graph-server/target/graph-server-0.0.1-SNAPSHOT.jar /path/to/store 8080
+
+                Three details are load-bearing:
+
+                * ServicesResourceTransformer. Vert.x and Netty find their implementations through META-INF/services,
+                  and a dozen jars contribute files with the same names. Concatenating them is the difference between a
+                  server that starts and one that fails on an unresolvable service.
+                * module-info.class is dropped. graph-core is a named module so that native access can be granted to it
+                  alone (see its module-info), but an uber jar is one classpath artifact and cannot carry several module
+                  descriptors. The scoped grant is the price of the single-file distribution.
+                * Enable-Native-Access: ALL-UNNAMED, which restores what that costs. Without it every FFM call from the
+                  shaded jar prints a restricted-method warning on JDK 24 and later, and a future release turns those
+                  into errors. Run the reactor jars instead of the shaded one to keep the narrow grant.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.6.2</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <!-- Signatures cover the original jars and are invalid once merged. -->
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                        <exclude>module-info.class</exclude>
+                                        <exclude>META-INF/versions/*/module-info.class</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>io.metaloom.graph.server.GraphServer</mainClass>
+                                    <manifestEntries>
+                                        <Enable-Native-Access>ALL-UNNAMED</Enable-Native-Access>
+                                    </manifestEntries>
+                                </transformer>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer" />
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheLicenseResourceTransformer" />
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>

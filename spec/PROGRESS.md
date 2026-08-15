@@ -33,7 +33,7 @@ not**, in one place.
 | 8 — Compaction and reclamation | **Done** except the p99 latency budget | `CompactionTest`, `CompactionCrashTest` |
 | 9 — Hardening | **Partial** — see §4.9; crash matrix **built**, no JMH, long runs not run | `CrashMatrixTest`, `WalFaultTest`; §6 of PHASE_STATUS |
 | 10 — MetaLoom integration | **Done** — built, measured, recommended against adopting | §6 below |
-| 11 — Query language | **Done** for a read-only openCypher subset, in its own module, with a Vert.x server and D3 UI | [CYPHER.md](CYPHER.md); `CypherVersusApiTest`, `NullSemanticsTest` |
+| 11 — Query language | **Done** for a read-only openCypher subset, in its own module, with a single-jar Vert.x server and a React and D3 graph browser | [CYPHER.md](CYPHER.md); `CypherVersusApiTest`, `NullSemanticsTest`, `e2e/graph-browser.spec.ts` |
 
 **The engine is usable today** for a single-writer embedded workload: durable, crash-safe,
 transactional, indexed, compacting, with snapshot isolation for readers, a read-only Cypher query
@@ -46,16 +46,17 @@ backup are requirements. None of those exists and none is faked.
 ## 2. Evidence
 
 The repository is three modules — `graph-core`, `graph-cypher`, `graph-server` — under one parent
-pom, and every profile below applies across all of them. `mvn clean install` builds the lot, Rust
-included: `graph-core` drives cargo at four points, **build** (generate-resources), **package** the
-shared object into the jar (process-classes), **test** the crate with clippy (test), and **clean** its
-target directory (clean).
+pom, and every profile below applies across all of them. `mvn clean install` builds the lot, Rust and
+the browser UI included: `graph-core` drives cargo at four points, **build** (generate-resources),
+**package** the shared object into the jar (process-classes), **test** the crate with clippy (test),
+and **clean** its target directory (clean); `graph-server` drives npm on the same terms and then
+shades a single runnable jar.
 
 ```bash
 mvn clean install             # everything, including the native layer
-mvn test -Dnative.skip=true   # the pure-Java fallback: 355 tests, 19 skipped rather than 3
+mvn test -Dnative.skip=true   # the pure-Java fallback: 359 tests, 23 skipped rather than 3
 mvn -o -Poffline install      # warm cargo registry, no network
-mvn test                      # 355 tests, 0 failures, 3 skipped — plus 12 Rust tests and clippy
+mvn test                      # 359 tests, 0 failures, 3 skipped — plus the UI's 17 and 12 Rust tests
 mvn test -Pbench              # benchmarks, the structural gates, and the supernode gates
 mvn test -Pcrash              # kill -9, compaction crash injection, and the crash matrix
 mvn test -Pslow               # the soak harness and the long-running reader
@@ -66,9 +67,9 @@ mvn test -Pcrash -Dtest=CrashMatrixTest -Dgraph.crash.transactions=24   # 2,394 
 tools/kill9-loop.sh 100       # the crash loop, one iteration per store
 tools/verify-native.sh        # cargo miri, then cargo fuzz on both targets
 
-mvn -o -pl graph-server exec:java \
-  -Dexec.mainClass=io.metaloom.graph.server.GraphServer \
-  -Dexec.args="/path/to/store 8080"      # the query UI on http://localhost:8080
+java -jar graph-server/target/graph-server-0.0.1-SNAPSHOT.jar /path/to/store 8080   # the graph browser
+tools/demo-server.sh                     # the same, over a seeded demo graph
+cd graph-server/src/main/frontend && npm run e2e   # 27 Playwright cases against that server
 ```
 
 In MetaLoom: `mvn test -pl loom/services/graphstore` — **23 tests**, and

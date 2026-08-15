@@ -6,7 +6,7 @@ Three modules:
 | Module | What it is |
 |---|---|
 | `graph-cypher` | Lexer, parser, pattern matcher, evaluator. Depends on `graph-core`'s **public api package only** |
-| `graph-server` | A Vert.x HTTP endpoint and a D3 UI |
+| `graph-server` | A Vert.x HTTP endpoint and a React and D3 graph browser, shaded into one runnable jar |
 | `graph-core` | The engine, unchanged except for what §6 lists |
 
 ```java
@@ -222,21 +222,28 @@ property equality → a label scan → a full node scan. So
 ## 8. The server and UI
 
 ```bash
-mvn -o -pl graph-server exec:java \
-    -Dexec.mainClass=io.metaloom.graph.server.GraphServer \
-    -Dexec.args="/path/to/store 8080"
+java -jar graph-server/target/graph-server-0.0.1-SNAPSHOT.jar /path/to/store 8080
+mvn -o -pl graph-server exec:java -Dexec.args="/path/to/store 8080"   # from the reactor
+tools/demo-server.sh                                                  # a seeded demo graph on 8080
 ```
+
+The jar is shaded: server, engine, query language, Vert.x, Netty, logging and the UI bundle in one
+file. `Enable-Native-Access: ALL-UNNAMED` is in its manifest — an uber jar cannot carry `graph-core`'s
+module descriptor, so the narrow `--enable-native-access=io.metaloom.graph.core` grant is not available
+to it. Run the reactor jars to keep the narrow one.
 
 | Route | |
 |---|---|
 | `POST /api/query` | `{"query": "...", "parameters": {...}}` → columns, rows, and a `graph` of nodes and links |
+| `GET /api/schema` | Labels and relationship types with live counts. `?refresh=true` forces a rescan |
 | `GET /api/stats` | Node and relationship counts, labels, storage bytes, open views |
 | `GET /` | The UI |
 
 One result serves both views: the table is the rows, and the graph is built by walking every value in
 every row and collecting whatever is renderable. A query returning only `n.name` gets a table and an
 empty canvas, which the UI says rather than showing blank space. A link is drawn only when **both**
-endpoints were returned, or D3 would invent a vertex for the missing one.
+endpoints were returned, or D3 would invent a vertex for the missing one; the rest travel as
+`danglingLinks`, because merge mode may already have the far end on screen.
 
 **Ids cross as strings.** An id here is around 2^60 and a JavaScript number is a double: exact to
 2^53. `1152921504606846977` arrives in a browser as `1152921504606846976`, and ids close enough
@@ -245,8 +252,47 @@ the safe range is stringified for the same reason — `RETURN id(n)` has to give
 can paste into another query. Found by running the UI, so there is now a test.
 
 **Queries run on worker threads**, never the event loop: an unindexed query is a full scan, bounded by
-the data rather than by the request. D3 v7 is **vendored** under `webroot/vendor/`, ISC-licensed, so
-the UI works with no network.
+the data rather than by the request.
+
+### 8.1 `/api/schema` is a scan
+
+The engine interns node labels and relationship types into **one** dictionary — `internEdgeType`
+delegates to `internLabel` — so the dictionary can say that `KNOWS` exists but not that it is a
+relationship type, and it still holds labels whose last node was deleted, because ids are never reused.
+A sidebar built from it would mix the two and list things that match nothing.
+
+So the counts come from the data: one pass over the live nodes, reading each node's labels and its
+outgoing edges. Outgoing only, or every relationship would be counted twice. It is O(nodes + edges),
+runs on a worker thread inside a snapshot view, and is cached for 60 s; the response carries
+`elapsedMillis` and `cached` so the UI can say which answer it is showing.
+
+### 8.2 The browser UI
+
+A React application under `graph-server/src/main/frontend`, bundled by Vite straight into
+`target/classes/webroot` — which is what `StaticHandler` serves and what ends up inside the jar, so
+`mvn package` cannot ship a stale bundle. npm is treated exactly as cargo is: absent means skipped,
+with a message, and `-Dui.skip=true` forces the same path. Without a bundle the server still answers
+every API route and the index page says so rather than returning a 404.
+
+| | |
+|---|---|
+| Left | Labels and relationship types with counts, each one clickable into a query; below it the inspector — the selected node's labels and properties, or the selected relationship's, with its incident relationships as links to walk |
+| Above | The query editor. Ctrl/Cmd+Enter runs it. **Replace** or **Merge** decides what a result does to the canvas |
+| Right | The force layout: colour per label and per relationship type, the type written on each line, drag, zoom, fit |
+
+Three decisions worth recording:
+
+- **Colour comes from a hash of the name**, not from order of appearance. The sidebar lists what is in
+  the store and the canvas draws what the last query returned; handing colours out in encounter order
+  would make the two disagree, and would change a label's colour depending on which query ran first.
+  Hashing means the legend and the picture agree with no shared state.
+- **Merge reuses node objects rather than rebuilding them.** d3-force writes `x`/`y` onto the objects
+  it is given, so a fresh object per result would drop every position and the whole picture would jump
+  each time a query mentioned a node already on screen. `model/graph.ts` mutates the existing object in
+  place and its tests assert object identity, which is the only way to state that rule.
+- **A dangling link is held, not dropped.** The server can only judge drawability within one result. In
+  merge mode a link whose far end arrives two queries later is drawn then — which is what makes it
+  possible to build a picture one query at a time. Held links are capped, newest kept.
 
 **No authentication.** The query language cannot write, but it reads everything. Bind to localhost
 unless something else provides access control.
@@ -263,7 +309,10 @@ unless something else provides access control.
 | `CypherVersusApiTest` | 12 | **The load-bearing one** — see below |
 | `VarLengthPathTest` | 8 | §3.2, against a graph where the difference shows |
 | `CypherSnapshotTest` | 4 | §4: views closed, joined, and a query atomic against a live writer |
-| `GraphServerTest` | 14 | The HTTP contract, both result shapes, and the id-precision regression |
+| `GraphServerTest` | 18 | The HTTP contract, both result shapes, the schema scan and its cache, and the id-precision regression |
+| `model/graph.test.ts` | 12 | The merge rule: node identity across results, held links, and that every change advances the version |
+| `model/colors.test.ts` | 5 | A colour is a function of a name, and the demo graph's labels do not collide |
+| `e2e/graph-browser.spec.ts` | 27 | The UI in a browser against a real server — see §9.1 |
 
 `CypherVersusApiTest` is the one that matters. [TESTING.md](TESTING.md) opens by observing that every
 defect this project has found came from a test comparing the engine against **something outside it**.
@@ -271,6 +320,29 @@ The query layer's version of that is: seed a random graph, and require every que
 what the Java API computes directly. The graph is seeded rather than chosen, so it contains the shapes
 an author would not have thought to write — nodes with several labels and none, missing properties,
 parallel edges, self-loops, and a mix of materialised and lightweight relationships.
+
+### 9.1 The browser suite
+
+`npm run e2e` in `graph-server/src/main/frontend`, opt-in because it needs a browser and starts a
+server. There are no mocks: Playwright drives Chromium against `tools/demo-server.sh`, which is the
+same command a human uses to look at the UI, over a store on disk seeded by `DemoServer`. That graph
+is deliberately awkward — a node with two labels, a node with none, a label with a space in it, two
+relationships between one pair, a self-relationship, and three lightweight edges — because each one is
+a case the UI has to get right and would otherwise only be exercised by hand.
+
+Writing it found four defects that the Java tests could not have:
+
+| | |
+|---|---|
+| **Replace mode drew every result but the first** | The version counter the canvas re-renders on was rebuilt from an empty graph each time, so it was always 1. Now a model function, with a test that the counter never repeats |
+| **Fit ran before the layout had settled** | Positions are still bunched a moment after a query, so the computed scale was the maximum and the simulation then spread the graph out at that magnification, off the edges of the screen. Now deferred to the simulation's `end` event, and capped |
+| **`Person` and `Product` were the same colour** | A twelve-entry palette, indexed by hash, collided on the two labels a user most needs to tell apart. Now a hue per name, with the demo graph's labels as a regression test |
+| **A 1.6 pixel line is not a click target** | Each line now has an invisible 16 pixel copy that takes the click — needed for a mouse, not only for a test |
+
+The suite also caught a harness defect worth naming: Vert.x copies classpath resources into
+`.vertx/file-cache-*` and serves the copy, so a server left running across a UI rebuild serves the
+previous bundle. Every assertion in the first run failed against markup that no longer existed.
+`DemoServer` disables that cache.
 
 ---
 

@@ -9,7 +9,11 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -84,6 +88,23 @@ public class GraphServerTest {
 	private HttpResponse<String> get(String path) throws Exception {
 		return client.send(HttpRequest.newBuilder(URI.create(base + path)).timeout(Duration.ofSeconds(20)).build(),
 			HttpResponse.BodyHandlers.ofString());
+	}
+
+	/** A [{name, count}] array as a map, so an assertion can name what it expects rather than an index. */
+	private static Map<String, Long> namedCounts(JsonArray array) {
+		Map<String, Long> counts = new LinkedHashMap<>();
+		for (int i = 0; i < array.size(); i++) {
+			counts.put(array.getJsonObject(i).getString("name"), array.getJsonObject(i).getLong("count"));
+		}
+		return counts;
+	}
+
+	private static Map<String, Long> counts(Object... pairs) {
+		Map<String, Long> expected = new LinkedHashMap<>();
+		for (int i = 0; i < pairs.length; i += 2) {
+			expected.put((String) pairs[i], (Long) pairs[i + 1]);
+		}
+		return expected;
 	}
 
 	@Test
@@ -177,9 +198,10 @@ public class GraphServerTest {
 	 * A relationship whose far end was not returned must not be drawn.
 	 * <p>
 	 * Otherwise D3 invents a vertex for the missing endpoint and the picture contains a node the query never produced.
+	 * It is not thrown away either — see {@link #testAnUnreturnedEndpointArrivesAsADanglingLink()}.
 	 */
 	@Test
-	public void testALinkToAnUnreturnedNodeIsDropped() throws Exception {
+	public void testALinkToAnUnreturnedNodeIsNotDrawn() throws Exception {
 		JsonObject json = new JsonObject(post("MATCH (a:Person)-[r:KNOWS]->(b) RETURN a, r").body());
 		JsonObject graph = json.getJsonObject("graph");
 		assertEquals(1, graph.getJsonArray("nodes").size(), "only a was returned");
@@ -236,19 +258,98 @@ public class GraphServerTest {
 		assertEquals(0, json.getInteger("openViews"), "a finished query must not have left a view open");
 	}
 
+	/**
+	 * The UI, whichever of the two supported builds this is.
+	 *
+	 * <p>
+	 * With npm present the React bundle is in the jar and the page must load — including its hashed asset, which is
+	 * the part a broken build would silently drop while still serving a valid-looking index. With {@code -Dui.skip} or
+	 * no npm there is no bundle, and the server must say so rather than 404: a user who gets "Not Found" from the root
+	 * of their own server has no way to tell a missing bundle from a broken deployment.
+	 * </p>
+	 */
 	@Test
 	public void testTheUiIsServed() throws Exception {
 		HttpResponse<String> page = get("/");
+		boolean bundled = GraphServer.class.getResource("/webroot/index.html") != null;
+		if (!bundled) {
+			assertEquals(503, page.statusCode());
+			assertTrue(page.body().contains("No UI bundle"), "the page has to name the reason");
+			return;
+		}
+
 		assertEquals(200, page.statusCode());
 		assertTrue(page.body().contains("Graph browser"));
 
-		// Vendored rather than fetched from a CDN, so the UI works on a machine with no internet access.
-		HttpResponse<String> d3 = get("/vendor/d3.v7.min.js");
-		assertEquals(200, d3.statusCode());
-		assertTrue(d3.body().startsWith("// https://d3js.org"), "the D3 bundle must actually be there");
+		// Vite writes content-hashed asset names into the page, so following one proves the bundle in this jar is the
+		// one the page asks for. A stale or half-copied webroot fails here and nowhere else.
+		Matcher script = Pattern.compile("src=\"\\.?/?(assets/[^\"]+\\.js)\"").matcher(page.body());
+		assertTrue(script.find(), "the page must reference a bundled script, was:\n" + page.body());
+		HttpResponse<String> asset = get("/" + script.group(1));
+		assertEquals(200, asset.statusCode(), "the script the page asks for must be in the jar");
+		assertTrue(asset.body().length() > 10_000, "that is not a React bundle");
 
-		assertEquals(200, get("/app.js").statusCode());
-		assertEquals(200, get("/app.css").statusCode());
+		Matcher style = Pattern.compile("href=\"\\.?/?(assets/[^\"]+\\.css)\"").matcher(page.body());
+		assertTrue(style.find(), "the page must reference a bundled stylesheet");
+		assertEquals(200, get("/" + style.group(1)).statusCode());
+	}
+
+	@Test
+	public void testTheSchemaListsLabelsAndTypesWithCounts() throws Exception {
+		HttpResponse<String> response = get("/api/schema");
+		assertEquals(200, response.statusCode());
+		JsonObject json = new JsonObject(response.body());
+
+		assertEquals(counts("Person", 2L, "Employee", 1L, "Product", 1L), namedCounts(json.getJsonArray("labels")));
+		// A lightweight edge has no relationship record, so a count from the record store would miss it. These counts
+		// come from the adjacency list, where both kinds live.
+		assertEquals(counts("BOUGHT", 1L, "KNOWS", 1L), namedCounts(json.getJsonArray("relationshipTypes")));
+		assertEquals(3L, json.getLong("nodeCount"));
+		assertEquals(2L, json.getLong("relationshipCount"));
+		assertEquals(0L, json.getLong("unlabelledNodeCount"));
+		assertEquals(Boolean.FALSE, json.getBoolean("cached"), "the first call cannot come from a cache");
+	}
+
+	/**
+	 * The scan is O(nodes + edges), so it is cached — and the response says which answer this is.
+	 * <p>
+	 * A user looking at a sidebar has to be able to tell "this is what the store contains" from "this is what it
+	 * contained a minute ago", which is what the flag and the rescan button are for.
+	 */
+	@Test
+	public void testTheSchemaIsCachedUntilARescanIsAskedFor() throws Exception {
+		assertEquals(Boolean.FALSE, new JsonObject(get("/api/schema").body()).getBoolean("cached"));
+		assertEquals(Boolean.TRUE, new JsonObject(get("/api/schema").body()).getBoolean("cached"));
+		assertEquals(Boolean.FALSE, new JsonObject(get("/api/schema?refresh=true").body()).getBoolean("cached"));
+	}
+
+	@Test
+	public void testARescanSeesANewNode() throws Exception {
+		try (Transaction txn = store.begin()) {
+			store.createNode(java.util.List.of("Robot"), Properties.of().set("name", "Marvin"));
+			txn.commit();
+		}
+		JsonObject json = new JsonObject(get("/api/schema?refresh=true").body());
+		assertEquals(4L, json.getLong("nodeCount"));
+		assertTrue(namedCounts(json.getJsonArray("labels")).containsKey("Robot"));
+	}
+
+	/**
+	 * A relationship whose far end this result did not return travels separately.
+	 * <p>
+	 * It cannot be drawn now — D3 would invent a vertex for the missing end — but in merge mode the far end may
+	 * already be on the canvas from an earlier query, so discarding it would make merge mode unable to join anything
+	 * up.
+	 */
+	@Test
+	public void testAnUnreturnedEndpointArrivesAsADanglingLink() throws Exception {
+		JsonObject graph = new JsonObject(post("MATCH (a:Person)-[r:KNOWS]->(b) RETURN a, r").body())
+			.getJsonObject("graph");
+		assertEquals(0, graph.getJsonArray("links").size(), "not drawable from this result alone");
+		assertEquals(1, graph.getJsonArray("danglingLinks").size());
+		JsonObject dangling = graph.getJsonArray("danglingLinks").getJsonObject(0);
+		assertEquals("KNOWS", dangling.getString("type"));
+		assertTrue(dangling.getValue("target") instanceof String, "still a string id, like every other id");
 	}
 
 	@Test

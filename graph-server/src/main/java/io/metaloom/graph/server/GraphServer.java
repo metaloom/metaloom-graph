@@ -28,7 +28,8 @@ import io.vertx.ext.web.handler.StaticHandler;
  * An HTTP front end: a Cypher endpoint and the browser UI that uses it.
  *
  * <pre>
- * mvn -o -pl graph-server exec:java -Dexec.mainClass=io.metaloom.graph.server.GraphServer -Dexec.args="/path/to/store"
+ * java -jar graph-server-0.0.1-SNAPSHOT.jar /path/to/store 8080   # the shaded jar, everything included
+ * mvn -pl graph-server exec:java -Dexec.args="/path/to/store"     # from the reactor
  * </pre>
  *
  * <h2>Threading</h2>
@@ -64,6 +65,7 @@ public final class GraphServer implements AutoCloseable {
 	private final Vertx vertx;
 	private final GraphStore store;
 	private final boolean ownsStore;
+	private final SchemaScanner schema;
 	private HttpServer server;
 
 	public GraphServer(GraphStore store) {
@@ -74,6 +76,7 @@ public final class GraphServer implements AutoCloseable {
 		this.vertx = vertx;
 		this.store = store;
 		this.ownsStore = ownsStore;
+		this.schema = new SchemaScanner(store);
 	}
 
 	public static void main(String[] args) throws Exception {
@@ -96,8 +99,21 @@ public final class GraphServer implements AutoCloseable {
 
 		router.post("/api/query").handler(this::query);
 		router.get("/api/stats").handler(this::stats);
-		// Cached in production, never in a build tree: an edited UI file should show up on reload.
-		router.route("/*").handler(StaticHandler.create("webroot").setCachingEnabled(false).setIndexPage("index.html"));
+		router.get("/api/schema").handler(this::schema);
+
+		if (uiIsBundled()) {
+			// Cached in production, never in a build tree: an edited UI file should show up on reload.
+			router.route("/*").handler(StaticHandler.create("webroot").setCachingEnabled(false).setIndexPage("index.html"));
+		} else {
+			// The UI is a React bundle built by npm during `mvn package`. A build with -Dui.skip=true, or on a machine
+			// with no npm, produces a working API and no bundle — so say which one this is instead of serving a 404
+			// that looks like the server is broken.
+			logger.warn("No UI bundle on the classpath: the API is up, the browser UI is not. See graph-server/README");
+			router.route("/*").handler(context -> context.response()
+				.putHeader("content-type", "text/html; charset=utf-8")
+				.setStatusCode(503)
+				.end(NO_UI_PAGE));
+		}
 
 		server = vertx.createHttpServer();
 		return server.requestHandler(router).listen(port).map(HttpServer::actualPort);
@@ -150,6 +166,21 @@ public final class GraphServer implements AutoCloseable {
 		}
 	}
 
+	/**
+	 * The labels and relationship types in the store, with counts.
+	 *
+	 * <p>
+	 * A scan, cached — see {@link SchemaScanner}. {@code ?refresh=true} forces a fresh one, which is what the UI's
+	 * rescan button sends.
+	 * </p>
+	 */
+	private void schema(RoutingContext context) {
+		boolean refresh = "true".equals(context.request().getParam("refresh"));
+		vertx.<JsonObject>executeBlocking(() -> schema.schema(refresh), false)
+			.onSuccess(context::json)
+			.onFailure(error -> respondToFailure(context, error));
+	}
+
 	private void stats(RoutingContext context) {
 		vertx.<JsonObject>executeBlocking(() -> {
 			StoreStats stats = store.stats();
@@ -177,6 +208,25 @@ public final class GraphServer implements AutoCloseable {
 				.put("column", column)
 				.encode());
 	}
+
+	// ---------------------------------------------------------------- ui
+
+	/** The bundle is a build output, so whether it exists is a fact about this jar rather than about the source tree. */
+	private static boolean uiIsBundled() {
+		return GraphServer.class.getResource("/webroot/index.html") != null;
+	}
+
+	private static final String NO_UI_PAGE = """
+		<!doctype html><meta charset="utf-8"><title>Graph browser</title>
+		<style>body{font:14px system-ui;margin:3rem auto;max-width:40rem;color:#dfe6ee;background:#10151b}
+		code{background:#1e2732;padding:.1rem .35rem;border-radius:3px}</style>
+		<h1>No UI bundle in this build</h1>
+		<p>The Cypher API is running. The browser UI was not built into this jar, which happens when the build ran
+		with <code>-Dui.skip=true</code> or on a machine without <code>npm</code>.</p>
+		<p>Build it with <code>mvn -pl graph-server package</code>, or run the API directly:</p>
+		<pre>curl -XPOST localhost:8080/api/query -H 'content-type: application/json' \\
+		  -d '{"query":"MATCH (n) RETURN n LIMIT 10"}'</pre>
+		""";
 
 	// ---------------------------------------------------------------- lifecycle
 

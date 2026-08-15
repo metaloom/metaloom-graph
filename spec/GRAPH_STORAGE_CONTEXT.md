@@ -95,7 +95,7 @@ GRAPH_STORAGE_CONTEXT.md (this file)
 | [FILE_FORMAT.md](FILE_FORMAT.md) | Store directory layout, manifest, segment anatomy, page metadata array, free-slot bitmap, node and relationship record layouts, versioning and compaction | Adjacency internals, property internals |
 | [RELATIONSHIP_STORAGE.md](RELATIONSHIP_STORAGE.md) | Inline edges, adjacency blocks, edge compression, lightweight edges, traversal cost model | Node record layout |
 | [PROPERTY_STORAGE.md](PROPERTY_STORAGE.md) | Property blocks, key and label dictionaries, value typing, inline vs blob, string dedup | Relationship storage |
-| [CYPHER.md](CYPHER.md) | The read-only openCypher subset: grammar, null semantics, where it differs from the engine, the planner's costs, and the Vert.x server with its D3 UI | The public API |
+| [CYPHER.md](CYPHER.md) | The read-only openCypher subset: grammar, null semantics, where it differs from the engine, the planner's costs, and the Vert.x server with its React and D3 graph browser | The public API |
 | [TRANSACTIONS.md](TRANSACTIONS.md) | ACID guarantees, snapshot isolation, the anomaly matrix, per-page version chains, the reclamation horizon and budget, where Copy-on-Write genuinely applies. Also why `SERIALIZABLE`, `LockTable` and `xmin` are *not* built rather than unfinished | WAL record format |
 | [WAL.md](WAL.md) | WAL record format, LSN semantics, group commit, ARIES recovery, checkpointing, log retention | Isolation semantics |
 | [SSD_IO.md](SSD_IO.md) | Seek-avoidance rules, alignment, page cache, prefetch, write amplification, TRIM, queue depth | Format details |

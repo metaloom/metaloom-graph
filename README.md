@@ -10,12 +10,12 @@ SSD. The defining design constraint:
 
 ## Status
 
-Durable, transactional, indexed, compacting, hardened, with snapshot isolation for readers, a read-only openCypher subset and a browser UI. 355 tests, plus 12 in the Rust crate.
+Durable, transactional, indexed, compacting, hardened, with snapshot isolation for readers, a read-only openCypher subset and a browser UI. 359 Java tests, 17 in the UI and 12 in the Rust crate, plus 27 browser cases on demand.
 
 | | |
 |---|---|
 | **Durability** | Write-ahead log. Every commit is fsynced *before* it touches a data file, so uncommitted data cannot reach disk and recovery is a single redo pass. |
-| **Query language** | A read-only openCypher subset — `MATCH` with variable-length paths, `WHERE`, `RETURN`, `WITH`, `UNWIND`, aggregation, parameters — in its own module, plus a Vert.x server with a D3 UI. [spec/CYPHER.md](spec/CYPHER.md) |
+| **Query language** | A read-only openCypher subset — `MATCH` with variable-length paths, `WHERE`, `RETURN`, `WITH`, `UNWIND`, aggregation, parameters — in its own module, plus a single-jar Vert.x server and a React and D3 graph browser. [spec/CYPHER.md](spec/CYPHER.md) |
 | **Transactions** | `begin` / `commit` / `rollback`, plus auto-commit for single operations. |
 | **Isolation** | One writer at a time; many concurrent readers. `store.beginRead()` gives a reader **MVCC snapshot isolation** — a view fixed at one instant across many reads, while the writer keeps committing. Reads take no lock and scale to 10x at 32 threads; writes are flat by design. **No concurrent writers.** |
 | **Indexes** | Label and property B+trees, unique constraints, and an index-versus-scan differential test. |
@@ -57,7 +57,7 @@ Measured against the original proof of concept ([spec/reports/BASELINE.md](spec/
 ## API
 
 Every line below runs as a test:
-[`UsageExampleTest`](src/test/java/io/metaloom/graph/core/example/UsageExampleTest.java) is this
+[`UsageExampleTest`](graph-core/src/test/java/io/metaloom/graph/core/example/UsageExampleTest.java) is this
 example with assertions, so the documentation cannot drift from the API.
 
 ```java
@@ -129,18 +129,33 @@ for (CypherRow row : result) {
 Each query runs inside a snapshot read view, so it sees one consistent state however long it takes —
 and joins the caller's view if there already is one.
 
-There is also a browser UI: a query box, a D3 force layout of the nodes and relationships a query
-returns, and a table of the raw rows.
+## The graph browser
+
+`graph-server` builds a single runnable jar — engine, query language, Vert.x and the UI inside it:
 
 ```bash
-mvn -o -pl graph-server exec:java \
-  -Dexec.mainClass=io.metaloom.graph.server.GraphServer \
-  -Dexec.args="/data/mygraph 8080"
+java -jar graph-server/target/graph-server-0.0.1-SNAPSHOT.jar /data/mygraph 8080
+tools/demo-server.sh          # or: a seeded demo graph, if you have no store yet
 ```
+
+| | |
+|---|---|
+| Left | Every label and relationship type in the store with live counts, each clickable into a query; below it the inspector — the selected node's labels and properties, or the selected relationship's, with its incident relationships as links to walk |
+| Above | The Cypher editor. Ctrl+Enter runs it. **Replace** clears the canvas for each result, **Merge** adds to it |
+| Right | A D3 force layout: one colour per label and per relationship type, the type written along each line, drag, zoom and fit |
+
+The UI is a React application under `graph-server/src/main/frontend`, bundled by Vite straight into the
+jar's resources. It is optional in the same way the Rust layer is: no `npm`, or `-Dui.skip=true`, and
+the build skips it, the API still works, and the index page says what happened.
+
+Two things worth knowing, both of which the tests pin down. **Colour comes from a hash of the name**,
+so the legend on the left and the circles on the right always agree without sharing any state. And
+**merge keeps node objects rather than rebuilding them**, so a node that appears in a second query
+stays where it is instead of the whole picture jumping.
 
 ## Building
 
-One command builds everything — three Java modules and the Rust native layer:
+One command builds everything — three Java modules, the Rust native layer and the React UI:
 
 ```bash
 mvn clean install
@@ -150,10 +165,12 @@ The reactor is a parent pom over `graph-core`, `graph-cypher` and `graph-server`
 `cargo` through the exec plugin at four points: **build** before compile, **package** the resulting
 shared object into the jar under its platform classifier, **test** the crate with
 `cargo test` and `clippy -D warnings` during `mvn test`, and **clean** the crate's target directory
-during `mvn clean`.
+during `mvn clean`. `graph-server` drives `npm` on the same terms — install, bundle into
+`target/classes/webroot`, and run the UI's own tests — and then shades everything into one runnable
+jar.
 
 ```bash
-mvn test              # 355 tests across three modules + the Rust crate's own
+mvn test              # 359 tests across three modules, the UI's own 17, and the Rust crate's 12
 mvn test -Pslow       # adds the scaling curve, the soak and the long-running reader
 mvn test -Pbench      # adds the benchmarks and the performance gates
 mvn test -Pall-tests  # everything
@@ -164,15 +181,25 @@ mvn test -Phuge -Dtest=GraphScaleBenchmark   # 10M nodes + 20M edges: 11 min, 6.
 
 | Flag | |
 |---|---|
-| `-Dnative.skip=true` | Build with no native layer at all, even where `cargo` is present. The whole suite passes on the pure-Java path; this is how that is checked. |
-| `-Poffline` | Passes cargo's offline flag, for a warm registry with no network. Pairs with `mvn -o`. |
-| `-DskipTests` | Skips the Rust tests too, not only the Java ones. |
+| `-Dnative.skip=true` | Build with no native layer at all, even where `cargo` is present, **and do not load one that an earlier build left behind**. The whole suite passes on the pure-Java path — 359 tests, 23 skipped rather than 3 — and this is how that is checked. |
+| `-Dui.skip=true` | Build with no browser UI, even where `npm` is present. The API is unaffected and the index page says the bundle is missing. |
+| `-Poffline` | Passes cargo's and npm's offline flags, for warm caches with no network. Pairs with `mvn -o`. |
+| `-DskipTests` | Skips the Rust and UI tests too, not only the Java ones. |
 
 Requires JDK 25. **The Rust layer is optional**: the build skips it automatically when `cargo` is
 absent and the engine runs on the pure-Java path — every native capability has a fallback
-([spec/NATIVE_FFM.md](spec/NATIVE_FFM.md) section 5).
+([spec/NATIVE_FFM.md](spec/NATIVE_FFM.md) section 5). **The UI is optional** in the same way, and
+needs `npm` only to build; the jar it produces needs nothing but a JVM.
 
-Run the query UI:
+The browser suite is opt-in, because it downloads a browser and starts a server:
+
+```bash
+cd graph-server/src/main/frontend
+npm run e2e        # Playwright, against the real server over the demo store
+npm run dev        # hot reload against a server started separately on 8080
+```
+
+Run the query UI from the reactor rather than the shaded jar:
 
 ```bash
 mvn -pl graph-server exec:java -Dexec.args="/data/mygraph 8080"
