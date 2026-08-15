@@ -1,0 +1,31 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <artifactId>graph-protocol</artifactId>
+
+    <parent>
+        <groupId>io.metaloom.graph</groupId>
+        <artifactId>graph-storage-ffm-poc</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <name>Graph Protocol</name>
+    <description>The binary wire protocol: frames, the value codec and the error codes, shared by the server and the client</description>
+
+    <!--
+        Neither graph-core nor graph-cypher, and there is a test that fails if either ever appears. That is what keeps
+        the client small and free of FFM: a client jar has no business carrying a storage engine it will never open or
+        a query engine it will never run. It is also what lets the wire format version independently of the store
+        format, which they would not do if this reused the storage codec.
+
+        Vert.x is here for Buffer and RecordParser only — the value codec itself is written on byte[] so that it can be
+        fuzzed without a transport. See spec/WIRE.md.
+    -->
+    <dependencies>
+        <dependency>
+            <groupId>io.vertx</groupId>
+            <artifactId>vertx-core</artifactId>
+        </dependency>
+    </dependencies>
+</project>

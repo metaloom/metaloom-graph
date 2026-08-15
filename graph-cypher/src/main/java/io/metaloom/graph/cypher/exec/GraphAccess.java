@@ -9,6 +9,8 @@ import java.util.Set;
 import io.metaloom.graph.core.api.Direction;
 import io.metaloom.graph.core.api.Edge;
 import io.metaloom.graph.core.api.GraphStore;
+import io.metaloom.graph.cypher.QueryAbort;
+import io.metaloom.graph.cypher.QueryAbortedException;
 import io.metaloom.graph.cypher.value.CypherNode;
 import io.metaloom.graph.cypher.value.CypherRelationship;
 
@@ -24,34 +26,94 @@ import io.metaloom.graph.cypher.value.CypherRelationship;
  */
 public final class GraphAccess {
 
+	/**
+	 * How many store touches pass between two consultations of the abort signal.
+	 *
+	 * <p>
+	 * Asking on every touch would be the obvious thing and would cost more than the work it guards: reading the clock
+	 * is on the order of twenty nanoseconds against a node read of roughly a hundred. A power of two so the test is a
+	 * mask, and small enough that the delay it introduces is microseconds — a query does not become unstoppable, it
+	 * becomes stoppable a thousand reads later.
+	 * </p>
+	 */
+	private static final int ABORT_CHECK_INTERVAL = 1024;
+
 	private final GraphStore store;
+	private final QueryAbort abort;
+	private int ticks;
 
 	public GraphAccess(GraphStore store) {
+		this(store, QueryAbort.NEVER);
+	}
+
+	public GraphAccess(GraphStore store, QueryAbort abort) {
 		this.store = store;
+		this.abort = abort == null ? QueryAbort.NEVER : abort;
 	}
 
 	public GraphStore store() {
 		return store;
 	}
 
+	/**
+	 * Consults the abort signal, occasionally.
+	 *
+	 * <p>
+	 * <b>Called before entering the store, never from inside a supplier the store runs.</b>
+	 * {@code GraphStoreImpl.read} runs its operation optimistically and, when a concurrent apply invalidates the
+	 * stamp, discards the attempt — exception and all — and runs it again. Throwing from in there would make an abort
+	 * a torn-read symptom rather than a decision. Checking on this side of the call keeps it outside that machinery
+	 * entirely.
+	 * </p>
+	 */
+	private void checkAbort() {
+		if (abort == QueryAbort.NEVER) {
+			return;
+		}
+		if (++ticks % ABORT_CHECK_INTERVAL != 0) {
+			return;
+		}
+		String reason = abort.abortReason();
+		if (reason != null) {
+			throw new QueryAbortedException(reason);
+		}
+	}
+
 	/** Materialises a node id into a value, reading its labels and properties once. */
 	public CypherNode node(long id) {
+		checkAbort();
 		return new CypherNode(id, List.copyOf(store.nodeLabels(id)), properties(store.nodeProperties(id)));
 	}
 
 	public boolean exists(long id) {
+		checkAbort();
 		return store.nodeExists(id);
 	}
 
+	/**
+	 * A full scan, which is the longest single thing a query can do and therefore the one that most needs a way out.
+	 *
+	 * <p>
+	 * The check goes in the consumer rather than around the call, because around the call it would fire once, before a
+	 * scan of ten million nodes. Throwing from inside is safe here specifically: {@code GraphStoreImpl.forEachNode}
+	 * uses {@code runRead}, which takes the latch outright rather than gambling on an optimistic pass, precisely
+	 * because "the consumer has side effects" and must not run twice.
+	 * </p>
+	 */
 	public void forEachNode(java.util.function.LongConsumer consumer) {
-		store.forEachNode(consumer);
+		store.forEachNode(id -> {
+			checkAbort();
+			consumer.accept(id);
+		});
 	}
 
 	public List<Long> nodesByLabel(String label) {
+		checkAbort();
 		return store.nodesByLabel(label);
 	}
 
 	public List<Long> nodesByProperty(String key, Object value) {
+		checkAbort();
 		return store.nodesByProperty(key, value);
 	}
 
@@ -66,6 +128,7 @@ public final class GraphAccess {
 	 *            null or empty means every type
 	 */
 	public List<Expansion> expand(long nodeId, Direction direction, Set<String> types) {
+		checkAbort();
 		List<Edge> edges = types == null || types.isEmpty()
 			? store.neighbours(nodeId, direction)
 			: store.neighbours(nodeId, direction, types);

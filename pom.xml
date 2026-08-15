@@ -23,10 +23,17 @@
         a query language is not a goal *of the storage layer*, and this is what keeps that literally true: graph-cypher
         depends on graph-core's public api package and on nothing inside it. It also means the query language is a real
         consumer of that API, which is a better test of the API than any test could be.
+
+        The same rule, one layer out: graph-protocol and graph-client depend on NEITHER of them. A client jar has no
+        business carrying a storage engine it will never open or a query engine it will never run, and there is a test
+        in graph-client that fails if either ever appears on its classpath. That is what keeps the client small and
+        free of FFM. See spec/WIRE.md.
     -->
     <modules>
         <module>graph-core</module>
         <module>graph-cypher</module>
+        <module>graph-protocol</module>
+        <module>graph-client</module>
         <module>graph-server</module>
     </modules>
 
@@ -85,6 +92,16 @@
             <dependency>
                 <groupId>io.metaloom.graph</groupId>
                 <artifactId>graph-cypher</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.metaloom.graph</groupId>
+                <artifactId>graph-protocol</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.metaloom.graph</groupId>
+                <artifactId>graph-client</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>

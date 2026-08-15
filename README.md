@@ -129,6 +129,39 @@ for (CypherRow row : result) {
 Each query runs inside a snapshot read view, so it sees one consistent state however long it takes —
 and joins the caller's view if there already is one.
 
+`Cypher.stream` is the same execution path with a sink instead of a list, for a result too large to
+hold or a query that has to be stoppable. `Cypher.query` *is* `stream` with a sink that collects, so
+the two cannot drift apart.
+
+## Over the network
+
+Two ports over one store. HTTP on 8080 serves the browser UI and `/api/query`, which builds a whole
+result as JSON — right for a browser drawing two hundred nodes. The binary port streams rows as the
+engine produces them, which is the one to use for anything larger:
+[spec/WIRE.md](spec/WIRE.md).
+
+```java
+try (GraphClient client = GraphClient.connect("localhost", 8081);
+     RowStream rows = client.query("MATCH (a:Airport) RETURN a.code, a.name")) {
+    for (Row row : rows) {
+        System.out.println(row.string("a.code") + " " + row.string("a.name"));
+    }
+}
+```
+
+The client depends on the protocol module and Vert.x — not on the storage engine, not on the query
+engine, and so not on FFM or the native library. A million rows cost it one batch of memory at a time;
+a consumer that falls behind pauses the socket, which the server discovers as backpressure.
+
+**It bounds the payload, not the executor.** The engine is still clause-at-a-time over a list, so a
+query's peak *server* memory is its widest intermediate result. What streaming buys is bounded client
+memory, a first row that arrives before the last one is found, cancellation, and a deadline the engine
+honours while it scans.
+
+**Neither port has authentication or transport security.** The binary one binds loopback for that
+reason. Which transport, and the measured trial that chose it:
+[spec/TRANSPORT_DECISION.md](spec/TRANSPORT_DECISION.md).
+
 ## The graph browser
 
 `graph-server` builds a single runnable jar — engine, query language, Vert.x and the UI inside it:
@@ -188,7 +221,8 @@ One command builds everything — three Java modules, the Rust native layer and 
 mvn clean install
 ```
 
-The reactor is a parent pom over `graph-core`, `graph-cypher` and `graph-server`. `graph-core` drives
+The reactor is a parent pom over `graph-core`, `graph-cypher`, `graph-protocol`, `graph-client` and
+`graph-server`. `graph-core` drives
 `cargo` through the exec plugin at four points: **build** before compile, **package** the resulting
 shared object into the jar under its platform classifier, **test** the crate with
 `cargo test` and `clippy -D warnings` during `mvn test`, and **clean** the crate's target directory
@@ -197,7 +231,7 @@ during `mvn clean`. `graph-server` drives `npm` on the same terms — install, b
 jar.
 
 ```bash
-mvn test              # 377 tests across three modules, the UI's own 17, and the Rust crate's 12
+mvn test              # 445 tests across five modules, the UI's own 17, and the Rust crate's 12
 mvn test -Pslow       # adds the scaling curve, the soak and the long-running reader
 mvn test -Pbench      # adds the benchmarks and the performance gates
 mvn test -Pall-tests  # everything
@@ -208,7 +242,7 @@ mvn test -Phuge -Dtest=GraphScaleBenchmark   # 10M nodes + 20M edges: 11 min, 6.
 
 | Flag | |
 |---|---|
-| `-Dnative.skip=true` | Build with no native layer at all, even where `cargo` is present, **and do not load one that an earlier build left behind**. The whole suite passes on the pure-Java path — 377 tests, 23 skipped rather than 3 — and this is how that is checked. |
+| `-Dnative.skip=true` | Build with no native layer at all, even where `cargo` is present, **and do not load one that an earlier build left behind**. The whole suite passes on the pure-Java path — 445 tests, 23 skipped rather than 3 — and this is how that is checked. |
 | `-Dui.skip=true` | Build with no browser UI, even where `npm` is present. The API is unaffected and the index page says the bundle is missing. |
 | `-Poffline` | Passes cargo's and npm's offline flags, for warm caches with no network. Pairs with `mvn -o`. |
 | `-DskipTests` | Skips the Rust and UI tests too, not only the Java ones. |
@@ -231,6 +265,34 @@ Run the query UI from the reactor rather than the shaded jar:
 ```bash
 mvn -pl graph-server exec:java -Dexec.args="/data/mygraph 8080"
 ```
+
+### A native binary
+
+The server also compiles to a standalone executable with no JVM:
+
+```bash
+export GRAALVM_HOME=/path/to/graalvm-25
+mvn -Pgraalvm verify                               # jar, then binary, then a smoke test against the binary
+./graph-server/target/native/graph-server --demo /tmp/demo 8080
+```
+
+**The FFM layer survives ahead-of-time compilation intact** — libc downcalls, mapped segment files, and
+the Rust crate `dlopen`ed from inside the image, which reports `ABI 2` and all five capabilities there
+just as it does on the JVM. What it needed was a metadata file listing every downcall signature, one
+build flag for shared arenas, and one substitution for netty, which builds its own FFM handles
+reflectively in a way the static analysis cannot compile.
+
+| | jar on JDK 25 | native binary |
+|---|---|---|
+| Launch to first response | ~490 ms | **~110 ms** |
+| Resident memory | ~160 MB | **~78 MB** |
+| Artifact | 8.1 MB **plus a JDK** | **38 MB, nothing else** |
+| Warm query over 23,584 relationships | **42 ms** | 129 ms |
+
+That last row is the trade and it is not a footnote: with no JIT, a scan-heavy query runs **3x slower**
+in the binary. The image wins where startup and footprint decide it; the jar wins for a server that
+stays up. The whole exercise, including the four things that build cleanly and fail at run time, is in
+[spec/GRAALVM.md](spec/GRAALVM.md).
 
 ## Specification
 

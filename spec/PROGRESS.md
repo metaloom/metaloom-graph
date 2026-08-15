@@ -34,19 +34,22 @@ not**, in one place.
 | 9 — Hardening | **Partial** — see §4.9; crash matrix **built**, no JMH, long runs not run | `CrashMatrixTest`, `WalFaultTest`; §6 of PHASE_STATUS |
 | 10 — MetaLoom integration | **Done** — built, measured, recommended against adopting | §6 below |
 | 11 — Query language | **Done** for a read-only openCypher subset, in its own module, with a single-jar Vert.x server and a React and D3 graph browser | [CYPHER.md](CYPHER.md); `CypherVersusApiTest`, `NullSemanticsTest`, `e2e/graph-browser.spec.ts` |
+| 12 — GraalVM native image | **Done** — the server builds to a 38 MB standalone binary, FFM and all, behind `-Pgraalvm` | [GRAALVM.md](GRAALVM.md); `ForeignDowncallMetadataTest`, `tools/native-image.sh` |
+| 13 — Binary streaming port | **Done** for stage 1: a framed TCP protocol and a Java client that stream rows as the engine produces them. The *executor* still materialises — see below | [WIRE.md](WIRE.md), [TRANSPORT_DECISION.md](TRANSPORT_DECISION.md); `WireVersusEmbeddedTest`, `WireServerTest`, `WireDecoderHostileInputTest` |
 
 **The engine is usable today** for a single-writer embedded workload: durable, crash-safe,
 transactional, indexed, compacting, with snapshot isolation for readers, a read-only Cypher query
-language and a browser UI — and it holds its answers against a reference model, against real SQL, and
-against its own Java API. It is **not** usable where concurrent writers, Cypher *writes* or an online
-backup are requirements. None of those exists and none is faked.
+language, a browser UI and a streaming binary port — and it holds its answers against a reference
+model, against real SQL, against its own Java API, and now over its own wire. It is **not** usable
+where concurrent writers, Cypher *writes*, an online backup or an authenticated network are
+requirements. None of those exists and none is faked.
 
 ---
 
 ## 2. Evidence
 
-The repository is three modules — `graph-core`, `graph-cypher`, `graph-server` — under one parent
-pom, and every profile below applies across all of them. `mvn clean install` builds the lot, Rust and
+The repository is five modules — `graph-core`, `graph-cypher`, `graph-protocol`, `graph-client`,
+`graph-server` — under one parent pom, and every profile below applies across all of them. `mvn clean install` builds the lot, Rust and
 the browser UI included: `graph-core` drives cargo at four points, **build** (generate-resources),
 **package** the shared object into the jar (process-classes), **test** the crate with clippy (test),
 and **clean** its target directory (clean); `graph-server` drives npm on the same terms and then
@@ -201,6 +204,49 @@ that a steal policy cannot be made correct over a `MAP_SHARED` mapping.
       in memory while the allocation behind it was discarded
 - [x] CI workflow written (`.github/workflows/ci.yml`), including the cargo job
 
+### Phase 12 — GraalVM native image
+
+- [x] **The server compiles to a standalone binary**, `mvn -Pgraalvm package`, with a smoke test that
+      seeds a store, runs a query, and fetches the UI and its hashed asset from the binary itself
+- [x] **The FFM layer needed no code changes.** libc downcalls, `Arena.ofShared` mappings and the
+      Rust crate `dlopen`ed at run time all work inside an image; the crate reports `ABI 2` and all
+      five capabilities from in there. What it needed was metadata, one build flag, and one
+      substitution for netty ([GRAALVM.md](GRAALVM.md))
+- [x] **`ForeignDowncallMetadataTest`** — the registrations checked against the source in both
+      directions, in the ordinary `mvn test`, so the file cannot silently fall behind a new binding
+- [x] **The fallback path holds under AOT**: an image built from a jar with no crate in it starts,
+      serves and queries on the pure-Java path
+- [x] `/api/stats` now reports `nativeLayer`, which is the only way to ask a running binary which of
+      the two paths it took
+- [ ] **PGO and `-march=native` untried.** A warm scan-heavy query is **3x slower** in the binary than
+      on the JVM, which is the honest cost of no JIT and the reason the jar is still the artifact for
+      a long-lived server. Neither remedy has been measured, so neither is claimed
+- [ ] Linux x86-64 only; the binary is not in CI, and the Playwright suite still runs against the jar
+
+### Phase 13 — The binary streaming port
+
+- [x] **`Cypher.stream`**, and `Cypher.query` reimplemented as a sink that collects it, so there is one
+      execution path and one place the read view is managed
+- [x] **`QueryAbort`**, consulted inside `GraphAccess` rather than only between rows — which is what
+      makes a deadline reach a scan that has not produced a row yet. It also made
+      `QUERY_TIMEOUT_MILLIS` implementable; it had been declared, read nowhere, and *unimplementable*,
+      because `executeBlocking` cannot interrupt a running task
+- [x] **The transport chosen by measurement**, with the criteria committed before the numbers
+      ([TRANSPORT_DECISION.md](TRANSPORT_DECISION.md)). The throwaway trial module is gone, as designed
+- [x] **`graph-protocol` and `graph-client` depend on neither engine**, asserted by loading rather than
+      by reading a pom
+- [x] **Four bounds on a slow reader**, and the memory multiplication enforced in `WireServerOptions`
+      rather than documented ([WIRE.md §4, §5](WIRE.md))
+- [ ] **The executor still materialises.** Stage 1 bounds the encoded payload, the client's memory,
+      time-to-first-row and cancellation. It does **not** bound what the query engine holds: a
+      `MATCH (n) RETURN n` over a 10M-node store still peaks at 10M rows of server heap. The lazy
+      clause prefix — `forEachNode(LongPredicate)`, a push pipeline, and `LIMIT` stopping the scan — is
+      the next piece and is not built
+- [ ] **No authentication and no transport security**, deliberately and documented
+      ([OPERATIONS.md §9.1](OPERATIONS.md)). The binary port binds loopback for that reason
+- [ ] The trial harness was never committed, so its numbers are recorded but not reproducible from this
+      repository
+
 ---
 
 ## 4. Pending
@@ -353,9 +399,11 @@ Still missing:
 - [x] `native-c-lib/` deleted
 - [x] Equivalence: the whole suite green with `metaloom.graph.native.enabled` both true and false
 - [x] **N1: io_uring, and `UringIoEngine`** — ring lifecycle, submit, reap, and a batch read that
-      serves more requests than the ring is deep in waves. **12.4x** over a `pread` loop on 64
+      serves more requests than the ring is deep in waves. **15.1x** over a `pread` loop on 64
       scattered 4 KiB reads through `O_DIRECT`, which upholds the claim in
-      [NATIVE_FFM.md](NATIVE_FFM.md) §1 that this is the largest lever in the design
+      [NATIVE_FFM.md](NATIVE_FFM.md) §1 that this is the largest lever in the design. **Called by
+      nothing but its own test**, because a mapped data path issues no reads to batch — the whole
+      question now has its own file, [IO_URING.md](IO_URING.md)
 - [x] `mlg_xxh3` and lz4 in the crate; CRC32C moved onto the hardware instruction, which **withdrew
       the 200x figure** — it compared an intrinsic against a bitwise loop. Rust is still slower, by
       7.8x

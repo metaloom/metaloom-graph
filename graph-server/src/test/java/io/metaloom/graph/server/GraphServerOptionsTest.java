@@ -84,6 +84,51 @@ public class GraphServerOptionsTest {
 	}
 
 	@Test
+	public void testTheQueryTimeoutIsParsedAndDefaulted() {
+		assertEquals(GraphServerOptions.DEFAULT_QUERY_TIMEOUT_MILLIS,
+			GraphServerOptions.parse(new String[] { "/data/g" }).queryTimeoutMillis(),
+			"a store with no limit named still gets one, or a runaway query holds a view for as long as it likes");
+		assertEquals(1500, GraphServerOptions.parse(new String[] { "--query-timeout=1500", "/data/g" })
+			.queryTimeoutMillis());
+		// Zero is the documented way to ask for no limit, so it must survive parsing rather than be treated as unset.
+		assertEquals(0, GraphServerOptions.parse(new String[] { "--query-timeout=0", "/data/g" })
+			.queryTimeoutMillis());
+
+		assertMessage("--query-timeout must be a number", new String[] { "--query-timeout=soon", "/data/g" });
+		assertMessage("--query-timeout must not be negative", new String[] { "--query-timeout=-1", "/data/g" });
+	}
+
+	@Test
+	public void testTheBinaryPortIsOnByDefaultAndCanBeTurnedOff() {
+		GraphServerOptions defaults = GraphServerOptions.parse(new String[] { "/data/g" });
+		assertTrue(defaults.wire(), "the binary port is part of the server rather than an extra to be discovered");
+		assertEquals(io.metaloom.graph.protocol.Protocol.DEFAULT_PORT, defaults.wirePort());
+		assertEquals(8, defaults.maxConcurrentStreams());
+
+		assertFalse(GraphServerOptions.parse(new String[] { "--no-wire", "/data/g" }).wire());
+		assertEquals(9100, GraphServerOptions.parse(new String[] { "--wire-port=9100", "/data/g" }).wirePort());
+		assertEquals(0, GraphServerOptions.parse(new String[] { "--wire-port=0", "/data/g" }).wirePort(),
+			"zero means any free port here as it does for the HTTP one");
+		assertEquals(2, GraphServerOptions.parse(new String[] { "--max-streams=2", "/data/g" })
+			.maxConcurrentStreams());
+	}
+
+	@Test
+	public void testTheTwoPortsMayNotBeTheSameOne() {
+		// Otherwise it surfaces as "address already in use" from whichever front end happened to bind second, which
+		// says nothing about the actual mistake.
+		assertMessage("both 8080", new String[] { "--wire-port=8080", "/data/g", "8080" });
+		// ...unless both are asking for any free port, where there is nothing to collide.
+		assertEquals(0, GraphServerOptions.parse(new String[] { "--wire-port=0", "/data/g", "0" }).wirePort());
+	}
+
+	@Test
+	public void testMaxStreamsIsValidated() {
+		assertMessage("--max-streams must be a number", new String[] { "--max-streams=many", "/data/g" });
+		assertMessage("--max-streams must be at least 1", new String[] { "--max-streams=0", "/data/g" });
+	}
+
+	@Test
 	public void testHelpIsARequestRatherThanAMistake() {
 		// So that `--help` can print the usage and exit zero.
 		assertThrows(GraphServerOptions.HelpRequested.class,
@@ -94,5 +139,10 @@ public class GraphServerOptionsTest {
 		String usage = GraphServerOptions.usage();
 		assertTrue(usage.contains("--demo-size"), "the usage has to name every flag it accepts");
 		assertTrue(usage.contains(String.valueOf(DemoData.SMALL)), "and what the sizes mean");
+		assertTrue(usage.contains("--query-timeout"), "including the one that bounds a runaway query");
+		assertTrue(usage.contains("--wire-port"), "and the binary port, which is on by default");
+		assertTrue(usage.contains("--max-streams"), "and the factor an operator has to multiply");
+		assertTrue(usage.contains("authentication"),
+			"a server with two unauthenticated ports should say so where somebody will read it");
 	}
 }

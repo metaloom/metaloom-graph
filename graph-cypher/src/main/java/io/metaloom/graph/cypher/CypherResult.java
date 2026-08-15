@@ -8,10 +8,17 @@ import java.util.List;
  * The rows a query returned, with their column names.
  *
  * <p>
- * Fully materialised. A streaming result would let a caller stop early, but it would also have to keep the read view
- * open until the caller finished with it — and a result that holds a snapshot open for an unknown length of time is
- * exactly the leak {@code SnapshotStats} exists to report. Materialising means the view closes when
- * {@link Cypher#query} returns, and the cost is stated in spec/CYPHER.md rather than discovered.
+ * Fully materialised. Handing a caller a lazy result would mean keeping the read view open until they finished with
+ * it — and a result that holds a snapshot open for an unknown length of time is exactly the leak {@code SnapshotStats}
+ * exists to report. Materialising means the view closes when {@link Cypher#query} returns, and the cost is stated in
+ * spec/CYPHER.md rather than discovered.
+ * </p>
+ *
+ * <p>
+ * {@link Cypher#stream} is the other half of that trade and the reason this class does not need to be lazy: it pushes
+ * rows to a {@link RowSink} <em>inside</em> the view rather than handing the view out, so a caller can consume a
+ * result larger than memory without ever holding a snapshot open past the call. This class is what you get when you
+ * say yes to every row.
  * </p>
  */
 public final class CypherResult implements Iterable<CypherRow> {

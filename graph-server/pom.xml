@@ -32,8 +32,23 @@
             <artifactId>graph-core</artifactId>
         </dependency>
         <dependency>
+            <groupId>io.metaloom.graph</groupId>
+            <artifactId>graph-protocol</artifactId>
+        </dependency>
+        <dependency>
             <groupId>io.vertx</groupId>
             <artifactId>vertx-core</artifactId>
+        </dependency>
+        <!--
+            The client, for tests only. The wire tests are worth far more when they go through the real client than
+            through a hand-rolled reader written to agree with the server: two halves written from one description by
+            one person agree with each other, including where both are wrong. Test scope, so nothing of it reaches
+            the shaded jar or the native image.
+        -->
+        <dependency>
+            <groupId>io.metaloom.graph</groupId>
+            <artifactId>graph-client</artifactId>
+            <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>io.vertx</groupId>
@@ -205,4 +220,92 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!--
+            The GraalVM native build: `mvn -Pgraalvm package`, producing target/native/graph-server.
+
+            Opt-in, because it needs a GraalVM installation that the ordinary build does not, and because
+            it takes about forty seconds on top of everything else. Off, nothing in this profile is read:
+            no svm dependency is resolved, and src/nativeimage/java is not a source root.
+
+            Almost everything that makes the image buildable travels inside the jar rather than living here:
+            the FFM downcall registrations and the shared-arena flag in graph-core, the reflection and
+            resource metadata in this module, both under META-INF/native-image. The exception is the netty
+            substitution in src/nativeimage/java, which is source and has to be compiled — so a jar built
+            *with* this profile is native-image ready and one built without it is not. That is the only
+            difference between the two jars, and it is why `native-image -jar` on a plain `mvn package` jar
+            still fails at netty's CleanerJava24Linker. See spec/GRAALVM.md section 5.
+        -->
+        <profile>
+            <id>graalvm</id>
+            <properties>
+                <!-- Must match the GraalVM that runs the build; the substitution API is not versioned across releases. -->
+                <graalvm.version>25.0.3</graalvm.version>
+            </properties>
+            <dependencies>
+                <!--
+                    Compile-only, and only inside this profile. `provided` keeps it out of the shaded jar and
+                    off the test classpath; native-image supplies these classes itself when it reads the image.
+                -->
+                <dependency>
+                    <groupId>org.graalvm.nativeimage</groupId>
+                    <artifactId>svm</artifactId>
+                    <version>${graalvm.version}</version>
+                    <scope>provided</scope>
+                </dependency>
+            </dependencies>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>build-helper-maven-plugin</artifactId>
+                        <version>3.6.0</version>
+                        <executions>
+                            <execution>
+                                <id>native-image-sources</id>
+                                <phase>generate-sources</phase>
+                                <goals>
+                                    <goal>add-source</goal>
+                                </goals>
+                                <configuration>
+                                    <sources>
+                                        <source>${project.basedir}/src/nativeimage/java</source>
+                                    </sources>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <!--
+                        verify, not package: the shade plugin has to have finished writing the jar this reads,
+                        and two executions of two different plugins in the same phase order by declaration in a
+                        way that is easy to get wrong and hard to notice.
+                    -->
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <version>3.1.0</version>
+                        <executions>
+                            <execution>
+                                <id>native-image</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+                                <configuration>
+                                    <executable>bash</executable>
+                                    <arguments>
+                                        <argument>${project.basedir}/../tools/native-image.sh</argument>
+                                        <argument>${project.build.directory}/${project.build.finalName}.jar</argument>
+                                        <argument>${project.build.directory}/native</argument>
+                                        <argument>graph-server</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

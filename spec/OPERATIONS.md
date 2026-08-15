@@ -14,7 +14,7 @@ Design rationale lives in the other files; [GRAPH_STORAGE_CONTEXT.md](GRAPH_STOR
 
 | | |
 |---|---|
-| **Deployment** | Embedded in a JVM process. No server, no port, no network protocol. |
+| **Deployment** | Embedded in a JVM process is the primary shape. `graph-server` also puts two ports over one store: HTTP on 8080 (browser UI, `/api/query`, whole results as JSON) and a binary streaming port on loopback:8081 ([WIRE.md](WIRE.md)). **Neither is authenticated** — see §9. |
 | **Concurrency** | One writer process, enforced by a `LOCK` file. One writer *thread*, enforced by a lock. Readers are unlimited and scale (measured to 10x at 32 threads). |
 | **Durability** | A commit is on the device when the call returns, under the default sync mode. |
 | **Failure domain** | The store directory. There is no replication, no failover and no backup mechanism inside the engine. |
@@ -255,6 +255,30 @@ What that does **not** cover:
 - **A malicious store can still make you do work.** Bounds are enforced, but a store can legitimately declare a large
   blob and make you read it. Do not open untrusted stores in a process that cannot afford the time.
 - **The dictionary files are not checksummed.** A corrupt dictionary produces wrong labels, not a detected error.
+
+### 9.1 The network, which has the same posture and a wider blast radius
+
+`graph-server` opens two ports over one store, and **neither has authentication or transport security**:
+
+| | | |
+|---|---|---|
+| HTTP | 8080, **all interfaces** | The browser UI and `/api/query`. Predates the note below, which is why it binds everything |
+| Binary | 8081, **loopback only** | Streaming Cypher ([WIRE.md](WIRE.md)). Loopback because a new unauthenticated port should not default to every interface |
+
+Both are **read-only**: the query language has no write clauses, so neither port can modify a store however it is
+addressed. Both can read **every byte** of one. Treat exposing either as equivalent to handing out the store
+directory, because that is what it is.
+
+- `--no-wire` turns the binary port off; `--wire-port=<n>` moves it. There is no flag to bind the binary port to
+  another interface, deliberately — putting it somewhere reachable should require thinking about what is in front of
+  it.
+- **A frame arriving on the binary port is untrusted input on the same terms a store directory is**, and is hardened
+  on the same terms: a non-differential oracle (`WireDecoderHostileInputTest`) asserts that decoding either returns a
+  value or throws the protocol's own exception, never runs out of memory on a length field, never overflows the
+  stack, and allocates in proportion to its input. It found three real defects the first time it ran.
+- **A single client can occupy the server without authenticating.** `maxConcurrentStreams` (default 8) is the only
+  rate limit there is; past it queries are refused rather than queued. A deadline and a retention watchdog bound how
+  long any one of them can hold a read view — see [WIRE.md §4](WIRE.md).
 
 ---
 

@@ -1,6 +1,7 @@
 # graph-server
 
-The HTTP front end: a Cypher endpoint over a store, and a browser UI that draws what it returns.
+Two front ends over one store: an HTTP port with a Cypher endpoint and a browser UI, and a binary port
+that streams rows as the engine produces them.
 
 ```bash
 java -jar target/graph-server-0.0.1-SNAPSHOT.jar /path/to/store 8080
@@ -8,6 +9,20 @@ java -jar target/graph-server-0.0.1-SNAPSHOT.jar --demo /tmp/demo 8080   # with 
 ../tools/demo-server.sh                                                  # the same, from the reactor
 mvn -pl graph-server exec:java -Dexec.args="--demo /tmp/demo 8080"
 ```
+
+| | | |
+|---|---|---|
+| HTTP | 8080, all interfaces | The UI and `/api/query`, which builds the whole result as JSON |
+| Binary | 8081, **loopback** | Streaming Cypher for `graph-client`. `--no-wire` turns it off, `--wire-port=` moves it |
+
+The binary port is the one for a result that does not fit in a browser: rows encode and flush in
+batches, a slow consumer becomes backpressure rather than heap, and a query can be cancelled or given
+a deadline the engine honours *while it scans*. What it does not bound is the query engine, which is
+still clause-at-a-time over a list — [spec/WIRE.md](../spec/WIRE.md) says exactly which of the two it
+is at every point.
+
+`--max-streams` and the per-stream write queue together are the memory this server may hold for
+clients that have stopped reading. That multiplication is enforced, not just documented.
 
 ## Demo data
 
@@ -30,9 +45,25 @@ The jar is shaded — engine, query language, Vert.x, Netty, logging and the UI 
 needs a JVM and nothing else. What the routes are and how a result becomes both a table and a graph:
 [spec/CYPHER.md §8](../spec/CYPHER.md).
 
-**Read-only, and unauthenticated.** The query language cannot write, so this cannot modify a store
-however it is addressed. It can read all of one. Bind it to localhost unless something else is
-providing access control.
+## A native binary
+
+```bash
+export GRAALVM_HOME=/path/to/graalvm-25
+mvn -Pgraalvm verify                    # jar, then a 38 MB binary, then a smoke test against both ports
+./target/native/graph-server --demo /tmp/demo 8080
+```
+
+No JVM, ~110 ms to first response against the jar's ~490, and half the resident memory — at the cost
+of a warm query running about 3x slower, because there is no JIT. **The FFM layer survives ahead-of-time
+compilation unchanged**, including the Rust crate, which is `dlopen`ed from inside the image. The
+profile exists rather than the build being pure metadata because of one netty substitution that has to
+be compiled; a jar built without `-Pgraalvm` is not native-image ready. All of it, including the four
+failures that build cleanly and only show up at run time: [spec/GRAALVM.md](../spec/GRAALVM.md).
+
+**Read-only, and unauthenticated — both ports.** The query language cannot write, so neither port can
+modify a store however it is addressed. Either can read all of one. The binary port binds loopback for
+that reason; the HTTP port does not and predates the note. Put something in front of them, or keep
+them on a trusted host. [spec/OPERATIONS.md §9.1](../spec/OPERATIONS.md).
 
 ## The UI
 

@@ -1,6 +1,7 @@
 package io.metaloom.graph.server;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -88,6 +89,67 @@ public class GraphServerTest {
 	private HttpResponse<String> get(String path) throws Exception {
 		return client.send(HttpRequest.newBuilder(URI.create(base + path)).timeout(Duration.ofSeconds(20)).build(),
 			HttpResponse.BodyHandlers.ofString());
+	}
+
+	/**
+	 * A query that outlives its budget is abandoned, and says so.
+	 *
+	 * <p>
+	 * The point is not that the request fails — it is <em>where</em> it fails. {@code executeBlocking} cannot
+	 * interrupt a task that has started, so a route that merely stopped waiting would leave the scan running with a
+	 * worker thread and a read view for as long as the data took. The assertion that the view count is back to zero
+	 * immediately afterwards is the one that distinguishes the two.
+	 * </p>
+	 */
+	@Test
+	public void testAQueryPastItsBudgetIsAbandonedAndReleasesItsView() throws Exception {
+		// Enough nodes that a scan crosses the engine's abort-check interval many times over, so the deadline is
+		// consulted during execution rather than only between rows.
+		try (Transaction txn = store.begin()) {
+			for (int i = 0; i < 20_000; i++) {
+				store.createNode(java.util.List.of("Filler"), Properties.of().set("n", (long) i));
+			}
+			txn.commit();
+		}
+
+		try (GraphServer strict = new GraphServer(store, 1)) {
+			int port = strict.listen(0).toCompletionStage().toCompletableFuture().join();
+			HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/api/query"))
+				.header("content-type", "application/json")
+				.POST(HttpRequest.BodyPublishers.ofString(
+					new JsonObject().put("query", "MATCH (n) RETURN n").encode()))
+				.timeout(Duration.ofSeconds(20))
+				.build();
+			HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+			assertEquals(503, response.statusCode(),
+				"the query was not wrong and the server is not broken; it declined to keep spending");
+			JsonObject json = new JsonObject(response.body());
+			assertEquals("timeout", json.getString("error"));
+			assertTrue(json.getString("message").contains("1 ms"),
+				"the message has to name the budget so an operator knows what to raise: " + json.getString("message"));
+		}
+
+		assertEquals(0, store.snapshotStats().openViews(),
+			"an abandoned query must give its read view back, or the timeout has only hidden the problem");
+	}
+
+	@Test
+	public void testAGenerousBudgetDoesNotTruncateAResult() throws Exception {
+		// The inverse, so the test above cannot pass by the deadline always firing.
+		try (GraphServer relaxed = new GraphServer(store, 60_000)) {
+			int port = relaxed.listen(0).toCompletionStage().toCompletableFuture().join();
+			HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/api/query"))
+				.header("content-type", "application/json")
+				.POST(HttpRequest.BodyPublishers.ofString(
+					new JsonObject().put("query", "MATCH (n:Person) RETURN n.name").encode()))
+				.timeout(Duration.ofSeconds(20))
+				.build();
+			HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+			assertEquals(200, response.statusCode());
+			assertEquals(2, new JsonObject(response.body()).getInteger("rowCount"));
+		}
 	}
 
 	/** A [{name, count}] array as a map, so an assertion can name what it expects rather than an index. */
@@ -256,6 +318,11 @@ public class GraphServerTest {
 		assertEquals(3, json.getLong("nodes"));
 		assertEquals(1, json.getLong("relationships"), "the lightweight edge has no record and is not counted");
 		assertEquals(0, json.getInteger("openViews"), "a finished query must not have left a view open");
+		// Not the value — that legitimately differs between a build with the Rust crate and one without, and
+		// between a jar and a GraalVM binary. The point is that it is answerable at all: spec/NATIVE_FFM.md
+		// section 4 promises the store works either way, which makes "which way is this one" worth exposing.
+		assertNotNull(json.getString("nativeLayer"), "the native path this process took has to be visible");
+		assertFalse(json.getString("nativeLayer").isBlank(), "nativeLayer must say something");
 	}
 
 	/**

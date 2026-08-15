@@ -1,0 +1,60 @@
+{
+  "comment": [
+    "Every FFM downcall the engine makes. See spec/GRAALVM.md section 3.",
+    "",
+    "GraalVM cannot generate a downcall stub at run time, so each distinct function signature has to be",
+    "declared here. The symbol name does not matter, only the shape: one entry covers every function that",
+    "shares it. Layout names are the keys of Linker.canonicalLayouts() - jint for JAVA_INT, jlong for",
+    "JAVA_LONG, void* for ADDRESS - and not the names of the ValueLayout constants.",
+    "",
+    "A 'comment' inside a downcall entry is a parse error and inside a resource entry is a warning, so the",
+    "mapping back to the code lives up here:",
+    "",
+    "  jint()                                  mlg_version                     NativeCapabilities",
+    "  jlong()                                 mlg_capabilities, mlg_cqe_size  NativeCapabilities, NativeBindings",
+    "  jint(jint)                              close(2), fsync(2)              NativeLib",
+    "  jlong(jint)                             mlg_cqe_offset                  NativeBindings",
+    "  jint(jint,jint,jint)                    ioctl(2), for FICLONE           NativeLib",
+    "  jint(jint,jint,jlong,jlong)             fallocate(2)                    NativeLib",
+    "  jint(void*,jint,jint)                   open(2)                         NativeLib",
+    "  jint(void*,jlong,jint)                  madvise(2)                      NativeLib",
+    "  jint(jint,jlong,jlong,jint)             posix_fadvise(2)                NativeLib",
+    "  jlong(jint,void*,jlong,jlong)           pread(2), pwrite(2)             NativeLib",
+    "  jint(jint,void*,jint,jint,void*)        statx(2)                        NativeLib",
+    "  jlong(void*,jlong,void*,jlong)          mlg_lz4_compress                NativeCodec",
+    "  void*(jint)                             mlg_ring_new                    UringIoEngine",
+    "  void(void*)                             mlg_ring_free                   UringIoEngine",
+    "  jint(void*,jint)                        mlg_ring_submit                 UringIoEngine",
+    "  jint(void*,void*,jint)                  mlg_ring_reap                   UringIoEngine",
+    "  jint(void*,jint,void*,jint,jlong,jlong) mlg_ring_submit_read            UringIoEngine",
+    "",
+    "ForeignDowncallMetadataTest reads this file and those five classes and fails when they disagree.",
+    "",
+    "The single resource is the Rust crate, which NativeCapabilities.fromClasspath unpacks to a temporary",
+    "file and dlopens. Without it the image runs on the pure-Java fallback, exactly as the jar does."
+  ],
+  "foreign": {
+    "downcalls": [
+      { "returnType": "jint", "parameterTypes": [] },
+      { "returnType": "jlong", "parameterTypes": [] },
+      { "returnType": "jint", "parameterTypes": ["jint"] },
+      { "returnType": "jlong", "parameterTypes": ["jint"] },
+      { "returnType": "jint", "parameterTypes": ["jint", "jint", "jint"] },
+      { "returnType": "jint", "parameterTypes": ["jint", "jint", "jlong", "jlong"] },
+      { "returnType": "jint", "parameterTypes": ["void*", "jint", "jint"] },
+      { "returnType": "jint", "parameterTypes": ["void*", "jlong", "jint"] },
+      { "returnType": "jint", "parameterTypes": ["jint", "jlong", "jlong", "jint"] },
+      { "returnType": "jlong", "parameterTypes": ["jint", "void*", "jlong", "jlong"] },
+      { "returnType": "jint", "parameterTypes": ["jint", "void*", "jint", "jint", "void*"] },
+      { "returnType": "jlong", "parameterTypes": ["void*", "jlong", "void*", "jlong"] },
+      { "returnType": "void*", "parameterTypes": ["jint"] },
+      { "returnType": "void", "parameterTypes": ["void*"] },
+      { "returnType": "jint", "parameterTypes": ["void*", "jint"] },
+      { "returnType": "jint", "parameterTypes": ["void*", "void*", "jint"] },
+      { "returnType": "jint", "parameterTypes": ["void*", "jint", "void*", "jint", "jlong", "jlong"] }
+    ]
+  },
+  "resources": [
+    { "glob": "native/**" }
+  ]
+}

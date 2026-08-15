@@ -28,6 +28,15 @@ cannot reach inside it — [CYPHER.md](CYPHER.md). The storage layer has no quer
 also gained one API method as a result, `forEachNode`, which is the sort of gap only a real consumer
 finds.
 
+**Remote access was never on the non-goals list**, and there is now a binary streaming port with a
+Java client — [WIRE.md](WIRE.md). The same boundary applies one layer further out, and more strictly:
+`graph-protocol` and `graph-client` depend on **neither** the storage engine nor the query engine, and
+`ClientDependencyTest` fails by *loading* if either ever appears on the client's classpath. That is
+not tidiness. graph-core is an FFM module with a native library behind it, so a client that dragged it
+along would make every application embedding it grant native access and ship a shared object it will
+never call, in order to read rows off a socket. The server module is the only place the three layers
+meet, and it meets them by converting values at its edge rather than by sharing types.
+
 ---
 
 ## 2. Layering

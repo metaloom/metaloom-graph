@@ -3,7 +3,7 @@
 A storage engine is only as good as its evidence. This file defines how the project proves that it
 does not lose data.
 
-The suite today is 240 tests running in about forty seconds, plus benchmarks, a soak, a scaling
+The suite today is 445 tests running in about a minute, plus benchmarks, a soak, a scaling
 harness and a `kill -9` loop behind profiles and scripts. The PoC suite it replaced had one red test,
 three unbounded benchmarks living in the unit suite, and two tests that passed for reasons unrelated
 to what they asserted ([CURRENT_STATE.md §5](CURRENT_STATE.md#5-test-reality-check)).
@@ -73,13 +73,24 @@ src/test/java/io/metaloom/graph/core/
   integration/   whole-store scenarios
   example/       UsageExampleTest — the documented API, executable, so it cannot rot
   nativelib/     NativeCodecTest, IoEngineTest, UringIoEngineTest — the crate and the IO engines
+                 ForeignDowncallMetadataTest — the GraalVM downcall registrations against the code
   txn/           snapshot isolation: visibility, the anomaly matrix, vacuum, rollback, long readers
 
 graph-cypher/src/test/java/io/metaloom/graph/cypher/
                  parser, null semantics, execution, the versus-API differential, variable-length paths
+graph-protocol/src/test/java/io/metaloom/graph/protocol/
+                 the wire value codec round-tripped, frame reassembly against the delivery patterns
+                 TCP actually produces, and WireDecoderHostileInputTest — the non-differential oracle
+                 for the decoder, which is untrusted input on the same terms a store file is
+graph-client/src/test/java/io/metaloom/graph/client/
+                 ClientDependencyTest — fails by *loading* if graph-core or graph-cypher ever reaches
+                 the client's classpath
 graph-server/src/test/java/io/metaloom/graph/server/
                  the HTTP contract, the two result shapes the UI needs, the command line, and
                  demo/DemoDataTest — the generated air route graph the browser suite drives
+  wire/          the binary port: WireVersusEmbeddedTest compares 27 queries in process against over
+                 the wire cell by cell; WireServerTest covers overload, cancel, a deadline against a
+                 client that stopped reading, and openViews() == 0 after every test
 graph-server/src/main/frontend/src/model/*.test.ts
                  the UI's rules that are logic rather than appearance: what a merge does to node
                  identity, and that a label's colour is a function of its name. Run by `mvn test`

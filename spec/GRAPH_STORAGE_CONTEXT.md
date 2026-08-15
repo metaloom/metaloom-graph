@@ -24,7 +24,7 @@ The defining design constraint is:
 > **An element id decodes arithmetically into the exact file and byte offset of its record.
 > Reading an element by id costs zero index probes and zero extra seeks.**
 
-**Status.** Phases 0 to 10 are implemented to varying depth; 240 tests pass here, plus 23 in the MetaLoom
+**Status.** Phases 0 to 10 are implemented to varying depth; 445 tests pass here, plus 23 in the MetaLoom
 integration. The engine is **durable**
 (write-ahead log, fsync before any data page is touched, redo recovery), **transactional** (commit,
 rollback, auto-commit), **indexed** (label and property B+trees), and it reclaims space both without
@@ -75,9 +75,12 @@ GRAPH_STORAGE_CONTEXT.md (this file)
         ├─ PROPERTY_STORAGE.md ....... attributes, dictionaries, blobs
         ├─ TRANSACTIONS.md ........... ACID, snapshot isolation, page versions, CoW
         ├─ CYPHER.md ................. the openCypher subset, the server and the UI
+        ├─ WIRE.md ................... the binary streaming port, its codec and the Java client
         ├─ WAL.md .................... write-ahead log, recovery, checkpoints
         ├─ SSD_IO.md ................. I/O strategy, seek avoidance, alignment
         ├─ NATIVE_FFM.md ............. the Java <-> native boundary
+        ├─ IO_URING.md ............... the ring: what it buys, and why nothing calls it yet
+        ├─ GRAALVM.md ................ the native binary: FFM under native-image
         ├─ API.md .................... the public Java API
         ├─ TESTING.md ................ test setup, benchmarks, crash testing
         └─ OPERATIONS.md ............. sizing, tuning, monitoring, backup, recovery
@@ -95,14 +98,18 @@ GRAPH_STORAGE_CONTEXT.md (this file)
 | [FILE_FORMAT.md](FILE_FORMAT.md) | Store directory layout, manifest, segment anatomy, page metadata array, free-slot bitmap, node and relationship record layouts, versioning and compaction | Adjacency internals, property internals |
 | [RELATIONSHIP_STORAGE.md](RELATIONSHIP_STORAGE.md) | Inline edges, adjacency blocks, edge compression, lightweight edges, traversal cost model | Node record layout |
 | [PROPERTY_STORAGE.md](PROPERTY_STORAGE.md) | Property blocks, key and label dictionaries, value typing, inline vs blob, string dedup | Relationship storage |
-| [CYPHER.md](CYPHER.md) | The read-only openCypher subset: grammar, null semantics, where it differs from the engine, the planner's costs, and the Vert.x server with its React and D3 graph browser | The public API |
+| [CYPHER.md](CYPHER.md) | The read-only openCypher subset: grammar, null semantics, where it differs from the engine, the planner's costs, and the Vert.x HTTP server with its React and D3 graph browser | The public API; the binary streaming port (WIRE.md) |
+| [WIRE.md](WIRE.md) | The binary streaming port: the frame, the value codec, the server's four bounds on a slow reader, the memory multiplication, and the Java client | The query language (CYPHER.md), the HTTP route and the browser UI |
+| [TRANSPORT_DECISION.md](TRANSPORT_DECISION.md) | History, not specification: the measured trial that chose framed TCP over gRPC, with its criteria committed before its numbers, and what building the winner for real then changed | What the protocol *is* (WIRE.md) |
 | [TRANSACTIONS.md](TRANSACTIONS.md) | ACID guarantees, snapshot isolation, the anomaly matrix, per-page version chains, the reclamation horizon and budget, where Copy-on-Write genuinely applies. Also why `SERIALIZABLE`, `LockTable` and `xmin` are *not* built rather than unfinished | WAL record format |
 | [WAL.md](WAL.md) | WAL record format, LSN semantics, group commit, ARIES recovery, checkpointing, log retention | Isolation semantics |
 | [SSD_IO.md](SSD_IO.md) | Seek-avoidance rules, alignment, page cache, prefetch, write amplification, TRIM, queue depth | Format details |
-| [NATIVE_FFM.md](NATIVE_FFM.md) | Which functions live in native code and why, the FFM binding rules, arena lifetimes, the pure-Java fallback contract | Storage semantics |
+| [NATIVE_FFM.md](NATIVE_FFM.md) | Which functions live in native code and why, the FFM binding rules, arena lifetimes, the pure-Java fallback contract | Storage semantics, and the two capabilities that have a file of their own |
+| [IO_URING.md](IO_URING.md) | Capability N1 on its own: the Rust ring, `UringIoEngine`, the 15x measurement and what it is not, why no caller exists, and the group-commit design that would be the first | The other native capabilities |
+| [GRAALVM.md](GRAALVM.md) | Compiling the server to a native binary: what native-image does and does not support of the FFM API, downcall registration, the netty substitution, and what the binary costs against the jar | How the FFM layer works (NATIVE_FFM.md) |
 | [API.md](API.md) | The public Java API surface: `GraphStore`, transactions, cursors, traversal, element builders | Internals |
 | [TESTING.md](TESTING.md) | Test layout, fixtures, benchmark harness, crash and fault injection, invariant checkers | Implementation steps |
-| [OPERATIONS.md](OPERATIONS.md) | Running it: sizing, tuning, what to monitor, backup and restore, disaster recovery, what every exception means for an operator, security posture | Design rationale |
+| [OPERATIONS.md](OPERATIONS.md) | Running it: sizing, tuning, what to monitor, backup and restore, disaster recovery, what every exception means for an operator, the security posture of both ports | Design rationale; how the binary protocol works (WIRE.md) |
 | [PLAN.md](PLAN.md) | The phased implementation plan with per-phase deliverables, exit criteria and checkboxes | Design rationale |
 | [PROGRESS.md](PROGRESS.md) | The consolidated done/pending checklist across every phase, and the backlog in priority order | Deliverable definitions, rationale for a gap |
 | [reports/SCALE.md](reports/SCALE.md) | 10M nodes / 20M relationships measured, before and after the cell-based adjacency block: load time, disk cost, throughput curves | Small-scale benchmarks (BASELINE.md) |

@@ -209,7 +209,9 @@ property equality → a label scan → a full node scan. So
 - **Rows are materialised per clause**, not streamed, so a query's peak memory is its widest
   intermediate result and `LIMIT` does not stop the scan early. The shape was chosen because ORDER BY,
   DISTINCT and aggregation all need their whole input anyway, and a pull-based tree has many more
-  places for a scoping bug to hide.
+  places for a scoping bug to hide. **`Cypher.stream` does not change this** — it bounds what the
+  *caller* holds and when the first row arrives, not what the executor holds. [WIRE.md §0](WIRE.md)
+  states the same distinction from the transport's side, where it is easiest to overclaim.
 - **DISTINCT is quadratic** in the number of distinct rows. It cannot use a hash set: `1` and `1.0`
   are the same Cypher value with different hash codes, and two nodes are equal by id rather than by
   contents.
@@ -233,6 +235,10 @@ file. `Enable-Native-Access: ALL-UNNAMED` is in its manifest — an uber jar can
 module descriptor, so the narrow `--enable-native-access=io.metaloom.graph.core` grant is not available
 to it. Run the reactor jars to keep the narrow one.
 
+This is one of **two** front ends over one store. The other is the binary streaming port, on loopback
+8081 by default, which pushes rows as the engine produces them instead of building a whole result:
+[WIRE.md](WIRE.md). `--no-wire` turns it off. What follows is the HTTP one.
+
 | Route | |
 |---|---|
 | `POST /api/query` | `{"query": "...", "parameters": {...}}` → columns, rows, and a `graph` of nodes and links |
@@ -253,7 +259,11 @@ the safe range is stringified for the same reason — `RETURN id(n)` has to give
 can paste into another query. Found by running the UI, so there is now a test.
 
 **Queries run on worker threads**, never the event loop: an unindexed query is a full scan, bounded by
-the data rather than by the request.
+the data rather than by the request. They also run under a deadline — `--query-timeout`, 30 s by
+default, 0 to disable — which is enforced by the engine consulting an abort signal *while it scans*
+rather than by the route giving up waiting. `executeBlocking` cannot interrupt a task that has
+started, so a route that merely stopped waiting would abandon the answer while the scan kept its
+thread and its read view, which is the failure a timeout exists to prevent.
 
 ### 8.1 `/api/schema` is a scan
 

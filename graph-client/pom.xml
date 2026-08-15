@@ -1,0 +1,34 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <artifactId>graph-client</artifactId>
+
+    <parent>
+        <groupId>io.metaloom.graph</groupId>
+        <artifactId>graph-storage-ffm-poc</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <name>Graph Client</name>
+    <description>A Java client that streams a read-only Cypher result off the binary port</description>
+
+    <!--
+        graph-protocol and Vert.x, and that is the whole list. No graph-core, no graph-cypher, no FFM and no native
+        library — a client that had to carry a storage engine to read a row would be a strange thing to ship, and a
+        client that pulled in FFM would need an "enable-native-access" grant from every application that used it.
+
+        ClientDependencyTest fails if either engine ever appears here, because a dependency arrives by accident far
+        more often than it arrives by decision.
+    -->
+    <dependencies>
+        <dependency>
+            <groupId>io.metaloom.graph</groupId>
+            <artifactId>graph-protocol</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.vertx</groupId>
+            <artifactId>vertx-core</artifactId>
+        </dependency>
+    </dependencies>
+</project>

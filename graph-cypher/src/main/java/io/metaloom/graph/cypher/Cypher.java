@@ -1,5 +1,7 @@
 package io.metaloom.graph.cypher;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 import io.metaloom.graph.core.api.GraphStore;
@@ -20,6 +22,20 @@ import io.metaloom.graph.cypher.parse.CypherParser;
  *     System.out.println(row.get("f.name"));
  * }
  * }</pre>
+ *
+ * <h2>Two shapes, one execution path</h2>
+ *
+ * <p>
+ * {@link #query} materialises and {@link #stream} pushes rows to a {@link RowSink} as they are produced. They are not
+ * two implementations: {@code query} <em>is</em> {@code stream} with a sink that collects, so there is one place the
+ * read view is managed and no way for the two to drift apart.
+ * </p>
+ *
+ * <p>
+ * Use {@code stream} when the result may be large, when the caller wants the first row before the last one is found,
+ * or when the query has to be stoppable — a deadline or a cancellation can only be honoured between rows, and
+ * {@link RowSink#row} returning {@code false} is where that happens.
+ * </p>
  *
  * <h2>Isolation</h2>
  *
@@ -48,8 +64,90 @@ public final class Cypher {
 	}
 
 	public static CypherResult query(GraphStore store, String query, Map<String, Object> parameters) {
-		Ast.Query parsed = CypherParser.parse(query);
-		return execute(store, parsed, parameters);
+		return query(store, CypherParser.parse(query), parameters);
+	}
+
+	/**
+	 * Runs an already-parsed query.
+	 *
+	 * <p>
+	 * Parsing is pure and cheap and running is neither, so a server can parse on the thread that accepted the request
+	 * and only then pay for a worker and a read view. A syntax error — much the most common failure — then costs
+	 * neither.
+	 * </p>
+	 */
+	public static CypherResult query(GraphStore store, Ast.Query parsed, Map<String, Object> parameters) {
+		Collector collector = new Collector();
+		stream(store, parsed, parameters, collector);
+		return new CypherResult(collector.columns, collector.rows);
+	}
+
+	/**
+	 * Runs a query and pushes its rows to a sink as they are produced.
+	 *
+	 * <p>
+	 * <b>What this does and does not bound.</b> The sink never receives a materialised result, so a caller encoding
+	 * rows onto a socket never builds the whole payload — which is the difference between a bounded and an unbounded
+	 * client, and the difference between a first row after the last one is found and a first row after the first one
+	 * is. It does <b>not</b> yet bound what the executor holds: rows are produced a clause at a time over a list, so a
+	 * query's peak memory here is still its widest intermediate result. See spec/CYPHER.md.
+	 * </p>
+	 *
+	 * <p>
+	 * Runs entirely on the calling thread, which is what makes it safe: the read view is opened, used and closed by
+	 * one thread, and the sink is called from that same thread. {@link RowSink} states the rules an implementation has
+	 * to keep.
+	 * </p>
+	 */
+	public static void stream(GraphStore store, String query, Map<String, Object> parameters, RowSink sink) {
+		stream(store, CypherParser.parse(query), parameters, sink, QueryAbort.NEVER);
+	}
+
+	/** @see #stream(GraphStore, String, Map, RowSink) */
+	public static void stream(GraphStore store, Ast.Query parsed, Map<String, Object> parameters, RowSink sink) {
+		stream(store, parsed, parameters, sink, QueryAbort.NEVER);
+	}
+
+	/**
+	 * Runs a query that can be stopped from outside.
+	 *
+	 * <p>
+	 * There are two ways to stop, and a caller enforcing a deadline needs both. {@link RowSink#row} returning
+	 * {@code false} stops <em>delivery</em>, which is enough once rows are flowing. {@link QueryAbort} stops
+	 * <em>execution</em>, which is the one that matters for a query that has not produced a row yet — a scan of ten
+	 * million nodes reaches the sink exactly once, at the end, so a between-rows check alone would let it run to
+	 * completion and only then notice it had been abandoned.
+	 * </p>
+	 *
+	 * <p>
+	 * The signal is consulted inside {@link GraphAccess}, on a fraction of store touches, and raises
+	 * {@link QueryAbortedException} — which unwinds the executor and closes the read view on its way out.
+	 * </p>
+	 */
+	public static void stream(GraphStore store, Ast.Query parsed, Map<String, Object> parameters, RowSink sink,
+		QueryAbort abort) {
+		// Joins the caller's view when there is one. Opening a second would be refused, and closing theirs at the end
+		// of this query would be worse than being refused.
+		ReadTransaction view = store.hasReadTransaction() ? null : store.beginRead();
+		try {
+			QueryExecutor.Result result = new QueryExecutor(new GraphAccess(store, abort), parameters).run(parsed);
+			// Inside the try, so the sink sees every row while the view it was read under is still open. A sink that
+			// stops early simply ends the loop; that is an outcome, and the finally still closes the view.
+			sink.columns(result.columns());
+			for (List<Object> row : result.rows()) {
+				String reason = abort.abortReason();
+				if (reason != null) {
+					throw new QueryAbortedException(reason);
+				}
+				if (!sink.row(row)) {
+					return;
+				}
+			}
+		} finally {
+			if (view != null) {
+				view.close();
+			}
+		}
 	}
 
 	/** Parses without running, for a caller that wants to validate a query or inspect its shape. */
@@ -57,17 +155,28 @@ public final class Cypher {
 		return CypherParser.parse(query);
 	}
 
-	private static CypherResult execute(GraphStore store, Ast.Query parsed, Map<String, Object> parameters) {
-		// Joins the caller's view when there is one. Opening a second would be refused, and closing theirs at the end
-		// of this query would be worse than being refused.
-		ReadTransaction view = store.hasReadTransaction() ? null : store.beginRead();
-		try {
-			QueryExecutor.Result result = new QueryExecutor(new GraphAccess(store), parameters).run(parsed);
-			return new CypherResult(result.columns(), result.rows());
-		} finally {
-			if (view != null) {
-				view.close();
-			}
+	/**
+	 * Turns the streaming form back into the materialised one.
+	 *
+	 * <p>
+	 * {@link #query} is this and nothing else, so the two paths cannot drift apart: there is one execution path and
+	 * one place the read view is managed, and the blocking API is a sink that says yes to every row.
+	 * </p>
+	 */
+	private static final class Collector implements RowSink {
+
+		private List<String> columns = List.of();
+		private final List<List<Object>> rows = new ArrayList<>();
+
+		@Override
+		public void columns(List<String> columns) {
+			this.columns = columns;
+		}
+
+		@Override
+		public boolean row(List<Object> values) {
+			rows.add(values);
+			return true;
 		}
 	}
 }

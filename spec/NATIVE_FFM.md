@@ -11,12 +11,17 @@ been deleted.
 `cargo clippy -D warnings` run inside `mvn test`; `NativeCodecTest` and `UringIoEngineTest` hold the
 Rust side to the Java reference and to the claims below. The ABI is version **2**.
 
-**N1, io_uring, is built and it is the one that pays.** 64 scattered 4 KiB reads through `O_DIRECT`:
+**N1, io_uring, is built and it is the one that pays.** It now has a file of its own —
+[IO_URING.md](IO_URING.md) — covering the ring, the engine, the measurement and the caller it is
+waiting for. 64 scattered 4 KiB reads through `O_DIRECT`:
 
 | | Time |
 |---|---|
-| `pread` loop | 3,103 µs |
-| **io_uring batch** | **250 µs — 12.4x** |
+| `pread` loop | 2,942 µs |
+| **io_uring batch** | **195 µs — 15.1x** |
+
+(An earlier run of the same test on the same machine gave 3,103 µs against 250 µs, or 12.4x. The
+spread is what a shared machine does to a microbenchmark.)
 
 That upholds the claim in section 1 that this is the largest lever in the design, and it is the only
 capability here the JVM cannot approach: a page fault and a `FileChannel.read` are both synchronous,
@@ -234,6 +239,10 @@ exactly which path each capability took at open.
 `native.enabled=false` forces the fallback everywhere, and CI runs the **whole suite twice**, once
 each way, asserting identical results.
 
+The contract holds in a GraalVM native image too: an image built from a jar with no `.so` in it starts,
+serves and queries on the pure-Java path, and one built with the crate reports `ABI 2` and all five
+capabilities from inside the binary. See [GRAALVM.md §8.2](GRAALVM.md).
+
 ---
 
 ## 5. Build and Packaging
@@ -246,6 +255,7 @@ each way, asserting identical results.
 | Packaging | The `.so` is placed in `src/main/resources/native/<os>-<arch>/libmetaloom_graph_native.so` and shipped inside the jar |
 | Loading | Extract to a temp dir on first use, then `SymbolLookup.libraryLookup(path, arena)`. Honour `-Dmetaloom.graph.native.path` for a developer override |
 | Absence | A missing or unloadable library is **logged at INFO and falls back**, never fatal, unless `native.required=true` |
+| Ahead of time | Every downcall signature is declared in `META-INF/native-image/.../reachability-metadata.json` so the engine works inside a GraalVM binary. Adding a binding without adding its shape is caught by `ForeignDowncallMetadataTest` in the ordinary `mvn test` — see [GRAALVM.md](GRAALVM.md) |
 | CI | A matrix that builds the crate per target; `cargo clippy -D warnings`, `cargo test`, `cargo miri test` on the codec modules |
 
 **Absence must never be fatal.** The build detects a missing `cargo`, says so, and lets the Java build
@@ -343,8 +353,13 @@ library) and `main.c` are deleted in Phase 6.
 - [x] Graceful skip of the cargo build; the whole suite green with the native path disabled
 - [ ] The WAL on the direct engine. Needs an aligned block buffer and a padding record type; a partly
       filled block must never be rewritten in place, or a torn write destroys an acknowledged commit
-- [ ] N1: io_uring, `UringIoEngine`, cursor prefetch — **unwritten, and the only remaining capability
-      that would change a number**
+- [x] N1: io_uring — the crate's ring, `UringIoEngine.readBatch`, the ABI-checked completion layout, and
+      the 15x measurement. **Built and called by nothing but its own test**, because the data path is a
+      mapping and issues no reads; the write-ahead log under `GROUP_COMMIT` is the caller it is waiting
+      for, and `mlg_ring_submit_write`/`mlg_ring_submit_fsync` are exported by the crate and not yet
+      bound in Java. [IO_URING.md](IO_URING.md)
+- [ ] Cursor prefetch through the ring — needs a data path that is not memory mapped, which is a design
+      change rather than a wiring one
 - [ ] N3: `madvise`, `statx` block counts, `FICLONE` reflink snapshots
 - [ ] `mlg_xxh3`, SIMD codec paths, lz4 into `BlobStore` — blocked on `cargo`
 - [ ] Crate restructure, `module-info.java`, `cargo clippy`/`miri`/`fuzz` in CI — blocked on `cargo`
