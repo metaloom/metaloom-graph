@@ -1,0 +1,145 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <artifactId>graph-core</artifactId>
+
+    <parent>
+        <groupId>io.metaloom.graph</groupId>
+        <artifactId>graph-storage-ffm-poc</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <name>Graph Core</name>
+    <description>The storage engine: addressing, segments, the log, adjacency, indexes and transactions</description>
+
+    <dependencies>
+        <!-- Test only. The engine's sole runtime dependency is slf4j-api, inherited from the parent. -->
+        <dependency>
+            <groupId>commons-io</groupId>
+            <artifactId>commons-io</artifactId>
+            <version>2.18.0</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!--
+                A test jar so that graph-cypher's tests can reuse TempStore rather than growing a second copy of the
+                fixture that retains a store directory on failure.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>test-jar</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <!--
+                Builds the Rust native layer when cargo is present, and skips with a message when it is not.
+                A missing Rust toolchain must never make the project unbuildable for a Java-only contributor:
+                every native capability has a pure-Java fallback. See spec/NATIVE_FFM.md section 5.
+
+                This lives in graph-core alone. Nothing above the storage layer touches native code.
+            -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.1.0</version>
+                <executions>
+                    <!--
+                        `mvn clean` has to mean clean. Without this the Rust target directory survives, and it is
+                        the largest thing the build produces — 18 MiB of release artifacts after one compile, growing
+                        with every dependency the crate gains. A developer who runs clean to reclaim space, or to
+                        force a genuine rebuild, gets neither.
+                    -->
+                    <execution>
+                        <id>clean-native</id>
+                        <phase>clean</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${native.skip}</skip>
+                            <executable>sh</executable>
+                            <workingDirectory>${project.basedir}</workingDirectory>
+                            <arguments>
+                                <argument>-c</argument>
+                                <argument>if command -v cargo >/dev/null 2>&amp;1; then cargo clean --manifest-path native-rust-lib/Cargo.toml ${cargo.offline.flag}; fi</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                    <!--
+                        The crate's own tests and lints. They run in `mvn test`, not only in CI, because a Rust
+                        change that breaks the codec would otherwise be caught by the Java differential test with a
+                        far worse error message — or, if the shared object failed to rebuild, not at all.
+                    -->
+                    <execution>
+                        <id>test-native</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${native.test.skip}</skip>
+                            <executable>sh</executable>
+                            <workingDirectory>${project.basedir}</workingDirectory>
+                            <arguments>
+                                <argument>-c</argument>
+                                <argument>if command -v cargo >/dev/null 2>&amp;1; then cargo test --release --manifest-path native-rust-lib/Cargo.toml ${cargo.offline.flag} &amp;&amp; cargo clippy --release --all-targets --manifest-path native-rust-lib/Cargo.toml ${cargo.offline.flag} -- -D warnings; else echo "[native] cargo not found, skipping the Rust tests"; fi</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                    <!--
+                        Packages the built shared object into the jar under its platform classifier, so that a consumer
+                        who puts this jar on their path gets the native layer without building Rust. The search paths
+                        NativeCapabilities tries first are relative to the working directory, which only ever works in
+                        a build tree.
+
+                        One target, deliberately: cross-compiling to aarch64 or macOS needs toolchains this environment
+                        does not have, and the resource layout is per-classifier precisely so adding one later is a
+                        build change and not a code change. A jar built here declares what it contains and nothing more.
+                    -->
+                    <execution>
+                        <id>package-native</id>
+                        <phase>process-classes</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${native.skip}</skip>
+                            <executable>sh</executable>
+                            <workingDirectory>${project.basedir}</workingDirectory>
+                            <arguments>
+                                <argument>-c</argument>
+                                <argument>if [ -f native-rust-lib/target/release/libmetaloom_graph_native.so ]; then mkdir -p target/classes/native/${os.detected.classifier} &amp;&amp; cp native-rust-lib/target/release/libmetaloom_graph_native.so target/classes/native/${os.detected.classifier}/ &amp;&amp; echo "[native] packaged for ${os.detected.classifier}"; else echo "[native] nothing built, the jar will carry no library"; fi</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>build-native</id>
+                        <phase>generate-resources</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${native.skip}</skip>
+                            <executable>sh</executable>
+                            <workingDirectory>${project.basedir}</workingDirectory>
+                            <arguments>
+                                <argument>-c</argument>
+                                <argument>if command -v cargo >/dev/null 2>&amp;1; then cargo build --release --manifest-path native-rust-lib/Cargo.toml ${cargo.offline.flag}; else echo "[native] cargo not found, skipping the Rust layer (pure-Java fallback in use)"; fi</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

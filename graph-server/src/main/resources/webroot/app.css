@@ -1,0 +1,171 @@
+/* A deliberately small stylesheet: one file, no build step, no framework. */
+
+:root {
+  --bg: #14161a;
+  --panel: #1c1f26;
+  --panel-2: #232733;
+  --line: #2f3542;
+  --text: #e6e8ee;
+  --muted: #98a0b3;
+  --accent: #6aa9ff;
+  --accent-dim: #2b4a7a;
+  --error: #ff8080;
+  --error-bg: #3a1f22;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+.stats { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+
+main { flex: 1; display: flex; flex-direction: column; min-height: 0; padding: 12px; gap: 10px; }
+
+.editor { display: flex; flex-direction: column; gap: 8px; }
+
+textarea {
+  width: 100%;
+  font: 13px/1.5 var(--mono);
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px 12px;
+  resize: vertical;
+  tab-size: 2;
+}
+textarea:focus { outline: none; border-color: var(--accent-dim); }
+
+.controls { display: flex; align-items: center; gap: 12px; }
+
+button {
+  font: 500 13px/1 system-ui, sans-serif;
+  color: #07121f;
+  background: var(--accent);
+  border: 0;
+  border-radius: 5px;
+  padding: 8px 16px;
+  cursor: pointer;
+}
+button:hover { filter: brightness(1.08); }
+button:disabled { opacity: .55; cursor: default; }
+
+.hint, .timing { color: var(--muted); font-size: 12px; }
+.timing { font-family: var(--mono); margin-left: auto; }
+
+.examples { display: flex; flex-wrap: wrap; gap: 6px; }
+.examples button {
+  background: var(--panel-2);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 4px 8px;
+}
+.examples button:hover { color: var(--text); border-color: var(--accent-dim); }
+
+/* The caret line in a syntax error only lines up in a monospace font, so the whole message is one. */
+.error {
+  white-space: pre;
+  overflow-x: auto;
+  font: 12px/1.45 var(--mono);
+  color: var(--error);
+  background: var(--error-bg);
+  border: 1px solid #5c2b30;
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+.results { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+
+.tabs { display: flex; gap: 2px; }
+.tab {
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  padding: 6px 14px;
+  font-size: 12px;
+}
+.tab.active { color: var(--text); background: var(--panel-2); }
+
+.view {
+  flex: 1;
+  position: relative;
+  min-height: 0;
+  border: 1px solid var(--line);
+  border-radius: 0 6px 6px 6px;
+  background: var(--panel-2);
+  overflow: auto;
+}
+
+#canvas { width: 100%; height: 100%; display: block; cursor: grab; }
+#canvas:active { cursor: grabbing; }
+
+.empty, .inspector { position: absolute; }
+.empty {
+  inset: 0;
+  display: grid;
+  place-content: center;
+  text-align: center;
+  max-width: 460px;
+  margin: auto;
+  color: var(--muted);
+  padding: 20px;
+}
+.empty code { font-family: var(--mono); color: var(--text); }
+
+.inspector {
+  top: 10px; right: 10px;
+  width: 280px;
+  max-height: calc(100% - 20px);
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 12px;
+}
+.inspector h2 { margin: 0 0 8px; font-size: 12px; color: var(--muted); font-weight: 600; }
+.inspector dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; }
+.inspector dt { color: var(--muted); font-family: var(--mono); }
+.inspector dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+
+.node-label { pointer-events: none; font-size: 10px; fill: var(--text); }
+.rel-label { pointer-events: none; font-size: 9px; fill: var(--muted); }
+
+table { border-collapse: collapse; width: 100%; font-family: var(--mono); font-size: 12px; }
+th, td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+th { position: sticky; top: 0; background: var(--panel); color: var(--muted); font-weight: 600; }
+td .null { color: var(--muted); font-style: italic; }
+
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
+}

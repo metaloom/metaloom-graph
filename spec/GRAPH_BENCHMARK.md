@@ -8,10 +8,10 @@ mostly a record of what did not work.
 
 | Harness | Tag | What it answers |
 |---|---|---|
-| [`GraphScaleBenchmark`](../src/test/java/io/metaloom/graph/core/bench/GraphScaleBenchmark.java) | `huge` | What does it cost to load 10M nodes and 20M relationships |
-| [`GraphTraversalBenchmark`](../src/test/java/io/metaloom/graph/core/bench/GraphTraversalBenchmark.java) | `huge` | Random access by id, 30,000-relationship traversal, 30,000-hop chain |
-| [`SupernodeBenchmark`](../src/test/java/io/metaloom/graph/core/bench/SupernodeBenchmark.java) | `bench` | Does one node with 20,000 relationships degrade — with gates |
-| [`CodecProfileBenchmark`](../src/test/java/io/metaloom/graph/core/bench/CodecProfileBenchmark.java) | `bench` | Where the time inside a block read and write goes |
+| [`GraphScaleBenchmark`](../graph-core/src/test/java/io/metaloom/graph/core/bench/GraphScaleBenchmark.java) | `huge` | What does it cost to load 10M nodes and 20M relationships |
+| [`GraphTraversalBenchmark`](../graph-core/src/test/java/io/metaloom/graph/core/bench/GraphTraversalBenchmark.java) | `huge` | Random access by id, 30,000-relationship traversal, 30,000-hop chain |
+| [`SupernodeBenchmark`](../graph-core/src/test/java/io/metaloom/graph/core/bench/SupernodeBenchmark.java) | `bench` | Does one node with 20,000 relationships degrade — with gates |
+| [`CodecProfileBenchmark`](../graph-core/src/test/java/io/metaloom/graph/core/bench/CodecProfileBenchmark.java) | `bench` | Where the time inside a block read and write goes |
 
 ---
 
@@ -22,7 +22,7 @@ what the fix was is analysed in [reports/SCALE.md](reports/SCALE.md); this page 
 nothing else.
 
 Harness:
-[`GraphScaleBenchmark`](../src/test/java/io/metaloom/graph/core/bench/GraphScaleBenchmark.java),
+[`GraphScaleBenchmark`](../graph-core/src/test/java/io/metaloom/graph/core/bench/GraphScaleBenchmark.java),
 tagged `huge` and excluded from every profile including `-Pall-tests`.
 
 ```bash

@@ -1,0 +1,60 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <artifactId>graph-server</artifactId>
+
+    <parent>
+        <groupId>io.metaloom.graph</groupId>
+        <artifactId>graph-storage-ffm-poc</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <name>Graph Server</name>
+    <description>A Vert.x HTTP server exposing Cypher queries, with a browser UI that renders results with D3</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.metaloom.graph</groupId>
+            <artifactId>graph-cypher</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.metaloom.graph</groupId>
+            <artifactId>graph-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.vertx</groupId>
+            <artifactId>vertx-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.vertx</groupId>
+            <artifactId>vertx-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.metaloom.graph</groupId>
+            <artifactId>graph-core</artifactId>
+            <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!--
+                So that running the UI is one short command rather than one long one:
+
+                    mvn -pl graph-server exec:java -Dexec.args="/path/to/store 8080"
+
+                The main class is a property of this module, not something a caller should have to know and retype.
+            -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.1.0</version>
+                <configuration>
+                    <mainClass>io.metaloom.graph.server.GraphServer</mainClass>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

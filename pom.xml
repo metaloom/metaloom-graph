@@ -5,6 +5,7 @@
     <groupId>io.metaloom.graph</groupId>
     <artifactId>graph-storage-ffm-poc</artifactId>
     <version>0.0.1-SNAPSHOT</version>
+    <packaging>pom</packaging>
 
     <parent>
         <groupId>io.metaloom</groupId>
@@ -12,34 +13,85 @@
         <version>2.1.0</version>
     </parent>
 
-    <name>Graph Core</name>
+    <name>Graph Storage</name>
     <url>https://github.com/metaloom/graph-storage-ffm-poc</url>
     <description>A java implementation for a graph storage</description>
     <inceptionYear>2024</inceptionYear>
+
+    <!--
+        The storage engine and the query language are separate modules on purpose. spec/ARCHITECTURE.md states that
+        a query language is not a goal *of the storage layer*, and this is what keeps that literally true: graph-cypher
+        depends on graph-core's public api package and on nothing inside it. It also means the query language is a real
+        consumer of that API, which is a better test of the API than any test could be.
+    -->
+    <modules>
+        <module>graph-core</module>
+        <module>graph-cypher</module>
+        <module>graph-server</module>
+    </modules>
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.github.repository>jotschi/graph-storage-ffm-poc</project.github.repository>
         <!-- Tags excluded from the default surefire run. See spec/TESTING.md -->
         <excluded.test.groups>slow,bench,crash,fuzz,huge</excluded.test.groups>
-        <!-- Set to the cargo offline flag on a machine with a warm registry and no network. -->
+        <vertx.version>5.0.11</vertx.version>
+
+        <!--
+            The native layer. These live here rather than in graph-core so that `mvn -D...` is discoverable from the
+            root, which is where the build is driven from.
+
+            `native.skip` forces the Rust layer off even where cargo is present. The build already skips it
+            automatically when cargo is absent — every native capability has a pure-Java fallback, see
+            spec/NATIVE_FFM.md section 5 — so this is for the other case: proving the fallback path works, or cutting
+            build time when the crate has not changed.
+        -->
+        <native.skip>false</native.skip>
+        <!-- Follows native.skip unless the skip-native-tests profile below overrides it. -->
+        <native.test.skip>${native.skip}</native.test.skip>
+        <!-- Set to cargo's offline flag by -Poffline, for a machine with a warm registry and no network. -->
         <cargo.offline.flag></cargo.offline.flag>
     </properties>
 
-    <dependencies>
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>io.metaloom.graph</groupId>
+                <artifactId>graph-core</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.metaloom.graph</groupId>
+                <artifactId>graph-core</artifactId>
+                <version>${project.version}</version>
+                <type>test-jar</type>
+                <scope>test</scope>
+            </dependency>
+            <dependency>
+                <groupId>io.metaloom.graph</groupId>
+                <artifactId>graph-cypher</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.vertx</groupId>
+                <artifactId>vertx-core</artifactId>
+                <version>${vertx.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.vertx</groupId>
+                <artifactId>vertx-web</artifactId>
+                <version>${vertx.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
 
+    <dependencies>
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
         </dependency>
 
         <!-- Test -->
-        <dependency>
-            <groupId>commons-io</groupId>
-            <artifactId>commons-io</artifactId>
-            <version>2.18.0</version>
-            <scope>test</scope>
-        </dependency>
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter-api</artifactId>
@@ -67,78 +119,9 @@
                 </configuration>
             </plugin>
             <!--
-                Builds the Rust native layer when cargo is present, and skips with a message when it is not.
-                A missing Rust toolchain must never make the project unbuildable for a Java-only contributor:
-                every native capability has a pure-Java fallback. See spec/NATIVE_FFM.md section 5.
+                Inherited by every module, so that `mvn test -Pcrash` and friends select the same tags everywhere
+                rather than only in the module that happened to declare the configuration.
             -->
-            <plugin>
-                <groupId>org.codehaus.mojo</groupId>
-                <artifactId>exec-maven-plugin</artifactId>
-                <version>3.1.0</version>
-                <executions>
-                    <!--
-                        The crate's own tests and lints. They run in `mvn test`, not only in CI, because a Rust
-                        change that breaks the codec would otherwise be caught by the Java differential test with a
-                        far worse error message — or, if the shared object failed to rebuild, not at all.
-                    -->
-                    <execution>
-                        <id>test-native</id>
-                        <phase>test</phase>
-                        <goals>
-                            <goal>exec</goal>
-                        </goals>
-                        <configuration>
-                            <skip>${skipTests}</skip>
-                            <executable>sh</executable>
-                            <workingDirectory>${project.basedir}</workingDirectory>
-                            <arguments>
-                                <argument>-c</argument>
-                                <argument>if command -v cargo >/dev/null 2>&amp;1; then cargo test --release --manifest-path native-rust-lib/Cargo.toml ${cargo.offline.flag} &amp;&amp; cargo clippy --release --all-targets --manifest-path native-rust-lib/Cargo.toml ${cargo.offline.flag} -- -D warnings; else echo "[native] cargo not found, skipping the Rust tests"; fi</argument>
-                            </arguments>
-                        </configuration>
-                    </execution>
-                    <!--
-                        Packages the built shared object into the jar under its platform classifier, so that a consumer
-                        who puts this jar on their path gets the native layer without building Rust. The search paths
-                        NativeCapabilities tries first are relative to the working directory, which only ever works in
-                        a build tree.
-
-                        One target, deliberately: cross-compiling to aarch64 or macOS needs toolchains this environment
-                        does not have, and the resource layout is per-classifier precisely so adding one later is a
-                        build change and not a code change. A jar built here declares what it contains and nothing more.
-                    -->
-                    <execution>
-                        <id>package-native</id>
-                        <phase>process-classes</phase>
-                        <goals>
-                            <goal>exec</goal>
-                        </goals>
-                        <configuration>
-                            <executable>sh</executable>
-                            <workingDirectory>${project.basedir}</workingDirectory>
-                            <arguments>
-                                <argument>-c</argument>
-                                <argument>if [ -f native-rust-lib/target/release/libmetaloom_graph_native.so ]; then mkdir -p target/classes/native/${os.detected.classifier} &amp;&amp; cp native-rust-lib/target/release/libmetaloom_graph_native.so target/classes/native/${os.detected.classifier}/ &amp;&amp; echo "[native] packaged for ${os.detected.classifier}"; else echo "[native] nothing built, the jar will carry no library"; fi</argument>
-                            </arguments>
-                        </configuration>
-                    </execution>
-                    <execution>
-                        <id>build-native</id>
-                        <phase>generate-resources</phase>
-                        <goals>
-                            <goal>exec</goal>
-                        </goals>
-                        <configuration>
-                            <executable>sh</executable>
-                            <workingDirectory>${project.basedir}</workingDirectory>
-                            <arguments>
-                                <argument>-c</argument>
-                                <argument>if command -v cargo >/dev/null 2>&amp;1; then cargo build --release --manifest-path native-rust-lib/Cargo.toml ${cargo.offline.flag}; else echo "[native] cargo not found, skipping the Rust layer (pure-Java fallback in use)"; fi</argument>
-                            </arguments>
-                        </configuration>
-                    </execution>
-                </executions>
-            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
@@ -162,6 +145,30 @@
     </build>
 
     <profiles>
+        <!--
+            `mvn -DskipTests` should skip the Rust tests too, not just the Java ones. Activating on the property's
+            presence is the only way to see a bare `-DskipTests`, which sets it to the empty string rather than to
+            "true" and so cannot be read as a boolean.
+        -->
+        <profile>
+            <id>skip-native-tests</id>
+            <activation>
+                <property>
+                    <name>skipTests</name>
+                </property>
+            </activation>
+            <properties>
+                <native.test.skip>true</native.test.skip>
+            </properties>
+        </profile>
+        <!-- A warm cargo registry and no network: mvn -o -Poffline install -->
+        <profile>
+            <id>offline</id>
+            <properties>
+                <cargo.offline.flag>--offline</cargo.offline.flag>
+            </properties>
+        </profile>
+
         <!-- mvn test -Pslow / -Pbench / -Pcrash : see spec/TESTING.md -->
         <profile>
             <id>slow</id>

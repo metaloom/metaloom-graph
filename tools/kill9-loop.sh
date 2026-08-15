@@ -18,19 +18,20 @@ ITERATIONS="${1:-20}"
 SECONDS_PER="${2:-3}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="${TMPDIR:-/tmp}/graphstore-kill9-$$"
-CLASSPATH="$ROOT/target/classes:$ROOT/target/test-classes:$(cat "$ROOT/target/test-classpath.txt" 2>/dev/null || true)"
+CORE="$ROOT/graph-core"
+CLASSPATH="$CORE/target/classes:$CORE/target/test-classes:$(cat "$CORE/target/test-classpath.txt" 2>/dev/null || true)"
 
-if [ ! -d "$ROOT/target/test-classes" ]; then
-  echo "build first: mvn -o test-compile" >&2
+if [ ! -d "$CORE/target/test-classes" ]; then
+  echo "build first: mvn -o test-compile -pl graph-core -am" >&2
   exit 2
 fi
 
 # The dependency classpath is written out by `mvn dependency:build-classpath`; regenerate it when it is missing.
-if [ ! -f "$ROOT/target/test-classpath.txt" ]; then
+if [ ! -f "$CORE/target/test-classpath.txt" ]; then
   echo "generating the test classpath..."
-  (cd "$ROOT" && mvn -o -q dependency:build-classpath \
+  (cd "$CORE" && mvn -o -q dependency:build-classpath \
       -Dmdep.outputFile=target/test-classpath.txt -Dmdep.includeScope=test) || exit 2
-  CLASSPATH="$ROOT/target/classes:$ROOT/target/test-classes:$(cat "$ROOT/target/test-classpath.txt")"
+  CLASSPATH="$CORE/target/classes:$CORE/target/test-classes:$(cat "$CORE/target/test-classpath.txt")"
 fi
 
 mkdir -p "$WORK"

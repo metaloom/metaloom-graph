@@ -19,8 +19,14 @@ formats are in [FILE_FORMAT.md](FILE_FORMAT.md); the as-is picture is in
 6. **Native where it pays.** Rust via FFM for io_uring, `O_DIRECT`, SIMD checksums and codecs —
    never for things the JVM already does well.
 
-Explicit **non-goals** for the foreseeable phases: distribution, replication, a query language, and
-graph algorithms. This is a storage layer.
+Explicit **non-goals** for the foreseeable phases: distribution, replication and graph algorithms.
+This is a storage layer.
+
+A query language was on that list and is no longer, but the boundary it protected still holds: the
+openCypher subset lives in a **separate module** that depends on this one's public `api` package and
+cannot reach inside it — [CYPHER.md](CYPHER.md). The storage layer has no query language in it. It
+also gained one API method as a result, `forEachNode`, which is the sort of gap only a real consumer
+finds.
 
 ---
 

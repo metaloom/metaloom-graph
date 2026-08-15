@@ -225,8 +225,9 @@ offset size field                 notes
 7      1    inline_edge_count     0..2
 8      8    prop_block_id         PROP id, or NULL_ID
 16     8    adj_head_id           ADJ id of the first adjacency block, or NULL_ID
-24     8    version_ptr           UNDO id of the newest older version, or NULL_ID
-32     8    xmin                  commit timestamp (= LSN of the commit record)
+24     4    label_id_2            second label, 0 = absent
+28     4    label_id_3            third label, 0 = absent
+32     8    label_overflow_id     PROP block holding labels four and beyond, or NULL_ID
 40     8    inline_edge[0]        packed edge, see RELATIONSHIP_STORAGE.md §3
 48     8    inline_edge[1]
 56     4    degree_out
@@ -243,8 +244,15 @@ low-degree nodes.
 
 Design notes:
 
-- `xmin` is 8 bytes and is not optional. Snapshot isolation needs it and putting it in the record is
-  cheaper than a side table.
+- **Offsets 24 to 39 were `version_ptr` and `xmin`.** Phase 5 resolved visibility per *page* rather
+  than per record ([TRANSACTIONS.md §5.1](TRANSACTIONS.md#51-what-was-built)), so both were written as
+  zero and read by nothing; format version 3 spends them on the label set. The record is still 64
+  bytes and **no data migration is needed**: `NULL_ID` is zero, so a version 2 node decodes as exactly
+  one label, which is what it has. The version bump exists for the other direction — a version 2 build
+  would read a multi-label node's extra labels as an undo pointer.
+- Three labels fit the record. Beyond that the set spills into a `PROP` block, which is owned by the
+  node exactly as its properties are, and is therefore freed by the same cascade, relocated by the
+  same compaction sweep and checked by the same orphan detector.
 - `degree_out` / `degree_in` are maintained eagerly. They are what lets the traversal planner choose
   a direction without reading any adjacency block, and they make "is this a supernode" a free check.
 - `DENSE` flag marks a node whose adjacency uses the sorted/indexed block layout rather than the

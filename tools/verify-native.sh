@@ -26,16 +26,16 @@ fi
 
 if cargo +nightly miri --version >/dev/null 2>&1; then
     echo "=== miri ==="
-    cargo +nightly miri test --manifest-path native-rust-lib/Cargo.toml
+    cargo +nightly miri test --manifest-path graph-core/native-rust-lib/Cargo.toml
 else
     echo "[native] miri is unavailable. Install with:"
     echo "         rustup toolchain install nightly --profile minimal --component miri rust-src"
 fi
 
 if cargo fuzz --version >/dev/null 2>&1; then
-    for target in $(cargo fuzz list --fuzz-dir native-rust-lib/fuzz 2>/dev/null); do
+    for target in $(cargo fuzz list --fuzz-dir graph-core/native-rust-lib/fuzz 2>/dev/null); do
         echo "=== fuzz: ${target}, ${FUZZ_SECONDS}s ==="
-        cargo +nightly fuzz run "${target}" --fuzz-dir native-rust-lib/fuzz -- \
+        cargo +nightly fuzz run "${target}" --fuzz-dir graph-core/native-rust-lib/fuzz -- \
             "-max_total_time=${FUZZ_SECONDS}"
     done
 else

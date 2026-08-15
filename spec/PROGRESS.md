@@ -11,6 +11,7 @@ not**, in one place.
 | [reports/BASELINE.md](reports/BASELINE.md) | Measured numbers and the machine they were measured on |
 | [reports/SCALE.md](reports/SCALE.md) | 10M nodes / 20M relationships: load time, disk cost, and the adjacency defect it exposed |
 | [GRAPH_BENCHMARK.md](GRAPH_BENCHMARK.md) | Every scale run in one progression table, the traversal and supernode numbers, and the SIMD investigation |
+| [CYPHER.md](CYPHER.md) | The openCypher subset, its null semantics, the two engine mismatches, and the server and UI |
 | [CURRENT_STATE.md](CURRENT_STATE.md) | The proof of concept this replaced, and its defect register |
 
 **Legend**: `[x]` done and tested · `[~]` partially done, with the missing part named · `[ ]` not started.
@@ -32,18 +33,29 @@ not**, in one place.
 | 8 — Compaction and reclamation | **Done** except the p99 latency budget | `CompactionTest`, `CompactionCrashTest` |
 | 9 — Hardening | **Partial** — see §4.9; crash matrix **built**, no JMH, long runs not run | `CrashMatrixTest`, `WalFaultTest`; §6 of PHASE_STATUS |
 | 10 — MetaLoom integration | **Done** — built, measured, recommended against adopting | §6 below |
+| 11 — Query language | **Done** for a read-only openCypher subset, in its own module, with a Vert.x server and D3 UI | [CYPHER.md](CYPHER.md); `CypherVersusApiTest`, `NullSemanticsTest` |
 
 **The engine is usable today** for a single-writer embedded workload: durable, crash-safe,
-transactional, indexed, compacting, with snapshot isolation for readers, and it holds its answers
-against a reference model and against real SQL. It is **not** usable where concurrent writers or an
-online backup are requirements — neither exists and neither is faked.
+transactional, indexed, compacting, with snapshot isolation for readers, a read-only Cypher query
+language and a browser UI — and it holds its answers against a reference model, against real SQL, and
+against its own Java API. It is **not** usable where concurrent writers, Cypher *writes* or an online
+backup are requirements. None of those exists and none is faked.
 
 ---
 
 ## 2. Evidence
 
+The repository is three modules — `graph-core`, `graph-cypher`, `graph-server` — under one parent
+pom, and every profile below applies across all of them. `mvn clean install` builds the lot, Rust
+included: `graph-core` drives cargo at four points, **build** (generate-resources), **package** the
+shared object into the jar (process-classes), **test** the crate with clippy (test), and **clean** its
+target directory (clean).
+
 ```bash
-mvn test                      # 240 tests, 0 failures, 3 skipped — plus 12 Rust tests and clippy
+mvn clean install             # everything, including the native layer
+mvn test -Dnative.skip=true   # the pure-Java fallback: 355 tests, 19 skipped rather than 3
+mvn -o -Poffline install      # warm cargo registry, no network
+mvn test                      # 355 tests, 0 failures, 3 skipped — plus 12 Rust tests and clippy
 mvn test -Pbench              # benchmarks, the structural gates, and the supernode gates
 mvn test -Pcrash              # kill -9, compaction crash injection, and the crash matrix
 mvn test -Pslow               # the soak harness and the long-running reader
@@ -53,6 +65,10 @@ mvn test -Phuge -Dtest=GraphTraversalBenchmark   # random access, 30k-relationsh
 mvn test -Pcrash -Dtest=CrashMatrixTest -Dgraph.crash.transactions=24   # 2,394 fault cases, 240 s
 tools/kill9-loop.sh 100       # the crash loop, one iteration per store
 tools/verify-native.sh        # cargo miri, then cargo fuzz on both targets
+
+mvn -o -pl graph-server exec:java \
+  -Dexec.mainClass=io.metaloom.graph.server.GraphServer \
+  -Dexec.args="/path/to/store 8080"      # the query UI on http://localhost:8080
 ```
 
 In MetaLoom: `mvn test -pl loom/services/graphstore` — **23 tests**, and

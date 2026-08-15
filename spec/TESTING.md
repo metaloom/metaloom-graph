@@ -31,6 +31,7 @@ to what they asserted ([CURRENT_STATE.md §5](CURRENT_STATE.md#5-test-reality-ch
 | `cargo +nightly miri test` | 0 so far. It needed an `ffi_tests` module to be worth running at all: the existing tests exercise safe internals, and undefined behaviour lives in the entry points where a caller's pointer becomes a slice |
 | `CrashMatrixTest` | 1 — recovery against data files older than its log threw a raw `IllegalStateException` rather than a typed store failure, so a caller could not distinguish "this store is damaged" from "this code has a bug". Found on the matrix's first meaningful run |
 | `RollbackTest` | **1, and it was a false alarm on healthy data** — `verify(FULL)` bounded a blob's extent-chain walk at `segmentCount() * slotsPerPage() + 1`. A BLOB extent is page sized, so that is 2 on a single-segment store: every blob past about 16 KiB was reported as a chain that "does not terminate", with its remaining extents reported as orphaned on top. Nothing caught it because no test had ever written a blob and then run `verify(FULL)`. Reporting corruption that is not there is worse than missing some: it sends somebody hunting, and it made full verification unusable on any store holding real blobs |
+| `CypherVersusApiTest` and running the UI | 2 — a `RETURN *` that listed pattern variables out of order, and, found only by opening the browser, **64-bit ids losing precision as JSON numbers**: an id near 2^60 arrives in JavaScript rounded, so two nodes could collapse into one circle. Ids now cross as strings |
 | `LongRunningReaderTest` | 1 — reclamation walked every version chain on every commit to discover there was nothing to cut, which is quadratic while a reader is pinned. The test did not fail, it *did not finish*, which is the failure mode a shorter test would have reported as merely slow |
 
 The pattern is worth naming: **every one of these came from a test that compared the engine against
@@ -73,6 +74,11 @@ src/test/java/io/metaloom/graph/core/
   example/       UsageExampleTest — the documented API, executable, so it cannot rot
   nativelib/     NativeCodecTest, IoEngineTest, UringIoEngineTest — the crate and the IO engines
   txn/           snapshot isolation: visibility, the anomaly matrix, vacuum, rollback, long readers
+
+graph-cypher/src/test/java/io/metaloom/graph/cypher/
+                 parser, null semantics, execution, the versus-API differential, variable-length paths
+graph-server/src/test/java/io/metaloom/graph/server/
+                 the HTTP contract and the two result shapes the UI needs
   concurrency/   jcstress and custom harnesses
   crash/         fault-injection recovery tests
   invariant/     the checkers themselves plus their tests

@@ -2,7 +2,7 @@
 
 What it costs to build a large random graph, measured rather than estimated.
 
-Harness: [`GraphScaleBenchmark`](../../src/test/java/io/metaloom/graph/core/bench/GraphScaleBenchmark.java),
+Harness: [`GraphScaleBenchmark`](../../graph-core/src/test/java/io/metaloom/graph/core/bench/GraphScaleBenchmark.java),
 tagged `huge` and excluded from every profile including `-Pall-tests`.
 
 ```bash
@@ -78,7 +78,7 @@ the compression is real, and the budgets measure reads per operation, which the 
 ### 2.2 The fix: a block is a run of cells, and it grows
 
 `ADJ` is no longer page-strided. Its allocation unit is a **512 byte cell**
-([`Kind.ADJ_CELL_BYTES`](../../src/main/java/io/metaloom/graph/core/id/Kind.java)) and a block is a
+([`Kind.ADJ_CELL_BYTES`](../../graph-core/src/main/java/io/metaloom/graph/core/id/Kind.java)) and a block is a
 run of consecutive cells that **doubles as it fills** — 512 B, 1 KiB, 2 KiB, 4 KiB, one page — after
 which the node starts a chain exactly as before. The run allocator already supported this: it is the
 same page-straddle-avoiding `allocateRun` the property store uses.
