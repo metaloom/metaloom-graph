@@ -28,10 +28,28 @@ import io.metaloom.graph.cypher.ast.Ast;
 import io.metaloom.graph.cypher.exec.CypherTypeException;
 import io.metaloom.graph.cypher.parse.CypherSyntaxException;
 import io.metaloom.graph.server.demo.DemoData;
+import io.metaloom.graph.server.mcp.McpConstants;
+import io.metaloom.graph.server.mcp.McpJsonRpcHandler;
+import io.metaloom.graph.server.mcp.McpServer;
+import io.metaloom.graph.server.mcp.tool.GraphMcpTools;
+import io.metaloom.graph.server.metrics.GraphMetrics;
+import io.metaloom.graph.server.metrics.MicrometerGraphMetrics;
+import io.metaloom.graph.server.metrics.StoreMetricsBinder;
+import io.metaloom.graph.server.metrics.StoreStatsCache;
 import io.metaloom.graph.server.wire.WireServer;
 import io.metaloom.graph.server.wire.WireServerOptions;
+import io.micrometer.core.instrument.binder.jvm.ClassLoaderMetrics;
+import io.micrometer.core.instrument.binder.jvm.JvmGcMetrics;
+import io.micrometer.core.instrument.binder.jvm.JvmMemoryMetrics;
+import io.micrometer.core.instrument.binder.jvm.JvmThreadMetrics;
+import io.micrometer.core.instrument.binder.system.FileDescriptorMetrics;
+import io.micrometer.core.instrument.binder.system.ProcessorMetrics;
+import io.micrometer.core.instrument.binder.system.UptimeMetrics;
+import io.micrometer.prometheusmetrics.PrometheusConfig;
+import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
+import io.vertx.core.VertxOptions;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
@@ -39,6 +57,8 @@ import io.vertx.ext.web.Router;
 import io.vertx.ext.web.RoutingContext;
 import io.vertx.ext.web.handler.BodyHandler;
 import io.vertx.ext.web.handler.StaticHandler;
+import io.vertx.micrometer.MicrometerMetricsFactory;
+import io.vertx.micrometer.MicrometerMetricsOptions;
 
 /**
  * An HTTP front end: a Cypher endpoint and the browser UI that uses it.
@@ -114,6 +134,24 @@ public final class GraphServer implements AutoCloseable {
 	private final java.util.concurrent.atomic.AtomicBoolean closing = new java.util.concurrent.atomic.AtomicBoolean();
 	/** Queries on a worker thread right now. The store may not be closed while this is above zero. */
 	private final java.util.concurrent.atomic.AtomicInteger inFlight = new java.util.concurrent.atomic.AtomicInteger();
+	/**
+	 * Where this front end records. {@link GraphMetrics#NOOP} unless {@link #main} turned monitoring on, so that an
+	 * embedder constructing a server directly gets no meters and no Micrometer on its hot path.
+	 */
+	private GraphMetrics metrics = GraphMetrics.NOOP;
+	/** Binds a database's meters the first time it is resolved. Null when monitoring is off. */
+	private StoreMetricsBinder binder;
+	/** Owned only when {@link #main} made it, and cancelled on shutdown so its timer does not outlive the stores. */
+	private StoreStatsCache statsCache;
+	/** Set by {@link #main} when the monitoring port is on, so that one shutdown hook closes every front end. */
+	private MetricsServer monitoring;
+	/** Set by {@link #main} when the MCP port is on. Off by default — see {@link McpServer}. */
+	private McpServer mcp;
+	/**
+	 * Past this a query is written to the slow query log. Zero — off — for an embedded server, because a library that
+	 * logged warnings about its caller's queries without being asked would be a poor guest. {@link #main} sets it.
+	 */
+	private long slowQueryMillis;
 
 	public GraphServer(GraphDatabases databases) {
 		this(databases, GraphDatabases.DEFAULT_NAME);
@@ -177,23 +215,95 @@ public final class GraphServer implements AutoCloseable {
 		}
 		seedIfAsked(databases.database(options.database()), options);
 
-		// One Vert.x for both front ends. They serve the same databases in the same process and there is nothing to be
-		// gained from two sets of event loops competing for the same cores.
-		Vertx vertx = Vertx.vertx();
+		// The registry is built BEFORE Vert.x and handed to it. That order is the whole trick: Vert.x instruments its
+		// own event loops, pools and HTTP servers into whatever registry it is given at construction, and a registry
+		// created afterwards gets the application's meters and none of the runtime's.
+		PrometheusMeterRegistry registry = null;
+		GraphMetrics metrics = GraphMetrics.NOOP;
+		Vertx vertx;
+		if (options.metrics()) {
+			registry = new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
+			new ClassLoaderMetrics().bindTo(registry);
+			new JvmMemoryMetrics().bindTo(registry);
+			new JvmGcMetrics().bindTo(registry);
+			new JvmThreadMetrics().bindTo(registry);
+			new ProcessorMetrics().bindTo(registry);
+			new UptimeMetrics().bindTo(registry);
+			// This store memory-maps a file per segment, so file descriptors are a real limit here rather than a
+			// generic JVM statistic — running out of them is a documented way for the store to stop opening.
+			new FileDescriptorMetrics().bindTo(registry);
+			metrics = new MicrometerGraphMetrics(registry);
+			// setJvmMetricsEnabled(false) because the bindings above are already registered; leaving it on registers
+			// a second, differently named copy of every JVM meter.
+			vertx = Vertx.builder()
+				.with(new VertxOptions().setMetricsOptions(
+					new MicrometerMetricsOptions().setEnabled(true).setJvmMetricsEnabled(false)))
+				.withMetrics(new MicrometerMetricsFactory(registry))
+				.build();
+		} else {
+			// One Vert.x for every front end. They serve the same databases in the same process and there is nothing
+			// to be gained from several sets of event loops competing for the same cores.
+			vertx = Vertx.vertx();
+		}
+
 		GraphServer server = new GraphServer(vertx, databases, options.database(), true,
 			options.queryTimeoutMillis(), options.allowDrop(), options.allowWrite());
+		server.slowQueryMillis = options.slowQueryMillis();
+		if (options.slowQueryMillis() > 0 && options.queryTimeoutMillis() > 0
+			&& options.slowQueryMillis() >= options.queryTimeoutMillis()) {
+			// A warning and not a refusal: --query-timeout=0 is legal and this combination is merely useless, not
+			// wrong. Silence would mean an operator who set both waits for lines that can never be written.
+			logger.warn("--slow-query-millis ({}) is not below --query-timeout ({}), so no query can ever be logged "
+				+ "slow: it is abandoned first", options.slowQueryMillis(), options.queryTimeoutMillis());
+		}
+		if (registry != null) {
+			server.metrics = metrics;
+			StoreStatsCache cache = new StoreStatsCache(vertx, databases);
+			server.binder = new StoreMetricsBinder(metrics, databases, cache);
+			server.statsCache = cache;
+		}
+
 		int port = server.listen(options.port()).toCompletionStage().toCompletableFuture().join();
 		logger.info("Graph server on http://localhost:{} over {} ({} database(s), default '{}')",
 			port, options.root(), databases.names().size(), options.database());
 
 		if (options.wire()) {
 			WireServer wire = new WireServer(vertx, databases, options.database(), WireServerOptions.defaults()
+				.withHost(options.wireHost())
 				.withPort(options.wirePort())
 				.withMaxConcurrentStreams(options.maxConcurrentStreams())
 				.withQueryTimeoutMillis(options.queryTimeoutMillis()), options.allowWrite());
 			int wirePort = wire.listen().toCompletionStage().toCompletableFuture().join();
 			logger.info("Binary streaming port on {}:{} — see graph-client", wire.options().host(), wirePort);
+			wire.instrument(metrics, options.slowQueryMillis());
 			server.wire = wire;
+		}
+
+		if (options.mcp()) {
+			McpServer mcp = new McpServer(vertx,
+				new McpJsonRpcHandler(GraphMcpTools.all(vertx, databases, options.database(), options.allowWrite(),
+					options.queryTimeoutMillis()), options.allowWrite(), metrics),
+				options.mcpHost());
+			int mcpPort = mcp.listen(options.mcpPort()).toCompletionStage().toCompletableFuture().join();
+			logger.info("MCP on http://{}:{}{} (and {}) — {}", options.mcpHost(), mcpPort, McpConstants.SSE_PATH,
+				McpConstants.WEBSOCKET_PATH, options.allowWrite() ? "writable" : "read-only");
+			server.mcp = mcp;
+		}
+
+		if (registry != null) {
+			// Bound after the other front ends exist, so the gauges can read them. They resolve through `server`
+			// rather than closing over the objects, so the null case before one is created is a branch, not a race.
+			server.binder.bindServer(server.inFlight::get,
+				() -> server.wire == null ? 0 : server.wire.runningStreams(),
+				() -> server.wire == null ? 0L : server.wire.bufferedBytes());
+			metrics.bindGauge("graph_mcp_sessions", null,
+				() -> Integer.valueOf(server.mcp == null ? 0 : server.mcp.sessionCount()));
+
+			MetricsServer monitoring = new MetricsServer(vertx, registry, () -> !server.isClosing());
+			int metricsPort = monitoring.listen(options.metricsPort())
+				.toCompletionStage().toCompletableFuture().join();
+			logger.info("Monitoring on http://localhost:{}/metrics, /health and /ready", metricsPort);
+			server.monitoring = monitoring;
 		}
 
 		// Named, because a thread dump taken during a slow shutdown should say what is holding it. The hook is the
@@ -289,6 +399,9 @@ public final class GraphServer implements AutoCloseable {
 		try {
 			parsed = Cypher.parse(body.getString("query"));
 		} catch (RuntimeException e) {
+			// Counted, with no duration, because it never ran: a syntax error is much the most common failure and a
+			// dashboard that could not see it would show a server answering nothing and failing nothing.
+			metrics.recordQuery("http", "unknown", outcomeOf(e), 0, 0);
 			respondToFailure(context, e);
 			return;
 		}
@@ -296,6 +409,9 @@ public final class GraphServer implements AutoCloseable {
 		// Refused here, on the event loop, for the same reason a syntax error is: the tree already knows whether the
 		// query writes, so a refusal costs no worker thread, no transaction and no writer lock.
 		if (parsed.isWrite() && !allowWrite) {
+			// A rejection rather than an outcome: it cost nothing, and counting it as a fast query would drag the
+			// duration histogram towards zero — a server refusing every write would look like one answering instantly.
+			metrics.recordQueryRejected("http", "readonly");
 			fail(context, 403, "readonly", "This server does not accept write queries. Start it with --allow-write "
 				+ "to enable CREATE, SET, REMOVE and DELETE.");
 			return;
@@ -304,6 +420,7 @@ public final class GraphServer implements AutoCloseable {
 		if (closing.get()) {
 			// 503 with Connection: close, so a client behind a load balancer is taken out of rotation rather than
 			// retried onto a server that is going away.
+			metrics.recordQueryRejected("http", "shutdown");
 			context.response().putHeader("connection", "close");
 			fail(context, 503, "shutdown", "The server is shutting down and is not accepting queries");
 			return;
@@ -328,19 +445,37 @@ public final class GraphServer implements AutoCloseable {
 			// and it is the only one that can be stopped. `executeBlocking` cannot interrupt a task that has started,
 			// so without a cooperative check a timeout here would abandon the answer while the scan kept its thread
 			// and its snapshot — which is the thing the timeout exists to prevent.
-			Collector collector = new Collector();
-			Cypher.stream(store, parsed, parameters, collector, deadline);
-			CypherResult result = new CypherResult(collector.columns, collector.rows, collector.stats);
-			if (result.stats().containsUpdates()) {
-				// The schema is a 60-second cache over a full scan, so without this the sidebar would keep reporting
-				// labels and counts from before the write for up to a minute — and the UI has no other reason to
-				// re-fetch it.
-				SchemaScanner scanner = schemas.get(database);
-				if (scanner != null) {
-					scanner.invalidate();
+			String kind = parsed.isWrite() ? "write" : "read";
+			try {
+				Collector collector = new Collector();
+				Cypher.stream(store, parsed, parameters, collector, deadline);
+				CypherResult result = new CypherResult(collector.columns, collector.rows, collector.stats);
+				if (result.stats().containsUpdates()) {
+					// The schema is a 60-second cache over a full scan, so without this the sidebar would keep
+					// reporting labels and counts from before the write for up to a minute — and the UI has no other
+					// reason to re-fetch it.
+					SchemaScanner scanner = schemas.get(database);
+					if (scanner != null) {
+						scanner.invalidate();
+					}
 				}
+				long elapsed = System.nanoTime() - started;
+				metrics.recordQuery("http", kind, "ok", elapsed, result.size());
+				metrics.recordWriteStats(result.stats());
+				SlowQueryLog.maybeLog(slowQueryMillis, "http", database, body.getString("query"), parameters,
+					elapsed, result.size(), "ok", metrics);
+				return ResultJson.of(result, TimeUnit.NANOSECONDS.toMillis(elapsed));
+			} catch (RuntimeException failure) {
+				// Recorded here rather than in respondToFailure, because this is where the clock is. An abandoned
+				// query is the single most interesting thing in a slow query log — it is the one that cost the most
+				// and returned nothing — so it is logged on this path too.
+				long elapsed = System.nanoTime() - started;
+				String outcome = outcomeOf(failure);
+				metrics.recordQuery("http", kind, outcome, elapsed, 0);
+				SlowQueryLog.maybeLog(slowQueryMillis, "http", database, body.getString("query"), parameters,
+					elapsed, 0, outcome, metrics);
+				throw failure;
 			}
-			return ResultJson.of(result, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
 		}, false).onComplete(outcome -> inFlight.decrementAndGet())
 			.onSuccess(json -> context.json(json))
 			.onFailure(error -> respondToFailure(context, error));
@@ -384,6 +519,29 @@ public final class GraphServer implements AutoCloseable {
 	 * line that names the position. Anything else is a 500 and gets logged, because it is the server's problem.
 	 * </p>
 	 */
+	/**
+	 * The same short reason {@link #respondToFailure} puts in the error body, as a metric label.
+	 *
+	 * <p>
+	 * Deliberately next to that method and using the same words: a dashboard that grouped failures differently from
+	 * the way the API reports them would make "the browser says syntax, the graph says internal" a real conversation.
+	 * The label set is closed and small, which is what keeps it a usable Prometheus label — an exception class name
+	 * would be neither.
+	 * </p>
+	 */
+	private static String outcomeOf(Throwable error) {
+		return switch (error) {
+			case CypherSyntaxException ignored -> "syntax";
+			case CypherTypeException ignored -> "type";
+			case QueryAbortedException ignored -> "timeout";
+			case NoSuchDatabaseException ignored -> "database";
+			case ConstraintViolationException ignored -> "constraint";
+			case GraphStoreException ignored -> "store";
+			case IllegalArgumentException ignored -> "argument";
+			default -> "internal";
+		};
+	}
+
 	private void respondToFailure(RoutingContext context, Throwable error) {
 		switch (error) {
 			case CypherSyntaxException syntax ->
@@ -492,7 +650,14 @@ public final class GraphServer implements AutoCloseable {
 
 	private GraphStore lookup(String name) {
 		try {
-			return databases.database(name);
+			GraphStore store = databases.database(name);
+			// Bound here, from the one place a database is resolved, rather than eagerly for every directory under
+			// the root: a root holding fifty databases of which two are used should not open the other forty-eight
+			// in order to report that nothing is happening in them. Idempotent, so the cost is one set lookup.
+			if (binder != null) {
+				binder.bind(name);
+			}
+			return store;
 		} catch (GraphStoreException e) {
 			// A legal name that is not there: 404, and listing or creating is the next step.
 			throw new NoSuchDatabaseException(e.getMessage());
@@ -733,7 +898,7 @@ public final class GraphServer implements AutoCloseable {
 	}
 
 	private static final String NO_UI_PAGE = """
-		<!doctype html><meta charset="utf-8"><title>Graph browser</title>
+		<!doctype html><meta charset="utf-8"><title>MetaLoom // Graph</title>
 		<style>body{font:14px system-ui;margin:3rem auto;max-width:40rem;color:#dfe6ee;background:#10151b}
 		code{background:#1e2732;padding:.1rem .35rem;border-radius:3px}</style>
 		<h1>No UI bundle in this build</h1>
@@ -785,6 +950,22 @@ public final class GraphServer implements AutoCloseable {
 		if (server != null) {
 			// After the flag, so anything accepted in between is refused with 503 rather than served and then cut off.
 			server.close().toCompletionStage().toCompletableFuture().join();
+		}
+		if (mcp != null) {
+			// With the other listeners: an agent mid-conversation should be told the server is going rather than
+			// have its stream cut when the stores close.
+			mcp.closeQuietly();
+		}
+		if (statsCache != null) {
+			// Before the stores close, because its timer opens databases. A refresh landing after close() would be a
+			// blocking call against an unmapped segment — which is the one failure mode this whole ordering exists
+			// to prevent.
+			statsCache.close();
+		}
+		if (monitoring != null) {
+			// Last of the listeners rather than first: /ready has been answering 503 since the flag was set, which is
+			// what takes this pod out of a Service's endpoints, and it should keep saying so for as long as possible.
+			monitoring.closeQuietly();
 		}
 
 		if (!awaitQuiet(graceMillis)) {

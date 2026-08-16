@@ -6,11 +6,11 @@
 
     <parent>
         <groupId>io.metaloom.graph</groupId>
-        <artifactId>graph-storage-ffm-poc</artifactId>
+        <artifactId>metaloom-graph</artifactId>
         <version>0.0.1-SNAPSHOT</version>
     </parent>
 
-    <name>Graph Client</name>
+    <name>MetaLoom // Graph :: Client</name>
     <description>A Java client that streams a Cypher result off the binary port</description>
 
     <!--

@@ -20,7 +20,7 @@ const LONDON = "MATCH (a:Airport)-[r:IN_CITY]->(c:City) WHERE c.name = 'London' 
 
 test.beforeEach(async ({ page }) => {
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Graph browser' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'MetaLoom // Graph' })).toBeVisible();
 });
 
 /** Types a query, runs it, and waits for the server to have answered one way or the other. */

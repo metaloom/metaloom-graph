@@ -1,4 +1,4 @@
-# Graph Storage FFM PoC
+# MetaLoom // Graph
 
 A **native-code backed graph storage layer** for Java, built on the Foreign Function and Memory API.
 
@@ -337,7 +337,7 @@ stays up. The whole exercise, including the four things that build cleanly and f
 [spec/OPERATIONS.md](spec/OPERATIONS.md) is the one to read before running this anywhere real: sizing, tuning, what
 to monitor, and an explicit list of what is missing.
 
-[spec/GRAPH_STORAGE_CONTEXT.md](spec/GRAPH_STORAGE_CONTEXT.md) is the entry point: it routes to every
+[spec/CONTEXT.md](spec/CONTEXT.md) is the entry point: it routes to every
 spec file, carries the cheat sheet and the conventions, and links the phased plan in
 [spec/PLAN.md](spec/PLAN.md). [spec/CURRENT_STATE.md](spec/CURRENT_STATE.md) records the proof of
 concept this replaced, including its defect register.

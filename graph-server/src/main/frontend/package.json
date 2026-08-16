@@ -1,9 +1,9 @@
 {
-  "name": "graph-browser",
+  "name": "metaloom-graph-browser",
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "The browser UI for graph-server: a Cypher editor, a D3 force layout, and a schema sidebar",
+  "description": "The browser UI for MetaLoom // Graph: a Cypher editor, a D3 force layout, and a schema sidebar",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",

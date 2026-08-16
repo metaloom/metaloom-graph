@@ -33,6 +33,8 @@ import io.metaloom.graph.protocol.QuerySummary;
 import io.metaloom.graph.protocol.WireError;
 import io.metaloom.graph.protocol.WireFormatException;
 import io.metaloom.graph.protocol.WireValueCodec;
+import io.metaloom.graph.server.SlowQueryLog;
+import io.metaloom.graph.server.metrics.GraphMetrics;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
 import io.vertx.core.WorkerExecutor;
@@ -174,6 +176,12 @@ public final class WireServer implements AutoCloseable {
 	/** Set once shutdown begins: new queries are refused, and the ones running are given a bounded chance to finish. */
 	private final AtomicBoolean closing = new AtomicBoolean();
 
+	/** Where this port records. {@link GraphMetrics#NOOP} until {@link #instrument} says otherwise. */
+	private volatile GraphMetrics metrics = GraphMetrics.NOOP;
+
+	/** Past this a query is written to the slow query log. Zero — off — unless {@link #instrument} says otherwise. */
+	private volatile long slowQueryMillis;
+
 	private NetServer server;
 
 	public WireServer(GraphDatabases databases, String defaultDatabase) {
@@ -263,6 +271,48 @@ public final class WireServer implements AutoCloseable {
 
 	public WireServerOptions options() {
 		return options;
+	}
+
+	/**
+	 * Turns on recording and the slow query log for this port.
+	 *
+	 * <p>
+	 * Set after construction rather than taken as a constructor argument, for the same reason {@code GraphServer}
+	 * does it: this class has four public constructors and every test uses one of them, so threading two more
+	 * parameters through all of them would change a lot of call sites in order to pass {@code NOOP} and {@code 0}.
+	 * Only {@code GraphServer.main} calls this.
+	 * </p>
+	 *
+	 * @param slowQueryMillis
+	 *            0 to log nothing
+	 */
+	public void instrument(GraphMetrics metrics, long slowQueryMillis) {
+		this.metrics = metrics;
+		this.slowQueryMillis = slowQueryMillis;
+	}
+
+	/**
+	 * A wire error code as the same metric label the HTTP route uses.
+	 *
+	 * <p>
+	 * Mapped rather than lower-cased, so that {@code READ_ONLY} and {@code NO_SUCH_DATABASE} come out as the words
+	 * {@code GraphServer.outcomeOf} already produces. One dashboard covers both front ends only if they agree on the
+	 * label set.
+	 * </p>
+	 */
+	private static String outcomeOf(WireError code) {
+		return switch (code) {
+			case SYNTAX -> "syntax";
+			case TYPE -> "type";
+			case TIMEOUT, CANCELLED -> "timeout";
+			case NO_SUCH_DATABASE -> "database";
+			case CONSTRAINT_VIOLATION -> "constraint";
+			case STORE -> "store";
+			case READ_ONLY -> "readonly";
+			case OVERLOADED -> "overloaded";
+			case PROTOCOL, UNSUPPORTED_VERSION -> "protocol";
+			case INTERNAL -> "internal";
+		};
 	}
 
 	/** Queries running right now. Zero after every test, which is how a leaked permit is caught. */
@@ -536,9 +586,13 @@ public final class WireServer implements AutoCloseable {
 			try {
 				parsed = Cypher.parse(text);
 			} catch (CypherSyntaxException e) {
+				// No duration: it never ran. Counted anyway, because a syntax error is much the most common failure
+				// and a dashboard that could not see it would show a port answering nothing and failing nothing.
+				metrics.recordQuery("wire", "unknown", "syntax", 0, 0);
 				fail(streamId, WireError.SYNTAX, e.getMessage(), e.line(), e.column());
 				return;
 			} catch (RuntimeException e) {
+				metrics.recordQuery("wire", "unknown", "internal", 0, 0);
 				fail(streamId, WireError.INTERNAL, String.valueOf(e.getMessage()), 0, 0);
 				return;
 			}
@@ -546,6 +600,7 @@ public final class WireServer implements AutoCloseable {
 			if (closing.get()) {
 				// Refused rather than accepted and then abandoned a moment later: a client that is told now can
 				// reconnect somewhere else, where one cut off mid-result cannot tell a shutdown from a crash.
+				metrics.recordQueryRejected("wire", "shutdown");
 				fail(streamId, WireError.OVERLOADED, "The server is shutting down and is not accepting queries", 0, 0);
 				return;
 			}
@@ -553,6 +608,9 @@ public final class WireServer implements AutoCloseable {
 			// Refused on the event loop, like a syntax error: the tree already knows, so this costs no permit, no
 			// worker thread and no writer lock.
 			if (parsed.isWrite() && !allowWrite) {
+				// A rejection and not an outcome: it cost nothing, and counting it as a very fast query would drag
+				// the duration histogram towards zero.
+				metrics.recordQueryRejected("wire", "readonly");
 				fail(streamId, WireError.READ_ONLY, "This server does not accept write queries. Start it with "
 					+ "--allow-write to enable CREATE, SET, REMOVE and DELETE.", 0, 0);
 				return;
@@ -561,13 +619,15 @@ public final class WireServer implements AutoCloseable {
 			// Fail fast rather than queue. A client waiting on a queued query cannot tell a busy server from a stuck
 			// one, and the whole point of the bound is that the server stays predictable when it is at its limit.
 			if (!permits.tryAcquire()) {
+				// The one meter that says the bound in WireServerOptions is being hit rather than merely configured.
+				metrics.recordQueryRejected("wire", "overloaded");
 				fail(streamId, WireError.OVERLOADED,
 					"All " + options.maxConcurrentStreams() + " query slots are in use; retry shortly", 0, 0);
 				return;
 			}
 
 			Stream stream = new Stream(this, streamId, deadlineNanos(requestedDeadline), requestedDeadline,
-				parsed.isWrite());
+				parsed.isWrite(), text, parameters);
 			streams.put(streamId, stream);
 			running.put(stream.key, stream);
 			workers.executeBlocking(() -> {
@@ -658,6 +718,10 @@ public final class WireServer implements AutoCloseable {
 		private final AtomicLong buffered = new AtomicLong();
 		/** Whether this query changes the store, which decides both the write gate and the watchdog's victim. */
 		private final boolean writing;
+		/** Kept for the slow query log, which needs the text a person wrote rather than the tree it parsed into. */
+		private final String text;
+		/** Kept for the slow query log, which logs the <b>names</b> only. See {@link SlowQueryLog}. */
+		private final Map<String, Object> parameters;
 		/** The deadline timer, the cancel handler and the producer's error path all race to end a stream. */
 		private final AtomicBoolean terminated = new AtomicBoolean();
 
@@ -665,12 +729,15 @@ public final class WireServer implements AutoCloseable {
 		private volatile String abortReason;
 		private volatile WireError abortCode = WireError.TIMEOUT;
 
-		Stream(Connection connection, int streamId, long deadlineNanos, long budgetMillis, boolean writing) {
+		Stream(Connection connection, int streamId, long deadlineNanos, long budgetMillis, boolean writing,
+			String text, Map<String, Object> parameters) {
 			this.connection = connection;
 			this.streamId = streamId;
 			this.deadlineNanos = deadlineNanos;
 			this.budgetMillis = budgetMillis;
 			this.writing = writing;
+			this.text = text;
+			this.parameters = parameters;
 		}
 
 		void run(Ast.Query parsed, Map<String, Object> parameters) {
@@ -762,12 +829,19 @@ public final class WireServer implements AutoCloseable {
 			if (!terminated.compareAndSet(false, true)) {
 				return;
 			}
+			long elapsed = System.nanoTime() - startedNanos;
 			WireValueCodec.Writer payload = new WireValueCodec.Writer(QuerySummary.BYTES);
-			new QuerySummary(rows, TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - startedNanos),
+			new QuerySummary(rows, TimeUnit.NANOSECONDS.toMicros(elapsed),
 				stats.nodesCreated(), stats.nodesDeleted(), stats.relationshipsCreated(),
 				stats.relationshipsDeleted(), stats.propertiesSet(), stats.labelsAdded(), stats.labelsRemoved())
 					.write(payload);
 			write(Frames.COMPLETE, payload);
+			// Recorded inside the CAS, so a stream ended twice by a race between the deadline timer and the producer
+			// is counted once. That guarantee already existed for the frame; the meters get it for free.
+			metrics.recordQuery("wire", writing ? "write" : "read", "ok", elapsed, rows);
+			metrics.recordWriteStats(stats);
+			SlowQueryLog.maybeLog(slowQueryMillis, "wire", connection.database, text, parameters, elapsed, rows, "ok",
+				metrics);
 			release();
 		}
 
@@ -775,7 +849,14 @@ public final class WireServer implements AutoCloseable {
 			if (!terminated.compareAndSet(false, true)) {
 				return;
 			}
+			long elapsed = System.nanoTime() - startedNanos;
 			connection.fail(streamId, code, message, line, column);
+			String outcome = outcomeOf(code);
+			metrics.recordQuery("wire", writing ? "write" : "read", outcome, elapsed, 0);
+			// An abandoned query is the most interesting line in a slow query log: it cost the most and returned
+			// nothing.
+			SlowQueryLog.maybeLog(slowQueryMillis, "wire", connection.database, text, parameters, elapsed, 0, outcome,
+				metrics);
 			release();
 		}
 

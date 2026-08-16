@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
+import java.util.Map;
 
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -26,7 +27,7 @@ public class GraphServerOptionsTest {
 
 	@Test
 	public void testTheRootAndPortArePositional() {
-		GraphServerOptions options = GraphServerOptions.parse(new String[] { "/data/mygraph", "9000" });
+		GraphServerOptions options = parse("/data/mygraph", "9000");
 		assertEquals(Path.of("/data/mygraph"), options.root());
 		assertEquals(9000, options.port());
 		assertFalse(options.demo(), "demo data is never the default: it writes");
@@ -34,12 +35,12 @@ public class GraphServerOptionsTest {
 
 	@Test
 	public void testThePortIsOptional() {
-		assertEquals(GraphServerOptions.DEFAULT_PORT, GraphServerOptions.parse(new String[] { "/data/g" }).port());
+		assertEquals(GraphServerOptions.DEFAULT_PORT, parse("/data/g").port());
 	}
 
 	@Test
 	public void testDemoDefaultsToTheSmallGraph() {
-		GraphServerOptions options = GraphServerOptions.parse(new String[] { "--demo", "/data/g" });
+		GraphServerOptions options = parse("--demo", "/data/g");
 		assertTrue(options.demo());
 		assertEquals(DemoData.SMALL, options.demoAirports());
 	}
@@ -47,19 +48,19 @@ public class GraphServerOptionsTest {
 	@Test
 	public void testASizeImpliesDemo() {
 		// Asking for a size and getting no data because a second flag was missing is a silly way to lose a minute.
-		GraphServerOptions options = GraphServerOptions.parse(new String[] { "--demo-size=tiny", "/data/g" });
+		GraphServerOptions options = parse("--demo-size=tiny", "/data/g");
 		assertTrue(options.demo());
 		assertEquals(DemoData.TINY, options.demoAirports());
 	}
 
 	@Test
 	public void testASizeCanBeANumber() {
-		assertEquals(120, GraphServerOptions.parse(new String[] { "--demo-size=120", "/data/g" }).demoAirports());
+		assertEquals(120, parse("--demo-size=120", "/data/g").demoAirports());
 	}
 
 	@Test
 	public void testOptionsMayFollowTheStore() {
-		GraphServerOptions options = GraphServerOptions.parse(new String[] { "/data/g", "8100", "--demo-size=large" });
+		GraphServerOptions options = parse("/data/g", "8100", "--demo-size=large");
 		assertEquals(8100, options.port());
 		assertEquals(DemoData.LARGE, options.demoAirports());
 	}
@@ -78,20 +79,38 @@ public class GraphServerOptionsTest {
 
 	private static void assertMessage(String expected, String[] args) {
 		IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
-			() -> GraphServerOptions.parse(args));
+			() -> parse(args));
 		assertTrue(thrown.getMessage().contains(expected),
 			"expected a message containing '" + expected + "', was '" + thrown.getMessage() + "'");
+	}
+
+	/**
+	 * Parses against an <b>empty</b> environment.
+	 *
+	 * <p>
+	 * Every test here goes through this rather than through {@link GraphServerOptions#parse(String[])}, because that
+	 * one reads the real process environment: a developer with {@code GRAPH_ALLOW_WRITE} exported would otherwise see
+	 * failures in this class and no reason for them.
+	 * </p>
+	 */
+	private static GraphServerOptions parse(String... args) {
+		return GraphServerOptions.parse(args, name -> null);
+	}
+
+	/** Parses against a fixed environment, given as alternating name and value. */
+	private static GraphServerOptions parseWithEnv(Map<String, String> environment, String... args) {
+		return GraphServerOptions.parse(args, environment::get);
 	}
 
 	@Test
 	public void testTheQueryTimeoutIsParsedAndDefaulted() {
 		assertEquals(GraphServerOptions.DEFAULT_QUERY_TIMEOUT_MILLIS,
-			GraphServerOptions.parse(new String[] { "/data/g" }).queryTimeoutMillis(),
+			parse("/data/g").queryTimeoutMillis(),
 			"a store with no limit named still gets one, or a runaway query holds a view for as long as it likes");
-		assertEquals(1500, GraphServerOptions.parse(new String[] { "--query-timeout=1500", "/data/g" })
+		assertEquals(1500, parse("--query-timeout=1500", "/data/g")
 			.queryTimeoutMillis());
 		// Zero is the documented way to ask for no limit, so it must survive parsing rather than be treated as unset.
-		assertEquals(0, GraphServerOptions.parse(new String[] { "--query-timeout=0", "/data/g" })
+		assertEquals(0, parse("--query-timeout=0", "/data/g")
 			.queryTimeoutMillis());
 
 		assertMessage("--query-timeout must be a number", new String[] { "--query-timeout=soon", "/data/g" });
@@ -100,16 +119,16 @@ public class GraphServerOptionsTest {
 
 	@Test
 	public void testTheBinaryPortIsOnByDefaultAndCanBeTurnedOff() {
-		GraphServerOptions defaults = GraphServerOptions.parse(new String[] { "/data/g" });
+		GraphServerOptions defaults = parse("/data/g");
 		assertTrue(defaults.wire(), "the binary port is part of the server rather than an extra to be discovered");
 		assertEquals(io.metaloom.graph.protocol.Protocol.DEFAULT_PORT, defaults.wirePort());
 		assertEquals(8, defaults.maxConcurrentStreams());
 
-		assertFalse(GraphServerOptions.parse(new String[] { "--no-wire", "/data/g" }).wire());
-		assertEquals(9100, GraphServerOptions.parse(new String[] { "--wire-port=9100", "/data/g" }).wirePort());
-		assertEquals(0, GraphServerOptions.parse(new String[] { "--wire-port=0", "/data/g" }).wirePort(),
+		assertFalse(parse("--no-wire", "/data/g").wire());
+		assertEquals(9100, parse("--wire-port=9100", "/data/g").wirePort());
+		assertEquals(0, parse("--wire-port=0", "/data/g").wirePort(),
 			"zero means any free port here as it does for the HTTP one");
-		assertEquals(2, GraphServerOptions.parse(new String[] { "--max-streams=2", "/data/g" })
+		assertEquals(2, parse("--max-streams=2", "/data/g")
 			.maxConcurrentStreams());
 	}
 
@@ -119,7 +138,17 @@ public class GraphServerOptionsTest {
 		// says nothing about the actual mistake.
 		assertMessage("both 8080", new String[] { "--wire-port=8080", "/data/g", "8080" });
 		// ...unless both are asking for any free port, where there is nothing to collide.
-		assertEquals(0, GraphServerOptions.parse(new String[] { "--wire-port=0", "/data/g", "0" }).wirePort());
+		assertEquals(0, parse("--wire-port=0", "/data/g", "0").wirePort());
+
+		// All four listeners, not just the two that existed first. The monitoring port is on by default, so serving
+		// HTTP on 8082 is the collision an operator is most likely to walk into.
+		assertMessage("both 8082", new String[] { "/data/g", "8082" });
+		assertMessage("both 9000", new String[] { "--metrics-port=9000", "--mcp-port=9000", "/data/g" });
+		assertMessage("both 9000", new String[] { "--wire-port=9000", "--mcp-port=9000", "/data/g" });
+		// A disabled front end cannot collide with anything, so its port is not compared.
+		assertEquals(8082, parse("--no-metrics", "--wire-port=8082", "/data/g").wirePort());
+		assertEquals(8083, parse("--wire-port=8083", "/data/g").wirePort(),
+			"the MCP port is off by default, so its number is free");
 	}
 
 	@Test
@@ -130,41 +159,154 @@ public class GraphServerOptionsTest {
 
 	@Test
 	public void testTheDefaultDatabaseIsNamedAndValidated() {
-		assertEquals("default", GraphServerOptions.parse(new String[] { "/data/g" }).database());
-		assertEquals("sales", GraphServerOptions.parse(new String[] { "--database=sales", "/data/g" }).database());
+		assertEquals("default", parse("/data/g").database());
+		assertEquals("sales", parse("--database=sales", "/data/g").database());
 		// The name becomes a path. A usage error printed with the usage text beats a stack trace out of the storage
 		// layer, so it is checked here rather than at open time.
 		assertThrows(IllegalArgumentException.class,
-			() -> GraphServerOptions.parse(new String[] { "--database=../escaped", "/data/g" }));
+			() -> parse("--database=../escaped", "/data/g"));
 		assertThrows(IllegalArgumentException.class,
-			() -> GraphServerOptions.parse(new String[] { "--database=", "/data/g" }));
+			() -> parse("--database=", "/data/g"));
 	}
 
 	@Test
 	public void testWritingIsOffUnlessAskedFor() {
 		// Both ports, one flag. Off is the only defensible default when neither has authentication.
-		assertFalse(GraphServerOptions.parse(new String[] { "/data/g" }).allowWrite());
-		assertTrue(GraphServerOptions.parse(new String[] { "--allow-write", "/data/g" }).allowWrite());
+		assertFalse(parse("/data/g").allowWrite());
+		assertTrue(parse("--allow-write", "/data/g").allowWrite());
 		// And the two flags are independent: enabling writes is not asking to be able to delete whole databases.
-		assertFalse(GraphServerOptions.parse(new String[] { "--allow-write", "/data/g" }).allowDrop());
-		assertFalse(GraphServerOptions.parse(new String[] { "--allow-drop", "/data/g" }).allowWrite());
+		assertFalse(parse("--allow-write", "/data/g").allowDrop());
+		assertFalse(parse("--allow-drop", "/data/g").allowWrite());
 	}
 
 	@Test
 	public void testDroppingIsOffUnlessAskedFor() {
 		// The only route that destroys data, on a port with no authentication, beside a query language that cannot
 		// delete a single node. Off is the only defensible default.
-		assertFalse(GraphServerOptions.parse(new String[] { "/data/g" }).allowDrop());
-		assertTrue(GraphServerOptions.parse(new String[] { "--allow-drop", "/data/g" }).allowDrop());
+		assertFalse(parse("/data/g").allowDrop());
+		assertTrue(parse("--allow-drop", "/data/g").allowDrop());
+	}
+
+	@Test
+	public void testTheEnvironmentSuppliesEverySetting() {
+		// A container image cannot be reconfigured without rebuilding its CMD, and a chart has environment variables
+		// and not an argument vector. Every variable is checked here because one that is declared and not read starts
+		// a server that ignores it silently.
+		GraphServerOptions options = parseWithEnv(Map.ofEntries(
+			Map.entry("GRAPH_ROOT", "/data/fromenv"),
+			Map.entry("GRAPH_HTTP_PORT", "9090"),
+			Map.entry("GRAPH_DATABASE", "sales"),
+			Map.entry("GRAPH_ALLOW_WRITE", "true"),
+			Map.entry("GRAPH_ALLOW_DROP", "true"),
+			Map.entry("GRAPH_DEMO", "true"),
+			Map.entry("GRAPH_DEMO_SIZE", "tiny"),
+			Map.entry("GRAPH_QUERY_TIMEOUT_MILLIS", "1234"),
+			Map.entry("GRAPH_SLOW_QUERY_MILLIS", "77"),
+			Map.entry("GRAPH_WIRE_PORT", "9091"),
+			Map.entry("GRAPH_WIRE_HOST", "0.0.0.0"),
+			Map.entry("GRAPH_MAX_STREAMS", "3"),
+			Map.entry("GRAPH_METRICS_PORT", "9092"),
+			Map.entry("GRAPH_MCP_ENABLED", "true"),
+			Map.entry("GRAPH_MCP_PORT", "9093"),
+			Map.entry("GRAPH_MCP_HOST", "0.0.0.0")));
+
+		assertEquals(Path.of("/data/fromenv"), options.root(), "GRAPH_ROOT is what lets CMD carry no arguments");
+		assertEquals(9090, options.port());
+		assertEquals("sales", options.database());
+		assertTrue(options.allowWrite());
+		assertTrue(options.allowDrop());
+		assertTrue(options.demo());
+		assertEquals(DemoData.TINY, options.demoAirports());
+		assertEquals(1234, options.queryTimeoutMillis());
+		assertEquals(77, options.slowQueryMillis());
+		assertEquals(9091, options.wirePort());
+		assertEquals("0.0.0.0", options.wireHost());
+		assertEquals(3, options.maxConcurrentStreams());
+		assertEquals(9092, options.metricsPort());
+		assertTrue(options.mcp());
+		assertEquals(9093, options.mcpPort());
+		assertEquals("0.0.0.0", options.mcpHost());
+	}
+
+	@Test
+	public void testEveryDeclaredVariableIsActuallyRead() {
+		// The guard against the list in VARIABLES drifting away from the parser: a variable printed by --help and read
+		// by nothing is worse than one that was never documented, because it has been promised.
+		for (GraphServerOptions.EnvVar variable : GraphServerOptions.VARIABLES) {
+			assertTrue(GraphServerOptions.usage().contains(variable.name()),
+				variable.name() + " is declared but --help does not print it");
+		}
+		// And the reverse direction, spelled out: the count is asserted so that adding a variable to the parser
+		// without adding it to VARIABLES fails here rather than being noticed by an operator.
+		assertEquals(18, GraphServerOptions.VARIABLES.size(),
+			"a variable was added or removed; update this count and check --help still prints all of them");
+	}
+
+	@Test
+	public void testAFlagBeatsAVariable() {
+		// Otherwise a shell that exported GRAPH_ALLOW_WRITE for one server silently changes what a second one does.
+		GraphServerOptions options = parseWithEnv(
+			Map.of("GRAPH_ROOT", "/data/fromenv", "GRAPH_HTTP_PORT", "9090", "GRAPH_DATABASE", "fromenv"),
+			"/data/fromflag", "9100", "--database=fromflag");
+		assertEquals(Path.of("/data/fromflag"), options.root());
+		assertEquals(9100, options.port());
+		assertEquals("fromflag", options.database());
+	}
+
+	@Test
+	public void testAnEmptyVariableIsUnsetRatherThanEmpty() {
+		// An unset optional value is exactly how a Helm template renders one. Treating "" as a real setting would turn
+		// an omitted chart value into an empty database name, which is refused, at start-up, in production.
+		GraphServerOptions options = parseWithEnv(Map.of("GRAPH_DATABASE", "  ", "GRAPH_WIRE_HOST", ""), "/data/g");
+		assertEquals("default", options.database());
+		assertEquals("127.0.0.1", options.wireHost());
+	}
+
+	@Test
+	public void testABooleanTypoIsRefusedRatherThanReadAsFalse() {
+		// Boolean.parseBoolean maps every typo to false, so GRAPH_ALLOW_WRITE=ture would give a read-only server and
+		// no reason for it.
+		IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+			() -> parseWithEnv(Map.of("GRAPH_ALLOW_WRITE", "ture"), "/data/g"));
+		assertTrue(thrown.getMessage().contains("GRAPH_ALLOW_WRITE must be true or false"),
+			"the message has to name the variable, was '" + thrown.getMessage() + "'");
+		assertTrue(parseWithEnv(Map.of("GRAPH_ALLOW_WRITE", "yes"), "/data/g").allowWrite(),
+			"the forms an operator actually writes are accepted");
+		assertFalse(parseWithEnv(Map.of("GRAPH_ALLOW_WRITE", "0"), "/data/g").allowWrite());
+	}
+
+	@Test
+	public void testTheSlowQueryThresholdIsParsedAndDefaulted() {
+		assertEquals(GraphServerOptions.DEFAULT_SLOW_QUERY_MILLIS, parse("/data/g").slowQueryMillis());
+		assertEquals(50, parse("--slow-query-millis=50", "/data/g").slowQueryMillis());
+		// Zero is the documented way to log nothing, so it has to survive parsing rather than be treated as unset.
+		assertEquals(0, parse("--slow-query-millis=0", "/data/g").slowQueryMillis());
+		assertMessage("--slow-query-millis must not be negative", new String[] { "--slow-query-millis=-1", "/data/g" });
+	}
+
+	@Test
+	public void testTheMonitoringPortIsOnAndTheMcpPortIsNot() {
+		GraphServerOptions defaults = parse("/data/g");
+		assertTrue(defaults.metrics(), "a database that cannot be scraped is a database nobody can operate");
+		assertEquals(GraphServerOptions.DEFAULT_METRICS_PORT, defaults.metricsPort());
+		assertFalse(defaults.mcp(), "MCP is a remote code path an LLM drives, against a server with no authentication");
+		assertEquals(GraphServerOptions.DEFAULT_MCP_HOST, defaults.mcpHost(), "and it binds loopback when it is on");
+
+		assertFalse(parse("--no-metrics", "/data/g").metrics());
+		assertEquals(9200, parse("--metrics-port=9200", "/data/g").metricsPort());
+		assertTrue(parse("--mcp", "/data/g").mcp());
+		// Naming a port or a host is asking for the port, so that --mcp-port=9300 alone is not silently ignored.
+		assertTrue(parse("--mcp-port=9300", "/data/g").mcp());
+		assertTrue(parse("--mcp-host=0.0.0.0", "/data/g").mcp());
 	}
 
 	@Test
 	public void testHelpIsARequestRatherThanAMistake() {
 		// So that `--help` can print the usage and exit zero.
 		assertThrows(GraphServerOptions.HelpRequested.class,
-			() -> GraphServerOptions.parse(new String[] { "--help" }));
+			() -> parse("--help"));
 		assertThrows(GraphServerOptions.HelpRequested.class,
-			() -> GraphServerOptions.parse(new String[] { "-h" }));
+			() -> parse("-h"));
 
 		String usage = GraphServerOptions.usage();
 		assertTrue(usage.contains("--demo-size"), "the usage has to name every flag it accepts");

@@ -445,7 +445,7 @@ public class GraphServerTest {
 		}
 
 		assertEquals(200, page.statusCode());
-		assertTrue(page.body().contains("Graph browser"));
+		assertTrue(page.body().contains("MetaLoom // Graph"));
 
 		// Vite writes content-hashed asset names into the page, so following one proves the bundle in this jar is the
 		// one the page asks for. A stale or half-copied webroot fails here and nowhere else.

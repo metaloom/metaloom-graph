@@ -3,7 +3,7 @@
     xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
     <groupId>io.metaloom.graph</groupId>
-    <artifactId>graph-storage-ffm-poc</artifactId>
+    <artifactId>metaloom-graph</artifactId>
     <version>0.0.1-SNAPSHOT</version>
     <packaging>pom</packaging>
 
@@ -13,8 +13,8 @@
         <version>2.1.0</version>
     </parent>
 
-    <name>Graph Storage</name>
-    <url>https://github.com/metaloom/graph-storage-ffm-poc</url>
+    <name>MetaLoom // Graph</name>
+    <url>https://github.com/metaloom/metaloom-graph</url>
     <description>A java implementation for a graph storage</description>
     <inceptionYear>2024</inceptionYear>
 
@@ -53,10 +53,16 @@
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <project.github.repository>jotschi/graph-storage-ffm-poc</project.github.repository>
+        <project.github.repository>metaloom/metaloom-graph</project.github.repository>
         <!-- Tags excluded from the default surefire run. See spec/TESTING.md -->
         <excluded.test.groups>slow,bench,crash,fuzz,huge</excluded.test.groups>
         <vertx.version>5.0.11</vertx.version>
+        <!--
+            Pinned to what vertx-micrometer-metrics ${vertx.version} was built against. Micrometer and its Vert.x
+            binding share a registry object across the boundary, so a version skew here is the kind that compiles and
+            then throws NoSuchMethodError at the first scrape rather than at build time.
+        -->
+        <micrometer.version>1.15.10</micrometer.version>
 
         <!--
             The native layer. These live here rather than in graph-core so that `mvn -D...` is discoverable from the
@@ -127,6 +133,21 @@
                 <groupId>io.vertx</groupId>
                 <artifactId>vertx-web</artifactId>
                 <version>${vertx.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.vertx</groupId>
+                <artifactId>vertx-micrometer-metrics</artifactId>
+                <version>${vertx.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.micrometer</groupId>
+                <artifactId>micrometer-core</artifactId>
+                <version>${micrometer.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.micrometer</groupId>
+                <artifactId>micrometer-registry-prometheus</artifactId>
+                <version>${micrometer.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

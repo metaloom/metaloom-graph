@@ -383,7 +383,7 @@ The simple form compares under Cypher equality, so `1` and `1.0` select the same
 | `OPTIONAL MATCH` | Needs null-padding semantics through the rest of the pipeline |
 | List comprehensions, map projections, pattern comprehensions | Not built |
 | `ALL`/`ANY`/`NONE`/`SINGLE` predicates, `EXISTS` subqueries | Not built |
-| `CALL`, procedures, `LOAD CSV` | No procedure mechanism exists |
+| User-defined procedures, `LOAD CSV` | No procedure *registry* exists. `CALL` itself is built and there is exactly one procedure: `CALL vector.query(label, key, vector, k) YIELD node, score` — see [VECTOR.md](VECTOR.md). Any other name is refused at execution with that message |
 | Temporal and spatial types | The store has `Instant`; Cypher's temporal algebra is not implemented |
 
 **Each of these is refused at parse time, by name, with a caret.** The parser accepts only what the

@@ -52,7 +52,7 @@ P6–P10 are performance and operations.
 1. **Every phase ends green.** No phase leaves the build red or a test disabled.
 2. **Every phase ships its tests.** The "Tests" line in each phase is a deliverable, not a follow-up.
 3. **Every phase updates its spec file.** The code wins on conflict; fix the spec in the same change
-   ([GRAPH_STORAGE_CONTEXT.md §0.2](GRAPH_STORAGE_CONTEXT.md#02-the-two-rules)).
+   ([CONTEXT.md §0.2](CONTEXT.md#02-the-two-rules)).
 4. **Every phase records benchmark numbers.** Even when they are bad. A phase with no measurement is
    a phase with no evidence.
 5. **No format change after P2 without a version bump** and a converter.

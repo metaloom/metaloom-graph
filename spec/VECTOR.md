@@ -191,7 +191,7 @@ a scan that is sequential, and gives the addressing invariant back: a vector id 
 to a byte offset, so an ANN structure holding candidate ids fetches their vectors with **zero probes**
 ([ID_ENCODING.md](ID_ENCODING.md)).
 
-But [GRAPH_STORAGE_CONTEXT.md §5.1](GRAPH_STORAGE_CONTEXT.md) requires that every record stride divide
+But [CONTEXT.md §5.1](CONTEXT.md) requires that every record stride divide
 `PAGE_SIZE`, and `PAGE_SIZE` is 4, 8 or 16 KiB — all powers of two. **So a vector record stride must
 be a power of two.** Every existing stride obeys this (64, 32, 512) and it has never bitten anyone,
 because no record size has been application-chosen before. Vectors are:

@@ -1,17 +1,38 @@
 package io.metaloom.graph.server;
 
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.function.UnaryOperator;
 
 import io.metaloom.graph.core.api.GraphDatabases;
 import io.metaloom.graph.protocol.Protocol;
 import io.metaloom.graph.server.demo.DemoData;
+import io.metaloom.graph.server.wire.WireServerOptions;
 
 /**
- * The command line.
+ * The command line and the environment.
  *
  * <p>
  * Parsed into a value rather than read out of {@code args} where it is used, so that it can be tested without starting
  * a server: an argument mistake that only shows up as a server bound to the wrong port is a bad way to find out.
+ * </p>
+ *
+ * <h2>Where a setting comes from</h2>
+ *
+ * <p>
+ * <b>Command line flag beats environment variable beats default.</b> The environment exists because a container image
+ * cannot be reconfigured without rebuilding its {@code CMD}, and a Helm chart has environment variables and not an
+ * argument vector. The flag still wins so that a shell that sets {@code GRAPH_ALLOW_WRITE} for one server cannot
+ * silently change what a second one started in the same shell does.
+ * </p>
+ *
+ * <p>
+ * The variables are declared once in {@link #VARIABLES}, which is what both the reading and the {@code --help} output
+ * are generated from — a variable that is read and not documented, or documented and not read, is the failure this
+ * shape rules out. There is no {@code sensitive} marker on them because nothing in this system is a credential:
+ * neither port has authentication, which {@code spec/OPERATIONS.md §9} states rather than hides.
  * </p>
  *
  * @param root
@@ -24,14 +45,33 @@ import io.metaloom.graph.server.demo.DemoData;
  * @param demoAirports
  *            how much demo data: the airport count that everything else is generated around
  * @param queryTimeoutMillis
- *            how long a single query may run before it is abandoned, 0 for no limit. Applies to both front ends
+ *            how long a single query may run before it is abandoned, 0 for no limit. Applies to every front end
+ * @param slowQueryMillis
+ *            a query that takes at least this long is written to the slow query log, 0 to log none. Applies to every
+ *            front end
  * @param wire
  *            whether to open the binary port as well as the HTTP one
  * @param wirePort
- *            the binary port, 0 for any free one. Bound to loopback — it has no authentication
+ *            the binary port, 0 for any free one
+ * @param wireHost
+ *            what the binary port binds. Loopback by default — it has no authentication. In a pod that makes it
+ *            unreachable from outside the pod, which is the correct default and the reason the chart has to widen it
+ *            deliberately rather than the image doing it for everyone
  * @param maxConcurrentStreams
  *            queries the binary port will run at once. <b>Multiplied by the write queue size, this is the memory the
  *            server may hold for clients that have stopped reading</b>; see {@code WireServerOptions}
+ * @param metrics
+ *            whether to open the monitoring port, which serves {@code /metrics}, {@code /health} and {@code /ready}
+ * @param metricsPort
+ *            the monitoring port, 0 for any free one. Separate from the HTTP port so that a liveness probe never
+ *            shares a listener with the query path it is supposed to be reporting on
+ * @param mcp
+ *            whether to open the Model Context Protocol port. <b>Off by default</b>, unlike the others: it is a remote
+ *            code path an LLM drives against a server with no authentication
+ * @param mcpPort
+ *            the MCP port, 0 for any free one
+ * @param mcpHost
+ *            what the MCP port binds. Loopback by default, for the reason above
  * @param database
  *            the database a request that does not name one gets, created at startup if it is not there
  * @param allowDrop
@@ -39,12 +79,14 @@ import io.metaloom.graph.server.demo.DemoData;
  *            {@code allowWrite}: it destroys a whole database and its directory in one request, including databases
  *            no query addressed, and enabling writes is not asking for that
  * @param allowWrite
- *            whether a query may change a store at all. Off by default: neither port has authentication, and the
+ *            whether a query may change a store at all. Off by default: no port has authentication, and the
  *            difference between handing out a copy of the data and handing out the ability to delete it deserves an
  *            explicit act
  */
 public record GraphServerOptions(Path root, int port, boolean demo, int demoAirports, long queryTimeoutMillis,
-	boolean wire, int wirePort, int maxConcurrentStreams, String database, boolean allowDrop, boolean allowWrite) {
+	long slowQueryMillis, boolean wire, int wirePort, String wireHost, int maxConcurrentStreams,
+	boolean metrics, int metricsPort, boolean mcp, int mcpPort, String mcpHost,
+	String database, boolean allowDrop, boolean allowWrite) {
 
 	static final int DEFAULT_PORT = 8080;
 
@@ -59,30 +101,168 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 	 */
 	public static final long DEFAULT_QUERY_TIMEOUT_MILLIS = 30_000;
 
+	/**
+	 * One second, above which a query is written to the slow query log.
+	 *
+	 * <p>
+	 * Chosen to be well clear of anything the browser UI does on the demo graph, so that a fresh install logs nothing
+	 * and a line in that log means something. It is far below {@link #DEFAULT_QUERY_TIMEOUT_MILLIS} on purpose: a
+	 * threshold at or above the timeout can never fire, because the query is abandoned first.
+	 * </p>
+	 */
+	public static final long DEFAULT_SLOW_QUERY_MILLIS = 1_000;
+
+	/** The monitoring port. Mirrors Loom's 8989 in role, not in number — 8082 keeps this project's ports adjacent. */
+	public static final int DEFAULT_METRICS_PORT = 8082;
+
+	public static final int DEFAULT_MCP_PORT = 8083;
+
+	/** The same reasoning as {@link WireServerOptions#DEFAULT_HOST}, and deliberately the same value. */
+	public static final String DEFAULT_MCP_HOST = WireServerOptions.DEFAULT_HOST;
+
 	/** The same default the wire server carries; repeated here only so the usage text can print it. */
 	static final int DEFAULT_MAX_CONCURRENT_STREAMS = 8;
 
 	/**
-	 * Parses the command line, or throws {@link IllegalArgumentException} with a message worth printing.
+	 * One environment variable, its name and what it does.
+	 *
+	 * <p>
+	 * A declared list rather than a scatter of {@code getenv} calls, so that {@link #usage()} can print exactly the
+	 * set that is actually read.
+	 * </p>
+	 */
+	public record EnvVar(String name, String description) {
+	}
+
+	/** Every variable this server reads, in the order {@code --help} prints them. */
+	public static final List<EnvVar> VARIABLES = List.of(
+		new EnvVar("GRAPH_ROOT", "The root directory. Makes the positional argument optional, which is what lets a "
+			+ "container image carry no arguments at all."),
+		new EnvVar("GRAPH_HTTP_PORT", "The HTTP port."),
+		new EnvVar("GRAPH_DATABASE", "The default database name."),
+		new EnvVar("GRAPH_ALLOW_WRITE", "Accept write queries. true/false."),
+		new EnvVar("GRAPH_ALLOW_DROP", "Enable database deletion. true/false."),
+		new EnvVar("GRAPH_DEMO", "Seed an empty default database with the demo graph. true/false."),
+		new EnvVar("GRAPH_DEMO_SIZE", "tiny | small | medium | large, or a number of airports. Implies GRAPH_DEMO."),
+		new EnvVar("GRAPH_QUERY_TIMEOUT_MILLIS", "Abandon a query that runs longer than this. 0 disables."),
+		new EnvVar("GRAPH_SLOW_QUERY_MILLIS", "Log a query that takes at least this long. 0 disables."),
+		new EnvVar("GRAPH_WIRE_ENABLED", "Open the binary streaming port. true/false."),
+		new EnvVar("GRAPH_WIRE_PORT", "The binary streaming port."),
+		new EnvVar("GRAPH_WIRE_HOST", "What the binary port binds. Loopback by default, so in a pod it is not "
+			+ "reachable from outside until this is set."),
+		new EnvVar("GRAPH_MAX_STREAMS", "Queries the binary port runs at once."),
+		new EnvVar("GRAPH_METRICS_ENABLED", "Open the monitoring port. true/false."),
+		new EnvVar("GRAPH_METRICS_PORT", "The monitoring port: /metrics, /health and /ready."),
+		new EnvVar("GRAPH_MCP_ENABLED", "Open the MCP port. Off by default. true/false."),
+		new EnvVar("GRAPH_MCP_PORT", "The MCP port."),
+		new EnvVar("GRAPH_MCP_HOST", "What the MCP port binds. Loopback by default."));
+
+	public GraphServerOptions {
+		if (wireHost == null || wireHost.isBlank()) {
+			throw new IllegalArgumentException("A bind address is required for the binary port");
+		}
+		if (mcpHost == null || mcpHost.isBlank()) {
+			throw new IllegalArgumentException("A bind address is required for the MCP port");
+		}
+	}
+
+	/** Parses the command line against the real environment. */
+	static GraphServerOptions parse(String[] args) {
+		return parse(args, System::getenv);
+	}
+
+	/**
+	 * Parses the command line and the environment, or throws {@link IllegalArgumentException} with a message worth
+	 * printing.
 	 *
 	 * <p>
 	 * Options may appear before or after the positional arguments, and {@code --demo-size} implies {@code --demo}:
 	 * asking for a size and getting no data because a second flag was missing would be a silly way to lose a minute.
 	 * </p>
+	 *
+	 * @param env
+	 *            the environment lookup, injected so this can be tested without a process environment. Native image
+	 *            also sees a plain lambda here where it would need metadata for reflection over an options object
 	 */
-	static GraphServerOptions parse(String[] args) {
+	static GraphServerOptions parse(String[] args, UnaryOperator<String> env) {
 		Path store = null;
 		int port = DEFAULT_PORT;
 		boolean demo = false;
 		int airports = DemoData.SMALL;
 		long queryTimeout = DEFAULT_QUERY_TIMEOUT_MILLIS;
+		long slowQuery = DEFAULT_SLOW_QUERY_MILLIS;
 		boolean wire = true;
 		int wirePort = Protocol.DEFAULT_PORT;
+		String wireHost = WireServerOptions.DEFAULT_HOST;
 		int streams = DEFAULT_MAX_CONCURRENT_STREAMS;
+		boolean metrics = true;
+		int metricsPort = DEFAULT_METRICS_PORT;
+		boolean mcp = false;
+		int mcpPort = DEFAULT_MCP_PORT;
+		String mcpHost = DEFAULT_MCP_HOST;
 		String database = GraphDatabases.DEFAULT_NAME;
 		boolean allowDrop = false;
 		boolean allowWrite = false;
 		int positional = 0;
+
+		// The environment first, so that every flag below overwrites it rather than the other way round.
+		String value;
+		if ((value = read(env, "GRAPH_ROOT")) != null) {
+			store = Path.of(value);
+		}
+		if ((value = read(env, "GRAPH_HTTP_PORT")) != null) {
+			port = parsePort(value, "GRAPH_HTTP_PORT");
+		}
+		if ((value = read(env, "GRAPH_DATABASE")) != null) {
+			database = value;
+			GraphDatabases.validate(database);
+		}
+		if ((value = read(env, "GRAPH_ALLOW_WRITE")) != null) {
+			allowWrite = parseBoolean(value, "GRAPH_ALLOW_WRITE");
+		}
+		if ((value = read(env, "GRAPH_ALLOW_DROP")) != null) {
+			allowDrop = parseBoolean(value, "GRAPH_ALLOW_DROP");
+		}
+		if ((value = read(env, "GRAPH_DEMO")) != null) {
+			demo = parseBoolean(value, "GRAPH_DEMO");
+		}
+		if ((value = read(env, "GRAPH_DEMO_SIZE")) != null) {
+			airports = DemoData.airportsFor(value);
+			demo = true;
+		}
+		if ((value = read(env, "GRAPH_QUERY_TIMEOUT_MILLIS")) != null) {
+			queryTimeout = parseMillis(value, "GRAPH_QUERY_TIMEOUT_MILLIS");
+		}
+		if ((value = read(env, "GRAPH_SLOW_QUERY_MILLIS")) != null) {
+			slowQuery = parseMillis(value, "GRAPH_SLOW_QUERY_MILLIS");
+		}
+		if ((value = read(env, "GRAPH_WIRE_ENABLED")) != null) {
+			wire = parseBoolean(value, "GRAPH_WIRE_ENABLED");
+		}
+		if ((value = read(env, "GRAPH_WIRE_PORT")) != null) {
+			wirePort = parsePort(value, "GRAPH_WIRE_PORT");
+		}
+		if ((value = read(env, "GRAPH_WIRE_HOST")) != null) {
+			wireHost = value;
+		}
+		if ((value = read(env, "GRAPH_MAX_STREAMS")) != null) {
+			streams = parseStreams(value, "GRAPH_MAX_STREAMS");
+		}
+		if ((value = read(env, "GRAPH_METRICS_ENABLED")) != null) {
+			metrics = parseBoolean(value, "GRAPH_METRICS_ENABLED");
+		}
+		if ((value = read(env, "GRAPH_METRICS_PORT")) != null) {
+			metricsPort = parsePort(value, "GRAPH_METRICS_PORT");
+		}
+		if ((value = read(env, "GRAPH_MCP_ENABLED")) != null) {
+			mcp = parseBoolean(value, "GRAPH_MCP_ENABLED");
+		}
+		if ((value = read(env, "GRAPH_MCP_PORT")) != null) {
+			mcpPort = parsePort(value, "GRAPH_MCP_PORT");
+		}
+		if ((value = read(env, "GRAPH_MCP_HOST")) != null) {
+			mcpHost = value;
+		}
 
 		for (String argument : args) {
 			if (argument.equals("--demo")) {
@@ -91,13 +271,29 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 				airports = DemoData.airportsFor(argument.substring("--demo-size=".length()));
 				demo = true;
 			} else if (argument.startsWith("--query-timeout=")) {
-				queryTimeout = parseTimeout(argument.substring("--query-timeout=".length()));
+				queryTimeout = parseMillis(argument.substring("--query-timeout=".length()), "--query-timeout");
+			} else if (argument.startsWith("--slow-query-millis=")) {
+				slowQuery = parseMillis(argument.substring("--slow-query-millis=".length()), "--slow-query-millis");
 			} else if (argument.equals("--no-wire")) {
 				wire = false;
 			} else if (argument.startsWith("--wire-port=")) {
-				wirePort = parsePort(argument.substring("--wire-port=".length()));
+				wirePort = parsePort(argument.substring("--wire-port=".length()), "--wire-port");
+			} else if (argument.startsWith("--wire-host=")) {
+				wireHost = argument.substring("--wire-host=".length());
 			} else if (argument.startsWith("--max-streams=")) {
-				streams = parseStreams(argument.substring("--max-streams=".length()));
+				streams = parseStreams(argument.substring("--max-streams=".length()), "--max-streams");
+			} else if (argument.equals("--no-metrics")) {
+				metrics = false;
+			} else if (argument.startsWith("--metrics-port=")) {
+				metricsPort = parsePort(argument.substring("--metrics-port=".length()), "--metrics-port");
+			} else if (argument.equals("--mcp")) {
+				mcp = true;
+			} else if (argument.startsWith("--mcp-port=")) {
+				mcpPort = parsePort(argument.substring("--mcp-port=".length()), "--mcp-port");
+				mcp = true;
+			} else if (argument.startsWith("--mcp-host=")) {
+				mcpHost = argument.substring("--mcp-host=".length());
+				mcp = true;
 			} else if (argument.startsWith("--database=")) {
 				database = argument.substring("--database=".length());
 				// Validated here rather than at open time, so a typo is a usage error printed with the usage text
@@ -115,7 +311,7 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 				store = Path.of(argument);
 				positional++;
 			} else if (positional == 1) {
-				port = parsePort(argument);
+				port = parsePort(argument, "Port");
 				positional++;
 			} else {
 				throw new IllegalArgumentException("Unexpected argument '" + argument + "'");
@@ -123,54 +319,96 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 		}
 
 		if (store == null) {
-			throw new IllegalArgumentException("A root directory is required");
+			throw new IllegalArgumentException("A root directory is required, as an argument or in GRAPH_ROOT");
 		}
-		// Zero means "any free port" for both, and two of them would collide on nothing — but a fixed port given
-		// twice is a mistake that would otherwise surface as "address already in use" from whichever bound second.
-		if (wire && wirePort != 0 && wirePort == port) {
-			throw new IllegalArgumentException("The HTTP port and the binary port are both " + port
-				+ "; give --wire-port a different one or --no-wire");
-		}
-		return new GraphServerOptions(store, port, demo, airports, queryTimeout, wire, wirePort, streams, database,
-			allowDrop, allowWrite);
+		checkPortsDiffer(port, wire ? wirePort : -1, metrics ? metricsPort : -1, mcp ? mcpPort : -1);
+
+		return new GraphServerOptions(store, port, demo, airports, queryTimeout, slowQuery, wire, wirePort, wireHost,
+			streams, metrics, metricsPort, mcp, mcpPort, mcpHost, database, allowDrop, allowWrite);
 	}
 
-	private static int parseStreams(String argument) {
+	private static String read(UnaryOperator<String> env, String name) {
+		String value = env.apply(name);
+		if (value == null) {
+			return null;
+		}
+		value = value.trim();
+		// An empty variable is how a Helm template renders a value nobody set. Treating it as "unset" rather than as
+		// "" is what keeps an optional chart value from becoming an empty database name.
+		return value.isEmpty() ? null : value;
+	}
+
+	/**
+	 * Refuses two front ends configured onto one fixed port.
+	 *
+	 * <p>
+	 * Zero means "any free port", so zeros never collide with anything and are excluded; a disabled front end is
+	 * passed as -1 and excluded for the same reason. Without this the mistake surfaces as "address already in use"
+	 * from whichever listener happened to bind second, which names the port but not the two settings that chose it.
+	 * </p>
+	 */
+	private static void checkPortsDiffer(int http, int wire, int metrics, int mcp) {
+		Map<Integer, String> seen = new LinkedHashMap<>();
+		record Candidate(int port, String name) {
+		}
+		for (Candidate candidate : List.of(new Candidate(http, "the HTTP port"), new Candidate(wire, "the binary port"),
+			new Candidate(metrics, "the monitoring port"), new Candidate(mcp, "the MCP port"))) {
+			if (candidate.port() <= 0) {
+				continue;
+			}
+			String other = seen.putIfAbsent(candidate.port(), candidate.name());
+			if (other != null) {
+				throw new IllegalArgumentException(other + " and " + candidate.name() + " are both "
+					+ candidate.port() + "; give one of them a different port");
+			}
+		}
+	}
+
+	private static int parseStreams(String argument, String source) {
 		int streams;
 		try {
 			streams = Integer.parseInt(argument);
 		} catch (NumberFormatException e) {
-			throw new IllegalArgumentException("--max-streams must be a number, was '" + argument + "'");
+			throw new IllegalArgumentException(source + " must be a number, was '" + argument + "'");
 		}
 		if (streams < 1) {
-			throw new IllegalArgumentException("--max-streams must be at least 1, was " + streams);
+			throw new IllegalArgumentException(source + " must be at least 1, was " + streams);
 		}
 		return streams;
 	}
 
-	private static long parseTimeout(String argument) {
+	private static long parseMillis(String argument, String source) {
 		long millis;
 		try {
 			millis = Long.parseLong(argument);
 		} catch (NumberFormatException e) {
-			throw new IllegalArgumentException("--query-timeout must be a number of milliseconds, was '"
-				+ argument + "'");
+			throw new IllegalArgumentException(source + " must be a number of milliseconds, was '" + argument + "'");
 		}
 		if (millis < 0) {
-			throw new IllegalArgumentException("--query-timeout must not be negative, was " + millis);
+			throw new IllegalArgumentException(source + " must not be negative, was " + millis);
 		}
 		return millis;
 	}
 
-	private static int parsePort(String argument) {
+	private static boolean parseBoolean(String argument, String source) {
+		return switch (argument.toLowerCase()) {
+			case "true", "1", "yes", "on" -> true;
+			case "false", "0", "no", "off" -> false;
+			// Not Boolean.parseBoolean, which maps every typo to false — an operator who wrote GRAPH_ALLOW_WRITE=ture
+			// would get a read-only server and no reason for it.
+			default -> throw new IllegalArgumentException(source + " must be true or false, was '" + argument + "'");
+		};
+	}
+
+	private static int parsePort(String argument, String source) {
 		int port;
 		try {
 			port = Integer.parseInt(argument);
 		} catch (NumberFormatException e) {
-			throw new IllegalArgumentException("Port must be a number, was '" + argument + "'");
+			throw new IllegalArgumentException(source + " must be a number, was '" + argument + "'");
 		}
 		if (port < 0 || port > 65535) {
-			throw new IllegalArgumentException("Port must be between 0 and 65535, was " + port);
+			throw new IllegalArgumentException(source + " must be between 0 and 65535, was " + port);
 		}
 		return port;
 	}
@@ -186,17 +424,22 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 	}
 
 	static String usage() {
+		StringBuilder environment = new StringBuilder();
+		for (EnvVar variable : VARIABLES) {
+			environment.append("  ").append(variable.name()).append('\n');
+			environment.append("        ").append(variable.description()).append('\n');
+		}
 		return """
-			usage: graph-server [options] <root-directory> [http-port]
+			usage: graph-server [options] [root-directory] [http-port]
 
 			The root holds one subdirectory per database. A directory that is itself a store is
-			refused, with the two commands that move it into a root.
+			refused, with the two commands that move it into a root. It may also come from GRAPH_ROOT.
 
 			  --database=<name>     The database a request that does not name one gets. Created at
 			                        startup if it is not there. Letters, digits, '-' and '_'.
 			                        (default: %s)
 			  --allow-write         Accept CREATE, SET, REMOVE and DELETE queries. Off by default:
-			                        neither port has authentication, so enabling this hands anything
+			                        no port has authentication, so enabling this hands anything
 			                        that can reach the server the ability to change and delete data.
 			  --allow-drop          Enable DELETE /api/databases/<name>, which deletes a database and
 			                        everything in it. Off by default, and separate from --allow-write:
@@ -209,27 +452,42 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 			                        tiny=%d  small=%d  medium=%d  large=%d   (default: small)
 			  --query-timeout=<ms>  Abandon a query that runs longer than this. 0 disables the limit,
 			                        which lets one query hold a worker and a read view indefinitely.
-			                        Applies to both front ends. (default: %d)
-			  --wire-port=<port>    The binary streaming port, bound to loopback. 0 for any free one.
+			                        Applies to every front end. (default: %d)
+			  --slow-query-millis=<ms>
+			                        Write a query taking at least this long to the slow query log.
+			                        0 logs none. Must be below --query-timeout to ever fire.
 			                        (default: %d)
-			  --no-wire             HTTP only. No binary port.
+			  --wire-port=<port>    The binary streaming port. 0 for any free one. (default: %d)
+			  --wire-host=<addr>    What the binary port binds. (default: %s)
+			  --no-wire             No binary port.
 			  --max-streams=<n>     Queries the binary port runs at once; the n+1th is refused rather
 			                        than queued. Multiplied by the per-stream write queue, this is the
 			                        memory the server may hold for clients that stop reading.
 			                        (default: %d)
+			  --metrics-port=<port> The monitoring port: /metrics, /health and /ready. (default: %d)
+			  --no-metrics          No monitoring port.
+			  --mcp                 Open the Model Context Protocol port. Off by default: it is a
+			                        remote code path an LLM drives, against a server with no
+			                        authentication.
+			  --mcp-port=<port>     The MCP port. Implies --mcp. (default: %d)
+			  --mcp-host=<addr>     What the MCP port binds. Implies --mcp. (default: %s)
 			  -h, --help            This.
 
+			Environment. A flag beats a variable beats a default.
+
+			%s
 			The HTTP port serves the browser UI and /api/query, which materialises a whole result as
 			JSON. The binary port streams rows as they are produced; use graph-client to read it.
 
-			Neither port has authentication or transport security. The binary port binds loopback for
-			that reason; the HTTP port does not, and predates this note.
+			No port has authentication or transport security. The binary and MCP ports bind loopback
+			for that reason; the HTTP and monitoring ports do not.
 
 			The demo graph is an air route network: airports in cities in countries, airlines with
 			hubs, and routes between airports carrying distance, duration and flight number. See
 			spec/CYPHER.md for queries to try.
 			""".formatted(GraphDatabases.DEFAULT_NAME, DemoData.TINY, DemoData.SMALL, DemoData.MEDIUM,
-				DemoData.LARGE, DEFAULT_QUERY_TIMEOUT_MILLIS, Protocol.DEFAULT_PORT,
-				DEFAULT_MAX_CONCURRENT_STREAMS);
+				DemoData.LARGE, DEFAULT_QUERY_TIMEOUT_MILLIS, DEFAULT_SLOW_QUERY_MILLIS, Protocol.DEFAULT_PORT,
+				WireServerOptions.DEFAULT_HOST, DEFAULT_MAX_CONCURRENT_STREAMS, DEFAULT_METRICS_PORT,
+				DEFAULT_MCP_PORT, DEFAULT_MCP_HOST, environment);
 	}
 }

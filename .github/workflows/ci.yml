@@ -93,6 +93,6 @@ jobs:
           components: clippy, rustfmt
       # The crate has never been compiled in the development environment, which has no cargo. This job is the
       # first thing that would actually build and test it.
-      - run: cargo build --release --manifest-path native-rust-lib/Cargo.toml
-      - run: cargo test --manifest-path native-rust-lib/Cargo.toml
-      - run: cargo clippy --manifest-path native-rust-lib/Cargo.toml -- -D warnings
+      - run: cargo build --release --manifest-path graph-core/native-rust-lib/Cargo.toml
+      - run: cargo test --manifest-path graph-core/native-rust-lib/Cargo.toml
+      - run: cargo clippy --manifest-path graph-core/native-rust-lib/Cargo.toml -- -D warnings

@@ -257,7 +257,7 @@ Not everything here is scaffolding to throw away. These decisions are **kept** i
 
 ## 8. Key Classes Reference
 
-See [GRAPH_STORAGE_CONTEXT.md §7](GRAPH_STORAGE_CONTEXT.md#7-key-classes-reference).
+See [CONTEXT.md §7](CONTEXT.md#7-key-classes-reference).
 
 ---
 

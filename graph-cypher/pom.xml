@@ -6,11 +6,11 @@
 
     <parent>
         <groupId>io.metaloom.graph</groupId>
-        <artifactId>graph-storage-ffm-poc</artifactId>
+        <artifactId>metaloom-graph</artifactId>
         <version>0.0.1-SNAPSHOT</version>
     </parent>
 
-    <name>Graph Cypher</name>
+    <name>MetaLoom // Graph :: Cypher</name>
     <description>An openCypher subset: lexer, parser and executor over the storage engine, reads and writes</description>
 
     <dependencies>

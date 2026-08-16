@@ -6,7 +6,7 @@ This file is written for whoever is on call, not for whoever is writing the engi
 executed, it says so — an operational runbook full of untested steps is worse than an empty one, because it invites
 confidence it has not earned.
 
-Design rationale lives in the other files; [GRAPH_STORAGE_CONTEXT.md](GRAPH_STORAGE_CONTEXT.md) routes to them.
+Design rationale lives in the other files; [CONTEXT.md](CONTEXT.md) routes to them.
 
 ---
 
@@ -14,7 +14,7 @@ Design rationale lives in the other files; [GRAPH_STORAGE_CONTEXT.md](GRAPH_STOR
 
 | | |
 |---|---|
-| **Deployment** | Embedded in a JVM process is the primary shape. `graph-server` also puts two ports over a **root of databases**: HTTP on 8080 (browser UI, `/api/query`, whole results as JSON) and a binary streaming port on loopback:8081 ([WIRE.md](WIRE.md)). **Neither is authenticated** — see §9. |
+| **Deployment** | Embedded in a JVM process is the primary shape. `graph-server` also puts up to four ports over a **root of databases**: HTTP on 8080 (browser UI, `/api/query`, whole results as JSON), a binary streaming port on loopback:8081 ([WIRE.md](WIRE.md)), monitoring on 8082 ([METRICS.md](METRICS.md)) and MCP on loopback:8083, off by default ([MCP.md](MCP.md)). **None is authenticated** — see §9. |
 | **Databases** | One directory per database under the root, each a complete independent store ([DATABASES.md](DATABASES.md)). Sizing below is **per database**. |
 | **Concurrency** | One writer process, enforced by a `LOCK` file. One writer *thread*, enforced by a lock. Readers are unlimited and scale (measured to 10x at 32 threads). |
 | **Durability** | A commit is on the device when the call returns, under the default sync mode. |
@@ -83,6 +83,58 @@ Fixed at store creation, recorded in the manifest, and not changeable without a 
 because each one is an fsync. Batching a load into a single transaction is nearly three orders of magnitude faster.
 If ingest is slow, the answer is almost always transaction size, not configuration.
 
+### 3.1 Configuring `graph-server`
+
+Three sources, and **a command line flag beats an environment variable beats a default**. The flag wins so that a shell
+which exported `GRAPH_ALLOW_WRITE` for one server cannot silently change what a second one started in the same shell
+does. The environment exists because a container image cannot be reconfigured without rebuilding its `CMD`, and a Helm
+chart has environment variables and not an argument vector.
+
+`GRAPH_ROOT` is the one that matters structurally: it is what makes the positional root argument optional, and therefore
+what lets the image's `CMD` carry no arguments at all.
+
+| Variable | Flag | Default |
+|----------|------|---------|
+| `GRAPH_ROOT` | *(first positional)* | — required |
+| `GRAPH_HTTP_PORT` | *(second positional)* | 8080 |
+| `GRAPH_DATABASE` | `--database=` | `default` |
+| `GRAPH_ALLOW_WRITE` | `--allow-write` | false |
+| `GRAPH_ALLOW_DROP` | `--allow-drop` | false |
+| `GRAPH_DEMO` | `--demo` | false |
+| `GRAPH_DEMO_SIZE` | `--demo-size=` | small |
+| `GRAPH_QUERY_TIMEOUT_MILLIS` | `--query-timeout=` | 30000 |
+| `GRAPH_SLOW_QUERY_MILLIS` | `--slow-query-millis=` | 1000 — see §4.2 |
+| `GRAPH_WIRE_ENABLED` | `--no-wire` | true |
+| `GRAPH_WIRE_PORT` | `--wire-port=` | 8081 |
+| `GRAPH_WIRE_HOST` | `--wire-host=` | 127.0.0.1 |
+| `GRAPH_MAX_STREAMS` | `--max-streams=` | 8 |
+| `GRAPH_METRICS_ENABLED` | `--no-metrics` | true |
+| `GRAPH_METRICS_PORT` | `--metrics-port=` | 8082 |
+| `GRAPH_MCP_ENABLED` | `--mcp` | **false** |
+| `GRAPH_MCP_PORT` | `--mcp-port=` | 8083 |
+| `GRAPH_MCP_HOST` | `--mcp-host=` | 127.0.0.1 |
+
+The list is declared once, in `GraphServerOptions.VARIABLES`, and both the reading and the `--help` output are generated
+from it. A variable that is read and not documented, or documented and not read, is the failure that shape rules out;
+`GraphServerOptionsTest` asserts both directions.
+
+Three behaviours that are decisions rather than accidents:
+
+- **An empty variable is unset, not empty.** `GRAPH_DATABASE=""` is exactly how a Helm template renders a value nobody
+  set, and treating it as a real setting would turn an omitted chart value into an empty database name — refused, at
+  start-up, in production.
+- **A boolean typo is refused.** `Boolean.parseBoolean` maps every typo to `false`, so `GRAPH_ALLOW_WRITE=ture` would
+  give a read-only server and no reason for it. `true/false`, `1/0`, `yes/no` and `on/off` are accepted; anything else
+  is a start-up error naming the variable.
+- **Two fixed ports on one number are refused at parse time**, across all four listeners. Otherwise it surfaces as
+  "address already in use" from whichever bound second, which names the port but not the two settings that chose it.
+  Port `0` means "any free one" and is excluded, as is a disabled front end. Note that the monitoring port defaults to
+  8082, so serving HTTP on 8082 is now a start-up error rather than a race.
+
+**`GRAPH_WIRE_HOST` deserves its own line.** The binary port binds loopback by default, which inside a pod means it is
+unreachable from outside that pod. That is the correct default and the reason the chart has to widen it deliberately:
+defaulting it to `0.0.0.0` in the image would silently undo a security decision for everyone who ever runs the image.
+
 ---
 
 ## 4. Monitoring
@@ -103,6 +155,53 @@ If ingest is slow, the answer is almost always transaction size, not configurati
 Run `store.verify(VerifyLevel.FULL, VerifyOptions.throttled())` on a schedule. Throttled, it drops the read latch
 every 4096 elements, so it does not stall a live store. It is the only thing that will tell you about a structural
 problem before a query does.
+
+### 4.1 Prometheus
+
+Every signal in the table above is also a meter on the monitoring port, so those thresholds can be alert rules rather
+than something a human reads during an incident. [METRICS.md](METRICS.md) is the catalogue, and its §6 maps each row
+above to its meter name.
+
+```bash
+curl localhost:8082/metrics        # the scrape
+curl localhost:8082/health         # liveness  — 200 while the process is up
+curl localhost:8082/ready          # readiness — 503 once shutdown has begun
+```
+
+Two things worth knowing before you read a dashboard:
+
+- **The size gauges are up to 15 seconds old**, and publish their own age as `graph_store_stats_age_seconds`.
+  `store.stats()` lists a directory and stats every file in it, and a Prometheus scrape collects gauges on an event
+  loop; doing that per series per scrape would make the server slower the more closely it is watched. Everything else
+  — the log, the readers, the I/O totals — is read live.
+- **`/health` and `/ready` are on the monitoring port and not the query port**, so that a query load heavy enough to
+  saturate HTTP cannot make a liveness probe time out and get a merely-busy server killed.
+
+### 4.2 The slow query log
+
+The histogram says how often and how bad. It cannot say *which query* — a query string cannot be a Prometheus label
+without producing one time series per distinct query. That is what this is for, and the two are meant to be read
+together.
+
+`--slow-query-millis=<ms>` / `GRAPH_SLOW_QUERY_MILLIS`, default **1000**, `0` to log nothing. A query at or over the
+threshold produces one `WARN` line and increments `graph_queries_slow`:
+
+```
+Slow query: 1420 ms, 12 rows, outcome ok, http front end, database 'default', params [city, since] — MATCH (p:Person)...
+```
+
+Four decisions in that line:
+
+- **Parameter values are never logged.** `MATCH (u:User {token: $t})` puts the secret in the parameter map rather than
+  in the text, and this is the file most likely to be shipped whole to an aggregator that a different set of people can
+  read. The parameter *names* are logged, because they are schema rather than data.
+- **The text is collapsed to one line and truncated at 500 characters**, so a generated query cannot fill a disk.
+- **Failed and abandoned queries are logged too**, with their outcome. A query that hit its timeout is the most
+  interesting line in this log: it cost the most and returned nothing.
+- **Set it below `--query-timeout`**, or nothing can ever be logged — the query is abandoned first. The server prints a
+  warning at start-up if the two are configured that way, rather than refusing, because `--query-timeout=0` is legal.
+
+It applies to every front end, tagged `http`, `wire` or `mcp`.
 
 ---
 
@@ -292,12 +391,17 @@ What that does **not** cover:
 
 ### 9.1 The network, which has the same posture and a wider blast radius
 
-`graph-server` opens two ports over one store, and **neither has authentication or transport security**:
+`graph-server` opens up to four ports over one root, and **none of them has authentication or transport security**:
 
 | | | |
 |---|---|---|
 | HTTP | 8080, **all interfaces** | The browser UI and `/api/query`. Predates the note below, which is why it binds everything |
 | Binary | 8081, **loopback only** | Streaming Cypher ([WIRE.md](WIRE.md)). Loopback because a new unauthenticated port should not default to every interface |
+| Monitoring | 8082, **all interfaces**, on by default | `/metrics`, `/health`, `/ready` ([METRICS.md](METRICS.md)). **Do not publish it**: a scrape carries database names, node counts and store sizes |
+| MCP | 8083, **loopback only**, **off by default** | The Model Context Protocol ([MCP.md](MCP.md)). Off rather than merely loopback, because it is a remote code path an LLM drives against a server with no authentication |
+
+`GRAPH_WIRE_HOST` and `GRAPH_MCP_HOST` widen the two loopback ports, deliberately and one at a time. In a pod the
+loopback default means those ports are unreachable from outside the pod, which is the correct starting position.
 
 Both can read **every byte** of one store — and of **every database under the root**, because there is no
 per-database authentication either. Treat exposing either as equivalent to handing out the root directory, because that
@@ -340,7 +444,10 @@ Stated plainly, because an operations document that implies capabilities the sys
 
 - No online backup, no incremental backup, no point-in-time recovery (§5).
 - No repair tool for a store that fails `verify` (§6.3).
-- No metrics exporter. `StoreMetrics` is a Java object; wiring it to anything is the embedder's job.
+- No authentication on any port (§9.1). This is the largest gap after backup.
+- No metrics exporter **for an embedder**. `graph-server` exports Prometheus metrics ([METRICS.md](METRICS.md)); the
+  engine itself still just returns `StoreMetrics` as a Java object, and wiring that up in a process that embeds
+  `graph-core` directly remains the embedder's job. That is deliberate — see METRICS.md §2.
 - No background maintenance. Checkpoint, reclaim and compact are calls the embedder has to schedule.
 - No multi-writer concurrency, no replication, no failover.
 - The power-loss procedure in §8 is written and untested.
@@ -348,4 +455,4 @@ Stated plainly, because an operations document that implies capabilities the sys
 ---
 
 _Git HEAD revision: `e4601d1`_
-_Last updated: 2026-08-15 (Cypher writes and --allow-write)_
+_Last updated: 2026-08-16 (env-var configuration, Prometheus metrics, the slow query log, MCP)_

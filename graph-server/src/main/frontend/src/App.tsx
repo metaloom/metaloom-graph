@@ -206,7 +206,7 @@ export function App() {
   return (
     <div className="app">
       <header className="topBar">
-        <h1>Graph browser</h1>
+        <h1>MetaLoom // Graph</h1>
         <span className="subtitle">
           openCypher{allowWrite ? '' : ', read-only'}
         </span>

@@ -49,7 +49,7 @@ import io.vertx.core.json.JsonObject;
  * count.
  * </p>
  */
-final class SchemaScanner {
+public final class SchemaScanner {
 
 	/** How long a scan result is served before another one is run. */
 	static final long TTL_MILLIS = 60_000;
@@ -60,7 +60,7 @@ final class SchemaScanner {
 	private JsonObject cached;
 	private long cachedAtNanos;
 
-	SchemaScanner(GraphStore store) {
+	public SchemaScanner(GraphStore store) {
 		this.store = store;
 	}
 
@@ -70,7 +70,7 @@ final class SchemaScanner {
 	 * @param force
 	 *            run a scan whatever the cache says — what the UI's refresh button sends
 	 */
-	synchronized JsonObject schema(boolean force) {
+	public synchronized JsonObject schema(boolean force) {
 		if (!force && cached != null && TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - cachedAtNanos) < TTL_MILLIS) {
 			return cached.copy().put("cached", true);
 		}

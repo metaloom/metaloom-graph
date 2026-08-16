@@ -6,11 +6,11 @@
 
     <parent>
         <groupId>io.metaloom.graph</groupId>
-        <artifactId>graph-storage-ffm-poc</artifactId>
+        <artifactId>metaloom-graph</artifactId>
         <version>0.0.1-SNAPSHOT</version>
     </parent>
 
-    <name>Graph Server</name>
+    <name>MetaLoom // Graph :: Server</name>
     <description>A Vert.x HTTP server exposing Cypher queries, with a React and D3 browser UI built into the jar</description>
 
     <properties>
@@ -53,6 +53,28 @@
         <dependency>
             <groupId>io.vertx</groupId>
             <artifactId>vertx-web</artifactId>
+        </dependency>
+        <!--
+            Monitoring. Micrometer rather than the Prometheus client directly, because vertx-micrometer-metrics is
+            what instruments the event loops and the HTTP servers, and it wants a Micrometer registry — using the
+            Prometheus client as well would mean two registries and two scrape endpoints that disagree.
+
+            These stop at graph-server on purpose. graph-core's only runtime dependency is slf4j and its job here is
+            to *expose* records — StoreMetrics, StoreStats, IoStats, SnapshotStats — which it already does. An engine
+            that a caller can embed without also taking a metrics framework is worth more than one that reports its
+            own numbers. See spec/METRICS.md section 2.
+        -->
+        <dependency>
+            <groupId>io.vertx</groupId>
+            <artifactId>vertx-micrometer-metrics</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
         </dependency>
         <!--
             The one runtime dependency this module adds over the library modules. `java -jar` has to log somewhere:
@@ -232,9 +254,9 @@
                                     <resource>META-INF/LICENSE</resource>
                                 </transformer>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheNoticeResourceTransformer">
-                                    <projectName>Graph Storage</projectName>
+                                    <projectName>MetaLoom // Graph</projectName>
                                     <organizationName>MetaLoom</organizationName>
-                                    <organizationURL>https://github.com/metaloom/graph-storage-ffm-poc</organizationURL>
+                                    <organizationURL>https://github.com/metaloom/metaloom-graph</organizationURL>
                                     <inceptionYear>2024</inceptionYear>
                                 </transformer>
                             </transformers>

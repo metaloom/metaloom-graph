@@ -1,10 +1,10 @@
-# Graph Storage — Project Context for AI Coding Agents
+# MetaLoom // Graph — Project Context for AI Coding Agents
 
-This document is the **entry point** for work on `graph-storage-ffm-poc`. It is an **index and
+This document is the **entry point** for work on `metaloom-graph`. It is an **index and
 router**, not a second copy of the specs: it catalogues every file under `spec/`, tells you which
 one to open, and carries the project-wide cheat sheet, glossary and gotchas.
 
-> **Project root**: `/home/defaultuser/workspaces/metaloom/graph-storage-ffm-poc` —
+> **Project root**: `/home/defaultuser/workspaces/metaloom/metaloom-graph` —
 > **spec root**: [spec/](.)
 
 ---
@@ -64,7 +64,7 @@ its defect register — worth reading before reintroducing any of its patterns.
 ### 0.3 Reading order for a new task
 
 ```
-GRAPH_STORAGE_CONTEXT.md (this file)
+CONTEXT.md (this file)
    ├─ CURRENT_STATE.md ......... what actually exists today, and its defects
    ├─ ARCHITECTURE.md .......... target layering, components, threading model
    ├─ PLAN.md .................. phased implementation plan — pick your work item here
@@ -89,7 +89,8 @@ GRAPH_STORAGE_CONTEXT.md (this file)
         ├─ GRAALVM.md ................ the native binary: FFM under native-image
         ├─ API.md .................... the public Java API
         ├─ TESTING.md ................ test setup, benchmarks, crash testing
-        └─ OPERATIONS.md ............. sizing, tuning, monitoring, backup, recovery
+        ├─ OPERATIONS.md ............. configuration, sizing, tuning, monitoring, backup, recovery
+        └─ METRICS.md ................ the Prometheus meter catalogue, and the alert rules it implies
 ```
 
 ---
@@ -120,11 +121,15 @@ GRAPH_STORAGE_CONTEXT.md (this file)
 | [GRAALVM.md](GRAALVM.md) | Compiling the server to a native binary: what native-image does and does not support of the FFM API, downcall registration, the netty substitution, and what the binary costs against the jar | How the FFM layer works (NATIVE_FFM.md) |
 | [API.md](API.md) | The public Java API surface: `GraphStore`, transactions, cursors, traversal, element builders | Internals |
 | [TESTING.md](TESTING.md) | Test layout, fixtures, benchmark harness, crash and fault injection, invariant checkers | Implementation steps |
-| [OPERATIONS.md](OPERATIONS.md) | Running it: sizing, tuning, what to monitor, backup and restore, disaster recovery, what every exception means for an operator, the security posture of both ports | Design rationale; how the binary protocol works (WIRE.md) |
+| [OPERATIONS.md](OPERATIONS.md) | Running it: sizing, tuning, **how the server is configured from flags and the environment**, what to monitor, **the slow query log**, backup and restore, disaster recovery, what every exception means for an operator, the security posture of every port | Design rationale; how the binary protocol works (WIRE.md); the meter catalogue (METRICS.md) |
+| [METRICS.md](METRICS.md) | The Prometheus catalogue: every `graph_` meter with its type, labels and call site, the cached-versus-live tiers and why size gauges are refreshed on a timer, and the map from OPERATIONS.md §4's thresholds to alert rules. **Parsed by `MetricsCatalogScrapeTest`** — editing it can break the build | Which signals to watch and when to worry (OPERATIONS.md §4) |
 | [PLAN.md](PLAN.md) | The phased implementation plan with per-phase deliverables, exit criteria and checkboxes | Design rationale |
 | [PROGRESS.md](PROGRESS.md) | The consolidated done/pending checklist across every phase, and the backlog in priority order | Deliverable definitions, rationale for a gap |
 | [reports/SCALE.md](reports/SCALE.md) | 10M nodes / 20M relationships measured, before and after the cell-based adjacency block: load time, disk cost, throughput curves | Small-scale benchmarks (BASELINE.md) |
 | [GRAPH_BENCHMARK.md](GRAPH_BENCHMARK.md) | The run log: every `GraphScaleBenchmark` result in one progression table, what changed between runs, and what is measurement noise rather than progress | Why any one run came out as it did (SCALE.md) |
+| [reports/BASELINE.md](reports/BASELINE.md) | The predecessor PoC measured on its own terms — record sizes, read counts, mapping behaviour — so every "before" column elsewhere has a source | Anything about the current engine |
+| [reports/PHASE_STATUS.md](reports/PHASE_STATUS.md) | Per-phase status with the reason for every gap, including §7's MetaLoom integration and its **recommendation not to adopt** | The checklist itself (PROGRESS.md) |
+| [reports/API_REVIEW.md](reports/API_REVIEW.md) | A review pass over the public API surface and what it found | The API definition (API.md) |
 
 ---
 
@@ -208,6 +213,7 @@ Full description in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 | Term | Meaning |
 |------|---------|
+| **PoC** | The **predecessor** project this engine replaced, inventoried in [CURRENT_STATE.md](CURRENT_STATE.md). Never this project — every "PoC" in the spec tree refers backwards. This project is **MetaLoom // Graph** (`metaloom-graph`). |
 | **Element** | A node or a relationship. Both carry a label, properties and an `ElementId`. |
 | **Kind** | The store family an id belongs to: node, relationship, adjacency, property, blob, index, undo, vector. Encoded in the top 4 bits of every id. |
 | **Segment** | One file of a store family, at most `SEGMENT_CAPACITY` bytes of data. `node-000017.seg`. |
