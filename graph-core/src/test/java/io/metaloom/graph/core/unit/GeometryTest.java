@@ -1,6 +1,7 @@
 package io.metaloom.graph.core.unit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -71,5 +72,70 @@ public class GeometryTest {
 		assertThrows(IllegalArgumentException.class, () -> new Geometry(5000, 4 * GIB));
 		assertThrows(IllegalArgumentException.class, () -> new Geometry(2048, 4 * GIB));
 		assertThrows(IllegalArgumentException.class, () -> new Geometry(8192, 1234));
+	}
+
+	// ---------------------------------------------------------------- the declared vector kind
+
+	/**
+	 * The tables are sized by what the id encoding can express rather than by how many kinds happen to exist.
+	 * <p>
+	 * They were sized at 8 by hand while the encoding gives the kind 4 bits, and the population loop skips a code past
+	 * the end — so a ninth kind was neither a compile error nor a construction error. It was a set of zeroed tables
+	 * and an {@code ArrayIndexOutOfBoundsException} out of the address function on the first read.
+	 */
+	@Test
+	public void testEveryKindTheIdEncodingCanExpressHasATableEntry() {
+		assertEquals(16, Kind.MAX_KINDS, "four bits of kind");
+		assertEquals(Kind.VEC, Kind.byCode(8), "a code past the old table size resolves");
+		Geometry g = new Geometry(8192, 4 * GIB, 4096);
+		for (Kind kind : Kind.values()) {
+			if (kind == Kind.NULL) {
+				continue;
+			}
+			// The point is that none of these throws.
+			assertTrue(g.stride(kind) > 0, kind + " has no stride");
+			assertTrue(g.dataStart(kind) > 0, kind + " has no data start");
+		}
+	}
+
+	/** A store that never asked for vector storage does not have the kind at all — not a zero-sized one. */
+	@Test
+	public void testVectorStorageIsAbsentUntilItIsDeclared() {
+		Geometry without = new Geometry(8192, 4 * GIB);
+		assertEquals(0, without.stride(Kind.VEC));
+		assertEquals(0, without.vectorStride());
+		assertFalse(without.isEnabled(Kind.VEC));
+		assertTrue(without.isEnabled(Kind.NODE), "and every other kind is unaffected");
+
+		Geometry with = new Geometry(8192, 4 * GIB, 4096);
+		assertEquals(4096, with.stride(Kind.VEC));
+		assertTrue(with.isEnabled(Kind.VEC));
+		assertEquals(2, with.recordsPerPage(Kind.VEC), "two 768-dimension vectors to an 8 KiB page");
+		assertEquals(0, with.dataStart(Kind.VEC) % 8192, "and the data region still starts on a page");
+
+		// Declaring vector storage must not move anything else.
+		for (Kind kind : new Kind[] { Kind.NODE, Kind.REL, Kind.PROP, Kind.ADJ, Kind.BLOB, Kind.INDEX, Kind.UNDO }) {
+			assertEquals(without.dataStart(kind), with.dataStart(kind), kind + " moved");
+			assertEquals(without.stride(kind), with.stride(kind), kind + " changed stride");
+		}
+	}
+
+	/**
+	 * A declared stride is the one number in the layout an application chooses, so it is the one that can be wrong.
+	 * It goes through exactly the same invariant as every built-in stride: it must divide the page.
+	 */
+	@Test
+	public void testADeclaredStrideMustStillDivideThePage() {
+		// 3072 is 768 four-byte floats — the most common embedding width, and the one that does not fit.
+		IllegalArgumentException bad =
+			assertThrows(IllegalArgumentException.class, () -> new Geometry(8192, 4 * GIB, 3072));
+		assertTrue(bad.getMessage().contains("3072"), bad.getMessage());
+		assertTrue(bad.getMessage().contains("VEC"), bad.getMessage());
+
+		assertThrows(IllegalArgumentException.class, () -> new Geometry(8192, 4 * GIB, -1));
+		// Legal strides are the powers of two that divide the page.
+		for (int stride : new int[] { 512, 1024, 2048, 4096, 8192 }) {
+			assertEquals(stride, new Geometry(8192, 4 * GIB, stride).stride(Kind.VEC));
+		}
 	}
 }

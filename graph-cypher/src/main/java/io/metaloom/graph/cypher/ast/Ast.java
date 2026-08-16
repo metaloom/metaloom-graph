@@ -65,7 +65,30 @@ public final class Ast {
 		}
 	}
 
-	public sealed interface Clause permits Match, Unwind, With, Return, Create, Merge, SetClause, Remove, Delete {
+	public sealed interface Clause permits Match, Unwind, With, Return, Create, Merge, SetClause, Remove, Delete,
+		Call {
+	}
+
+	/**
+	 * A procedure call, which is how a query reaches an access path the pattern matcher has no way to express.
+	 *
+	 * <p>
+	 * There is one procedure, {@code vector.query}, and the shape is deliberate rather than general: the planner is a
+	 * fixed order with no cost model, so it could never <em>recognise</em> a nearest-neighbour query written as
+	 * {@code ORDER BY … LIMIT}. Making the access path explicit is the honest alternative to pretending it can be
+	 * inferred.
+	 * </p>
+	 *
+	 * <p>
+	 * Binding the node into a variable is what buys the rest: a following {@code MATCH} on that variable takes the
+	 * pattern matcher's already-bound branch and <b>verifies</b> rather than scanning, so a graph predicate is applied
+	 * to the search's results without a single planner change.
+	 * </p>
+	 *
+	 * @param yields
+	 *            the variables the call binds, in the order the procedure produces them
+	 */
+	public record Call(String procedure, List<Expr> arguments, List<String> yields) implements Clause {
 	}
 
 	/**

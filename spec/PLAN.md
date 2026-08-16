@@ -396,11 +396,11 @@ predicted in [SSD_IO.md §4](SSD_IO.md#4-io-engines); zero native allocations le
       transaction today
 - [ ] Optional string intern table for property dedup
 - [ ] B+tree adjacency for extreme supernodes — the chain tier is the ceiling
-- [~] Vector search. The plan said "delegating to an external ANN index rather than implementing one";
-      the decision taken instead is to **implement HNSW here**, because the query an external index
+- [x] Vector search. The plan said "delegating to an external ANN index rather than implementing one";
+      the decision taken instead was to **implement HNSW here**, because the query an external index
       cannot serve is the combined one — nearest neighbours *that also satisfy a graph predicate*.
-      Six stages, tracked in [VECTOR.md §7](VECTOR.md). Stage 1 is built: the `vector.*` functions and
-      `nearestByScan`, the exact answer the index will be measured against
+      Built in six stages, tracked in [VECTOR.md §7](VECTOR.md), with recall measured against the
+      exact scan rather than asserted
 - [ ] Concurrent split/merge under jcstress; crash-during-build test
 
 **Exit criteria**: an indexed lookup on a 10^8-element store costs at most 4 device reads; the
@@ -598,5 +598,5 @@ The full done/pending checklist, including the backlog in priority order, is
 
 ---
 
-_Git HEAD revision: `364b5f7`_
+_Git HEAD revision: `8f178b4`_
 _Last updated: 2026-08-14_

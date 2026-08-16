@@ -163,6 +163,16 @@ Cursors are `AutoCloseable`, single-threaded, and prefetch ahead. They never mat
 result set — the PoC's `Set<Relationship>` return type cannot express a traversal that does not fit
 in memory.
 
+**One of these exists today, in a smaller shape.** `GraphStore.neighbourCursor(nodeId, direction,
+types)` returns a `NeighbourCursor` with `next()` / `edge()` / `close()`, which streams the block
+chain — one block decoded at a time, so stopping early costs the head block and nothing else
+([RELATIONSHIP_STORAGE.md §5.4](RELATIONSHIP_STORAGE.md)). Three differences from the sketch above
+are real rather than cosmetic: it yields an `Edge` record instead of a flyweight over the page, so
+one small object per row survives; it does not prefetch, which needs the io_uring engine; and it is
+on the store rather than a transaction, because `GraphStore`'s mutations join whatever transaction
+the calling thread holds. What it does have is the lifetime the sketch describes — it holds a read
+view until closed, which is the part that makes it different from a list.
+
 ---
 
 ## 5. Edges vs Relationships
@@ -217,7 +227,23 @@ List<Long> found  = store.nodesByProperty("email", "a@b.c");  // property index,
 store.createUniqueConstraint("email");                        // refused if the data already breaks it
 
 List<Neighbour> near = store.nearestByScan("Person", "embedding", query, 10, VectorMetric.COSINE);
+
+store.createVectorIndex(VectorIndexDefinition.of("Person", "embedding", 768, VectorMetric.COSINE));
+List<Neighbour> fast = store.nearest("Person", "embedding", query, 10, null);
+List<Neighbour> filtered = store.nearest("Person", "embedding", query, 10, id -> isActive(id));
 ```
+
+`createVectorIndex` needs a store created with `vectorDimensions(768)`: the vector and its links live
+in one fixed-size record, and that size is fixed at creation like the page size. It walks the label's
+nodes, refuses if any holds a vector of another length, and builds in batches — resumably, so calling
+it again after an interruption continues rather than restarting.
+
+`nearest` is approximate; `nearestByScan` is exact and is what the approximate one is measured against
+([VECTOR.md §8](VECTOR.md)). Querying an index that is absent or still building **fails by name**
+rather than returning an empty list, because "no index" and "no matches" are opposite answers.
+
+The `filter` is applied when admitting a result, never to steer the search — steering it is the
+standard way to collapse an approximate search's recall.
 
 `nearestByScan` is **exact and linear**: it reads every candidate's vector and compares it, with no
 index and no approximation. That is deliberate — it is the answer an approximate index gets measured
@@ -373,6 +399,9 @@ scopes them for the calling thread rather than duplicating them.
 - [x] `createEdge` / `createRelationship` / `deleteEdge` / `deleteRelationship`
 - [x] `Properties` typed accessors, absent versus null
 - [x] `neighbours(direction, types)` and breadth-first `traverse(maxDepth)`
+- [x] `neighbourCursor(direction, types)` — the streaming form of the same walk, which `neighbours`
+      is now a drain of. It holds a read view until closed, so it is the one read on the API that a
+      caller can leak; §4 says what that costs and why the list form does not pay it
 - [x] `hasEdge(nodeId, neighbourId)` — "are these two connected", answered without materialising the
       node's neighbours. Direction- and type-agnostic, stops at the first match, and skips the blocks
       whose location range cannot hold the target
@@ -414,5 +443,5 @@ scopes them for the calling thread rather than duplicating them.
 
 ---
 
-_Git HEAD revision: `8f178b4`_
-_Last updated: 2026-08-16 (nearestByScan)_
+_Git HEAD revision: `20f7e3d`_
+_Last updated: 2026-08-16 (IDX-4: the streaming neighbour cursor)_

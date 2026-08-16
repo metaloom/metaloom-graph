@@ -1,6 +1,7 @@
 package io.metaloom.graph.core.api;
 
 import io.metaloom.graph.core.segment.Geometry;
+import io.metaloom.graph.core.store.vec.VectorRecord;
 
 /**
  * Store configuration. Options that affect the on-disk format are recorded in the manifest and refused on reopen if
@@ -22,6 +23,7 @@ public final class GraphStoreOptions {
 	private final WalSyncMode walSyncMode;
 	private final long walSyncIntervalMillis;
 	private final long retainedVersionBytes;
+	private final int vectorDimensions;
 
 	/**
 	 * Which {@link io.metaloom.graph.core.io.IoEngine} the store uses.
@@ -39,8 +41,9 @@ public final class GraphStoreOptions {
 	}
 
 	private GraphStoreOptions(int pageSize, long segmentCapacity, long walSegmentBytes, WalSyncMode walSyncMode,
-		long walSyncIntervalMillis, IoEngineKind ioEngine, long retainedVersionBytes) {
+		long walSyncIntervalMillis, IoEngineKind ioEngine, long retainedVersionBytes, int vectorDimensions) {
 		this.retainedVersionBytes = retainedVersionBytes;
+		this.vectorDimensions = vectorDimensions;
 		this.pageSize = pageSize;
 		this.segmentCapacity = segmentCapacity;
 		this.walSegmentBytes = walSegmentBytes;
@@ -56,7 +59,7 @@ public final class GraphStoreOptions {
 	public static GraphStoreOptions defaults() {
 		return new GraphStoreOptions(Geometry.DEFAULT_PAGE_SIZE, Geometry.DEFAULT_SEGMENT_CAPACITY,
 			DEFAULT_WAL_SEGMENT_BYTES, WalSyncMode.FSYNC_ON_COMMIT, 20, IoEngineKind.AUTO,
-			DEFAULT_RETAINED_VERSION_BYTES);
+			DEFAULT_RETAINED_VERSION_BYTES, 0);
 	}
 
 	public static Builder builder() {
@@ -97,6 +100,17 @@ public final class GraphStoreOptions {
 		return retainedVersionBytes;
 	}
 
+	/**
+	 * The vector dimension this store holds, or 0 for a store with no vector storage.
+	 * <p>
+	 * Fixed at creation, like the page size, and for a related reason: {@code Geometry} derives the whole {@code VEC}
+	 * layout from it, and crash recovery has to be able to build that segment set <b>before</b> it replays anything,
+	 * so the number cannot live anywhere that is itself recovered.
+	 */
+	public int vectorDimensions() {
+		return vectorDimensions;
+	}
+
 	public static final class Builder {
 
 		private int pageSize = Geometry.DEFAULT_PAGE_SIZE;
@@ -106,6 +120,7 @@ public final class GraphStoreOptions {
 		private long walSyncIntervalMillis = 20;
 		private IoEngineKind ioEngine = IoEngineKind.AUTO;
 		private long retainedVersionBytes = DEFAULT_RETAINED_VERSION_BYTES;
+		private int vectorDimensions = 0;
 
 		/** Fixed at store creation. 4096 suits random-heavy loads, 16384 scan-heavy ones. */
 		public Builder pageSize(int pageSize) {
@@ -154,9 +169,35 @@ public final class GraphStoreOptions {
 			return this;
 		}
 
+		/**
+		 * Gives the store vector storage of exactly this dimension, fixed for its lifetime.
+		 * <p>
+		 * A vector property of this length is then stored as a {@code VEC} record — one page read to fetch, and room
+		 * in the same record for the links an ANN index will later hang off it. A vector of any <em>other</em> length
+		 * still goes to the blob store, because it cannot fit the fixed record.
+		 * </p>
+		 * <p>
+		 * Zero, the default, means no vector storage at all: no segment directory, no format change, and every vector
+		 * property behaves exactly as it did before.
+		 * </p>
+		 */
+		public Builder vectorDimensions(int vectorDimensions) {
+			this.vectorDimensions = vectorDimensions;
+			return this;
+		}
+
 		public GraphStoreOptions build() {
+			if (vectorDimensions < 0) {
+				throw new IllegalArgumentException("vectorDimensions cannot be negative: " + vectorDimensions);
+			}
+			if (vectorDimensions > 0 && VectorRecord.strideFor(vectorDimensions, pageSize) == 0) {
+				throw new IllegalArgumentException("A vector of " + vectorDimensions + " dimensions needs "
+					+ (VectorRecord.HEADER_BYTES + 4 * vectorDimensions + 8 * VectorRecord.MIN_LINK_SLOTS)
+					+ " bytes with its links, which does not fit a " + pageSize
+					+ " byte page. Raise pageSize, or lower the dimension.");
+			}
 			return new GraphStoreOptions(pageSize, segmentCapacity, walSegmentBytes, walSyncMode,
-				walSyncIntervalMillis, ioEngine, retainedVersionBytes);
+				walSyncIntervalMillis, ioEngine, retainedVersionBytes, vectorDimensions);
 		}
 	}
 }

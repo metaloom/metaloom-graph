@@ -17,12 +17,14 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
 import io.metaloom.graph.client.ClientOptions;
@@ -61,8 +63,25 @@ import io.vertx.core.buffer.Buffer;
  * the same volume from a million small rows would spend its time in the executor and its memory on boxed longs, and
  * would be measuring the wrong thing.
  * </p>
+ *
+ * <h2>Every test here has a deadline, and that is not belt and braces</h2>
+ *
+ * <p>
+ * These tests block on a socket, and the failure mode of the thing they test is <b>not producing a row</b> — so the
+ * natural way for a defect here to present is a thread parked forever rather than an assertion that fails. That is the
+ * worst shape a test failure can take: the build stops with no output, on a machine nobody is watching, and the
+ * evidence has to be recovered with a thread dump. It happened: a missing {@code volatile} on
+ * {@code GraphClient.readsPaused} let a consumer skip the socket resume, and this class hung an entire reactor build
+ * with the client parked in {@code LinkedBlockingQueue.take()}.
+ * </p>
+ *
+ * <p>
+ * A class-level {@link Timeout} turns that back into an ordinary red test with a stack trace pointing at the line that
+ * blocked. Thirty seconds is far longer than the slowest test here needs and far shorter than a human's patience.
+ * </p>
  */
 @Tag("unit")
+@Timeout(value = 30, unit = TimeUnit.SECONDS)
 public class WireServerTest {
 
 	private static final int DOCUMENTS = 2_000;

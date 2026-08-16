@@ -99,8 +99,27 @@ public final class GraphClient implements AutoCloseable {
 	 */
 	private volatile Context socketContext;
 
-	/** Only ever written from the socket's event loop, so the pause and the resume cannot cross. */
-	private boolean readsPaused;
+	/**
+	 * Whether the socket is currently paused.
+	 *
+	 * <p>
+	 * <b>Volatile, and it has to be.</b> This is only ever <em>written</em> from the socket's event loop, which is what
+	 * keeps the pause and the resume from crossing — but {@link #consumed(long)} <em>reads</em> it from the consuming
+	 * thread, and that read is what decides whether the resume is scheduled at all. Without the barrier a consumer can
+	 * observe a stale {@code false} after the event loop has paused, skip the hop onto the loop, drain the last batch it
+	 * already had, and then block forever on a server that has finished sending. The socket stays shut and nothing ever
+	 * re-checks: there is no timer behind this, the next {@code consumed} call is the only thing that would have
+	 * resumed it, and it never comes.
+	 * </p>
+	 *
+	 * <p>
+	 * That failure was real and its symptom was nowhere near its cause: the suite passed in isolation and hung the
+	 * build under load, in {@code WireServerTest}, with the client parked in {@code LinkedBlockingQueue.take()} while
+	 * the server's worker sat idle in its pool having already written every row. A missing {@code volatile} on a field
+	 * whose comment explained why it did not need one.
+	 * </p>
+	 */
+	private volatile boolean readsPaused;
 	private volatile Welcome server;
 	private volatile boolean closed;
 
@@ -359,8 +378,20 @@ public final class GraphClient implements AutoCloseable {
 				RowStream stream = streams.get(streamId);
 				if (stream != null) {
 					byte[] bytes = payload.getBytes();
-					stream.onRows(bytes);
+					// Accounted for BEFORE it is published, and the order is the whole correctness argument.
+					//
+					// onRows makes the batch visible to the consuming thread, which may take it and call
+					// consumed() immediately. With the calls the other way round, that consumer decrements a
+					// total the event loop has not yet incremented: it sees a not-yet-paused flag, skips the
+					// resume, and the increment that follows then crosses the mark and pauses the socket with no
+					// consumer callback left to lift it. If that was the last ROWS batch, the COMPLETE frame
+					// behind it is never read and the consumer blocks forever on a query that has finished.
+					//
+					// Counting first makes the invariant hold: every byte a consumer can see has already been
+					// added, so after any pause there is still an unconsumed batch in a stream's queue, and
+					// therefore still a consumed() call to come that will lift the pause.
 					queued(bytes.length);
+					stream.onRows(bytes);
 				}
 			}
 			case Frames.COMPLETE -> {
@@ -445,7 +476,23 @@ public final class GraphClient implements AutoCloseable {
 		}
 	}
 
-	/** Called from a consuming thread as a batch is decoded, so the resume has to be hopped onto the event loop. */
+	/**
+	 * Called from a consuming thread as a batch is decoded, so the resume has to be hopped onto the event loop.
+	 *
+	 * <p>
+	 * <b>Why the volatile read is enough, rather than hopping unconditionally.</b> A pause only ever happens on the
+	 * event loop immediately after it has handed a batch to a stream — so after any pause there is always at least one
+	 * more batch sitting in a stream's queue, and therefore at least one more call to this method to see the paused
+	 * flag and lift it. Hopping onto the loop on every batch instead would cost a task per batch to re-derive an
+	 * answer that is almost always "not paused".
+	 * </p>
+	 *
+	 * <p>
+	 * The one case this does not cover is inherent to a per-connection budget rather than to the check: a batch queued
+	 * for a stream <em>nobody is consuming</em> holds the budget down for every other stream on the same socket. That
+	 * is the trade {@link #queued(long)} documents, not a lost wakeup.
+	 * </p>
+	 */
 	void consumed(long bytes) {
 		long total = queuedBytes.addAndGet(-bytes);
 		Context loop = socketContext;

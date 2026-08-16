@@ -23,6 +23,7 @@ import io.metaloom.graph.core.store.adj.PackedEdge;
 import io.metaloom.graph.core.store.blob.BlobStore;
 import io.metaloom.graph.core.store.node.NodeStore;
 import io.metaloom.graph.core.store.prop.PropertyStore;
+import io.metaloom.graph.core.store.vec.VectorStore;
 import io.metaloom.graph.core.store.rel.RelStore;
 
 /**
@@ -74,8 +75,11 @@ public final class Compactor {
 	/**
 	 * Adjacency first, so that the blocks its defragmentation frees are gone before {@code ADJ} is compacted, and the
 	 * index last, so that its rebuild sees the node ids the {@code NODE} pass settled on.
+	 * <p>
+	 * {@code VEC} sits beside {@code BLOB} because the two are reached the same way — from inside a property payload —
+	 * and {@code NODE} stays last so that a vector record's back-pointer is repointed against final node ids.
 	 */
-	private static final Kind[] ORDER = { Kind.ADJ, Kind.BLOB, Kind.PROP, Kind.REL, Kind.NODE };
+	private static final Kind[] ORDER = { Kind.ADJ, Kind.BLOB, Kind.VEC, Kind.PROP, Kind.REL, Kind.NODE };
 
 	private final Map<Kind, SegmentSet> sets;
 	private final NodeStore nodes;
@@ -83,17 +87,26 @@ public final class Compactor {
 	private final AdjacencyStore adjacency;
 	private final PropertyStore properties;
 	private final BlobStore blobs;
+	/** Null in a store with no vector storage, in which case every VEC pass below is a no-op. */
+	private final VectorStore vectors;
 	private final IndexCatalog indexes;
 	private final MaintenanceRunner runner;
 
 	public Compactor(Map<Kind, SegmentSet> sets, NodeStore nodes, RelStore rels, AdjacencyStore adjacency,
 		PropertyStore properties, BlobStore blobs, IndexCatalog indexes, MaintenanceRunner runner) {
+		this(sets, nodes, rels, adjacency, properties, blobs, null, indexes, runner);
+	}
+
+	public Compactor(Map<Kind, SegmentSet> sets, NodeStore nodes, RelStore rels, AdjacencyStore adjacency,
+		PropertyStore properties, BlobStore blobs, VectorStore vectors, IndexCatalog indexes,
+		MaintenanceRunner runner) {
 		this.sets = sets;
 		this.nodes = nodes;
 		this.rels = rels;
 		this.adjacency = adjacency;
 		this.properties = properties;
 		this.blobs = blobs;
+		this.vectors = vectors;
 		this.indexes = indexes;
 		this.runner = runner;
 	}
@@ -129,6 +142,10 @@ public final class Compactor {
 				continue;
 			}
 			SegmentSet set = sets.get(kind);
+			if (set == null) {
+				// A declared kind this store was created without, so there is nothing of it to compact.
+				continue;
+			}
 			if (set.liveness() >= options.livenessThreshold()) {
 				logger.debug("Skipping {}: liveness {} is at or above the {} threshold", kind, set.liveness(),
 					options.livenessThreshold());
@@ -209,7 +226,7 @@ public final class Compactor {
 		List<Target> targets = new ArrayList<>();
 		runner.runRead(() -> {
 			switch (kind) {
-				case NODE, REL, BLOB -> {
+				case NODE, REL, BLOB, VEC -> {
 					for (long id : sets.get(kind).liveIds()) {
 						targets.add(new Target(id, 1));
 					}
@@ -234,9 +251,11 @@ public final class Compactor {
 						addPropertyTarget(targets, rels.propBlockId(relId));
 					}
 				}
-				default -> {
+				case INDEX, UNDO, NULL -> {
 					// INDEX is rebuilt rather than relocated, and UNDO has no records yet.
 				}
+				// No default. A kind added later must be classified here deliberately: falling into a silent default
+				// would leave it permanently uncompacted, which is the kind of gap nothing fails on and nobody sees.
 			}
 		});
 		return targets;
@@ -339,6 +358,7 @@ public final class Compactor {
 						properties.owner(overflow, newId);
 					}
 				}
+				remapVectorOwners(map);
 				remapPropertyPayloads(map);
 			}
 			case REL -> {
@@ -351,6 +371,7 @@ public final class Compactor {
 				for (long newId : map.entries().values()) {
 					properties.owner(rels.propBlockId(newId), newId);
 				}
+				remapVectorOwners(map);
 				remapPropertyPayloads(map);
 			}
 			case PROP -> {
@@ -408,11 +429,39 @@ public final class Compactor {
 				}
 				remapPropertyPayloads(map);
 			}
+			case VEC -> {
+				// A vector record is reached from exactly one place, the payload of its owner's property block, so the
+				// payload sweep is the whole of it. The record's own back-pointer does not move — the owner did not.
+				//
+				// The ANN links inside these records are deliberately NOT remapped here. Rewriting them would be a
+				// random write per link per moved record, and the structure they form is rebuildable by construction:
+				// the same argument that makes the B+trees a resetTrees() rather than a page-by-page fix-up.
+				remapPropertyPayloads(map);
+			}
 			default -> throw new IllegalArgumentException("Compaction does not relocate " + moved);
 		}
 	}
 
-	/** Rewrites the ids embedded in every live property payload: blob escapes and explicit element references. */
+	/**
+	 * Repoints the back-pointer of every vector record whose owner just moved.
+	 * <p>
+	 * It is the same obligation a relocated node's property block has, and it is owed for the same reason: an owner id
+	 * that names a slot its element no longer occupies is an ownership mismatch the moment anything verifies.
+	 */
+	private void remapVectorOwners(ForwardingMap map) {
+		if (vectors == null) {
+			return;
+		}
+		for (long vectorId : sets.get(Kind.VEC).liveIds()) {
+			long owner = vectors.owner(vectorId);
+			long mapped = map.mapId(owner);
+			if (mapped != owner) {
+				vectors.owner(vectorId, mapped);
+			}
+		}
+	}
+
+	/** Rewrites the ids embedded in every live property payload: blob escapes, vector records and element references. */
 	private void remapPropertyPayloads(ForwardingMap map) {
 		for (long nodeId : sets.get(Kind.NODE).liveIds()) {
 			if (!map.isSource(nodeId)) {

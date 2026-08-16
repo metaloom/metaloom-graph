@@ -9,6 +9,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
+import io.metaloom.graph.core.api.VectorIndexDefinition;
+import io.metaloom.graph.core.api.VectorIndexState;
+import io.metaloom.graph.core.api.VectorMetric;
 import io.metaloom.graph.core.catalog.Catalog;
 import io.metaloom.graph.core.id.ElementId;
 import io.metaloom.graph.core.segment.SegmentSet;
@@ -45,6 +48,31 @@ public final class IndexCatalog {
 	private static final int OFF_UNIQUE_COUNT = 64;
 	private static final int OFF_UNIQUE_KEYS = 68;
 	private static final int MAX_UNIQUE_KEYS = 256;
+
+	/**
+	 * Declared vector indexes: a count, then that many fixed-size entries.
+	 * <p>
+	 * Past the unique-key list, which reaches {@code 68 + 4 * 256 = 1092} when it is full. Rounded up to leave that
+	 * list room to grow without either of them having to move — a field that moves is a format change, and this page
+	 * has already cost the project one defect for being reasoned about too cleverly (see the offset-30 note above).
+	 */
+	private static final int OFF_VECTOR_COUNT = 1152;
+	private static final int OFF_VECTOR_ENTRIES = 1156;
+	private static final int VECTOR_ENTRY_BYTES = 64;
+	private static final int MAX_VECTOR_INDEXES = 16;
+
+	// Field offsets within one vector-index entry.
+	private static final int VI_LABEL_ID = 0;
+	private static final int VI_KEY_ID = 4;
+	private static final int VI_DIMENSIONS = 8;
+	private static final int VI_METRIC = 12;
+	private static final int VI_STATE = 13;
+	private static final int VI_M = 14;
+	private static final int VI_EF_CONSTRUCTION = 16;
+	private static final int VI_MODEL_ID = 20;
+	private static final int VI_ENTRY_POINT = 24;
+	private static final int VI_MAX_LEVEL = 32;
+	private static final int VI_BUILT_COUNT = 40;
 
 	private final SegmentSet segments;
 	private final Catalog catalog;
@@ -188,6 +216,179 @@ public final class IndexCatalog {
 			}
 		}
 		return conflicting;
+	}
+
+	// ---------------------------------------------------------------- declared vector indexes
+
+	/**
+	 * Declares an approximate-nearest-neighbour index, and returns its ordinal.
+	 * <p>
+	 * The ordinal is how a vector record says which index owns it, in a field two bytes wide — so it is a position in
+	 * this list rather than an id, and the list is append-only within the life of a declaration. Dropping an index
+	 * clears its slot without moving the ones after it, because moving them would silently reassign every vector
+	 * record that named one.
+	 */
+	public int addVectorIndex(VectorIndexDefinition definition, int labelId, int keyId, int modelId)
+		throws IOException {
+		ensureInitialised();
+		List<VectorIndexDefinition> existing = vectorIndexes();
+		for (VectorIndexDefinition other : existing) {
+			if (other != null && other.covers(definition.label(), definition.key())) {
+				throw new IllegalStateException("A vector index on :" + definition.label() + "." + definition.key()
+					+ " already exists");
+			}
+		}
+		int ord = -1;
+		for (int i = 0; i < existing.size(); i++) {
+			if (existing.get(i) == null) {
+				ord = i;
+				break;
+			}
+		}
+		if (ord < 0) {
+			if (existing.size() >= MAX_VECTOR_INDEXES) {
+				throw new IllegalStateException("At most " + MAX_VECTOR_INDEXES + " vector indexes are supported");
+			}
+			ord = existing.size();
+		}
+		MemorySegment page = segments.mutable(catalogPageId);
+		long base = OFF_VECTOR_ENTRIES + (long) ord * VECTOR_ENTRY_BYTES;
+		page.set(Layouts.INT, base + VI_LABEL_ID, labelId);
+		page.set(Layouts.INT, base + VI_KEY_ID, keyId);
+		page.set(Layouts.INT, base + VI_DIMENSIONS, definition.dimensions());
+		page.set(Layouts.BYTE, base + VI_METRIC, (byte) (definition.metric().ordinal() + 1));
+		page.set(Layouts.BYTE, base + VI_STATE, (byte) (definition.state().ordinal() + 1));
+		page.set(Layouts.BYTE, base + VI_M, (byte) definition.m());
+		page.set(Layouts.INT, base + VI_EF_CONSTRUCTION, definition.efConstruction());
+		page.set(Layouts.INT, base + VI_MODEL_ID, modelId);
+		page.set(Layouts.LONG, base + VI_ENTRY_POINT, ElementId.NULL);
+		page.set(Layouts.INT, base + VI_MAX_LEVEL, 0);
+		page.set(Layouts.LONG, base + VI_BUILT_COUNT, 0L);
+		if (ord >= existing.size()) {
+			page.set(Layouts.INT, OFF_VECTOR_COUNT, ord + 1);
+		}
+		segments.touched(catalogPageId);
+		return ord;
+	}
+
+	/**
+	 * Every declared vector index by ordinal, with a null for a slot that has been dropped.
+	 * <p>
+	 * The nulls are the point: the position <i>is</i> the identity, so the list is returned with its holes rather than
+	 * compacted. A caller wanting only the live ones filters.
+	 */
+	public List<VectorIndexDefinition> vectorIndexes() {
+		if (!initialised()) {
+			return List.of();
+		}
+		MemorySegment page = segments.resolve(catalogPageId);
+		int count = page.get(Layouts.INT, OFF_VECTOR_COUNT);
+		if (count < 0 || count > MAX_VECTOR_INDEXES) {
+			throw new io.metaloom.graph.core.api.PageCorruptException("The index catalog declares " + count
+				+ " vector indexes, which is outside 0.." + MAX_VECTOR_INDEXES);
+		}
+		List<VectorIndexDefinition> result = new java.util.ArrayList<>(count);
+		for (int ord = 0; ord < count; ord++) {
+			result.add(readVectorIndex(page, ord));
+		}
+		return result;
+	}
+
+	private VectorIndexDefinition readVectorIndex(MemorySegment page, int ord) {
+		long base = OFF_VECTOR_ENTRIES + (long) ord * VECTOR_ENTRY_BYTES;
+		int state = Byte.toUnsignedInt(page.get(Layouts.BYTE, base + VI_STATE));
+		if (state == 0) {
+			// A dropped slot, or one never used. Both read as "no index here", which is what a zeroed page means
+			// everywhere else in this engine.
+			return null;
+		}
+		int metric = Byte.toUnsignedInt(page.get(Layouts.BYTE, base + VI_METRIC));
+		if (metric < 1 || metric > VectorMetric.values().length || state > VectorIndexState.values().length) {
+			throw new io.metaloom.graph.core.api.PageCorruptException("Vector index " + ord
+				+ " declares metric " + metric + " and state " + state + ", which are not values this build knows");
+		}
+		String label = catalog.label(page.get(Layouts.INT, base + VI_LABEL_ID));
+		String key = catalog.key(page.get(Layouts.INT, base + VI_KEY_ID));
+		int modelId = page.get(Layouts.INT, base + VI_MODEL_ID);
+		return new VectorIndexDefinition(label, key,
+			page.get(Layouts.INT, base + VI_DIMENSIONS),
+			VectorMetric.values()[metric - 1],
+			modelId == 0 ? "" : catalog.key(modelId),
+			Byte.toUnsignedInt(page.get(Layouts.BYTE, base + VI_M)),
+			page.get(Layouts.INT, base + VI_EF_CONSTRUCTION),
+			VectorIndexState.values()[state - 1]);
+	}
+
+	/** The ordinal of the index covering this label and key, or -1. */
+	public int vectorIndexOrdinal(String label, String key) {
+		List<VectorIndexDefinition> declared = vectorIndexes();
+		for (int ord = 0; ord < declared.size(); ord++) {
+			VectorIndexDefinition definition = declared.get(ord);
+			if (definition != null && definition.covers(label, key)) {
+				return ord;
+			}
+		}
+		return -1;
+	}
+
+	/** Moves a declaration into a new state, which is how a finished build becomes queryable. */
+	public void vectorIndexState(int ord, VectorIndexState state) {
+		requireDeclared(ord);
+		MemorySegment page = segments.mutable(catalogPageId);
+		page.set(Layouts.BYTE, OFF_VECTOR_ENTRIES + (long) ord * VECTOR_ENTRY_BYTES + VI_STATE,
+			(byte) (state.ordinal() + 1));
+		segments.touched(catalogPageId);
+	}
+
+	/** The ANN graph's entry point, and the highest layer it appears in. Null until the first member is linked. */
+	public long vectorEntryPoint(int ord) {
+		requireDeclared(ord);
+		return segments.resolve(catalogPageId)
+			.get(Layouts.LONG, OFF_VECTOR_ENTRIES + (long) ord * VECTOR_ENTRY_BYTES + VI_ENTRY_POINT);
+	}
+
+	public int vectorMaxLevel(int ord) {
+		requireDeclared(ord);
+		return segments.resolve(catalogPageId)
+			.get(Layouts.INT, OFF_VECTOR_ENTRIES + (long) ord * VECTOR_ENTRY_BYTES + VI_MAX_LEVEL);
+	}
+
+	public void vectorEntryPoint(int ord, long vectorId, int maxLevel) {
+		requireDeclared(ord);
+		long base = OFF_VECTOR_ENTRIES + (long) ord * VECTOR_ENTRY_BYTES;
+		MemorySegment page = segments.mutable(catalogPageId);
+		page.set(Layouts.LONG, base + VI_ENTRY_POINT, vectorId);
+		page.set(Layouts.INT, base + VI_MAX_LEVEL, maxLevel);
+		segments.touched(catalogPageId);
+	}
+
+	/** How many members the build has linked so far, so a BUILDING index can report progress rather than a shrug. */
+	public long vectorBuiltCount(int ord) {
+		requireDeclared(ord);
+		return segments.resolve(catalogPageId)
+			.get(Layouts.LONG, OFF_VECTOR_ENTRIES + (long) ord * VECTOR_ENTRY_BYTES + VI_BUILT_COUNT);
+	}
+
+	public void vectorBuiltCount(int ord, long built) {
+		requireDeclared(ord);
+		segments.mutable(catalogPageId)
+			.set(Layouts.LONG, OFF_VECTOR_ENTRIES + (long) ord * VECTOR_ENTRY_BYTES + VI_BUILT_COUNT, built);
+		segments.touched(catalogPageId);
+	}
+
+	/** Clears a declaration. The slot is left in place so no other index's ordinal changes. */
+	public void removeVectorIndex(int ord) {
+		requireDeclared(ord);
+		MemorySegment page = segments.mutable(catalogPageId);
+		long base = OFF_VECTOR_ENTRIES + (long) ord * VECTOR_ENTRY_BYTES;
+		page.asSlice(base, VECTOR_ENTRY_BYTES).fill((byte) 0);
+		segments.touched(catalogPageId);
+	}
+
+	private void requireDeclared(int ord) {
+		if (!initialised() || ord < 0 || ord >= vectorIndexes().size() || vectorIndexes().get(ord) == null) {
+			throw new IllegalArgumentException("No vector index with ordinal " + ord);
+		}
 	}
 
 	// ---------------------------------------------------------------- maintenance hooks

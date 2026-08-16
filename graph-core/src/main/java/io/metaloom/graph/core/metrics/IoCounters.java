@@ -24,7 +24,14 @@ import io.metaloom.graph.core.id.Kind;
  */
 public final class IoCounters {
 
-	private static final int KINDS = 8;
+	/**
+	 * One counter per kind code the id encoding can express, not per kind that exists today.
+	 * <p>
+	 * {@link #recordRead} indexes with a raw kind code on the hottest path in the engine and does not bound-check it,
+	 * because bound-checking a read counter would cost more than the counter. Sizing this by hand was therefore a
+	 * latent {@code ArrayIndexOutOfBoundsException} for the next kind anybody added.
+	 */
+	private static final int KINDS = Kind.MAX_KINDS;
 
 	private final LongAdder[] recordReads = adders();
 	private final LongAdder[] recordWrites = adders();

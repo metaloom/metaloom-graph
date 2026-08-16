@@ -174,6 +174,27 @@
                 <configuration>
                     <excludedGroups>${excluded.test.groups}</excludedGroups>
                     <!--
+                        A hung test JVM must become a failure, not a stalled build.
+
+                        Without this a test that parks forever - and the ones most able to do that are the ones that
+                        block on a socket - takes the whole reactor with it, silently, with no report and no output.
+                        That is exactly what a missing `volatile` on GraphClient.readsPaused did: the build sat for
+                        twenty-five minutes with no indication of which class was stuck, and the only way to find out
+                        was to attach a thread dump to the fork by hand.
+
+                        The number is deliberately generous. The whole graph-core suite is about a minute and
+                        graph-server a couple, so twenty minutes accuses nothing that is merely slow on a loaded
+                        machine; it exists to convert "forever" into "red", not to police duration. `mvn test -Pslow`
+                        and the soak run under their own profiles and override it where they need to.
+                    -->
+                    <forkedProcessTimeoutInSeconds>1200</forkedProcessTimeoutInSeconds>
+                    <!--
+                        And a bounded wait for a fork that has been told to exit and has not. A non-daemon thread left
+                        behind by a leaked event loop or an unclosed pool keeps the JVM alive after the last test has
+                        run, which stalls the build in a place no test report can explain.
+                    -->
+                    <forkedProcessExitTimeoutInSeconds>60</forkedProcessExitTimeoutInSeconds>
+                    <!--
                         Surefire's default patterns cover *Test and Test* only, so a class called *Benchmark was
                         silently never run and `mvn test -Pbench` quietly did nothing. The tag, not the file name,
                         is what decides whether a class runs in a given profile.

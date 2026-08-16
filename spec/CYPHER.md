@@ -31,7 +31,8 @@ for (CypherRow row : result) {
 ```
 Query        := SingleQuery (UNION [ALL] SingleQuery)*
 SingleQuery  := Clause+ [Return]          -- Return is required unless the query writes
-Clause       := Match | Unwind | With | Create | Merge | Set | Remove | Delete
+Clause       := Match | Unwind | With | Create | Merge | Set | Remove | Delete | Call
+Call         := CALL Name '(' [Expr (',' Expr)*] ')' YIELD Variable (',' Variable)*
 Match        := MATCH Pattern [WHERE Expr]
 Unwind       := UNWIND Expr AS Variable
 With         := WITH Projection [WHERE Expr]
@@ -72,6 +73,25 @@ spaces. Keywords are case-insensitive; identifiers are not; `:Order` and `.end` 
 | String | `toString`, `toUpper`, `toLower`, `trim`, `ltrim`, `rtrim`, `substring`, `replace`, `split` |
 | Numeric | `toInteger`, `toFloat`, `toBoolean`, `abs`, `ceil`, `floor`, `round`, `sqrt`, `sign` |
 | Vector | `vector.cosine`, `vector.dot`, `vector.l2` — [VECTOR.md](VECTOR.md) |
+
+**One procedure**, and it exists because the planner cannot infer an access path it has no cost model
+for:
+
+```cypher
+CALL vector.query('Person', 'embedding', $q, 10) YIELD node, score
+MATCH (node)-[:MEMBER_OF]->(:Team {name: 'infra'})
+RETURN node.name, score
+```
+
+`YIELD` is required — a call whose results bind to nothing has nowhere to put them, and this build has
+no implicit result table, so accepting it would make a query that looks like it does something do
+nothing. An unknown procedure is refused by the executor rather than the grammar, because "no such
+procedure" is not a syntax error.
+
+**The second line is the point.** `node` is already bound when the `MATCH` runs, so the pattern matcher
+takes its already-bound branch and *verifies* rather than scanning — a graph predicate applied to the
+results of a vector search, with no planner change at all. That combined query is the reason the index
+lives inside the engine instead of beside it ([VECTOR.md §4.5](VECTOR.md)).
 
 An unknown function names itself and lists what exists, rather than returning null — a typo that
 returns an empty result set is much worse than one that fails.
@@ -771,4 +791,4 @@ previous bundle. Every assertion in the first run failed against markup that no 
 ---
 
 _Git HEAD revision: `8f178b4`_
-_Last updated: 2026-08-16 (the vector functions and the namespaced-call fold)_
+_Last updated: 2026-08-16 (HNSW vector search, stages 1 to 6)_

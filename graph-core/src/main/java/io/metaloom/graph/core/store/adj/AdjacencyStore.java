@@ -1,8 +1,6 @@
 package io.metaloom.graph.core.store.adj;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
 
 import io.metaloom.graph.core.api.PageCorruptException;
 import io.metaloom.graph.core.id.ElementId;
@@ -59,11 +57,11 @@ public final class AdjacencyStore {
 	 * walk is bounded, because "follow pointers until null" against untrusted data is a process that never returns.
 	 * The bound is computed once per walk rather than per hop, since it costs a scan of the segment headers.
 	 */
-	private long chainLimit() {
+	long chainLimit() {
 		return segments.liveCount() + 1;
 	}
 
-	private long step(long nodeId, long blockId, long hops, long limit) {
+	long step(long nodeId, long blockId, long hops, long limit) {
 		if (hops > limit) {
 			throw new PageCorruptException("The adjacency chain of node " + ElementId.toString(nodeId)
 				+ " does not terminate after " + hops + " blocks; it contains a cycle");
@@ -78,7 +76,7 @@ public final class AdjacencyStore {
 	 * block's first cell to the end of its page is always safe to acquire — a block never straddles a page — so a
 	 * single acquisition yields both the header and the payload, and the slice is then cut to the declared size.
 	 */
-	private AdjacencyBlock block(long blockId) {
+	AdjacencyBlock block(long blockId) {
 		return view(segments.resolveRunToPageEnd(blockId), blockId);
 	}
 
@@ -240,49 +238,50 @@ public final class AdjacencyStore {
 	 * A filtered scan costs the same {@code ADJ} record reads as an unfiltered one and that is not a defect: the
 	 * chain's {@code next} pointer is in each block's header, so every block is acquired before it can be judged.
 	 * What the skip saves is the decode, counted as {@link io.metaloom.graph.core.api.IoStats#adjacencyBlocksSkipped}.
+	 * <p>
+	 * <b>This materialises the whole chain</b>, which is right for a caller that wants all of it and wrong for one
+	 * that may stop early. It is written as a drain of {@link #cursor(long, java.util.Set)} so that the walk and its
+	 * filters exist in one place.
 	 *
 	 * @param typeIds
 	 *            relationship type ids to admit, or null for every entry
 	 */
 	public long[] edges(long nodeId, java.util.Set<Integer> typeIds) {
-		List<long[]> chunks = new ArrayList<>();
-		int total = 0;
-
-		int inline = nodes.inlineEdgeCount(nodeId);
-		if (inline > 0) {
-			long[] head = new long[inline];
-			for (int i = 0; i < inline; i++) {
-				head[i] = nodes.inlineEdge(nodeId, i);
-			}
-			chunks.add(head);
-			total += inline;
-		}
-		long blockId = nodes.adjHeadId(nodeId);
-		long hops = 0;
-		long limit = chainLimit();
-		while (!ElementId.isNull(blockId)) {
-			AdjacencyBlock current = block(step(nodeId, blockId, ++hops, limit));
-			if (current.admitsAnyType(typeIds)) {
-				countDecode();
-				long[] entries = current.readAll();
-				chunks.add(entries);
-				total += entries.length;
-			} else {
-				countSkip();
-			}
-			blockId = current.nextBlockId();
-		}
-
-		long[] result = new long[total];
+		EdgeCursor cursor = cursor(nodeId, typeIds);
+		long[] result = new long[16];
 		int written = 0;
-		for (long[] chunk : chunks) {
-			for (long edge : chunk) {
-				if (!PackedEdge.isTombstone(edge) && !PackedEdge.excludedByType(edge, typeIds)) {
-					result[written++] = edge;
-				}
+		while (cursor.next()) {
+			if (written == result.length) {
+				result = java.util.Arrays.copyOf(result, result.length * 2);
 			}
+			result[written++] = cursor.edge();
 		}
 		return written == result.length ? result : java.util.Arrays.copyOf(result, written);
+	}
+
+	/**
+	 * The same walk, streamed: entries arrive one at a time and a block is decoded only when the previous one has been
+	 * consumed.
+	 * <p>
+	 * {@link #edges(long, java.util.Set)} is a drain of this, which is the point — the chain walk and its two filter
+	 * levels exist once. Use this when the caller may stop early and the array form when it will not.
+	 * <p>
+	 * <b>The cursor does not hold a read view.</b> It reads pages lazily, across as many calls as the caller makes, so
+	 * the caller has to keep the view stable for as long as it lives; inside {@code GraphStoreImpl.read} it must be
+	 * drained before the supplier returns, because that read may be re-run.
+	 *
+	 * @param typeIds
+	 *            relationship type ids to admit, or null for every entry
+	 */
+	public EdgeCursor cursor(long nodeId, java.util.Set<Integer> typeIds) {
+		int inline = nodes.inlineEdgeCount(nodeId);
+		long[] head = new long[inline];
+		for (int i = 0; i < inline; i++) {
+			head[i] = nodes.inlineEdge(nodeId, i);
+		}
+		// Eager, and cheap: there are at most two of them and they live in the node record the caller has already read.
+		// Copying them out here is what lets the cursor treat the inline tier and a block as the same kind of chunk.
+		return new EdgeCursor(this, nodeId, typeIds, head, nodes.adjHeadId(nodeId), chainLimit());
 	}
 
 	/**
@@ -350,14 +349,14 @@ public final class AdjacencyStore {
 		return lightweightCanMatch && PackedEdge.location(edge) == target;
 	}
 
-	private void countDecode() {
+	void countDecode() {
 		IoCounters counters = segments.counters();
 		if (counters != null) {
 			counters.adjacencyBlockDecoded();
 		}
 	}
 
-	private void countSkip() {
+	void countSkip() {
 		IoCounters counters = segments.counters();
 		if (counters != null) {
 			counters.adjacencyBlockSkipped();

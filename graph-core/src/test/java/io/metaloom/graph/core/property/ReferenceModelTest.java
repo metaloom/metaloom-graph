@@ -155,6 +155,23 @@ public class ReferenceModelTest {
 			Map<String, Object> props = randomProperties(random);
 			store.setNodeProperties(id, toProperties(props));
 			model.setProperties(id, props);
+		} else if (roll < 48) {
+			// The only writes that reach onLabelsChanged. Without them that hook has no differential coverage at all,
+			// and it is the one an index over (label, property) depends on most.
+			long id = nodes.get(random.nextInt(nodes.size()));
+			if (model.hasNode(id)) {
+				String label = LABELS[random.nextInt(LABELS.length)];
+				assertEquals(model.addLabel(id, label), store.addNodeLabel(id, label),
+					"operation " + operation + ": addNodeLabel disagreed with the model about whether it added one");
+			}
+		} else if (roll < 54) {
+			long id = nodes.get(random.nextInt(nodes.size()));
+			if (model.hasNode(id) && model.labels(id).size() > 1) {
+				// Never the last one: the store keeps a node's first label as its identity and the model mirrors that.
+				String label = model.labels(id).get(model.labels(id).size() - 1);
+				assertEquals(model.removeLabel(id, label), store.removeNodeLabel(id, label),
+					"operation " + operation + ": removeNodeLabel disagreed with the model");
+			}
 		} else if (roll < 62) {
 			long from = nodes.get(random.nextInt(nodes.size()));
 			long to = nodes.get(random.nextInt(nodes.size()));

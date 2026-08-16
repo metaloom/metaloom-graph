@@ -35,6 +35,7 @@ import io.metaloom.graph.core.api.GraphStoreOptions;
 import io.metaloom.graph.core.api.IoStats;
 import io.metaloom.graph.core.api.IsolationLevel;
 import io.metaloom.graph.core.api.Neighbour;
+import io.metaloom.graph.core.api.NeighbourCursor;
 import io.metaloom.graph.core.api.Properties;
 import io.metaloom.graph.core.api.ReadTransaction;
 import io.metaloom.graph.core.api.SnapshotStats;
@@ -43,12 +44,16 @@ import io.metaloom.graph.core.api.StoreClosedException;
 import io.metaloom.graph.core.api.StoreMetrics;
 import io.metaloom.graph.core.api.StoreStats;
 import io.metaloom.graph.core.api.Transaction;
+import io.metaloom.graph.core.api.VectorIndexDefinition;
+import io.metaloom.graph.core.api.VectorIndexState;
 import io.metaloom.graph.core.api.VectorMetric;
+import io.metaloom.graph.core.api.Vectors;
 import io.metaloom.graph.core.api.VerifyLevel;
 import io.metaloom.graph.core.api.VerifyOptions;
 import io.metaloom.graph.core.catalog.Catalog;
 import io.metaloom.graph.core.id.ElementId;
 import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.index.HnswIndex;
 import io.metaloom.graph.core.index.IndexCatalog;
 import io.metaloom.graph.core.maintenance.Compactor;
 import io.metaloom.graph.core.maintenance.MaintenanceRunner;
@@ -64,6 +69,8 @@ import io.metaloom.graph.core.store.adj.PackedEdge;
 import io.metaloom.graph.core.store.blob.BlobStore;
 import io.metaloom.graph.core.store.node.NodeStore;
 import io.metaloom.graph.core.store.prop.PropertyStore;
+import io.metaloom.graph.core.store.vec.VectorRecord;
+import io.metaloom.graph.core.store.vec.VectorStore;
 import io.metaloom.graph.core.store.rel.RelStore;
 import io.metaloom.graph.core.txn.PageVersions;
 import io.metaloom.graph.core.txn.Snapshot;
@@ -90,7 +97,11 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	private final AdjacencyStore adjacency;
 	private final PropertyStore properties;
 	private final BlobStore blobs;
+	/** Null unless the store was created with vector storage — see GraphStoreOptions.vectorDimensions. */
+	private final VectorStore vectors;
 	private final IndexCatalog indexes;
+	/** Null unless the store has vector storage. The ANN structure over the vector records. */
+	private final HnswIndex hnsw;
 	private final WalManager wal;
 	private final OverlayHolder overlays = new OverlayHolder();
 	private final TransactionManager transactions;
@@ -148,11 +159,14 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 		// Order matters: the property store backs the node store's label overflow, so it has to exist first.
 		this.blobs = new BlobStore(segmentSets.get(Kind.BLOB));
-		this.properties = new PropertyStore(segmentSets.get(Kind.PROP), blobs);
+		SegmentSet vecSegments = segmentSets.get(Kind.VEC);
+		this.vectors = vecSegments == null ? null : new VectorStore(vecSegments, manifest.vectorDimensions());
+		this.properties = new PropertyStore(segmentSets.get(Kind.PROP), blobs, vectors);
 		this.nodes = new NodeStore(segmentSets.get(Kind.NODE), properties);
 		this.rels = new RelStore(segmentSets.get(Kind.REL));
 		this.adjacency = new AdjacencyStore(segmentSets.get(Kind.ADJ), nodes);
 		this.indexes = new IndexCatalog(segmentSets.get(Kind.INDEX), catalog);
+		this.hnsw = vectors == null ? null : new HnswIndex(vectors, indexes);
 
 		for (SegmentSet set : segmentSets.values()) {
 			set.overlays(overlays);
@@ -185,11 +199,22 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		Map<Kind, SegmentSet> sets = new EnumMap<>(Kind.class);
 		IoCounters counters = new IoCounters();
 		try {
-			manifest = Manifest.open(path, options.pageSize(), options.segmentCapacity());
+			int vectorDimensions = options.vectorDimensions();
+			manifest = Manifest.open(path, options.pageSize(), options.segmentCapacity(),
+				VectorRecord.strideFor(vectorDimensions, options.pageSize()), vectorDimensions);
 			Geometry geometry = manifest.geometry();
 			catalog = new Catalog(path);
 			for (Kind kind : new Kind[] { Kind.NODE, Kind.REL, Kind.ADJ, Kind.PROP, Kind.BLOB, Kind.INDEX }) {
 				sets.put(kind, new SegmentSet(path, kind, geometry));
+			}
+			// Vector storage exists only if the store was created with it, and the manifest is the authority — not the
+			// options, which may not mention it on a reopen.
+			//
+			// It has to be built HERE, before recovery below. A committed VEC page image is replayed by looking its
+			// kind up in this map, so a set that is missing turns a perfectly ordinary recovery into
+			// "Recovery references VEC segment 0", which reads as corruption and refuses to open the store at all.
+			if (geometry.isEnabled(Kind.VEC)) {
+				sets.put(Kind.VEC, new SegmentSet(path, Kind.VEC, geometry));
 			}
 
 			for (SegmentSet set : sets.values()) {
@@ -491,20 +516,60 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 	@Override
 	public void runRead(MaintenanceRunner.Unit unit) throws IOException {
-		checkOpen();
-		if (writerLock.isHeldByCurrentThread() && currentTransaction != null) {
-			unit.run();
-			return;
-		}
 		// A maintenance scan is long and rare, so it takes the lock outright rather than gambling on optimism.
-		Snapshot snapshot = transactions.holder().current();
-		long stamp = applyLock.readLock();
+		ReadLease lease = new ReadLease();
 		try {
+			unit.run();
+		} finally {
+			lease.close();
+		}
+	}
+
+	/**
+	 * A read view held outright, for as long as the holder needs it.
+	 * <p>
+	 * {@link #read} is the right shape for an operation that fits in one call: it runs without a lock and repeats
+	 * itself if a commit landed underneath. Some reads cannot be repeated — a scan whose consumer has side effects, a
+	 * cursor that outlives the call that made it — and those take the latch instead. This is that acquisition, in a
+	 * form that can be handed to something with its own lifetime.
+	 * <p>
+	 * Inside the caller's own write transaction it acquires nothing: the overlay is already a consistent view, and the
+	 * writer taking a read latch against itself is at best pointless.
+	 */
+	private final class ReadLease implements AutoCloseable {
+
+		private final Snapshot snapshot;
+		private final long stamp;
+		private boolean held;
+
+		ReadLease() {
+			checkOpen();
+			Snapshot current = transactions.holder().current();
+			if (current != null) {
+				current.checkAlive();
+			}
+			if (writerLock.isHeldByCurrentThread() && currentTransaction != null) {
+				this.snapshot = null;
+				this.stamp = 0;
+				this.held = false;
+				return;
+			}
+			this.snapshot = current;
+			this.stamp = applyLock.readLock();
+			this.held = true;
 			if (snapshot != null) {
 				snapshot.exclusionHeld(true);
 			}
-			unit.run();
-		} finally {
+		}
+
+		@Override
+		public void close() {
+			if (!held) {
+				return;
+			}
+			// Cleared first: a cursor may be closed twice, and unlocking a stamp twice corrupts the lock rather than
+			// throwing.
+			held = false;
 			if (snapshot != null) {
 				snapshot.exclusionHeld(false);
 			}
@@ -540,6 +605,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				nodes.propBlockId(nodeId, properties.store(keyed, nodeId));
 			}
 			indexes.onNodeCreated(nodeId, labelIds, keyed);
+			maintainVectorMembership(nodeId);
 			return nodeId;
 		});
 	}
@@ -610,6 +676,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			after[before.length] = labelId;
 			nodes.labels(nodeId, after);
 			indexes.onLabelsChanged(nodeId, before, after);
+			maintainVectorMembership(nodeId);
 			return true;
 		});
 	}
@@ -637,6 +704,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			}
 			nodes.labels(nodeId, after);
 			indexes.onLabelsChanged(nodeId, before, after);
+			maintainVectorMembership(nodeId);
 			return true;
 		});
 	}
@@ -795,6 +863,316 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	private record Ranked(long nodeId, double rank, double score) {
 	}
 
+	// ---------------------------------------------------------------- declared vector indexes
+
+	@Override
+	public void createVectorIndex(VectorIndexDefinition definition) throws IOException {
+		if (vectors == null) {
+			throw new IllegalStateException("This store has no vector storage. Create it with "
+				+ "GraphStoreOptions.builder().vectorDimensions(" + definition.dimensions() + ")");
+		}
+		if (definition.dimensions() != vectors.dimensions()) {
+			throw new IllegalArgumentException("This store holds vectors of " + vectors.dimensions()
+				+ " dimensions, so an index over " + definition.dimensions() + " cannot be built on it");
+		}
+		write(() -> {
+			int labelId = catalog.internLabel(definition.label());
+			int keyId = catalog.internKey(definition.key());
+			int modelId = definition.model().isEmpty() ? 0 : catalog.internKey("vector.model:" + definition.model());
+			int ord = indexes.addVectorIndex(definition, labelId, keyId, modelId);
+			// The backfill, in the shape createUniqueConstraint uses: walk what is already there, refuse rather than
+			// declare something that is already false, and only then let the hooks take over.
+			long members = 0;
+			for (long nodeId : indexes.nodesByLabel(definition.label())) {
+				if (!nodes.exists(nodeId)) {
+					continue;
+				}
+				members += declareVectorMember(nodeId, definition, ord);
+			}
+			indexes.vectorBuiltCount(ord, members);
+			return null;
+		});
+		// The links are laid outside the declaring transaction, in batches. Declaring and building are separate
+		// because they have utterly different costs: the declaration is a scan, and the build runs a search of the
+		// graph so far for every member it adds. Keeping them in one transaction would hold the writer lock for the
+		// whole of it — which is the cost spec/VECTOR.md §4.4 warns about — and would make a crash lose all of it.
+		buildVectorIndex(definition.label(), definition.key());
+	}
+
+	@Override
+	public void buildVectorIndex(String label, String key) throws IOException {
+		int ord = indexes.vectorIndexOrdinal(label, key);
+		if (ord < 0) {
+			throw new IllegalArgumentException("No vector index on :" + label + "." + key);
+		}
+		VectorIndexDefinition definition = indexes.vectorIndexes().get(ord);
+		if (hnsw == null) {
+			return;
+		}
+		// A snapshot of the members. Taken once so the build has a fixed work list, and re-checked per batch because
+		// an ordinary write may have deleted one in between.
+		long[] members;
+		List<Long> pending = new ArrayList<>();
+		runRead(() -> {
+			for (long vectorId : segmentSets.get(Kind.VEC).liveIds()) {
+				if (vectors.indexOrdinal(vectorId) == ord
+					&& (vectors.flags(vectorId) & VectorRecord.FLAG_LINKED) == 0) {
+					pending.add(vectorId);
+				}
+			}
+		});
+		members = pending.stream().mapToLong(Long::longValue).toArray();
+
+		int batch = 0;
+		long linked = indexes.vectorBuiltCount(ord);
+		while (batch < members.length) {
+			int end = Math.min(batch + VECTOR_BUILD_BATCH, members.length);
+			int from = batch;
+			runWrite(() -> {
+				for (int i = from; i < end; i++) {
+					long vectorId = members[i];
+					// Re-checked rather than trusted: the work list was taken before this batch's transaction, and an
+					// ordinary write may have deleted the node or moved it out of the index since.
+					if (vectors.exists(vectorId) && vectors.indexOrdinal(vectorId) == ord) {
+						hnsw.insert(ord, definition, vectorId);
+					}
+				}
+			});
+			linked += end - batch;
+			batch = end;
+			final long progress = linked;
+			runWrite(() -> indexes.vectorBuiltCount(ord, progress));
+		}
+		// Only now is the structure complete, and only now will a query be answered from it. A state flipped before
+		// the last batch would be an index that answers confidently with a subset.
+		runWrite(() -> indexes.vectorIndexState(ord, VectorIndexState.READY));
+	}
+
+	/**
+	 * Members linked per transaction during a build.
+	 * <p>
+	 * Each insert searches the graph built so far, so a batch is real work rather than a write burst; the size is a
+	 * compromise between commit overhead and how long one transaction holds the writer lock.
+	 */
+	private static final int VECTOR_BUILD_BATCH = 256;
+
+	/**
+	 * Makes a node a member of one declared index, refusing a vector the index cannot hold.
+	 * <p>
+	 * Only the declaration scan calls this. Ordinary maintenance goes through
+	 * {@link #maintainVectorMembership}, which cannot refuse anything — by then the write has already been accepted,
+	 * and a node that does not qualify is simply not a member.
+	 *
+	 * @return 1 if the node became a member, 0 otherwise
+	 */
+	private long declareVectorMember(long nodeId, VectorIndexDefinition definition, int ord) {
+		int keyId = catalog.lookupKey(definition.key());
+		if (keyId == 0) {
+			return 0;
+		}
+		long block = nodes.propBlockId(nodeId);
+		Object stored = properties.read(block, keyId);
+		if (stored == null) {
+			return 0;
+		}
+		if (!(stored instanceof float[] vector) || vector.length != definition.dimensions()) {
+			throw new IllegalArgumentException("Node " + ElementId.toString(nodeId) + " holds a "
+				+ (stored instanceof float[] other ? other.length + " dimension vector" : "non-vector")
+				+ " under " + definition.key() + ", so an index over " + definition.dimensions()
+				+ " dimensions cannot cover it");
+		}
+		long vectorId = properties.ownedIdOf(block, keyId);
+		if (ElementId.isNull(vectorId) || ElementId.kind(vectorId) != Kind.VEC) {
+			// A vector of the store's own dimension always lands in a vector record, so this is a contradiction rather
+			// than a case to handle.
+			throw new IllegalStateException("Node " + ElementId.toString(nodeId) + " has a vector of the store's own "
+				+ "dimension that is not held in a vector record");
+		}
+		vectors.indexOrdinal(vectorId, ord);
+		return 1;
+	}
+
+	/**
+	 * Brings a node's vector-index membership back in line with its labels and its properties.
+	 *
+	 * <p>
+	 * Called from every write that can change either, which is why it recomputes rather than applying a delta: a
+	 * membership is a function of {@code (labels, property)} and both halves move independently. Adding {@code :Person}
+	 * to a node that already holds an embedding makes it a member; removing the label, or overwriting the vector with
+	 * something of the wrong length, stops it being one. A delta-based version would need every caller to know which
+	 * half it changed, and the one that got it wrong would leave a member that no longer qualifies — answering queries
+	 * with a node the index has no business returning.
+	 * </p>
+	 *
+	 * <p>
+	 * It costs nothing at all until an index is declared, which is the common case.
+	 * </p>
+	 */
+	private void maintainVectorMembership(long nodeId) {
+		if (vectors == null) {
+			return;
+		}
+		List<VectorIndexDefinition> declared = indexes.vectorIndexes();
+		if (declared.isEmpty()) {
+			return;
+		}
+		long block = nodes.propBlockId(nodeId);
+		if (ElementId.isNull(block)) {
+			return;
+		}
+		Set<String> labels = new HashSet<>(nodeLabels(nodeId));
+		Map<Long, Integer> claims = new LinkedHashMap<>();
+		for (int ord = 0; ord < declared.size(); ord++) {
+			VectorIndexDefinition definition = declared.get(ord);
+			if (definition == null || !labels.contains(definition.label())) {
+				continue;
+			}
+			int keyId = catalog.lookupKey(definition.key());
+			if (keyId == 0) {
+				continue;
+			}
+			long vectorId = properties.ownedIdOf(block, keyId);
+			if (!ElementId.isNull(vectorId) && ElementId.kind(vectorId) == Kind.VEC && vectors.exists(vectorId)) {
+				claims.put(vectorId, ord);
+			}
+		}
+		for (long ownedId : properties.ownedIds(block)) {
+			if (ElementId.kind(ownedId) != Kind.VEC || !vectors.exists(ownedId)) {
+				continue;
+			}
+			int wanted = claims.getOrDefault(ownedId, -1);
+			int held = vectors.indexOrdinal(ownedId);
+			if (held == wanted) {
+				continue;
+			}
+			if (held >= 0) {
+				// It is leaving an index. Repair the entry point before the record stops being a member, or a
+				// subsequent search starts from a node the index no longer owns.
+				VectorIndexDefinition leaving = declared.get(held);
+				if (leaving != null && hnsw != null) {
+					hnsw.remove(held, leaving, ownedId);
+				}
+				vectors.unlink(ownedId);
+			}
+			vectors.indexOrdinal(ownedId, wanted);
+			if (wanted >= 0 && hnsw != null) {
+				try {
+					hnsw.insert(wanted, declared.get(wanted), ownedId);
+				} catch (IOException e) {
+					throw new GraphStoreException("Linking a vector into its index failed", e);
+				}
+			}
+		}
+	}
+
+	@Override
+	public void dropVectorIndex(String label, String key) throws IOException {
+		write(() -> {
+			int ord = indexes.vectorIndexOrdinal(label, key);
+			if (ord < 0) {
+				throw new IllegalArgumentException("No vector index on :" + label + "." + key);
+			}
+			// Clear the membership stamp before the declaration, so no record is left claiming an ordinal that has
+			// been reused by a later declaration.
+			if (vectors != null) {
+				for (long vectorId : segmentSets.get(Kind.VEC).liveIds()) {
+					if (vectors.indexOrdinal(vectorId) == ord) {
+						vectors.indexOrdinal(vectorId, -1);
+						vectors.unlink(vectorId);
+					}
+				}
+			}
+			indexes.removeVectorIndex(ord);
+			return null;
+		});
+	}
+
+	@Override
+	public List<VectorIndexDefinition> vectorIndexes() {
+		return read(() -> {
+			List<VectorIndexDefinition> declared = new ArrayList<>();
+			for (VectorIndexDefinition definition : indexes.vectorIndexes()) {
+				if (definition != null) {
+					declared.add(definition);
+				}
+			}
+			return declared;
+		});
+	}
+
+	@Override
+	public List<Neighbour> nearest(String label, String key, float[] query, int k,
+		java.util.function.LongPredicate filter) throws IOException {
+		if (query == null || query.length == 0) {
+			throw new IllegalArgumentException("A vector search needs a query vector");
+		}
+		if (k <= 0) {
+			throw new IllegalArgumentException("k must be positive, got " + k);
+		}
+		checkOpen();
+		int ord = indexes.vectorIndexOrdinal(label, key);
+		if (ord < 0) {
+			throw new IllegalStateException("No vector index on :" + label + "." + key
+				+ ". Declare one with createVectorIndex, or use nearestByScan for an exact answer without one.");
+		}
+		VectorIndexDefinition definition = indexes.vectorIndexes().get(ord);
+		if (definition.state() != VectorIndexState.READY) {
+			throw new IllegalStateException("The vector index on :" + label + "." + key + " is "
+				+ definition.state() + " and cannot answer yet");
+		}
+		if (query.length != definition.dimensions()) {
+			throw new IllegalArgumentException("This index holds " + definition.dimensions()
+				+ " dimension vectors, and the query has " + query.length);
+		}
+		return searchMembers(ord, definition, query, k, filter);
+	}
+
+	/**
+	 * The member scan behind {@link #nearest}: exact, over the index's own members rather than the whole store.
+	 * <p>
+	 * It is what an approximate structure replaces, and until then it is what answers — which means the query surface
+	 * and the filter semantics are already settled and tested by the time the structure arrives.
+	 */
+	private List<Neighbour> searchMembers(int ord, VectorIndexDefinition definition, float[] query, int k,
+		java.util.function.LongPredicate filter) throws IOException {
+		VectorMetric metric = definition.metric();
+		List<Neighbour> result = new ArrayList<>();
+		runRead(() -> {
+			// The beam is widened for a filtered query. A filter is applied when admitting a result, never to steer
+			// the walk, so a selective one simply needs more candidates examined to find its k — the alternative,
+			// filtering what the walk visits, is what collapses recall.
+			int ef = Math.max(definition.efConstruction() / 4, 4 * k);
+			if (filter != null) {
+				ef *= 4;
+			}
+			List<Long> found = hnsw.search(ord, definition, query, k,
+				ef, filter == null ? null : vectorId -> {
+					long ownerId = vectors.owner(vectorId);
+					return nodes.exists(ownerId) && filter.test(ownerId);
+				});
+			for (long vectorId : found) {
+				long ownerId = vectors.owner(vectorId);
+				if (!nodes.exists(ownerId)) {
+					continue;
+				}
+				double score = metric == VectorMetric.EUCLIDEAN
+					? Vectors.euclidean(vectors.read(vectorId), query)
+					: scoreFromDot(metric, vectors.dot(vectorId, query), vectors.norm(vectorId), query);
+				result.add(new Neighbour(ownerId, score));
+			}
+		});
+		return result;
+	}
+
+	/** Cosine from a dot product and the two norms — which is why the record carries its own norm. */
+	private static double scoreFromDot(VectorMetric metric, double dot, double storedNorm, float[] query) {
+		if (metric == VectorMetric.DOT) {
+			return dot;
+		}
+		double queryNorm = Vectors.norm(query);
+		return storedNorm == 0 || queryNorm == 0 ? 0 : dot / (storedNorm * queryNorm);
+	}
+
 	@Override
 	public boolean nodeExists(long nodeId) {
 		return read(() -> nodes.exists(nodeId));
@@ -828,6 +1206,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			properties.free(old);
 			checkUnique(after, nodeId);
 			indexes.onPropertiesChanged(nodeId, before, after);
+			maintainVectorMembership(nodeId);
 			return null;
 		});
 	}
@@ -1013,17 +1392,106 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		return neighbours(nodeId, direction, null);
 	}
 
+	/**
+	 * {@inheritDoc}
+	 * <p>
+	 * A drain of {@link NeighbourWalk}, so the chain walk, the two filter levels and the entry-to-{@code Edge}
+	 * resolution exist once rather than twice.
+	 * <p>
+	 * <b>It stays on the optimistic read path, and the walk it drains takes no lease.</b> That is the whole difference
+	 * between this and {@link #neighbourCursor}: the list is built inside one call and re-running that call costs a
+	 * discarded list, so it can gamble on there being no concurrent apply. A cursor handed back to a caller cannot be
+	 * re-run, so it pays for the latch. Making this one take the latch too would turn every traversal in the engine
+	 * into a writer-excluding read to buy nothing.
+	 */
 	@Override
 	public List<Edge> neighbours(long nodeId, Direction direction, Set<String> types) {
 		return read(() -> {
 			requireNode(nodeId);
-			Set<Integer> typeIds = resolveTypes(types);
 			List<Edge> result = new ArrayList<>();
-			for (long packed : adjacency.edges(nodeId, typeIds)) {
-				materialise(nodeId, packed, direction, typeIds, result);
+			try (NeighbourWalk walk = new NeighbourWalk(nodeId, direction, resolveTypes(types), null)) {
+				while (walk.next()) {
+					result.add(walk.edge());
+				}
 			}
 			return result;
 		});
+	}
+
+	@Override
+	public NeighbourCursor neighbourCursor(long nodeId, Direction direction, Set<String> types) {
+		ReadLease lease = new ReadLease();
+		try {
+			requireNode(nodeId);
+			return new NeighbourWalk(nodeId, direction, resolveTypes(types), lease);
+		} catch (RuntimeException e) {
+			// The cursor never came into existence, so nothing will ever close it.
+			lease.close();
+			throw e;
+		}
+	}
+
+	/**
+	 * The streaming form of {@link #neighbours}: one adjacency entry pulled at a time, resolved into the API edges it
+	 * stands for.
+	 * <p>
+	 * <b>The pending buffer is not incidental.</b> {@link #materialise} appends <em>zero</em> edges for an entry the
+	 * type or direction filter rejects and <em>two</em> for a materialised self-loop, which is both an outgoing and an
+	 * incoming edge of the same node. A cursor that assumed one edge per entry would drop half of every self-loop, so
+	 * the walk keeps what one entry produced and serves it before pulling the next.
+	 *
+	 * @param lease
+	 *            the read view to release on close, or null when the caller holds one for the duration
+	 */
+	private final class NeighbourWalk implements NeighbourCursor {
+
+		private final long nodeId;
+		private final Direction direction;
+		private final Set<Integer> typeIds;
+		private final ReadLease lease;
+		private final io.metaloom.graph.core.store.adj.EdgeCursor entries;
+		private final List<Edge> pending = new ArrayList<>(2);
+
+		private int index;
+		private Edge current;
+
+		NeighbourWalk(long nodeId, Direction direction, Set<Integer> typeIds, ReadLease lease) {
+			this.nodeId = nodeId;
+			this.direction = direction;
+			this.typeIds = typeIds;
+			this.lease = lease;
+			this.entries = adjacency.cursor(nodeId, typeIds);
+		}
+
+		@Override
+		public boolean next() {
+			while (index == pending.size()) {
+				pending.clear();
+				index = 0;
+				if (!entries.next()) {
+					current = null;
+					return false;
+				}
+				materialise(nodeId, entries.edge(), direction, typeIds, pending);
+			}
+			current = pending.get(index++);
+			return true;
+		}
+
+		@Override
+		public Edge edge() {
+			if (current == null) {
+				throw new IllegalStateException("The cursor is not positioned on an edge; call next() first");
+			}
+			return current;
+		}
+
+		@Override
+		public void close() {
+			if (lease != null) {
+				lease.close();
+			}
+		}
 	}
 
 	/**
@@ -1365,7 +1833,8 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		long storageBefore = stats().storageBytes();
 		double livenessBefore = liveness(options.kinds());
 
-		Compactor.Result result = new Compactor(segmentSets, nodes, rels, adjacency, properties, blobs, indexes, this)
+		Compactor.Result result = new Compactor(segmentSets, nodes, rels, adjacency, properties, blobs, vectors,
+			indexes, this)
 			.compact(options);
 
 		counters.compacted(result.relocated.values().stream().mapToLong(Long::longValue).sum());
@@ -1421,7 +1890,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				set.verify();
 			}
 			if (level == VerifyLevel.FULL) {
-				List<String> violations = new InvariantChecker(nodes, rels, adjacency, properties, blobs, segmentSets)
+				List<String> violations = new InvariantChecker(nodes, rels, adjacency, properties, blobs, vectors, segmentSets)
 					.check(options, pacer(options, stamp));
 				if (!violations.isEmpty()) {
 					throw new GraphStoreException("Structural invariants violated (" + violations.size()

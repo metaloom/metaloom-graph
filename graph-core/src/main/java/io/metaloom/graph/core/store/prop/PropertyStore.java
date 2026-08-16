@@ -12,6 +12,7 @@ import io.metaloom.graph.core.id.ElementId;
 import io.metaloom.graph.core.id.Kind;
 import io.metaloom.graph.core.segment.SegmentSet;
 import io.metaloom.graph.core.store.blob.BlobStore;
+import io.metaloom.graph.core.store.vec.VectorStore;
 import io.metaloom.graph.core.util.Layouts;
 
 /**
@@ -45,15 +46,27 @@ public final class PropertyStore {
 
 	private final SegmentSet segments;
 	private final BlobStore blobs;
+	private final VectorStore vectors;
 	private final int cellBytes;
 	private final int maxPayloadBytes;
 
 	public PropertyStore(SegmentSet segments, BlobStore blobs) {
+		this(segments, blobs, null);
+	}
+
+	/**
+	 * @param vectors
+	 *            the store's vector records, or null when it has none. A {@code float[]} of that store's dimension is
+	 *            then written there instead of to a blob — one fixed-size record rather than a whole page — and every
+	 *            other vector still escapes to a blob.
+	 */
+	public PropertyStore(SegmentSet segments, BlobStore blobs, VectorStore vectors) {
 		if (segments.kind() != Kind.PROP) {
 			throw new IllegalArgumentException("PropertyStore requires a PROP segment set");
 		}
 		this.segments = segments;
 		this.blobs = blobs;
+		this.vectors = vectors;
 		this.cellBytes = segments.stride();
 		// A block never straddles a page, so it can never be larger than one page.
 		this.maxPayloadBytes = segments.slotsPerPage() * cellBytes - HEADER_BYTES;
@@ -67,7 +80,7 @@ public final class PropertyStore {
 		if (properties == null || properties.isEmpty()) {
 			return ElementId.NULL;
 		}
-		byte[] payload = encode(properties);
+		byte[] payload = encode(properties, ownerId);
 		if (payload.length > maxPayloadBytes) {
 			throw new IllegalArgumentException("Encoded property block of " + payload.length
 				+ " bytes exceeds the " + maxPayloadBytes + " bytes that fit one page");
@@ -84,7 +97,7 @@ public final class PropertyStore {
 		return id;
 	}
 
-	private byte[] encode(Map<Integer, Object> properties) throws IOException {
+	private byte[] encode(Map<Integer, Object> properties, long ownerId) throws IOException {
 		List<Integer> keys = new ArrayList<>(properties.keySet());
 		// Entries are sorted by key id so that lookup is a binary search rather than a scan.
 		keys.sort(null);
@@ -94,7 +107,7 @@ public final class PropertyStore {
 				throw new IllegalArgumentException("Property key id out of range: " + key);
 			}
 			writer.u24(key);
-			ValueCodec.encode(writer, properties.get(key), blobs);
+			ValueCodec.encode(writer, properties.get(key), blobs, vectors, ownerId);
 		}
 		return writer.toArray();
 	}
@@ -112,7 +125,7 @@ public final class PropertyStore {
 		ValueCodec.Reader reader = new ValueCodec.Reader(payload, 0, used);
 		while (reader.hasRemaining()) {
 			int key = reader.u24();
-			result.put(key, ValueCodec.decode(reader, blobs, true, null));
+			result.put(key, ValueCodec.decode(reader, blobs, vectors, true, null));
 		}
 		return result;
 	}
@@ -130,7 +143,7 @@ public final class PropertyStore {
 		while (reader.hasRemaining()) {
 			int key = reader.u24();
 			boolean wanted = key == keyId;
-			Object value = ValueCodec.decode(reader, blobs, wanted, null);
+			Object value = ValueCodec.decode(reader, blobs, vectors, wanted, null);
 			if (wanted) {
 				return value;
 			}
@@ -157,7 +170,7 @@ public final class PropertyStore {
 			if (key == keyId) {
 				return true;
 			}
-			ValueCodec.decode(reader, blobs, false, null);
+			ValueCodec.decode(reader, blobs, vectors, false, null);
 			if (key > keyId) {
 				return false;
 			}
@@ -244,9 +257,56 @@ public final class PropertyStore {
 
 	/** Every blob id the block references, in encounter order. */
 	public List<Long> blobIds(long blockId) {
-		List<Long> blobIds = new ArrayList<>();
+		List<Long> result = new ArrayList<>();
+		for (long id : ownedIds(blockId)) {
+			if (ElementId.kind(id) == Kind.BLOB) {
+				result.add(id);
+			}
+		}
+		return result;
+	}
+
+	/**
+	 * The record one specific key's value owns, or {@link ElementId#NULL} when it owns none.
+	 * <p>
+	 * {@link #ownedIds} answers "what does this block own", which is what the free path needs. This answers "what does
+	 * <em>this property</em> own", which is what a caller needs to act on one value — an index stamping the vector
+	 * record behind {@code :Person.embedding} cannot use a list it has no way to attribute to a key.
+	 */
+	public long ownedIdOf(long blockId, int keyId) {
 		if (ElementId.isNull(blockId)) {
-			return blobIds;
+			return ElementId.NULL;
+		}
+		int cells = cellCount(blockId);
+		MemorySegment block = segments.resolveRun(blockId, cells);
+		byte[] payload = payloadOf(blockId, block);
+		ValueCodec.Reader reader = new ValueCodec.Reader(payload, 0, payload.length);
+		while (reader.hasRemaining()) {
+			int key = reader.u24();
+			List<Long> owned = key == keyId ? new ArrayList<>(1) : null;
+			ValueCodec.decode(reader, blobs, vectors, false, owned);
+			if (key == keyId) {
+				return owned.isEmpty() ? ElementId.NULL : owned.get(0);
+			}
+			if (key > keyId) {
+				// Entries are sorted, so the key cannot appear later.
+				return ElementId.NULL;
+			}
+		}
+		return ElementId.NULL;
+	}
+
+	/**
+	 * Every record this block <b>owns</b>, of whatever kind: blob extent chains and vector records both.
+	 * <p>
+	 * The distinction matters on the free path. A property block is the only thing that points at these, so the
+	 * cascade has to see every one of them or the record outlives its owner — and it has to know which kind each is,
+	 * because they are freed by different stores.
+	 */
+	public List<Long> ownedIds(long blockId) {
+		List<Long> ownedIds = new ArrayList<>();
+		if (ElementId.isNull(blockId)) {
+			return ownedIds;
 		}
 		int cells = cellCount(blockId);
 		MemorySegment block = segments.resolveRun(blockId, cells);
@@ -255,9 +315,9 @@ public final class PropertyStore {
 		ValueCodec.Reader reader = new ValueCodec.Reader(payload, 0, used);
 		while (reader.hasRemaining()) {
 			reader.u24();
-			ValueCodec.decode(reader, blobs, false, blobIds);
+			ValueCodec.decode(reader, blobs, vectors, false, ownedIds);
 		}
-		return blobIds;
+		return ownedIds;
 	}
 
 	public SegmentSet segments() {
@@ -265,8 +325,11 @@ public final class PropertyStore {
 	}
 
 	/**
-	 * Frees a block and every blob it references. This cascade is what the proof of concept never had: deleting an
-	 * element there left its property records behind forever.
+	 * Frees a block and everything it owns. This cascade is what the proof of concept never had: deleting an element
+	 * there left its property records behind forever.
+	 * <p>
+	 * A value can own a blob extent chain or a vector record, and the two are released by different stores — so the
+	 * sweep dispatches on the id's kind rather than assuming. Assuming was safe only while blobs were the sole escape.
 	 */
 	public void free(long blockId) {
 		if (ElementId.isNull(blockId)) {
@@ -277,14 +340,20 @@ public final class PropertyStore {
 		byte[] payload = payloadOf(blockId, block);
 		int used = payload.length;
 
-		List<Long> blobIds = new ArrayList<>();
+		List<Long> ownedIds = new ArrayList<>();
 		ValueCodec.Reader reader = new ValueCodec.Reader(payload, 0, used);
 		while (reader.hasRemaining()) {
 			reader.u24();
-			ValueCodec.decode(reader, blobs, false, blobIds);
+			ValueCodec.decode(reader, blobs, vectors, false, ownedIds);
 		}
-		for (long blobId : blobIds) {
-			blobs.free(blobId);
+		for (long ownedId : ownedIds) {
+			if (ElementId.kind(ownedId) == Kind.VEC) {
+				if (vectors != null) {
+					vectors.free(ownedId);
+				}
+			} else {
+				blobs.free(ownedId);
+			}
 		}
 		segments.free(blockId, cells);
 	}

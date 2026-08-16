@@ -16,10 +16,40 @@ public enum Kind {
 	PROP(4, "prop", 32, 6),
 	BLOB(5, "blob", -1, 20),
 	INDEX(6, "index", -1, 30),
-	UNDO(7, "undo", 64, 44);
+	UNDO(7, "undo", 64, 44),
+	/**
+	 * Fixed-size vectors, one record per indexed vector, with its ANN links in the same record.
+	 * <p>
+	 * The only kind whose stride is <b>not</b> a property of the format: it is chosen when the store is created, from
+	 * the vector dimension the application declares, and recorded in the manifest. A store that has never asked for
+	 * vector storage has a stride of zero here, and then this kind does not exist — no segment set, no directory, no
+	 * geometry ([VECTOR.md](../../../../../../../../spec/VECTOR.md)).
+	 * <p>
+	 * Generation at 30, matching {@code ADJ} and {@code INDEX}. Bytes 24 to 32 of a vector record are therefore not
+	 * available to it, exactly as they are not available on an index page — see the trap in
+	 * {@code IndexCatalog}, which cost a defect.
+	 */
+	VEC(8, "vec", -2, 30);
 
 	/** Stride marker meaning "one page", resolved by the {@link io.metaloom.graph.core.segment.Geometry}. */
 	public static final int PAGE_SIZED = -1;
+
+	/**
+	 * Stride marker meaning "decided when the store is created and recorded in the manifest", resolved by the
+	 * {@link io.metaloom.graph.core.segment.Geometry} from a value it is handed. A kind marked this way and given a
+	 * stride of zero is <b>absent</b> rather than broken.
+	 */
+	public static final int DECLARED = -2;
+
+	/**
+	 * How many kind codes the id encoding can express: {@code ElementId} gives the kind 4 bits.
+	 * <p>
+	 * Anything sized per kind must use this rather than "however many constants there are today". Two arrays were
+	 * sized at 8 by hand — {@code Geometry}'s layout tables and {@code IoCounters}' per-kind counters — and a ninth
+	 * kind was therefore not a compile error: {@code Geometry} skipped it silently and then threw
+	 * {@code ArrayIndexOutOfBoundsException} from the read path, which is the worst of the available failure modes.
+	 */
+	public static final int MAX_KINDS = 16;
 
 	/**
 	 * The allocation unit of an adjacency block.
@@ -34,7 +64,7 @@ public enum Kind {
 	 */
 	public static final int ADJ_CELL_BYTES = 512;
 
-	private static final Kind[] BY_CODE = new Kind[16];
+	private static final Kind[] BY_CODE = new Kind[MAX_KINDS];
 
 	static {
 		for (Kind k : values()) {
@@ -76,7 +106,7 @@ public enum Kind {
 	}
 
 	public static Kind byCode(int code) {
-		if (code < 0 || code > 15) {
+		if (code < 0 || code >= MAX_KINDS) {
 			throw new IllegalArgumentException("Kind code out of range: " + code);
 		}
 		Kind kind = BY_CODE[code];

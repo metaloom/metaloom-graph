@@ -12,9 +12,15 @@ import io.metaloom.graph.core.id.Kind;
  */
 public final class CompactionOptions {
 
-	/** Kinds worth compacting by default. {@code UNDO} has no records yet and {@code NULL} is not a store. */
+	/**
+	 * Kinds worth compacting by default. {@code UNDO} has no records yet and {@code NULL} is not a store.
+	 * <p>
+	 * {@code VEC} is here even though most stores do not have it: a kind left out of this set is never swept, and a
+	 * default that has to be remembered when the feature is switched on is a default that will be forgotten. A store
+	 * without vector storage simply has no such segment set and the pass costs nothing.
+	 */
 	public static final Set<Kind> DEFAULT_KINDS =
-		EnumSet.of(Kind.ADJ, Kind.PROP, Kind.BLOB, Kind.REL, Kind.NODE, Kind.INDEX);
+		EnumSet.of(Kind.ADJ, Kind.PROP, Kind.BLOB, Kind.VEC, Kind.REL, Kind.NODE, Kind.INDEX);
 
 	private final Set<Kind> kinds;
 	private final double livenessThreshold;

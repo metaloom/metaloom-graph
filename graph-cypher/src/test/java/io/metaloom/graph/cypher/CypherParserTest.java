@@ -226,8 +226,15 @@ public class CypherParserTest {
 		assertTrue(assertThrows(CypherSyntaxException.class,
 			() -> CypherParser.parse("LOAD CSV FROM 'f.csv' AS row RETURN row")).getMessage()
 				.contains("LOAD CSV is not supported"));
-		assertTrue(assertThrows(CypherSyntaxException.class,
-			() -> CypherParser.parse("CALL db.labels()")).getMessage().contains("CALL is not supported"));
+		// CALL is no longer among them: the build has a procedure mechanism now, with one procedure in it. A call is
+		// parsed, and an unknown *procedure* is refused by the executor rather than by the grammar — which is the
+		// right layer for it, since "no such procedure" is not a syntax error.
+		Ast.Call call = assertInstanceOf(Ast.Call.class,
+			CypherParser.parse("CALL vector.query('Doc', 'embedding', $q, 5) YIELD node, score RETURN node")
+				.parts().get(0).clauses().get(0));
+		assertEquals("vector.query", call.procedure());
+		assertEquals(List.of("node", "score"), call.yields());
+		assertEquals(4, call.arguments().size());
 	}
 
 	// ---------------------------------------------------------------- write clauses

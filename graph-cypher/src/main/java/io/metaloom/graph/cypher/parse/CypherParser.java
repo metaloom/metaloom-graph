@@ -84,6 +84,8 @@ public final class CypherParser {
 				clauses.add(removeClause());
 			} else if (token.isKeyword("DELETE") || token.isKeyword("DETACH")) {
 				clauses.add(deleteClause());
+			} else if (token.isKeyword("CALL")) {
+				clauses.add(callClause());
 			} else if (token.isKeyword("RETURN")) {
 				clauses.add(returnClause());
 				returned = true;
@@ -121,7 +123,6 @@ public final class CypherParser {
 		return switch (token.text()) {
 			case "FOREACH" -> "FOREACH is not supported: use UNWIND, which this build does implement";
 			case "LOAD" -> "LOAD CSV is not supported: this build has no file-reading mechanism";
-			case "CALL" -> "CALL is not supported: this build has no procedure mechanism";
 			default -> null;
 		};
 	}
@@ -955,6 +956,43 @@ public final class CypherParser {
 		}
 		expectKeyword("END");
 		return new Ast.Case(subject, whens, thens, otherwise);
+	}
+
+	/**
+	 * {@code CALL namespace.procedure(args) YIELD a, b}.
+	 * <p>
+	 * {@code YIELD} is required rather than optional. A call whose results are not bound to anything has nowhere to
+	 * put them — this build has no implicit result table — and accepting it silently would make a query that looks
+	 * like it does something do nothing at all.
+	 */
+	private Ast.Call callClause() {
+		expectKeyword("CALL");
+		StringBuilder procedure = new StringBuilder(propertyKeyName());
+		while (peek().isSymbol(".")) {
+			take();
+			procedure.append('.').append(propertyKeyName());
+		}
+		expectSymbol("(", "the arguments of " + procedure);
+		List<Expr> arguments = new ArrayList<>();
+		if (!peek().isSymbol(")")) {
+			arguments.add(expression());
+			while (peek().isSymbol(",")) {
+				take();
+				arguments.add(expression());
+			}
+		}
+		expectSymbol(")", "the end of the arguments");
+		if (!peek().isKeyword("YIELD")) {
+			throw error(peek(), "CALL " + procedure + "() needs a YIELD naming what to bind its results to");
+		}
+		take();
+		List<String> yields = new ArrayList<>();
+		yields.add(propertyKeyName());
+		while (peek().isSymbol(",")) {
+			take();
+			yields.add(propertyKeyName());
+		}
+		return new Ast.Call(procedure.toString(), arguments, yields);
 	}
 
 	private Expr functionCall(String name) {

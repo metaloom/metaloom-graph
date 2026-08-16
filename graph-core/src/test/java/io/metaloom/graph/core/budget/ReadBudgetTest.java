@@ -13,8 +13,10 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
 import io.metaloom.graph.core.api.Direction;
+import io.metaloom.graph.core.api.Edge;
 import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.IoStats;
+import io.metaloom.graph.core.api.NeighbourCursor;
 import io.metaloom.graph.core.api.Properties;
 import io.metaloom.graph.core.api.Transaction;
 import io.metaloom.graph.core.fixture.TempStore;
@@ -179,6 +181,103 @@ public class ReadBudgetTest {
 				"a 100,000 edge scan must cost O(blocks), not O(edges): " + blocks + " blocks, " + stats);
 			assertTrue(stats.recordReads(Kind.ADJ) < 100_000 / 100,
 				"and must be at least two orders of magnitude below one read per edge: " + stats);
+		}
+	}
+
+	/**
+	 * The IDX-4 claim: taking one edge off a supernode costs one block, however dense the node is.
+	 * <p>
+	 * This is the budget the list form cannot meet by construction. {@code neighbours} decodes the whole chain and
+	 * builds an {@code Edge} per entry before the caller sees the first row, so a query that wants one row out of a
+	 * node of degree 10^6 pays for 10^6 — the last of the three supernode costs INDEX_TASKS.md §1 enumerates. A cursor
+	 * decodes a block only when the entries of the previous one have run out, so a caller that stops after one row has
+	 * touched exactly the head block.
+	 * <p>
+	 * <b>The comparison between the two degrees is the assertion, not the absolute number.</b> One read is the same
+	 * whether the chain is one block long or thirteen, which is what "the cost does not grow with the degree" means
+	 * and what a {@code LIMIT 1} needs to be true. The hub here is 100,000 edges rather than the 10^6 the task names:
+	 * what carries the claim is that the chain has a length at all, and thirteen blocks demonstrate it in a second
+	 * rather than a minute.
+	 */
+	@Test
+	public void testTakingOneEdgeOffASupernodeReadsOneBlock() throws Exception {
+		try (GraphStore store = stores.open()) {
+			GraphStoreImpl impl = (GraphStoreImpl) store;
+			long sparse;
+			long hub;
+			try (Transaction txn = store.begin()) {
+				sparse = fanOut(store, "E", 4000);
+				hub = fanOut(store, "E", 100_000);
+				txn.commit();
+			}
+			int blocks = impl.adjacencyStore().blockCount(hub);
+			assertEquals(1, impl.adjacencyStore().blockCount(sparse), "4000 edges are one block");
+			assertTrue(blocks >= 10, "the claim needs a chain; this node has " + blocks + " block(s)");
+
+			IoStats dense = cost(impl, () -> firstEdge(store, hub, null));
+			assertEquals(1, dense.recordReads(Kind.ADJ),
+				"one row off a " + blocks + " block chain must read the head block and no other: " + dense);
+			assertEquals(1, dense.adjacencyBlocksDecoded(), "and must decode it once: " + dense);
+			assertEquals(0, dense.adjacencyBlocksSkipped(), "with nothing to skip on an unfiltered walk: " + dense);
+
+			IoStats one = cost(impl, () -> firstEdge(store, sparse, null));
+			assertEquals(one.recordReads(Kind.ADJ), dense.recordReads(Kind.ADJ),
+				"a twenty-five fold denser node must not make the first row cost more: " + one + " against " + dense);
+
+			// The contrast is what the task is about: the list form owes the whole chain before it returns a row.
+			IoStats list = cost(impl, () -> store.neighbours(hub, Direction.OUT));
+			assertTrue(list.recordReads(Kind.ADJ) >= blocks,
+				"the list form reads every block of the chain: " + list);
+			assertEquals(blocks, list.adjacencyBlocksDecoded(), "and decodes every one of them: " + list);
+		}
+	}
+
+	/**
+	 * The same claim on the filtered path, which is where IDX-3 and IDX-4 have to compose.
+	 * <p>
+	 * The rare edges are written last and so land in the head block, which the block-level bitmap admits. A cursor
+	 * stops there; the list form still walks past every other block of the chain to prove there is nothing else — it
+	 * skips their decode, but the chain's {@code next} pointer is inside each block's header, so it owes the read
+	 * either way (§5.3). That difference — one read against one per block — is the whole of what streaming buys a
+	 * filtered {@code LIMIT 1}.
+	 */
+	@Test
+	public void testTakingOneFilteredEdgeOffASupernodeStopsAtTheFirstAdmittingBlock() throws Exception {
+		try (GraphStore store = stores.open()) {
+			GraphStoreImpl impl = (GraphStoreImpl) store;
+			long hub;
+			try (Transaction txn = store.begin()) {
+				hub = fanOut(store, "COMMON", 30_000);
+				// Appended last, so they sit in the head block: new blocks are pushed onto the head of the chain.
+				for (int i = 0; i < 5; i++) {
+					store.createEdge(hub, "RARE", store.createNode("Spoke"));
+				}
+				txn.commit();
+			}
+			int blocks = impl.adjacencyStore().blockCount(hub);
+			assertTrue(blocks >= 3, "the claim needs a chain; this node has " + blocks + " block(s)");
+
+			java.util.Set<String> rare = java.util.Set.of("RARE");
+			assertEquals("RARE", firstEdge(store, hub, rare).type(), "the filter must admit the rare edge");
+
+			IoStats cursor = cost(impl, () -> firstEdge(store, hub, rare));
+			assertEquals(1, cursor.recordReads(Kind.ADJ),
+				"the head block admits the filter, so the walk must stop there: " + cursor);
+			assertEquals(1, cursor.adjacencyBlocksDecoded(), "decoding one block: " + cursor);
+
+			IoStats list = cost(impl, () -> store.neighbours(hub, Direction.OUT, rare));
+			assertTrue(list.recordReads(Kind.ADJ) >= blocks,
+				"the list form has to reach the end of the chain to know there is no more: " + list);
+			assertTrue(list.adjacencyBlocksSkipped() >= blocks - 2,
+				"skipping the decode of every block whose bitmap excludes RARE, but not the read: " + list);
+		}
+	}
+
+	/** Opens a cursor, takes one edge, closes it. The operation the two budgets above measure. */
+	private static Edge firstEdge(GraphStore store, long nodeId, java.util.Set<String> types) {
+		try (NeighbourCursor cursor = store.neighbourCursor(nodeId, Direction.OUT, types)) {
+			assertTrue(cursor.next(), "the node must have at least one admitted edge");
+			return cursor.edge();
 		}
 	}
 

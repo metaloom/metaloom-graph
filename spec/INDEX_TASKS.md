@@ -22,12 +22,10 @@ touches, and a task that grows past a paragraph of design gets its own file
 
 | # | Task | Priority | Effort | Verdict |
 |---|---|---|---|---|
-| [IDX-4](#idx-4--a-streaming-neighbour-cursor) | Streaming neighbour cursor | **P1** | M | Build. A `LIMIT 1` over a supernode currently materialises every edge |
 | [IDX-5](#idx-5--a-relationship-scan-that-does-not-go-through-the-nodes) | `forEachRelationship` over the `REL` segment | P2 | S | Build. ~20 lines, and it removes most of the reason to want IDX-6 |
 | [IDX-6](#idx-6--a-relationship-type-index) | Relationship type index | P3 | L | **Do not build yet.** See §1 |
 | [IDX-7](#idx-7--composite-label-property-indexes) | Composite `(label, property)` indexes | P2 | M | Build when a workload has a label plus a low-selectivity property |
 | [IDX-8](#idx-8--statistics-enough-to-choose-a-label) | Per-label / per-key cardinality | P2 | M | Build with IDX-7 — it is what makes a choice between two indexes possible |
-| [IDX-9](#idx-9--vector-data) | Vector properties and ANN search | P1 | L | **In progress** — HNSW, six stages, planned and tracked in [VECTOR.md §7](VECTOR.md) |
 
 ---
 
@@ -47,46 +45,23 @@ degree 10^6:
 | Find `n` | one property probe, one verify | fine |
 | Read the block chain | ~124 blocks of 8 KiB, ~1 MiB, sequential-ish | fine — this is what the format is for |
 | Skip blocks that cannot hold `:RARE` | **fixed** — a block whose type bitmap admits no filtered type is walked past undecoded ([RELATIONSHIP_STORAGE.md §5.3](RELATIONSHIP_STORAGE.md)). It saves the decode, not the read: the chain pointer is inside each block | closed, §3 |
-| Materialise every entry into a `long[]`, then into `List<Edge>` | **10^6 longs and 10^6 `Edge` objects, before the caller sees the first row** | [IDX-4](#idx-4--a-streaming-neighbour-cursor) |
+| Materialise every entry into a `long[]`, then into `List<Edge>` | **fixed** — a cursor decodes a block only when the previous one is exhausted, so a query that stops early touches the head block and nothing else ([RELATIONSHIP_STORAGE.md §5.4](RELATIONSHIP_STORAGE.md)) | closed, §3 |
 | For each *materialised* entry, read the 64 byte `REL` record **and then** test the type | **fixed** — the entry caches its type ([RELATIONSHIP_STORAGE.md §3.1](RELATIONSHIP_STORAGE.md)), so the record is read once per surviving candidate | closed, §3 |
 
-Two of the three are now fixed, and the one that remains is the materialisation of every entry before
-the caller sees a row. None of the three is an index. A relationship type index answers "which
-relationships have type T" globally, while the supernode query already knows which node it is on —
-its problem is that the adjacency it holds is enumerated in full and unfiltered. **So the supernode
-work was IDX-3 and IDX-4, both inside the adjacency layer**, and only IDX-4 is left.
+All three are now fixed, and **none of the three was an index**. A relationship type index answers
+"which relationships have type T" globally, while the supernode query already knows which node it is
+on — its problem was that the adjacency it holds was enumerated in full and unfiltered. So the
+supernode work was IDX-2, IDX-3 and IDX-4, all three inside the adjacency layer, and all three are
+closed in §3.
+
+One caveat survives them, and it is a layer up rather than here: `PatternMatcher.expand` still
+collects a node's steps into a list, so a `LIMIT 1` *through Cypher* over a supernode still
+materialises that node's edges even though the storage layer no longer requires it. That is a query
+engine change, tracked in [RELATIONSHIP_STORAGE.md §5.4](RELATIONSHIP_STORAGE.md) where the seam is.
 
 The relationship index is worth building only when a workload really does ask the global question, and
 [IDX-5](#idx-5--a-relationship-scan-that-does-not-go-through-the-nodes) answers a large part of that
 question for a fraction of the cost. Its own entry says why it stays at P3.
-
----
-
-## IDX-4 — a streaming neighbour cursor
-
-**Priority P1.** `AdjacencyStore.edges` returns `long[]` and `GraphStoreImpl.neighbours` returns
-`List<Edge>`. Both are fully materialised before the caller sees anything. At degree 10^6 that is an
-8 MB `long[]` plus a million `Edge` records, for a query that may want one row.
-
-`NeighbourCursor` is listed in [RELATIONSHIP_STORAGE.md §11](RELATIONSHIP_STORAGE.md) as a target
-class and does not exist. The Cypher layer already has the right shape to consume one: `RowConsumer`
-and `forEachNodeWhile` exist precisely because "a scan of ten million nodes must not become a list of
-ten million rows", and the same argument applies one level down.
-
-**Build it on the filtered path.** IDX-3 is done and reduced how many blocks are decoded; IDX-4
-reduces how many entries are touched at all when the query stops early. The cursor should walk the
-chain the way `AdjacencyStore.edges(nodeId, typeIds)` does — consulting `admitsAnyType` per block —
-rather than duplicating that walk, and it must apply the entry-level type filter through
-`PackedEdge.excludedByType` and not re-derive the rule: a second implementation is a second place to
-get "type 0 means not cached" wrong, and that mistake silently drops edges
-([RELATIONSHIP_STORAGE.md §3.1](RELATIONSHIP_STORAGE.md)).
-
-**Watch the read view.** `neighbours` runs inside `read(...)`, which may take the optimistic path and
-re-run the body. A cursor that outlives the call cannot do that — it needs the latch held outright,
-the way `forEachNodeWhile` uses `runRead` and documents why ("the consumer has side effects").
-
-**Done when**: the read-counting harness shows a `LIMIT 1` over a degree-10^6 node reading one block;
-`neighbours(...)` is expressed in terms of the cursor rather than duplicating it.
 
 ---
 
@@ -241,36 +216,6 @@ rather than the result; the numbers are exposed on `StoreStats` so an operator c
 
 ---
 
-## IDX-9 — vector data
-
-**Priority P1, in progress. The design and the stage list live in [VECTOR.md](VECTOR.md); this entry
-is a pointer, not a second copy.**
-
-Vectors were already storable — `ValueCodec.T_VECTOR_F32`, `Properties.getVector` — and an
-*exact-equality* lookup on one works, because the property tree hashes it by content
-([INDEX.md §3.2](INDEX.md)). What nothing did is nearest neighbour, which
-[INDEX.md §11](INDEX.md) lists as "Full text, spatial, vector".
-
-The decision is **HNSW**, in six stages ([VECTOR.md §7](VECTOR.md)). Two things about it belong here
-rather than only there, because they land on this file's subject matter:
-
-- **It is a declared index**, which makes it the same declaration machinery as
-  [IDX-7](#idx-7--composite-label-property-indexes) — a list on the catalog page past the unique-key
-  list, a backfill scan, and the `initialised()` re-derivation so that absence reads as "not declared"
-  rather than "corrupt". IDX-7 is no longer a prerequisite for it, but the two should share that
-  machinery rather than grow two of it.
-- **It needs both hooks to carry both halves of a node.** `onLabelsChanged` gets no properties and
-  `onPropertiesChanged` gets no labels, so a `(label, key)` index cannot maintain itself from either
-  one alone. The fix planned is a property loader and a label loader on `IndexCatalog`, wired in the
-  `GraphStoreImpl` constructor and never called when nothing is declared — which is worth knowing
-  before anybody widens those signatures for another reason.
-
-**Stage 1 is built**: the three `vector.*` Cypher functions, the parser fold that lets a namespaced
-name exist at all, `GraphStore.nearestByScan` — the exact answer an approximate index gets measured
-against — and a bound on the vector dimension in `ValueCodec`, which was the last unchecked length
-field in the property codec.
-
----
 
 ## 2. What this list deliberately leaves out
 
@@ -293,9 +238,11 @@ these ids leads somewhere.
 |---|---|---|
 | IDX-1 | A `float[]` property was indexed under its identity hash, so an equality lookup missed, a delete left the entry dangling and a unique constraint never fired. Fixed by hashing arrays and lists by content, with `IndexCatalog.valueEquals` as the matching verification | [INDEX.md §3.2](INDEX.md); tests in [TESTING.md](TESTING.md); the vectors-stay-in-the-property-tree decision it forced in [VECTOR.md §1.3](VECTOR.md) |
 | IDX-2 | A type-filtered supernode traversal read one 64 byte relationship record per *edge* to learn the type it was filtering on. Fixed by caching the type in the materialised adjacency entry, with `0` reserved for "not cached" so no format version bump was needed | [RELATIONSHIP_STORAGE.md §3.1](RELATIONSHIP_STORAGE.md) (and §6.2 for the tombstone argument, §8 for the three rules); budget in [TESTING.md §7](TESTING.md) |
+| IDX-9 | Vectors were storable and not searchable. Built as **HNSW** in six stages: a `VEC` kind whose record interleaves a vector with its ANN links so a visited node costs one page read, a declared index over `(label, key)` maintained by the hooks, the graph itself with entry-point repair and the paper's diversity heuristic, a resumable batched build, and `CALL … YIELD`. The exact `nearestByScan` stayed, because an approximate index is only as good as the exact answer it is measured against | [VECTOR.md](VECTOR.md) — §7 for the stages and the three defects the tests found; [CYPHER.md §1.1](CYPHER.md) for the query surface; [PROPERTY_STORAGE.md §4](PROPERTY_STORAGE.md) for which of the two homes a vector gets |
+| IDX-4 | `edges` returned a `long[]` and `neighbours` a `List<Edge>`, both fully built before the caller saw anything, so a `LIMIT 1` over a node of degree 10^6 paid for 10^6. Fixed with `EdgeCursor` / `NeighbourCursor`, which decode a block only when the previous one is exhausted; `edges` and `neighbours` became drains of the cursor, so the walk and its two filter levels stayed in one place. The cursor holds the read latch outright, because unlike a list it cannot be re-run by the optimistic read path — which makes closing it the caller's obligation | [RELATIONSHIP_STORAGE.md §5.4](RELATIONSHIP_STORAGE.md) (and §6.3 for both traversal forms); budget in [TESTING.md §7](TESTING.md) |
 | IDX-3 | The `type_bitmap` and `min/max_location` a block maintains on every append were read only by the delete path, so a type-filtered scan of a supernode decoded every block of the chain and `hasEdge(a, b)` did not exist at all. Fixed by `edges(nodeId, typeIds)` and `hasEdge`, with two header flags saying when either summary may be trusted to rule something out — the bitmap under-describes a block holding an entry that caches no type, and the range mixes two address spaces in a block holding a materialised one. The saving is in blocks *decoded*; §5.3 says why it cannot be in blocks read, and corrects the O(log blocks) claim the section used to make | [RELATIONSHIP_STORAGE.md §5, §5.3, §6.4](RELATIONSHIP_STORAGE.md) (and §8 for the two skip rules); budget in [TESTING.md §7](TESTING.md) |
 
 ---
 
-_Git HEAD revision: `8f178b4`_
-_Last updated: 2026-08-16 (IDX-3 closed out; §1's cost table and IDX-4's order-of-work note follow it)_
+_Git HEAD revision: `20f7e3d`_
+_Last updated: 2026-08-16 (IDX-4: the streaming neighbour cursor)_

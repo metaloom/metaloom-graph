@@ -11,6 +11,7 @@ import java.util.UUID;
 import io.metaloom.graph.core.api.PageCorruptException;
 import io.metaloom.graph.core.id.ElementId;
 import io.metaloom.graph.core.store.blob.BlobStore;
+import io.metaloom.graph.core.store.vec.VectorStore;
 import io.metaloom.graph.core.util.VarInt;
 
 /**
@@ -38,6 +39,15 @@ public final class ValueCodec {
 	public static final int T_ELEMENT_REF = 8;
 	public static final int T_VECTOR_F32 = 9;
 	public static final int T_LIST = 10;
+	/**
+	 * A vector held in a {@code VEC} record rather than a blob: {@code i32 dim}, {@code i64 vecId}.
+	 * <p>
+	 * Same payload shape as {@link #T_VECTOR_F32}, deliberately — the two differ only in which store owns the bytes,
+	 * so every sweep that walks an id inside a payload treats them identically. Which one a vector gets is decided at
+	 * write time by {@code VectorStore.accepts}: the fixed-size record can only hold the one dimension the store was
+	 * created for, and everything else still escapes to a blob.
+	 */
+	public static final int T_VECTOR_REF = 11;
 
 	/** Values whose inline form would exceed this escape to the blob store. */
 	public static final int MAX_INLINE_BYTES = 255;
@@ -206,6 +216,16 @@ public final class ValueCodec {
 	// ---------------------------------------------------------------- encode
 
 	public static void encode(Writer w, Object value, BlobStore blobs) throws IOException {
+		encode(w, value, blobs, null, ElementId.NULL);
+	}
+
+	/**
+	 * @param vectors
+	 *            the store's vector records, or null when it has none. A {@code float[]} of exactly that store's
+	 *            dimension is written there; every other vector escapes to a blob as before.
+	 */
+	public static void encode(Writer w, Object value, BlobStore blobs, VectorStore vectors, long ownerId)
+		throws IOException {
 		switch (value) {
 			case null -> w.u8(tag(T_NULL, 0));
 			case Boolean b -> w.u8(tag(T_BOOL, b ? 1 : 0));
@@ -236,6 +256,14 @@ public final class ValueCodec {
 				w.u8(tag(T_ELEMENT_REF, 0));
 				w.i64(r.id());
 			}
+			// Two homes for a vector, and the store's fixed record can only hold the one dimension it was created
+			// for. Everything else — a different length, or a store with no vector storage at all — still escapes
+			// to a blob, so both paths stay live and both stay tested.
+			case float[] vector when vectors != null && vectors.accepts(vector) -> {
+				w.u8(tag(T_VECTOR_REF, 0));
+				w.i32(vector.length);
+				w.i64(vectors.store(vector, ownerId));
+			}
 			case float[] vector -> {
 				if (blobs == null) {
 					throw new IllegalStateException("Vectors require a blob store");
@@ -256,7 +284,7 @@ public final class ValueCodec {
 				w.u8(tag(T_LIST, 0));
 				w.varint(list.size());
 				for (Object element : list) {
-					encode(w, element, blobs);
+					encode(w, element, blobs, vectors, ownerId);
 				}
 			}
 			default -> throw new IllegalArgumentException(
@@ -309,10 +337,16 @@ public final class ValueCodec {
 	 *
 	 * @param materialise
 	 *            when false the value is parsed and skipped but not built, which the free path uses
-	 * @param blobIds
-	 *            when non-null, every blob id encountered is added to it
+	 * @param ownedIds
+	 *            when non-null, every id this value owns — a blob extent chain head, or a vector record — is added to
+	 *            it. The free path uses it to release them, and it has to see both kinds or a vector record leaks.
 	 */
-	public static Object decode(Reader r, BlobStore blobs, boolean materialise, List<Long> blobIds) {
+	public static Object decode(Reader r, BlobStore blobs, boolean materialise, List<Long> ownedIds) {
+		return decode(r, blobs, null, materialise, ownedIds);
+	}
+
+	public static Object decode(Reader r, BlobStore blobs, VectorStore vectors, boolean materialise,
+		List<Long> ownedIds) {
 		int tagByte = r.u8();
 		int type = tagByte & 0x1F;
 		int sizeClass = (tagByte >>> 5) & 0x7;
@@ -336,11 +370,11 @@ public final class ValueCodec {
 					? (Object) Float.intBitsToFloat(r.i32())
 					: (Object) Double.longBitsToDouble(r.i64());
 			case T_STRING: {
-				byte[] data = readBytes(r, sizeClass, blobs, materialise, blobIds);
+				byte[] data = readBytes(r, sizeClass, blobs, materialise, ownedIds);
 				return materialise && data != null ? new String(data, StandardCharsets.UTF_8) : null;
 			}
 			case T_BYTES:
-				return readBytes(r, sizeClass, blobs, materialise, blobIds);
+				return readBytes(r, sizeClass, blobs, materialise, ownedIds);
 			case T_TIMESTAMP: {
 				long micros = r.i64();
 				return materialise
@@ -358,8 +392,8 @@ public final class ValueCodec {
 			case T_VECTOR_F32: {
 				int dim = r.i32();
 				long blobId = r.i64();
-				if (blobIds != null) {
-					blobIds.add(blobId);
+				if (ownedIds != null) {
+					ownedIds.add(blobId);
 				}
 				if (!materialise) {
 					return null;
@@ -382,11 +416,32 @@ public final class ValueCodec {
 				}
 				return vector;
 			}
+			case T_VECTOR_REF: {
+				int dim = r.i32();
+				long vectorId = r.i64();
+				if (ownedIds != null) {
+					ownedIds.add(vectorId);
+				}
+				if (!materialise) {
+					return null;
+				}
+				if (vectors == null) {
+					// The manifest refuses to open a vectorful store without vector storage, so reaching this means
+					// the two disagree — which is corruption, not a configuration the caller can fix.
+					throw new PageCorruptException("A property references vector record "
+						+ ElementId.toString(vectorId) + " but this store has no vector storage");
+				}
+				if (dim != vectors.dimensions()) {
+					throw new PageCorruptException("A property declares a " + dim
+						+ " dimension vector in a store of " + vectors.dimensions());
+				}
+				return vectors.read(vectorId);
+			}
 			case T_LIST: {
 				int count = (int) r.varint();
 				List<Object> list = materialise ? new ArrayList<>(Math.min(count, 1024)) : null;
 				for (int i = 0; i < count; i++) {
-					Object element = decode(r, blobs, materialise, blobIds);
+					Object element = decode(r, blobs, vectors, materialise, ownedIds);
 					if (list != null) {
 						list.add(element);
 					}
@@ -398,7 +453,7 @@ public final class ValueCodec {
 		}
 	}
 
-	private static byte[] readBytes(Reader r, int sizeClass, BlobStore blobs, boolean materialise, List<Long> blobIds) {
+	private static byte[] readBytes(Reader r, int sizeClass, BlobStore blobs, boolean materialise, List<Long> ownedIds) {
 		if (sizeClass == 0) {
 			int length = r.u8();
 			byte[] data = r.bytes(length);
@@ -406,8 +461,8 @@ public final class ValueCodec {
 		}
 		r.i32(); // total length, informational
 		long blobId = r.i64();
-		if (blobIds != null) {
-			blobIds.add(blobId);
+		if (ownedIds != null) {
+			ownedIds.add(blobId);
 		}
 		return materialise ? blobs.read(blobId) : null;
 	}
@@ -477,6 +532,10 @@ public final class ValueCodec {
 			case T_ELEMENT_REF:
 				return patchId(payload, r, map);
 			case T_VECTOR_F32:
+			case T_VECTOR_REF:
+				// Identical payloads, and both hold an id compaction can move — a blob extent for one, a vector
+				// record for the other. This is the reference class the class javadoc calls the one a sweep is most
+				// likely to forget, because it lives inside an opaque payload rather than in a typed record field.
 				r.skip(4);
 				return patchId(payload, r, map);
 			case T_LIST: {

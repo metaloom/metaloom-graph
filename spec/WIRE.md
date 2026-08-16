@@ -285,6 +285,55 @@ as backpressure.
 stream A stalls stream B on the same connection. The answer is a second connection, not a cleverer
 client. HTTP/2 would not have had this property; that was known when the transport was chosen.
 
+### 5.1 The resume is the dangerous half, and it cost a build
+
+Pausing is easy: it happens on the event loop, in `queued(bytes)`, the moment the queued total crosses
+`readBufferBytes`. Resuming is not, because the event that should trigger it — a consumer decoding a
+batch — happens on **another thread**. `consumed(bytes)` therefore reads the paused flag off the event
+loop and, if it is set, hops back onto the loop to lift the pause there.
+
+**The whole scheme rests on one invariant**: after a pause there is always at least one unconsumed
+batch still in a stream's queue, so there is always one more `consumed` call to come and lift it.
+Nothing else will — there is no timer behind this, and the socket stays shut until some consumer
+calls in. Two separate defects broke that invariant, and the second was hiding behind the first.
+
+**One: `readsPaused` was not `volatile`.** It carried a comment explaining why it did not need to be —
+*"only ever written from the socket's event loop, so the pause and the resume cannot cross"* — which
+was true about the writes and silent about the read. The read in `consumed` is the one that decides
+whether the resume is scheduled at all, and a consumer observing a stale `false` skips the hop
+entirely.
+
+**Two, and this is the one that actually hung the build: the ROWS handler published a batch before
+accounting for it.** `stream.onRows(bytes)` makes the batch visible to the consuming thread;
+`queued(bytes.length)` adds it to the budget and decides whether to pause. In that order a consumer
+can take the batch and decrement a total the event loop has not yet incremented — so it sees a
+not-yet-paused flag, skips the resume, and the increment that follows crosses the mark and pauses the
+socket with no consumer callback left to lift it. When that was the last ROWS batch, the `COMPLETE`
+frame behind it was never read and the consumer blocked forever on a query that had finished.
+Counting before publishing restores the invariant: every byte a consumer can see has already been
+added.
+
+Fixing only the first left the test still hanging, which is the useful part of the story — the
+`volatile` was necessary and the ordering was the cause, and stopping at the plausible fix would have
+shipped the bug.
+
+The symptom was nowhere near either cause. The suite was green in isolation and hung the whole reactor
+build under load, inside `WireServerTest`; the thread dump is the only thing that named it — the
+client parked in `LinkedBlockingQueue.take()`, the server's `graph-wire-0` worker **idle in its pool**
+having already produced everything, and both event loops asleep in `epoll`. A server that is idle
+rather than stuck is the tell that the lost wakeup is on the client side.
+
+Two guards now exist so this class of defect cannot present as a stalled build again: `WireServerTest`
+carries a class-level 30 second `@Timeout`, so a parked test is a red test with a stack trace, and the
+parent pom sets `forkedProcessTimeoutInSeconds`, so any hung fork anywhere becomes a failure. Both
+earned their place immediately: the timeout is what turned the second defect from a stalled reactor
+into a 30 second failure naming the line.
+
+**The rules this leaves.** A field written on the event loop and read off it is `volatile`, and a
+comment justifying otherwise has to account for the read as well as the write. And a value is added to
+a shared budget **before** it is published to another thread, never after — publishing first opens a
+window in which the other thread can spend what has not been counted.
+
 ---
 
 ## 6. The client
@@ -340,7 +389,7 @@ oracle rather than only a round-trip test — see §8.
 | `WireVersusEmbeddedTest` | **The load-bearing one.** 27 queries, in process and over the wire, compared **cell by cell** — nodes, materialised *and* lightweight relationships, paths, lists, maps, nulls, and a string over 255 bytes. The comparison is written out field by field rather than calling the server's own converter, because a test that used the code under test to decide the answer would agree with it however wrong it was |
 | `WireDecoderHostileInputTest` | `@Tag("fuzz")`. Random bytes, every truncation offset, every single-byte corruption, a list claiming 2^31−1 elements in twelve bytes, nesting a million deep. The oracle knows nothing about the format: decode or raise `WireFormatException`, never OOM, never `StackOverflowError`, always terminate, **allocation proportional to input** |
 | `FrameReaderTest` | Reassembly against the delivery patterns TCP actually produces: a frame split at every byte boundary, three frames in one chunk, a header claiming two gigabytes |
-| `WireServerTest` | The mechanics — overload, cancel, deadline against a client that stopped reading, an oversized frame taking one connection and not the server, and `openViews() == 0` after every test |
+| `WireServerTest` | The mechanics — overload, cancel, deadline against a client that stopped reading, an oversized frame taking one connection and not the server, and `openViews() == 0` after every test. **Class-level `@Timeout(30s)`**: these tests block on a socket, so a flow-control defect presents as a parked thread rather than a failed assertion, and without a deadline it stalls the whole build instead of failing (§5.1) |
 | `WireServerTest` (writes) | A write refused without the flag and accepted with it; the counters in `COMPLETE`; a failed write rolled back with the writer lock returned; two connections writing to one database both finishing; and no view *and no held lock* left behind |
 | `WireVersusEmbeddedTest` (writes) | Eleven write statements run embedded against one database and over the wire against another seeded identically, comparing both the counters and a fingerprint of the resulting graph — with a control asserting the fingerprint can tell two graphs apart |
 | `QuerySummaryTest` | The `COMPLETE` payload: round trip, every truncation offset refused, trailing bytes ignored |
@@ -377,5 +426,6 @@ decoder on corrupt input.
 
 ---
 
-_Git HEAD revision: `e4601d1`_
-_Last updated: 2026-08-15 (Vert.x 5.0.11, protocol version 3)_
+_Git HEAD revision: `20f7e3d`_
+_Last updated: 2026-08-16 (new §5.1: the two client flow-control defects behind the
+intermittent build hang, and the two guards that turn a hang into a failure)_

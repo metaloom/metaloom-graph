@@ -1,10 +1,12 @@
 # VECTOR.md — vector data in the graph
 
-An exploration, not a commitment. Vectors are already **storable** in this engine and are not
-**searchable**: a `float[]` property round-trips through `ValueCodec`, and nothing can answer "which
-nodes have an embedding close to this one". This file works out what tying that in would mean — what
-the index would be keyed on, where it would live, and which of four possible shapes is worth building
-first.
+**Built.** Vectors were storable and not searchable: a `float[]` property round-tripped through
+`ValueCodec`, and nothing could answer "which nodes have an embedding close to this one". This file
+worked out what tying that in would mean, chose HNSW from four possible shapes (§4), and now records
+what was built — including the parts of the design that only survived contact with a test.
+
+Sections 1 to 4 are the reasoning, kept as written because the trade-offs did not change. §7 is the
+plan and its outcome.
 
 > **Do not put here**: how a property value is encoded ([PROPERTY_STORAGE.md](PROPERTY_STORAGE.md)),
 > how the two existing B+trees work ([INDEX.md](INDEX.md)), the task list this came out of
@@ -18,11 +20,12 @@ first.
 |---|---|
 | **Storable** | Yes — `ValueCodec.T_VECTOR_F32`, `Properties.getVector`, `float[]` of any length |
 | **Where** | Always the blob store: 13 bytes inline (tag, `int` dimension, `long` blob id) plus a blob extent |
-| **Indexed** | Only for exact equality, in the ordinary property tree. No ANN index yet — §7 |
+| **Indexed** | Exact equality in the property tree, **and HNSW** for nearest neighbour — §7 |
 | **Equality lookup** | Works — the value is hashed by content, see §1.3 and [INDEX_TASKS.md IDX-1](INDEX_TASKS.md#3-closed) |
 | **Nearest-k** | `GraphStore.nearestByScan(label, key, query, k, metric)` — **exact, by scanning**. No index, and that is the point: it is the ground truth an approximate one is measured against |
-| **Cypher surface** | `vector.cosine` / `vector.dot` / `vector.l2` ([CYPHER.md §1.1](CYPHER.md)). Still no `CALL`, and Cypher still cannot *write* a vector |
-| **Decision** | **HNSW, in six stages (§7).** Stage 1 is built; the format change is stage 3 |
+| **Where, once indexed** | A `VEC` record: the vector and its ANN links in one 4 KiB record, so a visited node costs one page read. Declared per store with `GraphStoreOptions.vectorDimensions` |
+| **Cypher surface** | `vector.cosine` / `dot` / `l2`, and `CALL vector.query(label, key, $q, k) YIELD node, score` ([CYPHER.md §1.1](CYPHER.md)). Cypher still cannot *write* a vector |
+| **Decision** | **HNSW, in six stages (§7). All six are built.** |
 
 ---
 
@@ -66,8 +69,8 @@ becomes 768 boxed doubles and roughly double the bytes on the wire. Returning em
 in bulk would want a value type in the wire codec ([WIRE.md](WIRE.md)); returning *ids and scores*,
 which is what an ANN query actually does, would not.
 
-`Functions.java` now has the three distance functions (stage 1); `CALL` is still rejected by the parser
-— "CALL is not supported: this build has no procedure mechanism" — and arrives in stage 6. See §6.
+`Functions.java` has the three distance functions, and `CALL … YIELD` now parses: the refusal in
+`CypherParser.unsupportedClause` is gone and there is one procedure, `vector.query`. See §6.
 
 ### 1.3 The defect underneath all of it, and the decision it forced
 
@@ -390,12 +393,29 @@ Two things follow from the scale, and they changed the design rather than being 
 
 | Stage | What | Status |
 |---|---|---|
-| **1** | `vector.cosine`/`dot`/`l2`, the namespaced-call parser fold, `nearestByScan`, and a bound on the vector dimension in `ValueCodec` | **built** — no format change, ships on existing stores |
-| **2** | `Geometry.KINDS` and `IoCounters.KINDS` 8 → 16, and `Kind.VEC` declared but disabled | |
-| **3** | `VEC` as the property backing: `GraphStoreOptions.vectorDimensions`, the manifest fields, `T_VECTOR_REF`, compaction, the invariant check. **The format bump, once** | |
-| **4** | The declared index and the four hooks. `nearest()` is still a scan, now restricted to members — the oracle for stage 5 | |
-| **5** | HNSW links and incremental insert | |
-| **6** | Bulk build, the BUILDING/READY state machine, and `CALL … YIELD` | |
+| **1** | `vector.cosine`/`dot`/`l2`, the namespaced-call parser fold, `nearestByScan`, and a bound on the vector dimension in `ValueCodec` | **built** |
+| **2** | `Geometry.KINDS` and `IoCounters.KINDS` 8 → 16 via `Kind.MAX_KINDS`, and `Kind.VEC` declared but disabled | **built** |
+| **3** | `VEC` as the property backing: `GraphStoreOptions.vectorDimensions`, the manifest fields, `T_VECTOR_REF`, compaction, the invariant check | **built** |
+| **4** | The declared index, its catalog entry, and membership maintained by the hooks | **built** |
+| **5** | HNSW links, incremental insert, entry-point repair | **built** |
+| **6** | The batched resumable build, BUILDING/READY, and `CALL … YIELD` | **built** |
+
+**What the format bump turned out to be.** Not a bump for most stores: `Manifest.open` compares with `!=`, so
+writing 4 unconditionally would have refused every store on disk to describe a field they do not have. The version is
+a function of the content — 3 when `vec_stride` is zero, 4 when it is not — and both are accepted, with the pair
+required to agree. A store with no vectors is bit-identical to what it was.
+
+**Three things the tests found that the design did not.**
+
+- **Two dimensions can share a stride.** A stride is a power of two rounded up, so 4 and 8 both land on 512, and a
+  check on the stride alone would have let a store created for one be opened as the other — reading every vector at
+  the wrong length. The manifest compares both numbers.
+- **Dropping an index left `FLAG_LINKED` set**, so the *next* index's build skipped every member as "already linked",
+  ended with no entry point, and answered every query with nothing. A record that leaves an index is now unlinked.
+- **Nearest-M pruning strands outliers.** Inserting one point outside a tight cluster gave it no in-links at all: every
+  neighbour was full of its own cluster, and proximity pruning drops the outsider first. It was in the index, correct
+  on disk, and returned by nothing. Both selection paths now use the paper's diversity heuristic — keep a candidate
+  only if it is nearer to the anchor than to anything already kept.
 
 **Stage 1 is the ground truth and had to come first.** Every measured surprise this project has had —
 [reports/SCALE.md](reports/SCALE.md)'s 59-of-61 GiB, the codec that turned out 7.8x slower than the
@@ -471,4 +491,4 @@ The repository's existing culture applies directly, and one test class matters m
 ---
 
 _Git HEAD revision: `8f178b4`_
-_Last updated: 2026-08-16 (HNSW decided; stage 1 built)_
+_Last updated: 2026-08-16 (HNSW vector search, stages 1 to 6)_

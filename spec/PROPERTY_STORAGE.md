@@ -134,7 +134,8 @@ text.
 | `TIMESTAMP` | 6 | — | 8 B epoch micros, UTC | done |
 | `UUID` | 7 | — | 16 B | done |
 | `ELEMENT_REF` | 8 | — | 8 B `ElementId` | done — a property pointing at another element |
-| `VECTOR_F32` | 9 | — | 4 B dim + 8 B `BLOB` id | done — embeddings, stored out of line |
+| `VECTOR_F32` | 9 | — | 4 B dim + 8 B `BLOB` id | done — a vector the store has no fixed record for |
+| `VECTOR_REF` | 11 | — | 4 B dim + 8 B `VEC` id | done — a vector of the store's own declared dimension |
 | `LIST` | 10 | — | varint count + encoded elements | done, recursive |
 | `MAP` | 11 | — | varint count + (key_id, value) pairs | not implemented |
 | `DURATION` | 12 | — | 8 B | not implemented |
@@ -150,6 +151,18 @@ Two decisions worth calling out:
 - **Typed values, not strings.** The PoC's `Map<String,String>` forces every integer, timestamp and
   boolean through decimal text: `42` costs 2 bytes of text plus a length plus a record header, and
   every read allocates a `String` and reparses. Typed storage is smaller, faster and lossless.
+**A vector has two homes, and the write path chooses.** A `float[]` whose length is exactly the store's
+declared `vectorDimensions` is written as `VECTOR_REF` into a fixed-size `VEC` record; anything else —
+another length, or a store created without vector storage — escapes to a blob as `VECTOR_F32`. The two
+tags carry identical payloads on purpose, so every sweep that walks an id inside a payload treats them
+the same: compaction remaps both through one case, and `PropertyStore.free` releases both by
+dispatching on the id's kind.
+
+Which matters because a blob extent is page sized. A 768-dimension vector costs 8 KiB as a blob and
+4 KiB as a record, and the record holds its ANN links in the same read — see [VECTOR.md](VECTOR.md).
+**One copy, never both**: keeping the blob as well would mean `onPropertiesChanged` had to update two
+of them, and a partial update is a silent wrong answer.
+
 - **`VECTOR_F32` is in the list from the start.** MetaLoom stores embeddings, and retrofitting a
   vector type into a format that only knows strings is exactly the migration this spec exists to
   avoid.
@@ -257,7 +270,7 @@ Compression (lz4 by default above 4 KiB) is applied per blob, in native code.
 - [x] Value type tags per §4, all except `MAP` and `DURATION`
 - [x] Segregated free lists for cell runs, page-straddle avoidance
 - [x] `BlobStore` with extent chaining and a whole-blob CRC
-- [x] `VECTOR_F32` support
+- [x] `VECTOR_F32` support, and `VECTOR_REF` for a store with fixed-size vector records
 - [x] Cascade: freeing an element frees its property block and every blob it references (the D12
       regression)
 - [x] Tests: every value type, blob escape, type mismatch, grow-and-shrink without leaking cells
@@ -281,5 +294,5 @@ Compression (lz4 by default above 4 KiB) is applied per blob, in native code.
 
 ---
 
-_Git HEAD revision: `364b5f7`_
+_Git HEAD revision: `8f178b4`_
 _Last updated: 2026-08-14_

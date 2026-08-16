@@ -27,13 +27,20 @@ public final class GraphModel {
 	public record Relationship(long from, String type, long to, Map<String, Object> properties) {
 	}
 
-	private final Map<Long, String> labels = new LinkedHashMap<>();
+	/**
+	 * A node's labels, in the order the store keeps them.
+	 * <p>
+	 * A list rather than a single label because {@code addNodeLabel} and {@code removeNodeLabel} are in the workload:
+	 * they are the only writes that reach {@code onLabelsChanged}, and that hook had no differential coverage at all
+	 * while this was one string.
+	 */
+	private final Map<Long, List<String>> labels = new LinkedHashMap<>();
 	private final Map<Long, Map<String, Object>> properties = new HashMap<>();
 	private final List<Edge> edges = new ArrayList<>();
 	private final Map<Long, Relationship> relationships = new LinkedHashMap<>();
 
 	public void createNode(long id, String label, Map<String, Object> props) {
-		labels.put(id, label);
+		labels.put(id, new ArrayList<>(List.of(label)));
 		properties.put(id, props == null ? Map.of() : new LinkedHashMap<>(props));
 	}
 
@@ -87,8 +94,29 @@ public final class GraphModel {
 		return labels.containsKey(id);
 	}
 
+	/** The first label, which is what {@code GraphStore.nodeLabel} returns. */
 	public String label(long id) {
-		return labels.get(id);
+		List<String> held = labels.get(id);
+		return held == null || held.isEmpty() ? null : held.get(0);
+	}
+
+	public List<String> labels(long id) {
+		return labels.getOrDefault(id, List.of());
+	}
+
+	/** @return false if the node already carried it, which is what the store reports */
+	public boolean addLabel(long id, String label) {
+		List<String> held = labels.get(id);
+		if (held == null || held.contains(label)) {
+			return false;
+		}
+		held.add(label);
+		return true;
+	}
+
+	public boolean removeLabel(long id, String label) {
+		List<String> held = labels.get(id);
+		return held != null && held.remove(label);
 	}
 
 	public Map<String, Object> properties(long id) {
@@ -101,8 +129,8 @@ public final class GraphModel {
 
 	public Set<Long> nodesByLabel(String label) {
 		Set<Long> result = new TreeSet<>();
-		labels.forEach((id, value) -> {
-			if (value.equals(label)) {
+		labels.forEach((id, held) -> {
+			if (held.contains(label)) {
 				result.add(id);
 			}
 		});
@@ -208,7 +236,10 @@ public final class GraphModel {
 	/** A deep copy, which is how the harness remembers the last committed state across a rollback or a crash. */
 	public GraphModel copy() {
 		GraphModel copy = new GraphModel();
-		copy.labels.putAll(labels);
+		// Per entry, not putAll: the values are mutable lists now, and a shallow copy would let a write into the
+		// pending model reach the committed one — which makes a rolled-back batch keep its labels and the harness
+		// report the engine as wrong.
+		labels.forEach((id, held) -> copy.labels.put(id, new ArrayList<>(held)));
 		properties.forEach((id, props) -> copy.properties.put(id, new LinkedHashMap<>(props)));
 		copy.edges.addAll(edges);
 		copy.relationships.putAll(relationships);

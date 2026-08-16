@@ -205,6 +205,27 @@ public interface GraphStore extends AutoCloseable {
 	List<Edge> neighbours(long nodeId, Direction direction, Set<String> types);
 
 	/**
+	 * The same edges, streamed: nothing is decoded until it is asked for, and a caller that stops early pays only for
+	 * what it read.
+	 *
+	 * <p>
+	 * This is to {@link #neighbours(long, Direction, Set)} what {@link #forEachNodeWhile} is to a full scan, one level
+	 * down. A node of degree 10^6 costs an 8 MB {@code long[]} and a million {@link Edge} objects to enumerate, and a
+	 * query wanting one row pays all of it; through a cursor the same query decodes the head block and stops.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>The cursor holds a read view and must be closed</b> — use it in a try-with-resources, and do not mutate the
+	 * store from the thread holding one. {@link NeighbourCursor} says what that costs and why the list form does not
+	 * pay it.
+	 * </p>
+	 *
+	 * @param types
+	 *            relationship types to admit, or null / empty for every type
+	 */
+	NeighbourCursor neighbourCursor(long nodeId, Direction direction, Set<String> types);
+
+	/**
 	 * Whether any edge connects the two nodes, in either direction and of any type.
 	 * <p>
 	 * Cheaper than {@link #neighbours(long, Direction)} on a dense node: it stops at the first match and walks past
@@ -300,6 +321,60 @@ public interface GraphStore extends AutoCloseable {
 	 *         the order rather than the number is the answer
 	 */
 	List<Neighbour> nearestByScan(String label, String key, float[] query, int k, VectorMetric metric);
+
+	/**
+	 * Declares an approximate-nearest-neighbour index over a label's vector property.
+	 *
+	 * <p>
+	 * Like {@link #createUniqueConstraint}, the existing data is walked first — every node carrying the label is
+	 * checked and, if it holds a vector of the declared dimension, made a member. A node whose vector is a different
+	 * length is refused rather than skipped: the whole point of pinning the dimension is that a member set of mixed
+	 * lengths is not an index, and silently leaving some nodes out would make the index answer confidently with a
+	 * subset.
+	 * </p>
+	 *
+	 * <p>
+	 * The store must have been created with vector storage of the same dimension
+	 * ({@link GraphStoreOptions.Builder#vectorDimensions}); the fixed-size records are what the index is built over.
+	 * </p>
+	 */
+	void createVectorIndex(VectorIndexDefinition definition) throws IOException;
+
+	/**
+	 * Links every member that is not linked yet, in batches, and marks the index ready.
+	 *
+	 * <p>
+	 * Called by {@link #createVectorIndex} and safe to call again: a member already in the structure is skipped, so an
+	 * interrupted build resumes rather than restarting. The marker is per record rather than a position in a list —
+	 * ids are not ordered by insertion once a compaction has run, so a watermark would resume in the wrong place.
+	 * </p>
+	 */
+	void buildVectorIndex(String label, String key) throws IOException;
+
+	/** Drops a declaration. The vectors themselves are properties and are untouched. */
+	void dropVectorIndex(String label, String key) throws IOException;
+
+	/** Every declared vector index, in declaration order. */
+	List<VectorIndexDefinition> vectorIndexes();
+
+	/**
+	 * The {@code k} nearest members of a declared index.
+	 *
+	 * <p>
+	 * Answers from the index's own member set rather than from a scan of the store, and applies {@code filter} — when
+	 * one is given — to each candidate before admitting it. That filter is the reason this lives inside the graph
+	 * engine at all: an external vector index knows nothing about the graph, so it has to over-fetch and let the
+	 * caller filter afterwards, with no way to know how far to over-fetch.
+	 * </p>
+	 *
+	 * @param filter
+	 *            an extra condition on the node, or null for none. Applied when admitting a result
+	 * @throws IllegalStateException
+	 *             if no such index is declared, or it is still building. "No index" and "no matches" are opposite
+	 *             answers and must never look the same
+	 */
+	List<Neighbour> nearest(String label, String key, float[] query, int k,
+		java.util.function.LongPredicate filter) throws IOException;
 
 	// ---------------------------------------------------------------- maintenance
 

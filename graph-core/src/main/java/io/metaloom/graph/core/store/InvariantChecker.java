@@ -16,6 +16,7 @@ import io.metaloom.graph.core.store.adj.PackedEdge;
 import io.metaloom.graph.core.store.blob.BlobStore;
 import io.metaloom.graph.core.store.node.NodeStore;
 import io.metaloom.graph.core.store.prop.PropertyStore;
+import io.metaloom.graph.core.store.vec.VectorStore;
 import io.metaloom.graph.core.store.rel.RelStore;
 
 /**
@@ -46,6 +47,8 @@ public final class InvariantChecker {
 	private final AdjacencyStore adjacency;
 	private final PropertyStore properties;
 	private final BlobStore blobs;
+	/** Null in a store with no vector storage, in which case the vector check has nothing to walk. */
+	private final VectorStore vectors;
 	private final Map<Kind, SegmentSet> segmentSets;
 
 	private VerifyOptions options = VerifyOptions.consistentSnapshot();
@@ -56,11 +59,17 @@ public final class InvariantChecker {
 
 	public InvariantChecker(NodeStore nodes, RelStore rels, AdjacencyStore adjacency, PropertyStore properties,
 		BlobStore blobs, Map<Kind, SegmentSet> segmentSets) {
+		this(nodes, rels, adjacency, properties, blobs, null, segmentSets);
+	}
+
+	public InvariantChecker(NodeStore nodes, RelStore rels, AdjacencyStore adjacency, PropertyStore properties,
+		BlobStore blobs, VectorStore vectors, Map<Kind, SegmentSet> segmentSets) {
 		this.nodes = nodes;
 		this.rels = rels;
 		this.adjacency = adjacency;
 		this.properties = properties;
 		this.blobs = blobs;
+		this.vectors = vectors;
 		this.segmentSets = segmentSets;
 	}
 
@@ -90,6 +99,7 @@ public final class InvariantChecker {
 		checkPropertyBlocks(violations);
 		checkAdjacencyChains(violations);
 		checkBlobChains(violations);
+		checkVectorRecords(violations);
 		if (stopped) {
 			violations.add("(scan stopped early: " + (violations.size() >= options.maxViolations()
 				? "violation limit of " + options.maxViolations() + " reached"
@@ -410,6 +420,74 @@ public final class InvariantChecker {
 					violations.add("Blob chain from " + ElementId.toString(blobId) + " does not terminate");
 					break;
 				}
+			}
+		}
+	}
+
+	/**
+	 * Every vector record has exactly one live owner, and every owner's reference resolves.
+	 *
+	 * <p>
+	 * Both directions matter and they fail differently. A property block naming a dead vector record is a read that
+	 * throws — loud, and easy to trace. A live vector record that <em>nothing</em> names is silent: it costs a
+	 * record's worth of space per occurrence and nothing ever reports it, which is exactly how the proof of concept
+	 * accumulated property records forever. The orphan sweep is the half that would otherwise go unnoticed.
+	 * </p>
+	 */
+	private void checkVectorRecords(List<String> violations) {
+		if (vectors == null) {
+			return;
+		}
+		SegmentSet vecSet = segmentSets.get(Kind.VEC);
+		if (vecSet == null) {
+			return;
+		}
+		Set<Long> reachable = new HashSet<>();
+		for (long nodeId : segmentSets.get(Kind.NODE).liveIds()) {
+			if (!step(violations)) {
+				return;
+			}
+			checkVectorsOf(violations, reachable, nodeId, nodes.propBlockId(nodeId));
+		}
+		for (long relId : segmentSets.get(Kind.REL).liveIds()) {
+			if (!step(violations)) {
+				return;
+			}
+			checkVectorsOf(violations, reachable, relId, rels.propBlockId(relId));
+		}
+		for (long vectorId : vecSet.liveIds()) {
+			if (!step(violations)) {
+				return;
+			}
+			if (!reachable.contains(vectorId)) {
+				violations.add("Vector record " + ElementId.toString(vectorId)
+					+ " is orphaned; no live property block references it");
+			}
+		}
+	}
+
+	private void checkVectorsOf(List<String> violations, Set<Long> reachable, long ownerId, long blockId) {
+		if (ElementId.isNull(blockId) || !segmentSets.get(Kind.PROP).isLive(blockId)) {
+			return;
+		}
+		for (long ownedId : properties.ownedIds(blockId)) {
+			if (ElementId.kind(ownedId) != Kind.VEC) {
+				continue;
+			}
+			if (!vectors.exists(ownedId)) {
+				violations.add("Property block " + ElementId.toString(blockId) + " of " + ElementId.toString(ownerId)
+					+ " references dead vector record " + ElementId.toString(ownedId));
+				continue;
+			}
+			if (!reachable.add(ownedId)) {
+				violations.add("Vector record " + ElementId.toString(ownedId) + " is shared; reached again from "
+					+ ElementId.toString(ownerId));
+				continue;
+			}
+			long recorded = vectors.owner(ownedId);
+			if (recorded != ownerId) {
+				violations.add("Vector record " + ElementId.toString(ownedId) + " names owner "
+					+ ElementId.toString(recorded) + " but is referenced by " + ElementId.toString(ownerId));
 			}
 		}
 	}

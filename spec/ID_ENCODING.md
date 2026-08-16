@@ -53,6 +53,7 @@ The PoC satisfies R1 only, and only for a single file per kind. See
 | 5 | `BLOB` | `PAGE_SIZE` | `4 GiB / PAGE_SIZE` | 4 GiB | [PROPERTY_STORAGE.md §6](PROPERTY_STORAGE.md#6-blob-store) |
 | 6 | `INDEX` | `PAGE_SIZE` | `4 GiB / PAGE_SIZE` | 4 GiB | Phase 7 |
 | 7 | `UNDO` | 64 B | 2^24 | 1 GiB | **Reserved and unused.** Snapshot isolation keeps before-images per page in memory instead, because undo does not need to be durable under no-steal — [TRANSACTIONS.md §5.1](TRANSACTIONS.md#51-what-was-built). The code is held for the record-level design in [§5.2](TRANSACTIONS.md#52-the-record-level-design-retained), which concurrent writers would need |
+| 8 | `VEC` | **declared** | varies | varies | One fixed-size vector and its ANN links in a single record, so a search visits a node in one page read. **The only kind whose stride is not a property of the format**: it comes from `GraphStoreOptions.vectorDimensions`, is recorded in the manifest, and is absent entirely in a store that never asked for it — [VECTOR.md](VECTOR.md) |
 | 8..15 | reserved | — | — | — | Do not use without bumping the format version |
 
 Slots per segment is `min(2^24, SEGMENT_CAPACITY / stride)` with `SEGMENT_CAPACITY = 4 GiB`. For
@@ -162,6 +163,7 @@ Every record carries a 16-bit `gen` field at a **fixed per-kind offset**, declar
 | BLOB | 20 |
 | INDEX | 30 |
 | UNDO | 44 |
+| VEC | 30 |
 
 The low 12 bits of that field must equal the id's `gen`. On every read:
 
@@ -333,5 +335,5 @@ Property-based tests belong here; see [TESTING.md §4](TESTING.md#4-property-bas
 
 ---
 
-_Git HEAD revision: `364b5f7`_
+_Git HEAD revision: `8f178b4`_
 _Last updated: 2026-08-14_

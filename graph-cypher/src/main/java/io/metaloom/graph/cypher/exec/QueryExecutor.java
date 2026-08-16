@@ -26,11 +26,13 @@ import io.metaloom.graph.cypher.func.Functions;
  */
 public final class QueryExecutor {
 
+	private final GraphAccess graph;
 	private final Evaluator evaluator;
 	private final PatternMatcher matcher;
 	private final Writer writer;
 
 	public QueryExecutor(GraphAccess graph, Map<String, Object> parameters) {
+		this.graph = graph;
 		this.evaluator = new Evaluator(graph, parameters);
 		this.matcher = new PatternMatcher(evaluator);
 		// MERGE has to match before it can decide whether to create, so the writer gets the same matcher rather than
@@ -144,12 +146,65 @@ public final class QueryExecutor {
 				case Ast.SetClause ignored -> false;
 				case Ast.Remove ignored -> false;
 				case Ast.Delete ignored -> false;
+				// A call produces its whole result set at once — the index returns k rows, not a stream — so there is
+				// nothing to push. Rows after it stream as usual.
+				case Ast.Call ignored -> false;
 			};
 			if (!ok) {
 				return false;
 			}
 		}
 		return true;
+	}
+
+	/**
+	 * Runs a procedure call, binding its results into each incoming row.
+	 *
+	 * <p>
+	 * There is exactly one procedure and it is dispatched by name here rather than through a registry, because a
+	 * registry for one entry is indirection without a second implementer. When there is a second, this becomes the
+	 * place that grows a map.
+	 * </p>
+	 */
+	private List<Row> call(Ast.Call call, List<Row> rows) {
+		if (!call.procedure().equalsIgnoreCase("vector.query")) {
+			throw new CypherTypeException("Unknown procedure " + call.procedure()
+				+ "(). This build has one: vector.query(label, key, vector, k) YIELD node, score");
+		}
+		if (call.arguments().size() != 4) {
+			throw new CypherTypeException("vector.query(label, key, vector, k) takes 4 arguments but got "
+				+ call.arguments().size());
+		}
+		if (call.yields().size() > 2) {
+			throw new CypherTypeException("vector.query yields node and score, so at most two names");
+		}
+		List<Row> out = new ArrayList<>();
+		for (Row row : rows) {
+			String label = text(evaluator.evaluate(call.arguments().get(0), row));
+			String key = text(evaluator.evaluate(call.arguments().get(1), row));
+			float[] query = Functions.vectorArgument(evaluator.evaluate(call.arguments().get(2), row),
+				"vector.query");
+			long k = Values.number(evaluator.evaluate(call.arguments().get(3), row), "vector.query").longValue();
+			if (query == null || k <= 0) {
+				continue;
+			}
+			for (GraphAccess.Scored scored : graph.nearest(label, key, query, (int) k)) {
+				Row bound = row.with(call.yields().get(0), graph.node(scored.nodeId()));
+				if (call.yields().size() > 1) {
+					bound = bound.with(call.yields().get(1), scored.score());
+				}
+				out.add(bound);
+			}
+		}
+		return out;
+	}
+
+	private static String text(Object value) {
+		if (value instanceof String string) {
+			return string;
+		}
+		throw new CypherTypeException("vector.query needs a label and a key as strings, got "
+			+ Values.typeName(value));
 	}
 
 	/**
@@ -338,6 +393,7 @@ public final class QueryExecutor {
 				case Ast.SetClause set -> rows = writer.set(set, rows);
 				case Ast.Remove remove -> rows = writer.remove(remove, rows);
 				case Ast.Delete delete -> rows = writer.delete(delete, rows);
+				case Ast.Call call -> rows = call(call, rows);
 			}
 		}
 

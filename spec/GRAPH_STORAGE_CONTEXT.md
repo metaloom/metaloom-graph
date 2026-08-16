@@ -24,10 +24,11 @@ The defining design constraint is:
 > **An element id decodes arithmetically into the exact file and byte offset of its record.
 > Reading an element by id costs zero index probes and zero extra seeks.**
 
-**Status.** Phases 0 to 10 are implemented to varying depth; 584 tests pass here, plus 23 in the MetaLoom
+**Status.** Phases 0 to 10 are implemented to varying depth; 749 tests pass here, plus 23 in the MetaLoom
 integration. The engine is **durable**
 (write-ahead log, fsync before any data page is touched, redo recovery), **transactional** (commit,
-rollback, auto-commit), **indexed** (label and property B+trees), and it reclaims space both without
+rollback, auto-commit), **indexed** (label and property B+trees, and an HNSW index for
+nearest-neighbour search over vector properties — [VECTOR.md](VECTOR.md)), and it reclaims space both without
 moving anything (native hole punching) and by **compacting** — relocating records, rewriting every
 reference to them and pulling the high water marks down.
 
@@ -75,7 +76,7 @@ GRAPH_STORAGE_CONTEXT.md (this file)
         ├─ PROPERTY_STORAGE.md ....... attributes, dictionaries, blobs
         ├─ INDEX.md .................. the label and property B+trees, unique constraints
         ├─ INDEX_TASKS.md ............ the work items behind INDEX.md's "not built" list
-        ├─ VECTOR.md ................. vector properties and ANN search: an exploration
+        ├─ VECTOR.md ................. vector records and the HNSW index over them
         ├─ TRANSACTIONS.md ........... ACID, snapshot isolation, page versions, CoW
         ├─ CYPHER.md ................. the openCypher subset, the server and the UI
         ├─ WIRE.md ................... the binary streaming port, its codec and the Java client
@@ -104,7 +105,7 @@ GRAPH_STORAGE_CONTEXT.md (this file)
 | [PROPERTY_STORAGE.md](PROPERTY_STORAGE.md) | Property blocks, key and label dictionaries, value typing, inline vs blob, string dedup | Relationship storage; the property *index* (INDEX.md) |
 | [INDEX.md](INDEX.md) | The two secondary B+trees — label to node and hashed property value to node — their page layout, the candidate verification a hashed key requires, the four maintenance hooks, unique constraints, and why relationships are not indexed | How a property is stored (PROPERTY_STORAGE.md); which access path a query picks (CYPHER.md) |
 | [INDEX_TASKS.md](INDEX_TASKS.md) | The work items behind [INDEX.md §11](INDEX.md): for each unbuilt index, whether it is worth building, what it costs and what "done" means. Also the answer to "are unindexed relationships a supernode problem" — they are not, and §1 says what is | The design of anything on the list; the cross-project backlog order (PROGRESS.md §5) |
-| [VECTOR.md](VECTOR.md) | Vector data in the graph: what is storable today, why no B+tree can answer a nearest-neighbour query, what a vector index would be declared on, and four ways to build one with a staged recommendation | How a property value is encoded (PROPERTY_STORAGE.md) |
+| [VECTOR.md](VECTOR.md) | Vector data in the graph: the `VEC` record that holds a vector with its ANN links, the declared index over `(label, property key)`, the HNSW structure and its build, why no B+tree can answer a nearest-neighbour query, and the four shapes considered before HNSW was chosen | How a property value is encoded (PROPERTY_STORAGE.md) |
 | [CYPHER.md](CYPHER.md) | The openCypher subset, reads and writes: grammar, null semantics, where it differs from the engine, which transaction a query gets, why writes are off by default, the planner's costs, and the Vert.x HTTP server with its React and D3 graph browser | The public API; the binary streaming port (WIRE.md) |
 | [DATABASES.md](DATABASES.md) | Several databases under one root: the directory layout, why a name is validated by allow-list, lazy opening, create and drop, and how a database is selected from each front end | The storage format; the frame layout (WIRE.md) |
 | [WIRE.md](WIRE.md) | The binary streaming port: the frame, the value codec, the server's four bounds on a slow reader, the memory multiplication, and the Java client | The query language (CYPHER.md), the HTTP route and the browser UI |
@@ -139,6 +140,7 @@ These constants are defined normatively in [ID_ENCODING.md](ID_ENCODING.md) and
 | Node record stride | 64 B | Exactly one cache line, never straddles a page |
 | Relationship record stride | 64 B | Same |
 | Property cell stride | 32 B | 256 cells per page |
+| `VEC` record stride | declared, a power of two (4 KiB at 768 dims) | Holds the vector and its ANN links in one record; 0 in a store without vector storage — [VECTOR.md](VECTOR.md) |
 | Adjacency cell stride | 512 B | A block is a run of cells that doubles as the node fills, up to one page. A page-per-node cost 10x the disk — [reports/SCALE.md](reports/SCALE.md) |
 | Undo record stride | 64 B | Same class as node/rel |
 | Slots per segment | `min(2^24, SEGMENT_CAPACITY / stride)` | Slot field is 24 bit; large strides simply use fewer bits |
@@ -205,7 +207,7 @@ Full description in [ARCHITECTURE.md](ARCHITECTURE.md).
 | Term | Meaning |
 |------|---------|
 | **Element** | A node or a relationship. Both carry a label, properties and an `ElementId`. |
-| **Kind** | The store family an id belongs to: node, relationship, adjacency, property, blob, index, undo. Encoded in the top 4 bits of every id. |
+| **Kind** | The store family an id belongs to: node, relationship, adjacency, property, blob, index, undo, vector. Encoded in the top 4 bits of every id. |
 | **Segment** | One file of a store family, at most `SEGMENT_CAPACITY` bytes of data. `node-000017.seg`. |
 | **Slot** | The index of a fixed-size record inside a segment. `offset = dataStart + slot * stride`. |
 | **Stride** | The fixed byte size of one record of a given kind. |
@@ -229,6 +231,12 @@ Full description in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ### 5.1 Binding rules for on-disk structures
 
+- **An application-chosen stride is still a stride.** `Kind.VEC` is the one kind whose record size is
+  not a property of the format — it comes from `GraphStoreOptions.vectorDimensions` and is recorded in
+  the manifest — and it goes through every rule below unchanged. In particular it must still divide the
+  page, which since pages are powers of two means it must be one: a 768-float vector is 3,072 bytes and
+  its record is 4,096. Fixed at store creation, because `Geometry` derives every per-kind table from it
+  and because crash recovery has to build that segment set before it can replay anything into it.
 - **Every record stride divides `PAGE_SIZE`.** A record must never straddle a page boundary — a
   straddling record doubles the I/O and breaks per-page checksums. This is why strides are 32, 64 or
   `PAGE_SIZE` and never something like the PoC's 1080 bytes.
@@ -327,7 +335,9 @@ Full description in [ARCHITECTURE.md](ARCHITECTURE.md).
 | `PropertyStore` / `ValueCodec` | `io.metaloom.graph.core.store.prop` | Property blocks and typed value encoding |
 | `BlobStore` | `io.metaloom.graph.core.store.blob` | Page-sized extents for large values |
 | `AdjacencyStore` / `AdjacencyBlock` / `EdgeCodec` / `PackedEdge` | `io.metaloom.graph.core.store.adj` | The three adjacency tiers and the compressing codec |
-| `BTree` / `IndexCatalog` | `io.metaloom.graph.core.index` | The label and property B+trees, rooted in an index page |
+| `BTree` / `IndexCatalog` | `io.metaloom.graph.core.index` | The label and property B+trees, rooted in an index page; also the declared vector-index list |
+| `HnswIndex` | `io.metaloom.graph.core.index` | The approximate-nearest-neighbour graph over the vector records |
+| `VectorStore` / `VectorRecord` | `io.metaloom.graph.core.store.vec` | One fixed-size record per vector, holding the vector **and** its ANN links so a search visits a node in one read |
 | `Compactor` / `ForwardingMap` | `io.metaloom.graph.core.maintenance` | Record relocation and the reference rewrite; **the only thing that breaks an id** |
 | `IoCounters` / `IoStats` / `StoreMetrics` | `io.metaloom.graph.core.metrics`, `...api` | Reads and writes per kind, log volume and lag, checkpoint and recovery timings |
 | `InvariantChecker` | `io.metaloom.graph.core.store` | Every structural invariant, throttled or not |
@@ -361,5 +371,5 @@ deliverables and exit criteria are in [PLAN.md](PLAN.md).
 
 ---
 
-_Git HEAD revision: `e4601d1`_
-_Last updated: 2026-08-15_
+_Git HEAD revision: `20f7e3d`_
+_Last updated: 2026-08-16 (IDX-4: the streaming neighbour cursor)_

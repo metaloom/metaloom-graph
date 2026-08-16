@@ -318,6 +318,48 @@ keyed on `(dir, type, neighbour)`** in the `INDEX` kind. That is a Phase 7 item;
 `adj_head_id` are already shaped to allow it without a format change (the head id's kind
 distinguishes `ADJ` from `INDEX`).
 
+### 5.4 Streaming the chain — the cursor
+
+§5.3 reduces how many blocks a filtered walk *decodes*. It does nothing about how many it *touches*,
+because the walk had no way to be told it was finished: `AdjacencyStore.edges` returned a `long[]`
+and `GraphStore.neighbours` a `List<Edge>`, both fully built before the caller saw anything. At
+degree 10^6 that is an 8 MB `long[]` plus a million `Edge` records for a query that may want one row.
+
+`EdgeCursor` (`store.adj`, packed entries) and `NeighbourCursor` (`api`, resolved `Edge`s) are the
+streaming form. A block is acquired and decoded only when the entries of the previous one have run
+out, so a caller that stops after one row has touched the head block and nothing else —
+`ReadBudgetTest.testTakingOneEdgeOffASupernodeReadsOneBlock` asserts one `recordReads(ADJ)` against a
+13-block chain, and asserts it is the same number a one-block node costs. This is the same argument
+`forEachNodeWhile` makes one level up: the reason a `LIMIT` costs what a reader expects is that the
+thing producing rows can be told to stop.
+
+**There is one walk, not two.** `edges(nodeId, typeIds)` is written as a drain of `cursor(nodeId,
+typeIds)`, and `neighbours(...)` as a drain of the same cursor with `materialise` on top. Both filter
+levels stay where §5.3 and §3.1 put them — `AdjacencyBlock.admitsAnyType` per block,
+`PackedEdge.excludedByType` per entry — and neither rule is re-derived in the streaming path. A
+second implementation of "type 0 means the cache is absent, not that the type is zero" is a second
+place to get it wrong, and getting it wrong drops edges silently.
+
+**A cursor holds a read view; a list does not.** `GraphStoreImpl.read` runs its body without a lock
+and re-runs it if a commit landed underneath, which is safe precisely because building a list has no
+side effects and can be thrown away. A cursor outlives the call that made it and cannot be re-run, so
+`neighbourCursor` takes the read latch outright and holds it until `close()` — the trade
+`forEachNodeWhile` already makes, for the reason it gives. Two consequences belong to the caller:
+an unclosed cursor stalls every writer, not only the thread that leaked it; and a mutation attempted
+from inside a cursor loop deadlocks the thread against its own latch. A cursor opened *inside* a
+write transaction takes no latch at all, because the transaction's overlay is already a stable view.
+
+`neighbours` deliberately stays on the optimistic path and drains a cursor that holds no lease.
+Making it take the latch would turn every traversal in the engine into a writer-excluding read to buy
+nothing.
+
+The Cypher layer consumes this at the seed (`forEachNodeWhile`) but **not yet at the expansion**:
+`PatternMatcher.expand` still collects a node's steps into a list before moving to the next pattern
+element, so a `LIMIT 1` through Cypher over a supernode still materialises that node's edges. The
+storage layer no longer forces it to; making the expansion streaming means restructuring the
+per-row relationship-uniqueness sets and path accumulators that walk in lockstep with it, which is
+its own change.
+
 ---
 
 ## 6. Operations
@@ -366,7 +408,10 @@ trade — see §8.
 ### 6.3 Traverse
 
 ```java
-Cursor c = tx.neighbours(nodeId, Direction.OUT, typeFilter);
+List<Edge> all = store.neighbours(nodeId, Direction.OUT, typeFilter);      // materialised
+try (NeighbourCursor c = store.neighbourCursor(nodeId, Direction.OUT, typeFilter)) {
+	while (c.next()) { ... }                                               // streamed, §5.4
+}
 ```
 
 1. Read the node record (64 B, one cache line, usually already read).
@@ -374,7 +419,8 @@ Cursor c = tx.neighbours(nodeId, Direction.OUT, typeFilter);
 3. Walk the block chain. For each block: check `type_bitmap` against the filter — but only where
    `TYPES_CACHED` says the bitmap describes every entry — and skip or decode. Issue a prefetch for
    `next_block_id` before decoding the current block, so the device and the CPU overlap. (The
-   prefetch is Phase 6 and needs the cursor; the skip is built.)
+   prefetch is Phase 6 and needs the io_uring engine; the skip and the cursor are built.) Through a
+   cursor this step is lazy: the next block is not touched until the current one is exhausted.
 4. Apply the type filter to every decoded entry from its own bits, which is free. A lightweight entry
    always carries its type; a materialised one carries it unless it caches none (§3.1).
 5. For the entries with `dir == 3` that survived step 4, read the relationship record and confirm the
@@ -513,8 +559,12 @@ one that says less.
       entries, dropping tombstones and packing the survivors. Breaks no ids, since block ids are
       internal, so it runs before any record relocation
 - [ ] Native SIMD codec + differential test against Java (Phase 6)
-- [ ] Traversal cursor with prefetch (Phase 6, needs the io_uring engine) —
-      [IDX-4](INDEX_TASKS.md#idx-4--a-streaming-neighbour-cursor)
+- [x] Streaming traversal cursor — IDX-4. `EdgeCursor` and `NeighbourCursor` decode a block only when
+      the previous one is exhausted, so taking one edge off a node of any degree costs the head block
+      and nothing else (§5.4). `edges` and `neighbours` are drains of it, so there is one walk rather
+      than two; the cursor holds the read latch outright because, unlike a list, it cannot be re-run
+- [ ] Prefetch on that cursor (Phase 6, needs the io_uring engine): keeping several block reads in
+      flight is a separate change from deciding when to issue the next one
 - [x] Type-bitmap and min/max skipping on the read path — IDX-3. `edges(nodeId, typeIds)` walks past
       a block whose bitmap admits no type in the filter, and `hasEdge(a, b)` walks past a block whose
       location range excludes the target. Two header flags say when either summary can be trusted to
@@ -533,11 +583,10 @@ one that says less.
 
 The three adjacency items above are what a "supernode is slow" report actually resolves to; the
 missing relationship index is a different problem with a different victim
-([INDEX_TASKS.md §1](INDEX_TASKS.md)). Two of the three are now done: IDX-2 reduced what each entry
-costs and IDX-3 reduces how many blocks are decoded at all. The one that remains is the streaming
-cursor ([IDX-4](INDEX_TASKS.md#idx-4--a-streaming-neighbour-cursor)), which reduces how many entries
-are touched when the query stops early — and which should be built on the filtered path rather than
-retrofitted onto it.
+([INDEX_TASKS.md §1](INDEX_TASKS.md)). All three are now done, and they compose along three
+independent axes: IDX-2 reduced what each surviving entry costs, IDX-3 reduces how many blocks are
+decoded, and IDX-4 reduces how many are touched at all when the query stops early. What is left at
+this layer is prefetch, which is an I/O-engine change rather than an adjacency one.
 
 ---
 
@@ -545,14 +594,16 @@ retrofitted onto it.
 
 | Class | Package | Purpose |
 |-------|---------|---------|
-| `AdjacencyStore` | `io.metaloom.graph.core.store.adj` | Insert, delete, enumerate edges; tier promotion; `edges(nodeId, typeIds)` and `hasEdge` |
+| `AdjacencyStore` | `io.metaloom.graph.core.store.adj` | Insert, delete, enumerate edges; tier promotion; `edges(nodeId, typeIds)`, `cursor(nodeId, typeIds)` and `hasEdge` |
 | `AdjacencyBlock` | `io.metaloom.graph.core.store.adj` | Block header accessors, entry iteration, and the two skip predicates `admitsAnyType` / `admitsNeighbour` |
 | `EdgeCodec` | `io.metaloom.graph.core.store.adj` | Delta + varint encode/decode, native and fallback |
 | `PackedEdge` | `io.metaloom.graph.core.store.adj` | The 8-byte edge tuple |
-| `NeighbourCursor` | `io.metaloom.graph.core.api` | Streaming traversal with prefetch |
+| `EdgeCursor` | `io.metaloom.graph.core.store.adj` | The chain walk, streamed: one packed entry at a time, one block decoded at a time (§5.4) |
+| `NeighbourCursor` | `io.metaloom.graph.core.api` | The same walk as resolved `Edge`s, holding a read view until closed. Prefetch is not built |
 
 ---
 
-_Git HEAD revision: `8f178b4`_
-_Last updated: 2026-08-16 (§5, §5.3, §6.3, §6.4, §8, §9, §10 and §11 synced with IDX-3;
-§5.3's O(log blocks) `hasEdge` claim corrected and §9's test list reconciled with the classes that exist)_
+_Git HEAD revision: `20f7e3d`_
+_Last updated: 2026-08-16 (IDX-4: new §5.4 for the streaming cursor; §6.3 shows both traversal forms
+and moves prefetch's blocker from "needs the cursor" to "needs the io_uring engine"; §10 and §11
+updated)_

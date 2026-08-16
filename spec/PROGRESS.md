@@ -25,7 +25,7 @@ not**, in one place.
 | 0 — Baseline and harness | **Done** except CI, which has no runner | [reports/BASELINE.md](reports/BASELINE.md) |
 | 1 — Addressing and segments | **Done** | `ElementIdTest`, `GeometryTest`, `SegmentLifecycleTest` |
 | 2 — Record stores and catalog | **Done** except `MAP`/`DURATION` value types | `ValueCodecTest`, `PropertyRoundTripTest` |
-| 3 — Adjacency and traversal | **Done** except streaming cursors | `AdjacencyTierTest`, `EdgeCodecTest`, `SpaceEfficiencyTest` |
+| 3 — Adjacency and traversal | **Done** except a streaming `traverse`; neighbour enumeration streams (IDX-4) | `AdjacencyTierTest`, `EdgeCodecTest`, `SpaceEfficiencyTest`, `NeighbourCursorTest` |
 | 4 — WAL, recovery, checkpoints | **Done**, as no-steal redo rather than ARIES | `RecoveryTest` |
 | 5 — Transactions | **Partial** — ACID, serialised writers, **snapshot isolation for readers**. No concurrent writers | `VisibilityTest`, `SnapshotIsolationTest`, `VacuumTest`, `ConcurrentReaderTest`, `RollbackTest` |
 | 6 — Native layer | **Done** except a second build target; `miri` and `fuzz` now installed and run | `NativeCodecTest`, `UringIoEngineTest`, `DirectWalTest`, `BlobCompressionTest`, `StatxTest`, `NativeBindingsTest` |
@@ -58,9 +58,9 @@ shades a single runnable jar.
 
 ```bash
 mvn clean install             # everything, including the native layer
-mvn test -Dnative.skip=true   # the pure-Java fallback: 377 tests, 23 skipped rather than 3
+mvn test -Dnative.skip=true   # the pure-Java fallback: the same tests, 23 skipped rather than 3
 mvn -o -Poffline install      # warm cargo registry, no network
-mvn test                      # 377 tests, 0 failures, 3 skipped — plus the UI's 17 and 12 Rust tests
+mvn test                      # 749 tests, 0 failures, 3 skipped — plus the UI's 17 and 12 Rust tests
 mvn test -Pbench              # benchmarks, the structural gates, and the supernode gates
 mvn test -Pcrash              # kill -9, compaction crash injection, and the crash matrix
 mvn test -Pslow               # the soak harness and the long-running reader
@@ -426,9 +426,14 @@ Ordered by phase. Each item says what it costs to leave undone.
       hundred closes it. **The highest-value change available**, and a format change, so it needs a
       version bump and a converter.
 
-- [ ] Streaming `EdgeCursor` / `TraversalCursor` with prefetch. Traversal materialises its result today,
-      so a traversal over a supernode is bounded by heap rather than by the caller's appetite. Needs
-      Phase 6 for the prefetch to mean anything.
+- [x] Streaming `EdgeCursor` / `NeighbourCursor` — IDX-4. One block is decoded only when the previous
+      one is exhausted, so taking one edge off a node of degree 10^6 costs the head block and nothing
+      else, and `edges` / `neighbours` are drains of the cursor rather than a second walk
+      ([RELATIONSHIP_STORAGE.md §5.4](RELATIONSHIP_STORAGE.md)), gated by `ReadBudgetTest`. The cursor
+      holds the read latch outright, because unlike a list it cannot be re-run by the optimistic read
+      path.
+- [ ] Prefetch on that cursor, and a `TraversalCursor` for the breadth-first form, which still
+      materialises. Needs Phase 6 for the prefetch to mean anything.
 - [x] Type-bitmap and min/max skipping on the **read** path — `AdjacencyStore.edges(nodeId, typeIds)`
       and `hasEdge(a, b)`, gated by `ReadBudgetTest`
       ([RELATIONSHIP_STORAGE.md §5.3](RELATIONSHIP_STORAGE.md)). It skips the *decode* of a block, not
@@ -655,12 +660,14 @@ The whole suite passes with `metaloom.graph.native.enabled` both true and false.
       at degree 200,000 against 0.024 at degree 2,000**. Both improve with degree. The chain tier is
       the ceiling in theory; in practice nothing has reached it. Revisit only if a measurement, not
       an intuition, says so — [GRAPH_BENCHMARK.md](GRAPH_BENCHMARK.md) section 8
-- [~] Vector search — **HNSW, being implemented here rather than delegated.** Six stages in
-      [VECTOR.md §7](VECTOR.md); stage 1 is built (`vector.cosine`/`dot`/`l2`, the namespaced-call
-      parser fold, `GraphStore.nearestByScan`, and a bound on the vector dimension in `ValueCodec` —
-      the last unchecked length field in the property codec). Stage 3 carries the format change: a
-      `VEC` kind whose record interleaves the vector with its links, and a property block that points
-      at it instead of at a blob
+- [x] **Vector search — HNSW, implemented here rather than delegated.** All six stages of
+      [VECTOR.md §7](VECTOR.md) are built: the `vector.*` distance functions and an exact
+      `nearestByScan`; a `VEC` kind whose record interleaves a vector with its ANN links, so a visited
+      node costs one page read; a declared index whose membership the hooks maintain; the HNSW graph
+      with entry-point repair; a resumable batched build; and `CALL vector.query(...) YIELD node,
+      score`, whose real value is that the following `MATCH` verifies an already-bound node — a graph
+      predicate applied to a vector search with no planner change. Format version 4, written **only**
+      by a store that has vectors, so every existing store still opens
 - [ ] Concurrent split/merge under jcstress — jcstress is not in the offline repository
 - [ ] Crash-during-build test — needs the resumable build above
 
@@ -826,5 +833,5 @@ Recorded so nobody re-opens them as oversights:
 
 ---
 
-_Git HEAD revision: `3a05a2a`_
-_Last updated: 2026-08-16 (phase 15 plus IDX-2)_
+_Git HEAD revision: `20f7e3d`_
+_Last updated: 2026-08-16 (IDX-4: the streaming neighbour cursor)_

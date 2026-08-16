@@ -3,7 +3,8 @@
 A storage engine is only as good as its evidence. This file defines how the project proves that it
 does not lose data.
 
-The suite today is 445 tests running in about a minute, plus benchmarks, a soak, a scaling
+The suite today is 749 tests across the five modules — 366 in `graph-core`, 253 in `graph-cypher`, 22
+in `graph-protocol`, 2 in `graph-client`, 106 in `graph-server` — running in a few minutes, plus benchmarks, a soak, a scaling
 harness and a `kill -9` loop behind profiles and scripts. The PoC suite it replaced had one red test,
 three unbounded benchmarks living in the unit suite, and two tests that passed for reasons unrelated
 to what they asserted ([CURRENT_STATE.md §5](CURRENT_STATE.md#5-test-reality-check)).
@@ -33,6 +34,7 @@ to what they asserted ([CURRENT_STATE.md §5](CURRENT_STATE.md#5-test-reality-ch
 | `RollbackTest` | **1, and it was a false alarm on healthy data** — `verify(FULL)` bounded a blob's extent-chain walk at `segmentCount() * slotsPerPage() + 1`. A BLOB extent is page sized, so that is 2 on a single-segment store: every blob past about 16 KiB was reported as a chain that "does not terminate", with its remaining extents reported as orphaned on top. Nothing caught it because no test had ever written a blob and then run `verify(FULL)`. Reporting corruption that is not there is worse than missing some: it sends somebody hunting, and it made full verification unusable on any store holding real blobs |
 | `CypherVersusApiTest` and running the UI | 2 — a `RETURN *` that listed pattern variables out of order, and, found only by opening the browser, **64-bit ids losing precision as JSON numbers**: an id near 2^60 arrives in JavaScript rounded, so two nodes could collapse into one circle. Ids now cross as strings |
 | `LongRunningReaderTest` | 1 — reclamation walked every version chain on every commit to discover there was nothing to cut, which is quadratic while a reader is pinned. The test did not fail, it *did not finish*, which is the failure mode a shorter test would have reported as merely slow |
+| A full `mvn test` hanging, plus a thread dump | **2, and no test could see either** — both in the client's flow control, both leaving a consumer blocked forever on a server that had already sent every row. `readsPaused` was not `volatile`, so a stale read could skip the socket resume; and the ROWS handler published a batch to the consuming thread *before* adding it to the budget, so a consumer could spend bytes that had not been counted and the pause that followed had no callback left to lift it. Green in isolation, hung the reactor under load. The dump named the area in one look — client parked in `LinkedBlockingQueue.take()`, server worker **idle in its pool**; an idle server, not a stuck one, puts the lost wakeup on the client — but **fixing only the first left it still hanging**, which is the lesson: a plausible cause that explains the symptom is not the same as the cause ([WIRE.md §5.1](WIRE.md)) |
 
 The pattern is worth naming: **every one of these came from a test that compared the engine against
 something outside it** — a model, a counter, a corrupt file, a thread count — rather than from a test
@@ -72,7 +74,16 @@ src/test/java/io/metaloom/graph/core/
                  distance functions everything else about vectors is measured against
   property/      jqwik property-based tests
   integration/   whole-store scenarios — including VectorScanTest, whose load-bearing case computes
-                 the expected nearest-k a second way, by sorting every vector inside the test
+                 the expected nearest-k a second way, by sorting every vector inside the test;
+                 VectorStorageTest (the VEC kind, its cascade, compaction and a crash);
+                 VectorIndexTest (the declared index, its membership and the index-versus-scan
+                 differential); VectorRecallTest — recall@k against the exact scan, **printed and
+                 floored** rather than asserted equal, because an approximate index that always
+                 agreed would be measured on data too small to approximate anything;
+                 NeighbourCursorTest — the streaming traversal, with the list form as its oracle over
+                 every shape of adjacency, because the two are built on one walk and the risk is that
+                 they drift. What it asserts alone is what a cursor has and a list does not: a
+                 position, a read view, and a close
   example/       UsageExampleTest — the documented API, executable, so it cannot rot
   nativelib/     NativeCodecTest, IoEngineTest, UringIoEngineTest — the crate and the IO engines
                  ForeignDowncallMetadataTest — the GraalVM downcall registrations against the code
@@ -369,6 +380,7 @@ each phase's numbers. Absolute targets to aim at, on a mid-range NVMe device, an
 | Type-filtered scan over materialised edges | relationship reads proportional to the *survivors*, not the degree | **20 REL touches for 5 survivors of 5,005**, gated ([IDX-2](INDEX_TASKS.md#3-closed)) |
 | Type-filtered scan over a supernode chain | blocks *decoded* proportional to the blocks the type bitmap admits, not to the chain length | **1 block of 4 decoded** for a rare type among 30,000 edges, gated ([IDX-3](INDEX_TASKS.md#3-closed)). Blocks *read* are unchanged and cannot fall: the chain pointer is inside each block ([RELATIONSHIP_STORAGE.md §5.3](RELATIONSHIP_STORAGE.md)) |
 | `hasEdge` against a supernode chain | 0 blocks decoded when no block's location range can hold the target | **0 of 4**, gated |
+| One edge off a supernode, through a cursor | 1 block read, independent of degree | **1 read and 1 decode over a 13-block chain, the same number a one-block node costs**, gated ([IDX-4](INDEX_TASKS.md#3-closed)). The list form over the same node reads and decodes all 13 |
 | Bytes per property-free edge | < 4 (both directions, amortised) | **2.0 to 2.5** |
 | Bytes per node with two small properties | < 140 | **128** |
 | Write amplification, mixed workload | < 3x | **1.70x**, gated |
@@ -483,5 +495,5 @@ diagnostic artefact and deleting it on failure is the most frustrating thing a t
 
 ---
 
-_Git HEAD revision: `3a05a2a`_
-_Last updated: 2026-08-16 (IDX-2 read budget)_
+_Git HEAD revision: `20f7e3d`_
+_Last updated: 2026-08-16 (IDX-4: the streaming neighbour cursor)_

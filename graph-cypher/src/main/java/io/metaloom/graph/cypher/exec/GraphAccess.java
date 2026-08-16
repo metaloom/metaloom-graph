@@ -175,6 +175,30 @@ public final class GraphAccess {
 	 *            the far end, relative to the node the expansion started from — which is not the same as
 	 *            {@code relationship.endId()} when the edge was traversed against its direction
 	 */
+	/**
+	 * The {@code k} nearest members of a declared vector index.
+	 * <p>
+	 * No filter is passed down. The graph predicate a caller wants is expressed as the {@code MATCH} that follows the
+	 * call: binding the node makes the pattern matcher verify it rather than scan, which applies the predicate to the
+	 * search's results without the query layer having to hand a callback into the store.
+	 */
+	public List<Scored> nearest(String label, String key, float[] query, int k) {
+		checkAbort();
+		try {
+			List<Scored> scored = new ArrayList<>();
+			for (io.metaloom.graph.core.api.Neighbour neighbour : store.nearest(label, key, query, k, null)) {
+				scored.add(new Scored(neighbour.nodeId(), neighbour.score()));
+			}
+			return scored;
+		} catch (java.io.IOException e) {
+			throw new java.io.UncheckedIOException(e);
+		}
+	}
+
+	/** One vector-search result: the node, and the metric's own value for it. */
+	public record Scored(long nodeId, double score) {
+	}
+
 	public record Expansion(CypherRelationship relationship, long neighbourId) {
 	}
 

@@ -417,6 +417,11 @@ public final class Functions {
 	 * or the list of numbers a stored vector becomes on its way through {@code GraphAccess.normalise}. A list of
 	 * integers counts — {@code [1, 2, 3]} written literally in a query is a list of longs.
 	 */
+	/** The same coercion, for the procedure mechanism, which takes a vector argument for the same two shapes. */
+	public static float[] vectorArgument(Object value, String where) {
+		return vectorArg(where, value);
+	}
+
 	private static float[] vectorArg(String function, Object value) {
 		if (value == null) {
 			return null;

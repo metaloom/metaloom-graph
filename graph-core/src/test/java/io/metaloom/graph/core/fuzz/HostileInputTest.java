@@ -18,6 +18,7 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 
 import io.metaloom.graph.core.api.Direction;
 import io.metaloom.graph.core.api.GraphStore;
+import io.metaloom.graph.core.api.GraphStoreOptions;
 import io.metaloom.graph.core.api.GraphStoreException;
 import io.metaloom.graph.core.api.Properties;
 import io.metaloom.graph.core.api.Transaction;
@@ -27,6 +28,7 @@ import io.metaloom.graph.core.id.ElementId;
 import io.metaloom.graph.core.id.Kind;
 import io.metaloom.graph.core.segment.Geometry;
 import io.metaloom.graph.core.store.GraphStoreImpl;
+import io.metaloom.graph.core.store.vec.VectorRecord;
 
 /**
  * The format parsers against deliberately hostile input.
@@ -164,6 +166,39 @@ public class HostileInputTest {
 					() -> store.nodeProperties(nodeId));
 				assertTrue(failure.getMessage().contains("dimensions"),
 					"the failure must name the field that is wrong: " + failure.getMessage());
+			}
+		});
+	}
+
+	/**
+	 * The same length field, on the other of the two paths a vector can take. A record-backed vector declares its
+	 * dimension twice — once in the property payload and once in the record's own header — and the two disagreeing
+	 * means one of them is corrupt, so neither may be used to size an array.
+	 */
+	@Test
+	public void testVectorRecordDeclaringTheWrongDimension() throws Exception {
+		assertTimeoutPreemptively(LIMIT, () -> {
+			long nodeId;
+			long vectorId;
+			Geometry geometry;
+			GraphStoreOptions options = GraphStoreOptions.builder()
+				.pageSize(Geometry.DEFAULT_PAGE_SIZE)
+				.segmentCapacity(TempStore.TEST_SEGMENT_CAPACITY)
+				.vectorDimensions(4)
+				.build();
+			try (GraphStore store = stores.open(options)) {
+				nodeId = store.createNode("N", Properties.of().set("v", new float[] { 1f, 2f, 3f, 4f }));
+				GraphStoreImpl impl = (GraphStoreImpl) store;
+				vectorId = impl.propertyStore().ownedIds(impl.nodeStore().propBlockId(nodeId)).get(0);
+				geometry = impl.geometry();
+			}
+			// The dimension in the record's own header, which the reader checks against what the store can hold.
+			patchInt(segmentFile(Kind.VEC), geometry.byteOffset(Kind.VEC, ElementId.slot(vectorId))
+				+ VectorRecord.OFF_DIM, Integer.MAX_VALUE - 1);
+
+			try (GraphStore store = stores.open(options)) {
+				expectTypedFailure(() -> store.nodeProperties(nodeId),
+					"a vector record whose dimension is not the store's must be rejected, not allocated");
 			}
 		});
 	}
