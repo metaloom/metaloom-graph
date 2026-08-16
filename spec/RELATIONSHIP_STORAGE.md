@@ -33,14 +33,14 @@ delta-compressed entries.
 graph LR
     N["Node record<br/>64 B"] -->|degree 1-2| I["inline_edge[0..1]<br/>in the node record"]
     N -->|degree 3..~1000| B1["One adjacency block<br/>8 KiB, append order"]
-    N -->|degree > ~1000| D["Block chain, sorted<br/>+ per-block min/max<br/>DENSE flag set"]
+    N -->|degree > ~1000| D["Block chain<br/>each block sorted<br/>+ per-block min/max<br/>DENSE flag set"]
 ```
 
 | Tier | Trigger | Where |
 |------|---------|-------|
 | **Inline** | `degree_out + degree_in <= 2` | `inline_edge[0..1]` in the node record |
 | **Blocked** | up to one block's capacity | a single `ADJ` block, `adj_head_id` |
-| **Dense** | beyond one block | a chain of blocks with a sorted, skippable layout; node flagged `DENSE` |
+| **Dense** | beyond one block | a chain of blocks, each sorted within itself and skippable by its header summary; node flagged `DENSE` |
 
 Promotion is one-way and happens on insert; demotion happens only during compaction.
 
@@ -81,7 +81,7 @@ A materialised entry's 48 bits hold a relationship location, and the relationshi
 authority on its type, direction and endpoints. The entry **also carries the type**, as a cache, and
 that is the difference between a type-filtered traversal of a supernode costing one random 64 byte
 read per *edge* and one per *surviving candidate*
-([IDX-2](INDEX_TASKS.md#idx-2--push-the-type-filter-into-adjacency-for-materialised-entries)).
+([IDX-2](INDEX_TASKS.md#3-closed)).
 
 Two values are reserved, and neither costs a real type:
 
@@ -172,7 +172,7 @@ offset size field
 28     2    tail_count         raw entries at the end of the page
 30     2    gen
 32     4    sorted_count       entries in the compressed region
-36     1    flags              FULL
+36     1    flags              FULL | TYPES_CACHED | NO_MATERIALISED
 37     1    cells              allocation units this block spans, 1..pageSize/512
 38     2    reserved
 40     8    min_location       for skipping a block without decoding it
@@ -189,6 +189,26 @@ offset size field
 
 `flags` is **one byte**, not four. It was written four bytes wide once, which silently claimed the
 reserved bytes beside it and erased `cells` on every write.
+
+Two of its three bits say whether the summary beside them can be trusted to rule something out, and
+both are **set to claim, never set to warn** — a block written before they existed reads as `0`,
+which says "cannot answer", which is the safe answer. That is the whole compatibility argument, and
+it is the same trick type id `0` plays in §3.1.
+
+| Bit | Meaning when set | Withdrawn by |
+|---|---|---|
+| `FULL` (1) | The block is at page size and cannot take more entries | — |
+| `TYPES_CACHED` (2) | Every materialised entry in this block caches a real type, so `type_bitmap` describes **every** entry and a read may skip on it | a materialised entry with `type == 0` |
+| `NO_MATERIALISED` (4) | The block holds no materialised entry, so `min/max_location` bound **neighbour** locations and a search for one may skip on them | any materialised entry |
+
+`NO_MATERIALISED` exists because the 48 bit field means two different things. On a lightweight entry
+it is a neighbour location; on a materialised one it is a *relationship* location (§3). A block
+holding both has a min/max over two address spaces mixed together, and ruling a neighbour out
+against that range would be meaningless.
+
+Both bits are recomputed from scratch whenever a block is rewritten, alongside the min/max and the
+bitmap they qualify — so a rewrite that drops the last uncached entry makes the block skippable
+again. `FULL` is a property of the block rather than of its contents and is preserved across one.
 
 **The hybrid is what makes the compression pay.** An append writes an 8-byte raw entry at the tail;
 when the tail meets the sorted region the block recompresses everything into the sorted region, which
@@ -265,12 +285,33 @@ loop that is roughly 3x slower and entirely correct.
 
 ### 5.3 Dense nodes
 
-Above one block, blocks form a chain via `next_block_id`. Each block's `min_neighbour` /
-`max_neighbour` and `type_bitmap` let a filtered traversal ("outgoing `FOLLOWS` edges only", "does an
-edge to node X exist") skip blocks without decoding them.
+Above one block, blocks form a chain via `next_block_id`. Each block's `min_location` /
+`max_location` and `type_bitmap` let a filtered traversal ("outgoing `FOLLOWS` edges only", "does an
+edge to node X exist") skip blocks without decoding them: `AdjacencyStore.edges(nodeId, typeIds)`
+uses the bitmap, `AdjacencyStore.hasEdge(a, b)` uses the range.
 
-The chain is kept sorted across blocks so that a merge-scan is possible and `hasEdge(a, b)` is
-O(log blocks) block reads plus one in-block binary search rather than a full scan.
+**A skip saves the decode, not the read, and the difference is not a detail.** The chain's `next`
+pointer lives inside each block's own header, so a walk has to acquire every block of the chain
+before it can judge any of them — the record read is owed either way. What a skip removes is the
+varint decode of up to 8,000 entries and the `long[]` they land in. A type-filtered and an
+unfiltered scan of the same node therefore have the **same** `recordReads(ADJ)` and different
+`adjacencyBlocksDecoded()`, which is the unit `IoStats` counts it in and the unit
+`ReadBudgetTest.testATypeFilteredScanSkipsTheBlocksWhoseBitmapExcludesTheType` asserts in. Claiming
+it as saved I/O would be claiming something the format does not deliver; a block directory stored
+apart from the blocks would, and does not exist.
+
+**`hasEdge(a, b)` is O(blocks), not O(log blocks).** This section used to claim that the chain is
+kept sorted across blocks, so that a merge-scan and a binary search were possible. It is not and they
+are not: new blocks are pushed onto the **head** (§5.1), so block order is insertion order, not key
+order, and each block is sorted only within itself. There is nothing to binary search over. What
+`hasEdge` does have is a range check that prunes and an early exit — a neighbour in the head block
+costs one decode however long the chain is, and a neighbour outside every block's range costs none
+at all. A block holding any materialised entry is never pruned, per `NO_MATERIALISED` above.
+
+Two limits are worth stating rather than discovering. The bitmap is 64 bits over `typeId & 63`, so
+past roughly 64 distinct types the false-positive rate makes type skipping worth little; and
+skipping only pays on a chain, which starts above one page — roughly 8,000 entries. Below that there
+is one block and nothing to skip. **This is a supernode optimisation and is measured as one.**
 
 For very high-degree nodes (configurable, default 2^20 edges) the chain is replaced by a **B+tree
 keyed on `(dir, type, neighbour)`** in the `INDEX` kind. That is a Phase 7 item; the `DENSE` flag and
@@ -330,9 +371,10 @@ Cursor c = tx.neighbours(nodeId, Direction.OUT, typeFilter);
 
 1. Read the node record (64 B, one cache line, usually already read).
 2. Yield matching inline edges. For degree <= 2, **done, with no further I/O**.
-3. Walk the block chain. For each block: check `type_bitmap` and `min/max` against the filter, skip
-   or decode. Issue a prefetch for `next_block_id` before decoding the current block, so the device
-   and the CPU overlap.
+3. Walk the block chain. For each block: check `type_bitmap` against the filter — but only where
+   `TYPES_CACHED` says the bitmap describes every entry — and skip or decode. Issue a prefetch for
+   `next_block_id` before decoding the current block, so the device and the CPU overlap. (The
+   prefetch is Phase 6 and needs the cursor; the skip is built.)
 4. Apply the type filter to every decoded entry from its own bits, which is free. A lightweight entry
    always carries its type; a materialised one carries it unless it caches none (§3.1).
 5. For the entries with `dir == 3` that survived step 4, read the relationship record and confirm the
@@ -343,9 +385,24 @@ supernode of materialised edges, a filter matching five of five thousand costs f
 instead of five thousand; `ReadBudgetTest.testATypeFilteredSupernodeReadsOnlyTheSurvivingRelationships`
 measures exactly that, in `Kind.REL` record touches.
 
+Step 3 is what keeps step 4 from running at all on a block that cannot match. It only pays on a
+chain and only where the bitmap is authoritative; §5.3 states both limits and the unit it is
+measured in.
+
 Prefetch depth is configurable; with the io_uring engine the cursor keeps several block reads in
 flight, which is the only way to saturate an NVMe device from a single traversal thread. See
 [SSD_IO.md §5](SSD_IO.md#5-prefetch-and-queue-depth).
+
+### 6.4 Does an edge connect a and b
+
+```java
+boolean linked = store.hasEdge(a, b);
+```
+
+Inline entries first, then the block chain, skipping any block whose `min/max_location` excludes
+`b` — and stopping at the first match. Direction-agnostic and type-agnostic: it answers the question
+§5.3 poses. A materialised entry names its relationship rather than its neighbour, so it is resolved
+through the record; a block holding one is never pruned on the range.
 
 ---
 
@@ -383,11 +440,14 @@ The numbers are estimates, but the orders of magnitude are structural, not tunin
 - **A materialised entry's type is a cache; type 0 means "not cached", not "type 0".** Never filter
   an entry out on the strength of a zero, and never match one by its exact packed value (§3.1).
 - **The type bitmap under-describes an entry that caches no type**: such an entry contributes bit 0,
-  not the bit of its real type. Block skipping on the read path
-  ([IDX-3](INDEX_TASKS.md#idx-3--block-skipping-on-the-read-path)) must therefore not skip a block on
-  the type bitmap alone unless every materialised entry in it caches a type — which is true of blocks
-  written since IDX-2 and false of a store restored from before it. Skipping is an optimisation; a
-  skipped block that held a match is a wrong answer.
+  not the bit of its real type. So a block is skipped on the type bitmap only when its
+  `TYPES_CACHED` flag says every materialised entry in it caches a type — true of blocks written
+  since IDX-2, false of a store restored from before it, and false of any block one such entry has
+  been appended to since. Skipping is an optimisation; a skipped block that held a match is a wrong
+  answer.
+- **`min/max_location` bound entry locations, which are not all neighbour locations.** A materialised
+  entry's 48 bits are a relationship location. Only a block flagged `NO_MATERIALISED` may be pruned
+  on the range by a search for a neighbour.
 - **Deleting a supernode is slow.** That is the accepted trade for making the common case free. If a
   workload deletes supernodes frequently, that is a signal to build the Phase 7 B+tree adjacency.
 
@@ -395,21 +455,42 @@ The numbers are estimates, but the orders of magnitude are structural, not tunin
 
 ## 9. Test Setup
 
-- `PackedEdgeTest`: round trip all four `dir` values, all 14 type bits, and 48-bit neighbours at 0,
-  1, max; a materialised entry round-tripping its cached type; the two uncacheable type ids falling
-  back to "not recorded"; the tombstone still unreachable through every constructor.
-- `AdjacencyBlockTest`: fill a block in layout 0, seal to layout 1, decode, assert set equality with
-  the input, for random and for adversarial (all-max-delta) inputs.
-- `EdgeCodecFuzzTest`: property-based — any multiset of edges encodes and decodes to itself; the
-  native codec and the Java fallback produce byte-identical output.
-- `AdjacencyTierTest`: assert the inline -> block -> dense promotion boundaries, and that promotion
-  preserves the edge set exactly.
-- `BidirectionalityTest`: for a random graph, assert every out-edge on `a` has a matching in-edge on
-  `b` (the D9 regression).
-- `TraversalCostTest`: instrumented `IoEngine` counting device reads; assert that enumerating a
-  degree-2 node costs 0 adjacency reads and a degree-1000 node costs 1.
-- `SupernodeTest`: 10^6 edges on one node; assert block-chain scan time is linear and that a filtered
-  scan on a rare type skips at least 90 percent of blocks.
+**These are the classes that exist.** The list used to name `AdjacencyBlockTest`,
+`EdgeCodecFuzzTest`, `BidirectionalityTest`, `TraversalCostTest` and `SupernodeTest`, none of which
+was ever written; the behaviour they described is covered, but by other classes and in one case by a
+benchmark rather than a test. A spec that sends a reader to a file that is not there is worse than
+one that says less.
+
+- `PackedEdgeTest` (`core/unit`): round trip all four `dir` values, all 14 type bits, and 48-bit
+  neighbours at 0, 1, max; a materialised entry round-tripping its cached type; the two uncacheable
+  type ids falling back to "not recorded"; `excludedByType` never excluding an uncached entry; the
+  tombstone still unreachable through every constructor.
+- `EdgeCodecTest` (`core/unit`): round trip preserves the edge set, extreme values, the two
+  compression ratios of §5.2, and corrupt input rejected rather than read out of bounds — a
+  backwards delta, an overflowing delta, a zero-length group.
+- `NativeCodecTest` (`core/nativelib`): the differential — native encoding byte-identical to Java,
+  each side decoding the other's output, truncated input refused.
+- `AdjacencyTierTest` (`core/integration`): the inline -> block -> chain promotion boundaries and
+  that promotion preserves the edge set; that a degree-three node costs one 512 byte cell rather than
+  a page; **that every out-edge on `a` has a matching in-edge on `b`** for a random graph, which is
+  the D9 regression; lightweight and materialised entries in one chain; the cached type, the
+  uncached-type entry traversing and deleting, a stale cached type caught by `verify`; and
+  `hasEdge` answering from every tier.
+- `InvariantTest` (`core/integration`): `verify(FULL)` catching a removed mirror entry and a drifted
+  degree counter, which is the same claim enforced from the checker's side.
+- `ReadBudgetTest` (`core/budget`): reads per operation as build failures — a degree-2 node costing
+  0 adjacency reads, a degree-4000 node costing 1, a 100,000 edge scan costing O(blocks); a
+  type-filtered supernode reading only the surviving relationship records (IDX-2); a type-filtered
+  scan **decoding** only the blocks its bitmap admits, a block holding an uncached-type entry never
+  skipped, and `hasEdge` skipping the blocks that cannot hold its target (IDX-3).
+- `DeviceReadBudgetTest` (`core/budget`): the same claims in major page faults on an evicted store,
+  skipped where the filesystem does not honour `posix_fadvise`.
+- `SpaceEfficiencyTest` (`core/integration`): bytes per entry at each degree — the 8,065 entries per
+  8 KiB block that §5.2 quotes.
+- `SupernodeBenchmark` (`core/bench`): insertion cost per edge, read cost per edge and degree-counter
+  cost on a single node of degree 20,000 (`-Dgraph.supernode.degree` to raise it). It asserts on
+  *ratios* — cost at full degree against cost at a hundredth of it — so it gates the shape of the
+  curve without gating on wall-clock.
 
 ---
 
@@ -434,11 +515,15 @@ The numbers are estimates, but the orders of magnitude are structural, not tunin
 - [ ] Native SIMD codec + differential test against Java (Phase 6)
 - [ ] Traversal cursor with prefetch (Phase 6, needs the io_uring engine) —
       [IDX-4](INDEX_TASKS.md#idx-4--a-streaming-neighbour-cursor)
-- [ ] Type-bitmap skipping on the read path —
-      [IDX-3](INDEX_TASKS.md#idx-3--block-skipping-on-the-read-path). The metadata is written on every
-      append and `mayContainType` has one caller, `remove`; `mayContainLocation` has none
+- [x] Type-bitmap and min/max skipping on the read path — IDX-3. `edges(nodeId, typeIds)` walks past
+      a block whose bitmap admits no type in the filter, and `hasEdge(a, b)` walks past a block whose
+      location range excludes the target. Two header flags say when either summary can be trusted to
+      rule something out (§5), because the bitmap under-describes a block holding an entry that
+      caches no type and the range mixes two address spaces in a block holding a materialised one.
+      **The saving is in blocks decoded, not blocks read** — the chain pointer is inside each block,
+      so every one is acquired regardless (§5.3)
 - [x] The type filter applied before the relationship record is read —
-      [IDX-2](INDEX_TASKS.md#idx-2--push-the-type-filter-into-adjacency-for-materialised-entries). A
+      [IDX-2](INDEX_TASKS.md#3-closed). A
       materialised entry caches its type (§3.1), so the record is read once per surviving candidate
       rather than once per entry: 5 reads rather than 5,000 for a filter matching 5 of 5,005, measured
       by `ReadBudgetTest.testATypeFilteredSupernodeReadsOnlyTheSurvivingRelationships`. Direction is
@@ -448,9 +533,11 @@ The numbers are estimates, but the orders of magnitude are structural, not tunin
 
 The three adjacency items above are what a "supernode is slow" report actually resolves to; the
 missing relationship index is a different problem with a different victim
-([INDEX_TASKS.md §1](INDEX_TASKS.md)). One of the three is now done, and the two that remain — block
-skipping and the streaming cursor — reduce how many entries are decoded and how many are touched at
-all, where IDX-2 reduced what each one costs.
+([INDEX_TASKS.md §1](INDEX_TASKS.md)). Two of the three are now done: IDX-2 reduced what each entry
+costs and IDX-3 reduces how many blocks are decoded at all. The one that remains is the streaming
+cursor ([IDX-4](INDEX_TASKS.md#idx-4--a-streaming-neighbour-cursor)), which reduces how many entries
+are touched when the query stops early — and which should be built on the filtered path rather than
+retrofitted onto it.
 
 ---
 
@@ -458,13 +545,14 @@ all, where IDX-2 reduced what each one costs.
 
 | Class | Package | Purpose |
 |-------|---------|---------|
-| `AdjacencyStore` | `io.metaloom.graph.core.store.adj` | Insert, delete, enumerate edges; tier promotion |
-| `AdjacencyBlock` | `io.metaloom.graph.core.store.adj` | Block header accessors and entry iteration |
+| `AdjacencyStore` | `io.metaloom.graph.core.store.adj` | Insert, delete, enumerate edges; tier promotion; `edges(nodeId, typeIds)` and `hasEdge` |
+| `AdjacencyBlock` | `io.metaloom.graph.core.store.adj` | Block header accessors, entry iteration, and the two skip predicates `admitsAnyType` / `admitsNeighbour` |
 | `EdgeCodec` | `io.metaloom.graph.core.store.adj` | Delta + varint encode/decode, native and fallback |
 | `PackedEdge` | `io.metaloom.graph.core.store.adj` | The 8-byte edge tuple |
 | `NeighbourCursor` | `io.metaloom.graph.core.api` | Streaming traversal with prefetch |
 
 ---
 
-_Git HEAD revision: `3a05a2a`_
-_Last updated: 2026-08-16 (§3.1, §6.2, §6.3, §8, §9 and §10 synced with IDX-2)_
+_Git HEAD revision: `8f178b4`_
+_Last updated: 2026-08-16 (§5, §5.3, §6.3, §6.4, §8, §9, §10 and §11 synced with IDX-3;
+§5.3's O(log blocks) `hasEdge` claim corrected and §9's test list reconciled with the classes that exist)_

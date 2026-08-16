@@ -25,7 +25,9 @@ public record IoStats(
 	long recoveryNanos,
 	long recoveredPageImages,
 	long compactions,
-	long recordsRelocated) {
+	long recordsRelocated,
+	long adjacencyBlockDecodes,
+	long adjacencyBlockSkips) {
 
 	/**
 	 * Defensive copies. The components are arrays, so a record's generated accessors hand out the internals and a
@@ -91,7 +93,28 @@ public record IoStats(
 			recoveryNanos - earlier.recoveryNanos,
 			recoveredPageImages - earlier.recoveredPageImages,
 			compactions - earlier.compactions,
-			recordsRelocated - earlier.recordsRelocated);
+			recordsRelocated - earlier.recordsRelocated,
+			adjacencyBlockDecodes - earlier.adjacencyBlockDecodes,
+			adjacencyBlockSkips - earlier.adjacencyBlockSkips);
+	}
+
+	/**
+	 * Adjacency blocks a walk acquired and then walked past without decoding, because their header summary ruled out
+	 * everything the read was looking for.
+	 * <p>
+	 * <b>This is deliberately not counted as a saved read.</b> The summary lives in the block's own header and the
+	 * chain's {@code next} pointer beside it, so every block of a chain is acquired — and counted in
+	 * {@code recordReads(ADJ)} — whether or not it is decoded. What a skip saves is the decode and the array it fills.
+	 * A filtered and an unfiltered scan of the same node therefore have the <em>same</em> {@code ADJ} read count and
+	 * different decode counts, which is the honest shape of the win.
+	 */
+	public long adjacencyBlocksSkipped() {
+		return adjacencyBlockSkips;
+	}
+
+	/** Adjacency blocks a walk decoded. Its sum with {@link #adjacencyBlocksSkipped()} is the blocks it walked. */
+	public long adjacencyBlocksDecoded() {
+		return adjacencyBlockDecodes;
 	}
 
 	/**
@@ -117,6 +140,8 @@ public record IoStats(
 			.append(", forces=").append(dataForces)
 			.append(", pagesPunched=").append(pagesPunched)
 			.append(", checkpoints=").append(checkpoints)
+			.append(", adjBlocks=").append(adjacencyBlockDecodes).append('/')
+			.append(adjacencyBlockDecodes + adjacencyBlockSkips).append(" decoded")
 			.append(']').toString();
 	}
 

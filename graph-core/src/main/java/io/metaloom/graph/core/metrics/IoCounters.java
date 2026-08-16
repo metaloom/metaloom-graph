@@ -29,6 +29,21 @@ public final class IoCounters {
 	private final LongAdder[] recordReads = adders();
 	private final LongAdder[] recordWrites = adders();
 
+	/**
+	 * Adjacency blocks a read walked past without decoding, and blocks it decoded.
+	 * <p>
+	 * These are the unit block skipping is measurable in, and {@code recordReads(ADJ)} is not. A chain is a linked
+	 * list whose {@code next} pointer lives in each block's own header, so a walk has to acquire every block in the
+	 * chain whatever it intends to do with it — the record read is owed before the skip decision can even be made.
+	 * What a skip saves is the varint decode of up to 8,000 entries and the {@code long[]} it lands in, which is CPU
+	 * and allocation rather than I/O. Counting it as an I/O saving would be a claim the format cannot support.
+	 * <p>
+	 * {@link LongAdder}s for the same reason the per-kind counters are: these are incremented on the read path from
+	 * every reader thread, not once per commit under the writer lock.
+	 */
+	private final LongAdder adjacencyBlockDecodes = new LongAdder();
+	private final LongAdder adjacencyBlockSkips = new LongAdder();
+
 	private static LongAdder[] adders() {
 		LongAdder[] result = new LongAdder[KINDS];
 		for (int i = 0; i < KINDS; i++) {
@@ -57,6 +72,14 @@ public final class IoCounters {
 
 	public void recordWrite(int kindCode) {
 		recordWrites[kindCode].increment();
+	}
+
+	public void adjacencyBlockDecoded() {
+		adjacencyBlockDecodes.increment();
+	}
+
+	public void adjacencyBlockSkipped() {
+		adjacencyBlockSkips.increment();
 	}
 
 	public void pageApplied(int bytes) {
@@ -108,7 +131,8 @@ public final class IoCounters {
 	public IoStats snapshot() {
 		return new IoStats(sums(recordReads), sums(recordWrites), pageApplies, bytesApplied, walBytesAppended,
 			walRecords, walSyncs, dataForces, pagesPunched, checkpoints, checkpointNanos, recoveryNanos,
-			recoveredPageImages, compactions, recordsRelocated);
+			recoveredPageImages, compactions, recordsRelocated,
+			adjacencyBlockDecodes.sum(), adjacencyBlockSkips.sum());
 	}
 
 	private static long[] sums(LongAdder[] adders) {
@@ -124,6 +148,8 @@ public final class IoCounters {
 			recordReads[i].reset();
 			recordWrites[i].reset();
 		}
+		adjacencyBlockDecodes.reset();
+		adjacencyBlockSkips.reset();
 		pageApplies = 0;
 		bytesApplied = 0;
 		walBytesAppended = 0;

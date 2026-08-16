@@ -182,10 +182,11 @@ Spec: [RELATIONSHIP_STORAGE.md](RELATIONSHIP_STORAGE.md)
 - [x] Tests: `PackedEdgeTest`, `EdgeCodecTest`, `AdjacencyTierTest`, `SpaceEfficiencyTest`,
       `GraphStoreTest`
 - [ ] Streaming `EdgeCursor` / `TraversalCursor` with prefetch (Phase 6)
-- [ ] Type-bitmap skipping on the read path
+- [x] Type-bitmap and min/max skipping on the read path — `edges(nodeId, typeIds)` and `hasEdge`
+      ([RELATIONSHIP_STORAGE.md §5.3](RELATIONSHIP_STORAGE.md))
 - [ ] `Bidirectionality` and `DegreeCounters` as standalone invariant checkers
 
-**Exit criteria**: `TraversalCostTest` proves the S4 and S5 budgets — 0 adjacency reads for degree 2,
+**Exit criteria**: `ReadBudgetTest` proves the S4 and S5 budgets — 0 adjacency reads for degree 2,
 1 read for degree 4000; a 10M-edge scale-free graph's adjacency occupies under 4 bytes per directed
 entry; BFS depth 3 on that graph beats the PoC by at least two orders of magnitude.
 
@@ -395,7 +396,11 @@ predicted in [SSD_IO.md §4](SSD_IO.md#4-io-engines); zero native allocations le
       transaction today
 - [ ] Optional string intern table for property dedup
 - [ ] B+tree adjacency for extreme supernodes — the chain tier is the ceiling
-- [ ] Vector index hook (delegating to an external ANN index rather than implementing one)
+- [~] Vector search. The plan said "delegating to an external ANN index rather than implementing one";
+      the decision taken instead is to **implement HNSW here**, because the query an external index
+      cannot serve is the combined one — nearest neighbours *that also satisfy a graph predicate*.
+      Six stages, tracked in [VECTOR.md §7](VECTOR.md). Stage 1 is built: the `vector.*` functions and
+      `nearestByScan`, the exact answer the index will be measured against
 - [ ] Concurrent split/merge under jcstress; crash-during-build test
 
 **Exit criteria**: an indexed lookup on a 10^8-element store costs at most 4 device reads; the

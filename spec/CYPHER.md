@@ -71,9 +71,39 @@ spaces. Keywords are case-insensitive; identifiers are not; `:Order` and `.end` 
 | Scalar | `length`, `size`, `head`, `last`, `tail`, `reverse`, `range`, `coalesce`, `timestamp`, `exists` |
 | String | `toString`, `toUpper`, `toLower`, `trim`, `ltrim`, `rtrim`, `substring`, `replace`, `split` |
 | Numeric | `toInteger`, `toFloat`, `toBoolean`, `abs`, `ceil`, `floor`, `round`, `sqrt`, `sign` |
+| Vector | `vector.cosine`, `vector.dot`, `vector.l2` — [VECTOR.md](VECTOR.md) |
 
 An unknown function names itself and lists what exists, rather than returning null — a typo that
 returns an empty result set is much worse than one that fails.
+
+**The vector functions are the only namespaced names in the grammar, and the dot is not lexical.**
+`.` is deliberately not an identifier character — making it one breaks both `n.name` and the `*1..3`
+range — so `vector.cosine(a, b)` reaches the parser as a property access on a variable called
+`vector`, and `postfix()` folds it back into a call when the namespace is a **bare variable** and a
+`(` follows immediately. Both halves of that guard matter: `n.a.b(…)` is left alone. Without the fold
+the query does not fail as an unknown function — the unconsumed `(` falls out of the projection and
+`RETURN` reports that a parenthesis cannot follow it, which is a message about the wrong thing.
+
+They take a vector in either shape it can arrive in: a `float[]` passed as a parameter, or the list of
+numbers a stored vector has already become on its way through `GraphAccess.normalise`. Null in, null
+out — a node with no embedding must not fail the query for every node that has one — but **two vectors
+of different lengths are refused rather than scored**, because the overwhelmingly likely cause is a
+query vector written for a different model than the stored one.
+
+**Cypher can read a vector and cannot write one.** `GraphAccess.storable` accepts only `Boolean`,
+`Long`, `Double`, `String` and `List`, so `SET n.embedding = [0.1, 0.2]` stores a list of doubles,
+which is a different value from the `float[]` the Java API writes and will not match it. Populating a
+vector property is a Java API operation today.
+
+**The spelling that matters for a top-k.** `ORDER BY` is sort-then-truncate and `Comparator.comparing`
+recomputes its key on every comparison, so ordering directly on a call evaluates the distance
+`O(n log n)` times:
+
+```cypher
+// once per row
+MATCH (d:Doc) WITH d, vector.cosine(d.embedding, $q) AS score
+ORDER BY score DESC LIMIT 10 RETURN d.name, score
+```
 
 ---
 
@@ -740,5 +770,5 @@ previous bundle. Every assertion in the first run failed against markup that no 
 
 ---
 
-_Git HEAD revision: `e4601d1`_
-_Last updated: 2026-08-15 (write clauses added)_
+_Git HEAD revision: `8f178b4`_
+_Last updated: 2026-08-16 (the vector functions and the namespaced-call fold)_

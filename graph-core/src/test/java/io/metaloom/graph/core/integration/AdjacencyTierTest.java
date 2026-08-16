@@ -1,6 +1,7 @@
 package io.metaloom.graph.core.integration;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayList;
@@ -326,6 +327,65 @@ public class AdjacencyTierTest {
 			assertEquals(0, store.neighbours(b, Direction.IN).size());
 			assertEquals(0, store.degreeOut(a));
 			assertEquals(0, store.degreeIn(b));
+			store.verify(io.metaloom.graph.core.api.VerifyLevel.FULL);
+		}
+	}
+
+	/**
+	 * {@code hasEdge} has to answer from every tier, and a materialised entry is the one it cannot answer from the
+	 * adjacency alone: its 48 bit field names the relationship, not the neighbour, so only the record says who is at
+	 * the other end. An entry that caches no type is the same shape and must answer the same way.
+	 */
+	@Test
+	public void testHasEdgeAnswersFromEveryTier() throws Exception {
+		try (GraphStore store = stores.open()) {
+			GraphStoreImpl impl = (GraphStoreImpl) store;
+			long a = store.createNode("A");
+			long inline = store.createNode("Inline");
+			long stranger = store.createNode("Stranger");
+			store.createEdge(a, "T", inline);
+
+			assertTrue(store.hasEdge(a, inline), "an inline edge is still an edge");
+			assertTrue(store.hasEdge(inline, a), "and it is symmetric: the mirror entry answers from the other side");
+			assertFalse(store.hasEdge(a, stranger), "a node that was never linked is not a neighbour");
+			assertFalse(store.hasEdge(a, a), "and neither is the node itself, absent a self-loop");
+
+			// A materialised entry, which only the relationship record can resolve to a neighbour.
+			long materialised = store.createNode("Materialised");
+			long relId = store.createRelationship(a, "T", materialised);
+			assertTrue(store.hasEdge(a, materialised));
+			assertTrue(store.hasEdge(materialised, a));
+
+			// The same entry in the shape a pre-IDX-2 store wrote it: dir 3, type 0.
+			try (io.metaloom.graph.core.api.Transaction txn = store.begin()) {
+				assertTrue(impl.adjacencyStore().removeMaterialised(a, relId));
+				impl.adjacencyStore().add(a, io.metaloom.graph.core.store.adj.PackedEdge.ofRelationship(relId));
+				txn.commit();
+			}
+			assertTrue(store.hasEdge(a, materialised), "an entry that caches no type resolves the same way");
+
+			long loop = store.createNode("Loop");
+			store.createRelationship(loop, "T", loop);
+			assertTrue(store.hasEdge(loop, loop), "a materialised self-loop is an edge to the node itself");
+
+			store.deleteRelationship(relId);
+			assertFalse(store.hasEdge(a, materialised), "a deleted relationship is not an edge");
+			assertTrue(store.hasEdge(a, inline), "and deleting it leaves the other tier alone");
+
+			// Past the inline tier, so the answer comes out of a block rather than the node record.
+			long hub = store.createNode("Hub");
+			long[] spokes = new long[500];
+			try (io.metaloom.graph.core.api.Transaction txn = store.begin()) {
+				for (int i = 0; i < spokes.length; i++) {
+					spokes[i] = store.createNode("Spoke");
+					store.createEdge(hub, "T", spokes[i]);
+				}
+				txn.commit();
+			}
+			assertTrue(impl.adjacencyStore().blockCount(hub) > 0, "the hub must have outgrown the inline tier");
+			assertTrue(store.hasEdge(hub, spokes[0]), "the oldest entry of the block");
+			assertTrue(store.hasEdge(hub, spokes[spokes.length - 1]), "and the newest");
+			assertFalse(store.hasEdge(hub, stranger));
 			store.verify(io.metaloom.graph.core.api.VerifyLevel.FULL);
 		}
 	}

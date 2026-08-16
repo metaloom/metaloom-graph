@@ -1,5 +1,6 @@
 package io.metaloom.graph.core.fuzz;
 
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -128,6 +129,41 @@ public class HostileInputTest {
 			try (GraphStore store = stores.open()) {
 				expectTypedFailure(() -> store.nodeProperties(nodeId),
 					"a blob length far beyond what the chain can hold must be rejected before it is allocated");
+			}
+		});
+	}
+
+	/**
+	 * A vector's dimension is a length field like any other, and it was the last one in the property codec with nothing
+	 * checking it: {@code new float[dim]} straight off the page. Four corrupted bytes then either exhaust the heap for
+	 * a value that is twelve bytes long, or walk off the end of the blob with an index-out-of-bounds that says nothing
+	 * about where the corruption is.
+	 */
+	@Test
+	public void testVectorClaimingBillionsOfDimensions() throws Exception {
+		assertTimeoutPreemptively(LIMIT, () -> {
+			long nodeId;
+			long blockId;
+			Geometry geometry;
+			try (GraphStore store = stores.open()) {
+				nodeId = store.createNode("N", Properties.of().set("v", new float[] { 1f, 2f, 3f }));
+				blockId = ((GraphStoreImpl) store).nodeStore().propBlockId(nodeId);
+				geometry = ((GraphStoreImpl) store).geometry();
+			}
+			// The block's 16 byte header, then this node's single entry: a 3 byte key id, a 1 byte tag, then the
+			// dimension as an int. The blob id follows it and is left intact, so the payload the reader finds is
+			// perfectly valid — only its declared length is a lie.
+			long dimOffset = geometry.byteOffset(Kind.PROP, ElementId.slot(blockId)) + 16 + 3 + 1;
+			patchInt(segmentFile(Kind.PROP), dimOffset, Integer.MAX_VALUE - 1);
+
+			try (GraphStore store = stores.open()) {
+				expectTypedFailure(() -> store.nodeProperties(nodeId),
+					"a dimension the blob cannot hold must be rejected before the array is allocated");
+				// And by the dimension check specifically, rather than by something incidental further along.
+				GraphStoreException failure = assertThrows(GraphStoreException.class,
+					() -> store.nodeProperties(nodeId));
+				assertTrue(failure.getMessage().contains("dimensions"),
+					"the failure must name the field that is wrong: " + failure.getMessage());
 			}
 		});
 	}

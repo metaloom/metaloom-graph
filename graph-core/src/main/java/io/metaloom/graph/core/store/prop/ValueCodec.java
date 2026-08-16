@@ -8,6 +8,8 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 
+import io.metaloom.graph.core.api.PageCorruptException;
+import io.metaloom.graph.core.id.ElementId;
 import io.metaloom.graph.core.store.blob.BlobStore;
 import io.metaloom.graph.core.util.VarInt;
 
@@ -363,6 +365,15 @@ public final class ValueCodec {
 					return null;
 				}
 				byte[] raw = blobs.read(blobId);
+				// The dimension comes off a data page and is therefore untrusted. Unchecked, a flipped byte makes this
+				// `new float[dim]` a heap-exhaustion oracle for a value that is four bytes long, or walks off the end
+				// of `raw` with an AIOOBE that says nothing about where the corruption is. The blob's own length is the
+				// authority: it was written as exactly four bytes per component and its CRC has already been verified.
+				if (dim < 0 || (long) dim * 4 != raw.length) {
+					throw new PageCorruptException("A vector declares " + dim + " dimensions, which is "
+						+ ((long) dim * 4) + " bytes, but its blob " + ElementId.toString(blobId) + " holds "
+						+ raw.length);
+				}
 				float[] vector = new float[dim];
 				for (int i = 0; i < dim; i++) {
 					int bits = (raw[i * 4] & 0xFF) | ((raw[i * 4 + 1] & 0xFF) << 8)

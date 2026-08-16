@@ -204,6 +204,15 @@ public interface GraphStore extends AutoCloseable {
 
 	List<Edge> neighbours(long nodeId, Direction direction, Set<String> types);
 
+	/**
+	 * Whether any edge connects the two nodes, in either direction and of any type.
+	 * <p>
+	 * Cheaper than {@link #neighbours(long, Direction)} on a dense node: it stops at the first match and walks past
+	 * the blocks whose recorded location range cannot hold the target without decoding them. It is a pruned scan of
+	 * the block chain, not an index lookup — see RELATIONSHIP_STORAGE.md §5.3.
+	 */
+	boolean hasEdge(long nodeId, long neighbourId);
+
 	/** Breadth-first expansion up to {@code maxDepth} hops. The start node is not included. */
 	List<Edge> traverse(long startNodeId, Direction direction, Set<String> types, int maxDepth);
 
@@ -263,6 +272,34 @@ public interface GraphStore extends AutoCloseable {
 
 	/** Property keys currently declared unique. */
 	List<String> uniqueConstraints();
+
+	/**
+	 * The {@code k} nodes whose vector property is nearest the query, <b>found by scanning</b>.
+	 *
+	 * <p>
+	 * Exact, and linear in the number of candidates: it reads every candidate's vector and compares it. There is no
+	 * approximation and no index — which is the point. This is the answer an approximate index is measured against,
+	 * so it must be computable whether or not one exists, and it must not share code with one.
+	 * </p>
+	 *
+	 * <p>
+	 * {@code label} selects the candidates through the label index; passing null scans every live node instead. Nodes
+	 * that do not carry the key, or whose value is not a vector, are not candidates. <b>A vector of a different length
+	 * is skipped rather than refused</b>: a property key is free-form, so one node holding a 512-dimension value is a
+	 * fact about that node and not a reason to fail everybody else's query. A declared index will refuse the write
+	 * instead, which is the right place for that refusal.
+	 * </p>
+	 *
+	 * <p>
+	 * Equal distances break on the lower node id, so the answer is the same on every run over the same data. That is
+	 * not cosmetic: a corpus with any repeated vector produces ties, and an oracle that reorders them between runs
+	 * cannot be compared against anything.
+	 * </p>
+	 *
+	 * @return at most {@code k} neighbours, <b>nearest first</b> under the metric — see {@link Neighbour#score} for why
+	 *         the order rather than the number is the answer
+	 */
+	List<Neighbour> nearestByScan(String label, String key, float[] query, int k, VectorMetric metric);
 
 	// ---------------------------------------------------------------- maintenance
 

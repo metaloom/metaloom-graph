@@ -18,10 +18,11 @@ first.
 |---|---|
 | **Storable** | Yes — `ValueCodec.T_VECTOR_F32`, `Properties.getVector`, `float[]` of any length |
 | **Where** | Always the blob store: 13 bytes inline (tag, `int` dimension, `long` blob id) plus a blob extent |
-| **Indexed** | Only for exact equality, in the ordinary property tree. No ANN index — [INDEX.md §11](INDEX.md) |
-| **Equality lookup** | Works — the value is hashed by content, see §1.3 and [INDEX_TASKS.md IDX-1](INDEX_TASKS.md#idx-1--a-float-property-is-indexed-under-a-non-deterministic-key) |
-| **Cypher surface** | A vector comes back as a list of doubles; there is no distance function and no `CALL` |
-| **Decision** | Nothing is decided. §7 recommends a staged answer, of which stage 0 is not an index |
+| **Indexed** | Only for exact equality, in the ordinary property tree. No ANN index yet — §7 |
+| **Equality lookup** | Works — the value is hashed by content, see §1.3 and [INDEX_TASKS.md IDX-1](INDEX_TASKS.md#3-closed) |
+| **Nearest-k** | `GraphStore.nearestByScan(label, key, query, k, metric)` — **exact, by scanning**. No index, and that is the point: it is the ground truth an approximate one is measured against |
+| **Cypher surface** | `vector.cosine` / `vector.dot` / `vector.l2` ([CYPHER.md §1.1](CYPHER.md)). Still no `CALL`, and Cypher still cannot *write* a vector |
+| **Decision** | **HNSW, in six stages (§7).** Stage 1 is built; the format change is stage 3 |
 
 ---
 
@@ -65,8 +66,8 @@ becomes 768 boxed doubles and roughly double the bytes on the wire. Returning em
 in bulk would want a value type in the wire codec ([WIRE.md](WIRE.md)); returning *ids and scores*,
 which is what an ANN query actually does, would not.
 
-There are no distance functions in `Functions.java`, and `CALL` is explicitly rejected by the parser —
-"CALL is not supported: this build has no procedure mechanism". Both matter for §6.
+`Functions.java` now has the three distance functions (stage 1); `CALL` is still rejected by the parser
+— "CALL is not supported: this build has no procedure mechanism" — and arrives in stage 6. See §6.
 
 ### 1.3 The defect underneath all of it, and the decision it forced
 
@@ -74,7 +75,7 @@ There are no distance functions in `Functions.java`, and `CALL` is explicitly re
 identity hash, so every vector property was indexed under a key nothing could reproduce: the lookup
 missed the node, the delete missed the entry, and a unique constraint on the key never fired. Full
 write-up in
-[INDEX_TASKS.md IDX-1](INDEX_TASKS.md#idx-1--a-float-property-is-indexed-under-a-non-deterministic-key).
+[INDEX_TASKS.md IDX-1](INDEX_TASKS.md#3-closed).
 
 It is recorded here because fixing it forced the question this file has to answer anyway — **should a
 vector be in the property tree at all?** — and the answer taken was **yes, hashed by content**. A
@@ -343,58 +344,95 @@ mechanism", so the neat form —
 CALL vector.query('Person', 'embedding', $q, 10) YIELD node, score
 ```
 
-— needs a parser feature before it needs an index. Three options, in increasing order of how much they
-ask of the planner:
+— needs a parser feature before it needs an index. **All three of the surfaces below are being built**,
+in the order they are listed, which is also the order of how much each asks of the parser.
 
-1. **A function plus `ORDER BY … LIMIT`.** `ORDER BY vector.cosine(n.embedding, $q) LIMIT 10` is the
-   most natural Cypher and the worst fit: the planner is "a fixed order rather than a cost model"
-   ([INDEX.md §7](INDEX.md)), so it cannot recognise this as a top-k and would evaluate the distance
-   over every candidate — which is Option A with extra steps. It is, however, exactly the right
-   *semantics*, and a good stage 0: correct answers immediately, with the index as a later optimisation
-   of a query that already works.
-2. **A dedicated clause or a minimal `CALL`.** Explicit, unambiguous, and honest about the fact that
-   the access path is chosen by the user rather than by a planner that cannot choose.
-3. **Java API only.** `store.nearest(label, key, query, k)`, with the Cypher surface deferred. Fastest
-   to build and enough to evaluate whether any of this is worth having.
+1. **The distance functions**, built in stage 1 and useful on their own: `vector.cosine`,
+   `vector.dot`, `vector.l2`, specified in [CYPHER.md §1.1](CYPHER.md) along with the parser fold that
+   makes a namespaced name possible at all. They are what re-ranks a small candidate set, and they are
+   the ground truth any ANN index is measured against.
+2. **The Java API**, also stage 1: `nearestByScan(label, key, query, k, metric)` today, joined by an
+   indexed `nearest(...)` in stage 4.
+3. **A minimal `CALL … YIELD`**, in stage 6. Explicit, and honest about the access path being chosen
+   by the caller rather than by a planner that cannot choose — and it buys something no other spelling
+   does: a `CALL … YIELD node` binds `node` before the following `MATCH`, so the pattern matcher takes
+   its *already bound* branch and verifies rather than scans. That is the graph-predicate pushdown of
+   §4.5, for free, with no planner change.
 
-Whichever is chosen, add the distance functions to `Functions.java` regardless — `vector.cosine`,
-`vector.dot`, `vector.l2`. They are useful on their own for re-ranking a small candidate set, they are
-what a brute-force query needs, and they are the ground truth any ANN index must be tested against.
+**What is deliberately not built is the implicit rewrite.**
+`ORDER BY vector.cosine(n.embedding, $q) LIMIT 10` is the most natural Cypher and the worst fit: the
+planner is "a fixed order rather than a cost model" ([INDEX.md §7](INDEX.md)), so it cannot recognise
+a top-k, and `ORDER BY` is sort-then-truncate with a comparator that recomputes its key — so the
+distance is evaluated `O(n log n)` times rather than `n`. The spelling to use instead is in
+[CYPHER.md §1.1](CYPHER.md): project the score once in a `WITH` and order on the alias.
 
 ---
 
-## 7. Recommendation
+## 7. The plan, and what is built
 
-Staged, with a decision point after each stage rather than a plan that commits to the end:
+**The decision is HNSW** (§4.4), at a target of **10M vectors of 768 f32 dimensions**, with a declared
+index, incremental maintenance through the four hooks *and* a bulk rebuild, and the query surface of
+§6. IVF (§4.3) is not being built first, which is a deliberate departure from what the earlier version
+of this section recommended.
 
-| Stage | What | Why it is first |
+Two things follow from the scale, and they changed the design rather than being absorbed by it:
+
+- **The vectors leave the blob store.** A `BLOB` extent is page-sized, so a 3,072-byte vector costs
+  8 KiB today; 10M of them is ~80 GB. They move to the `VEC` kind of §4.2, whose record
+  **interleaves the vector with its HNSW links**, so a visited node costs one page read rather than
+  two and 10M costs ~41 GB. The property block holds a `VEC` id, not a blob id — §9's question 3,
+  answered: **one copy, not both.** Keeping both would force `onPropertiesChanged` to update two of
+  them, and a partial update is a silent wrong answer, which is exactly the IDX-1 failure class.
+- **The bulk build's searches run outside the writer lock.** §9's question 4, answered: an insert at
+  `efConstruction = 200` is ~2,000 distance evaluations, and doing those under the single writer lock
+  is the "hours" number §4.4 warns about. The search runs in a read transaction against a snapshot and
+  only the resulting link sets are written.
+
+| Stage | What | Status |
 |---|---|---|
-| **0** | ~~Fix [IDX-1](INDEX_TASKS.md#idx-1--a-float-property-is-indexed-under-a-non-deterministic-key)~~ **done**; still open: add `vector.cosine` / `dot` / `l2`; brute-force nearest-k over a label scan | No format change, no new structure, and it makes vector queries *possible* — which is the difference that matters. It is also the ground truth for everything after it |
-| **1** | Decide whether a use case exists that Option D cannot serve — specifically a graph predicate applied during the search | This is the actual decision, and it is not a technical one. Writing a second ANN implementation needs a reason a commodity library cannot supply |
-| **2** | The `VEC` kind and contiguous fixed-stride storage (§4.2), with the true dimension in the declaration | Turns the brute-force scan from scattered blob reads into a sequential one, and is a prerequisite for both B and C |
-| **3** | IVF (§4.3) | Cheapest real index, fits the write model and the I/O model, degrades to stage 2 rather than to wrong answers |
-| **4** | HNSW (§4.4), only if IVF's recall is measurably insufficient | The build-time cost against a single-writer engine is the risk, and it should be measured on a real corpus before it is built |
+| **1** | `vector.cosine`/`dot`/`l2`, the namespaced-call parser fold, `nearestByScan`, and a bound on the vector dimension in `ValueCodec` | **built** — no format change, ships on existing stores |
+| **2** | `Geometry.KINDS` and `IoCounters.KINDS` 8 → 16, and `Kind.VEC` declared but disabled | |
+| **3** | `VEC` as the property backing: `GraphStoreOptions.vectorDimensions`, the manifest fields, `T_VECTOR_REF`, compaction, the invariant check. **The format bump, once** | |
+| **4** | The declared index and the four hooks. `nearest()` is still a scan, now restricted to members — the oracle for stage 5 | |
+| **5** | HNSW links and incremental insert | |
+| **6** | Bulk build, the BUILDING/READY state machine, and `CALL … YIELD` | |
 
-**Do not start at stage 3 or 4.** Every measured surprise this project has had —
+**Stage 1 is the ground truth and had to come first.** Every measured surprise this project has had —
 [reports/SCALE.md](reports/SCALE.md)'s 59-of-61 GiB, the codec that turned out 7.8x slower than the
-JDK — came from building the sophisticated thing before measuring the simple one.
+JDK — came from building the sophisticated thing before measuring the simple one, and an approximate
+index with no exact answer to compare against cannot be measured at all.
 
 ---
 
-## 8. What it would have to be tested against
+## 8. What it is tested against
 
-The repository's existing culture applies directly, and one test class matters more than the rest:
+The repository's existing culture applies directly, and one test class matters more than the rest.
 
-- **A brute-force reference model.** `ReferenceModelTest`'s argument — "an index that agrees with
-  itself proves nothing" — is even stronger for an approximate index. Exact top-k computed in memory,
-  compared against the index, reported as **recall@k** rather than as pass/fail, with a floor the
-  build fails below. Its workload already writes a vector property, so the exact-equality half of this
-  is in place and an ANN index would be extending a harness rather than starting one.
+**Built in stage 1:**
+
+| | |
+|---|---|
+| `VectorsTest` | The three distance functions on their own, including the zero-vector case and the reason every accumulator is a `double` |
+| `VectorScanTest` | `nearestByScan` end to end. The load-bearing case computes the expected answer a **second way** — by sorting every vector inside the test — for all three metrics, so the scan is never its own oracle |
+| `VectorFunctionTest` | The Cypher functions, and specifically the two shapes a vector arrives in: a `float[]` parameter, and the list of doubles a *stored* vector has already become |
+| `CypherParserTest` | That a namespaced call is not parsed as a property access, and that the fold is narrow enough to leave `n.a.b` alone |
+| `HostileInputTest` | A vector declaring billions of dimensions. It was the last unbounded length field in the property codec |
+
+**Still to come, with the stage that brings it:**
+
+- **A brute-force reference model** (stage 5). `ReferenceModelTest`'s argument — "an index that agrees
+  with itself proves nothing" — is even stronger for an approximate index. Exact top-k from
+  `nearestByScan`, compared against the index, reported as **recall@k** rather than as pass/fail, with
+  a floor the build fails below. Recall *under a filter* is a separate measurement with its own floor:
+  see §4.4's note on why filtering traversal candidates collapses it.
+- **`addNodeLabel` / `removeNodeLabel` in `ReferenceModelTest`'s operation mix** (stage 4). They are
+  not there today, so `onLabelsChanged` — the hook a `(label, key)` index depends on most — is not
+  under the differential oracle at all.
 - **Dimension and metric mismatch are refused**, not silently accepted: a 512-dim write into a 768-dim
   index, and a query vector of the wrong length.
 - **Maintenance completeness**: create, update the vector, relabel, delete — each followed by a query
   that must not return the stale answer. This is where the four hooks earn their place, and where
-  [IDX-1](INDEX_TASKS.md#idx-1--a-float-property-is-indexed-under-a-non-deterministic-key)'s dangling
+  [IDX-1](INDEX_TASKS.md#3-closed)'s dangling
   entry came from.
 - **`verify(FULL)`** over a store with a declared vector index, since `NoDanglingRefs` is what catches
   an index entry pointing at a freed slot.
@@ -404,19 +442,33 @@ The repository's existing culture applies directly, and one test class matters m
 
 ---
 
-## 9. Open questions
+## 9. Questions, answered and open
 
-1. **Does the combined graph-plus-vector query exist as a requirement?** Everything in §7 stage 1
-   turns on it. Without it, an off-the-shelf ANN index beside the store covers the need (§4.5).
-2. **Is 768 dimensions the target?** It is the width that does not fit a power-of-two stride, and
-   knowing the answer changes §4.2's recommendation between "pad" and "no waste at all".
-3. **Where does the vector live once indexed** — blob, `VEC` segment, or both? Both is a doubling and
-   should be a deliberate choice, not a default.
-4. **Does an ANN build have to happen under the write lock?** An offline build that produces a
-   structure installed by one short transaction would sidestep §4.4's worst cost entirely, and is
-   probably the only way HNSW is affordable here.
+**Answered, and the answers are what shaped §7:**
+
+1. ~~Does the combined graph-plus-vector query exist as a requirement?~~ **Yes** — it is the reason
+   this is being built here rather than beside the store (§4.5), and §6's `CALL … YIELD` is how it is
+   expressed.
+2. ~~Is 768 dimensions the target?~~ **Yes.** So the stride is 4096 with the vector padded, and §4.2's
+   table is the sizing that follows.
+3. ~~Where does the vector live once indexed?~~ **`VEC` only, never both** — §7.
+4. ~~Does an ANN build have to happen under the write lock?~~ **No, and it must not** — the search runs
+   in a read transaction, only the link sets are written (§7).
+
+**Still open:**
+
+- **What recall floor is worth failing a build over?** It has to be a number in
+  `performance-gates.properties` before stage 5 lands, and it cannot be chosen without measuring what
+  this implementation actually achieves on a realistic corpus.
+- **What does the single-threaded insert rate turn out to be?** Measured on 100k vectors before stage 6
+  commits to the bulk build, because it is the one number that could still say HNSW is unaffordable
+  here — and finding that out after building it is the mistake [reports/SCALE.md](reports/SCALE.md)
+  records.
+- **Does a second index at a different dimension ever need to coexist?** One `Kind` means one stride
+  means one dimension ceiling per store (§4.2). The escape hatch is several `VEC` kind codes, and it is
+  not being built until something needs it.
 
 ---
 
-_Git HEAD revision: `3a05a2a`_
-_Last updated: 2026-08-16_
+_Git HEAD revision: `8f178b4`_
+_Last updated: 2026-08-16 (HNSW decided; stage 1 built)_

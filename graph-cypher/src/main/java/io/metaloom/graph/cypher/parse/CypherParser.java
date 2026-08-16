@@ -807,7 +807,21 @@ public final class CypherParser {
 		while (true) {
 			if (peek().isSymbol(".")) {
 				take();
-				expression = new Ast.Property(expression, propertyKeyName());
+				String name = propertyKeyName();
+				// A namespaced function call — `vector.cosine(a, b)`. The lexer cannot see it: `.` is not an
+				// identifier character (and must not become one, or `n.name` and the `1..3` range both break), so
+				// `vector.cosine` arrives here as a property access on a variable named `vector`. Folding it back into
+				// a call is only safe because of the two conditions below: the namespace has to be a bare variable, so
+				// `n.a.b(…)` is untouched, and a `(` has to follow immediately.
+				//
+				// Without this the query does not fail as an unknown function. It fails at the *clause* — the `(` falls
+				// out of the projection and RETURN reports that a parenthesis cannot follow it — which is a message
+				// nobody could act on.
+				if (expression instanceof Ast.Variable namespace && peek().isSymbol("(")) {
+					expression = functionCall(namespace.name() + "." + name);
+					continue;
+				}
+				expression = new Ast.Property(expression, name);
 				continue;
 			}
 			if (peek().isSymbol("[")) {

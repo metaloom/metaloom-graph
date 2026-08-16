@@ -7,6 +7,7 @@ import java.util.List;
 import io.metaloom.graph.core.api.PageCorruptException;
 import io.metaloom.graph.core.id.ElementId;
 import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.metrics.IoCounters;
 import io.metaloom.graph.core.segment.SegmentSet;
 import io.metaloom.graph.core.store.node.NodeStore;
 
@@ -224,6 +225,26 @@ public final class AdjacencyStore {
 
 	/** Every adjacency entry of a node, inline entries first. */
 	public long[] edges(long nodeId) {
+		return edges(nodeId, null);
+	}
+
+	/**
+	 * The adjacency entries of a node that a type filter admits, inline entries first.
+	 * <p>
+	 * <b>The filter runs at two levels and they are not redundant.</b> Per block it is
+	 * {@link AdjacencyBlock#admitsAnyType}, which decides whether up to 8,000 entries are varint-decoded at all; per
+	 * entry it is {@link PackedEdge#excludedByType}, which is the single authority on what one entry's bits prove.
+	 * The block level never re-derives the entry rule — it defers to the {@code FLAG_TYPES_CACHED} bit for the one
+	 * case the entry rule exists to protect, the materialised entry that caches no type.
+	 * <p>
+	 * A filtered scan costs the same {@code ADJ} record reads as an unfiltered one and that is not a defect: the
+	 * chain's {@code next} pointer is in each block's header, so every block is acquired before it can be judged.
+	 * What the skip saves is the decode, counted as {@link io.metaloom.graph.core.api.IoStats#adjacencyBlocksSkipped}.
+	 *
+	 * @param typeIds
+	 *            relationship type ids to admit, or null for every entry
+	 */
+	public long[] edges(long nodeId, java.util.Set<Integer> typeIds) {
 		List<long[]> chunks = new ArrayList<>();
 		int total = 0;
 
@@ -241,9 +262,14 @@ public final class AdjacencyStore {
 		long limit = chainLimit();
 		while (!ElementId.isNull(blockId)) {
 			AdjacencyBlock current = block(step(nodeId, blockId, ++hops, limit));
-			long[] entries = current.readAll();
-			chunks.add(entries);
-			total += entries.length;
+			if (current.admitsAnyType(typeIds)) {
+				countDecode();
+				long[] entries = current.readAll();
+				chunks.add(entries);
+				total += entries.length;
+			} else {
+				countSkip();
+			}
 			blockId = current.nextBlockId();
 		}
 
@@ -251,12 +277,91 @@ public final class AdjacencyStore {
 		int written = 0;
 		for (long[] chunk : chunks) {
 			for (long edge : chunk) {
-				if (!PackedEdge.isTombstone(edge)) {
+				if (!PackedEdge.isTombstone(edge) && !PackedEdge.excludedByType(edge, typeIds)) {
 					result[written++] = edge;
 				}
 			}
 		}
 		return written == result.length ? result : java.util.Arrays.copyOf(result, written);
+	}
+
+	/**
+	 * True when some adjacency entry of {@code nodeId} connects it to {@code neighbourId}, in either direction and
+	 * whatever the type.
+	 * <p>
+	 * This is the operation {@code min_location} / {@code max_location} were written for on the read path. A block
+	 * whose recorded range excludes the target cannot hold a lightweight entry naming it and is walked past without
+	 * decoding; the walk also stops at the first match, so a neighbour in the head block costs one decode however long
+	 * the chain is.
+	 * <p>
+	 * <b>It is O(blocks), not O(log blocks).</b> Each block is sorted internally but the chain is not sorted across
+	 * blocks — new blocks are pushed onto the head (§5.1), so block order is insertion order, not key order, and there
+	 * is nothing to binary search over. The range check prunes; it does not index.
+	 * <p>
+	 * A block holding any materialised entry is never pruned: the 48 bit field of such an entry is a relationship
+	 * location rather than a neighbour's, so the block's range mixes two address spaces and rules nothing out.
+	 *
+	 * @param materialisedReaches
+	 *            tested against each surviving materialised entry, which only the relationship record can resolve;
+	 *            given the packed entry
+	 */
+	public boolean hasEdge(long nodeId, long neighbourId, java.util.function.LongPredicate materialisedReaches) {
+		long target = ElementId.location(neighbourId);
+		// Resolved once rather than per entry: a lightweight entry records a location and no generation, so whether
+		// it can name the id the caller asked about is one question about the neighbour's slot. A slot that has been
+		// freed reads as generation 0 and a reused one as a different generation, and neither is the node asked for.
+		int gen = nodes.segments().generationAt(ElementId.segment(neighbourId), ElementId.slot(neighbourId));
+		boolean lightweightCanMatch = gen != 0 && gen == ElementId.gen(neighbourId);
+		int inline = nodes.inlineEdgeCount(nodeId);
+		for (int i = 0; i < inline; i++) {
+			if (reaches(nodes.inlineEdge(nodeId, i), target, lightweightCanMatch, materialisedReaches)) {
+				return true;
+			}
+		}
+		long blockId = nodes.adjHeadId(nodeId);
+		long hops = 0;
+		long limit = chainLimit();
+		while (!ElementId.isNull(blockId)) {
+			AdjacencyBlock current = block(step(nodeId, blockId, ++hops, limit));
+			if (!current.admitsNeighbour(target)) {
+				countSkip();
+				blockId = current.nextBlockId();
+				continue;
+			}
+			countDecode();
+			for (long edge : current.readAll()) {
+				if (reaches(edge, target, lightweightCanMatch, materialisedReaches)) {
+					return true;
+				}
+			}
+			blockId = current.nextBlockId();
+		}
+		return false;
+	}
+
+	private boolean reaches(long edge, long target, boolean lightweightCanMatch,
+		java.util.function.LongPredicate materialisedReaches) {
+		if (PackedEdge.isTombstone(edge)) {
+			return false;
+		}
+		if (PackedEdge.isMaterialised(edge)) {
+			return materialisedReaches.test(edge);
+		}
+		return lightweightCanMatch && PackedEdge.location(edge) == target;
+	}
+
+	private void countDecode() {
+		IoCounters counters = segments.counters();
+		if (counters != null) {
+			counters.adjacencyBlockDecoded();
+		}
+	}
+
+	private void countSkip() {
+		IoCounters counters = segments.counters();
+		if (counters != null) {
+			counters.adjacencyBlockSkipped();
+		}
 	}
 
 	/** Removes one entry. Returns false if the node had no such entry. */

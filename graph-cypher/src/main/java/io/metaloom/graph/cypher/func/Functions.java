@@ -6,6 +6,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
+import io.metaloom.graph.core.api.VectorMetric;
 import io.metaloom.graph.cypher.ast.Ast;
 import io.metaloom.graph.cypher.exec.CypherTypeException;
 import io.metaloom.graph.cypher.exec.Evaluator;
@@ -43,7 +44,11 @@ public final class Functions {
 		"tostring", "toupper", "tolower", "upper", "lower", "trim", "ltrim", "rtrim",
 		"substring", "replace", "split", "reverse",
 		"tointeger", "tofloat", "toboolean", "abs", "ceil", "floor", "round", "sqrt", "sign", "nodes",
-		"relationships");
+		"relationships",
+		// Namespaced, which the parser folds back together — see CypherParser.postfix. They are here rather than
+		// behind an index because they are the ground truth an approximate index is measured against, and because
+		// re-ranking a small candidate set is worth having on its own.
+		"vector.cosine", "vector.dot", "vector.l2");
 
 	public static boolean isAggregate(String name) {
 		return AGGREGATES.contains(name.toLowerCase(Locale.ROOT));
@@ -372,8 +377,65 @@ public final class Functions {
 				double value = Values.number(args.get(0), "sign").doubleValue();
 				return (long) Math.signum(value);
 			}
+			case "vector.cosine" -> {
+				expect(call, 2);
+				return distance(call, args, VectorMetric.COSINE);
+			}
+			case "vector.dot" -> {
+				expect(call, 2);
+				return distance(call, args, VectorMetric.DOT);
+			}
+			case "vector.l2" -> {
+				expect(call, 2);
+				return distance(call, args, VectorMetric.EUCLIDEAN);
+			}
 			default -> throw new CypherTypeException("Unknown function " + call.name() + "()");
 		}
+	}
+
+	/**
+	 * One of the three vector functions. Null in, null out, as everywhere else in the language — a node that simply has
+	 * no embedding must not fail the query for every node that does.
+	 */
+	private static Object distance(Ast.FunctionCall call, List<Object> args, VectorMetric metric) {
+		float[] a = vectorArg(call.name(), args.get(0));
+		float[] b = vectorArg(call.name(), args.get(1));
+		if (a == null || b == null) {
+			return null;
+		}
+		if (a.length != b.length) {
+			// Not null, and not a silent zero. Two vectors of different lengths are incomparable, and the overwhelmingly
+			// likely cause is that a query vector was written for a different model than the stored one.
+			throw new CypherTypeException(call.name() + "() cannot compare a vector of " + a.length
+				+ " dimensions with one of " + b.length);
+		}
+		return metric.score(a, b);
+	}
+
+	/**
+	 * A vector argument, from either shape one can arrive in: a {@code float[]} passed straight through as a parameter,
+	 * or the list of numbers a stored vector becomes on its way through {@code GraphAccess.normalise}. A list of
+	 * integers counts — {@code [1, 2, 3]} written literally in a query is a list of longs.
+	 */
+	private static float[] vectorArg(String function, Object value) {
+		if (value == null) {
+			return null;
+		}
+		if (value instanceof float[] vector) {
+			return vector;
+		}
+		if (value instanceof List<?> list) {
+			float[] vector = new float[list.size()];
+			for (int i = 0; i < vector.length; i++) {
+				Object element = list.get(i);
+				if (element == null) {
+					throw new CypherTypeException(function + "() cannot take a vector holding a null at index " + i);
+				}
+				vector[i] = Values.number(element, function).floatValue();
+			}
+			return vector;
+		}
+		throw typeError(function, value);
 	}
 
 	private static Long parseLong(String value) {

@@ -168,6 +168,29 @@ public class CypherParserTest {
 			.projection().items().get(0).expression();
 	}
 
+	/**
+	 * A namespaced function name is not something the lexer can produce: {@code .} is not an identifier character, and
+	 * making it one would break both {@code n.name} and the {@code *1..3} range. So {@code vector.cosine(a, b)} arrives
+	 * at the parser as a property access on a variable called {@code vector}, and the parser folds it back.
+	 * <p>
+	 * The failure this prevents is not "unknown function". It is that the unconsumed {@code (} falls out of the
+	 * projection and RETURN reports that a parenthesis cannot follow it — a message about the wrong thing entirely.
+	 */
+	@Test
+	public void testANamespacedFunctionCallIsNotAPropertyAccess() {
+		Ast.Expr expression = projected("RETURN vector.cosine([1.0, 0.0], [0.0, 1.0])");
+		Ast.FunctionCall call = assertInstanceOf(Ast.FunctionCall.class, expression);
+		assertEquals("vector.cosine", call.name());
+		assertEquals(2, call.arguments().size());
+
+		// The fold is deliberately narrow, and both halves of the guard matter.
+		assertInstanceOf(Ast.Property.class, projected("RETURN n.embedding"),
+			"a plain property access is untouched");
+		Ast.Property nested = assertInstanceOf(Ast.Property.class, projected("RETURN n.a.b"),
+			"only a bare variable can be a namespace, so a nested access stays an access");
+		assertEquals("b", nested.key());
+	}
+
 	@Test
 	public void testUnion() {
 		Ast.Query query = CypherParser.parse("RETURN 1 AS x UNION ALL RETURN 2 AS x UNION RETURN 3 AS x");

@@ -25,12 +25,12 @@ import io.metaloom.graph.core.util.Layouts;
  * 28  2  tail_count
  * 30  2  gen
  * 32  4  sorted_count
- * 36  1  flags
+ * 36  1  flags          -- FULL | TYPES_CACHED | NO_MATERIALISED
  * 37  1  cells          -- allocation units this block spans; 0 marks a continuation cell
  * 38  2  reserved
- * 40  8  min_location
+ * 40  8  min_location   -- with max_location, the range a read may rule a neighbour out against
  * 48  8  max_location
- * 56  8  type_bitmap
+ * 56  8  type_bitmap    -- the types a read may rule out, when TYPES_CACHED says it is complete
  *
  * Page layout:
  * [ header ][ compressed sorted region ][ free ][ raw tail entries, 8 bytes each, growing downwards ]
@@ -49,6 +49,34 @@ public final class AdjacencyBlock {
 	public static final int ENTRY_BYTES = 8;
 
 	public static final int FLAG_FULL = 1;
+
+	/**
+	 * Every materialised entry in this block caches a real type, so {@link #typeBitmap()} describes <b>every</b> entry
+	 * and a read may skip the block on the strength of it.
+	 * <p>
+	 * Without this bit the bitmap is only a filter over the types it happens to know about. A materialised entry that
+	 * caches no type contributes bit 0 rather than the bit of its real type (§3.1), so a block holding one is
+	 * <em>under-described</em> by its own bitmap and skipping it would drop a real edge from the answer. That is not a
+	 * missed optimisation, it is a wrong result.
+	 * <p>
+	 * <b>Zero is the safe value, which is why this is set rather than cleared.</b> A block written before this bit
+	 * existed has a flags byte of 0 or {@link #FLAG_FULL}, reads as "not known to be complete", and is never skipped —
+	 * exactly the treatment a pre-cache store needs.
+	 */
+	public static final int FLAG_TYPES_CACHED = 2;
+
+	/**
+	 * This block holds no materialised entry, so {@link #minLocation()} and {@link #maxLocation()} bound
+	 * <b>neighbour</b> locations and a search for one may skip the block.
+	 * <p>
+	 * The 48 bit field of a materialised entry is a <em>relationship</em> location, not a neighbour's, so a block
+	 * holding one has a min/max over two different address spaces mixed together. Ruling out a neighbour against that
+	 * range is meaningless. The same zero-is-safe argument as above applies: an old block reads as "may hold one".
+	 */
+	public static final int FLAG_NO_MATERIALISED = 4;
+
+	/** The bits {@link #rewrite} recomputes from scratch, as against {@link #FLAG_FULL}, which it must preserve. */
+	private static final int DERIVED_FLAGS = FLAG_TYPES_CACHED | FLAG_NO_MATERIALISED;
 
 	private static final int OFF_NODE_ID = 0;
 	private static final int OFF_NEXT = 8;
@@ -99,7 +127,8 @@ public final class AdjacencyBlock {
 		page.set(Layouts.INT, OFF_SORTED_COUNT, 0);
 		// A byte, not an int: flags used to be written four bytes wide, which reached across the reserved bytes
 		// beside it and would now erase the cell count on every initialise and every markFull.
-		page.set(Layouts.BYTE, OFF_FLAGS, (byte) 0);
+		// An empty block trivially satisfies both derived claims; observe() withdraws them as entries arrive.
+		page.set(Layouts.BYTE, OFF_FLAGS, (byte) DERIVED_FLAGS);
 		page.set(Layouts.LONG, OFF_MIN_LOCATION, Long.MAX_VALUE);
 		page.set(Layouts.LONG, OFF_MAX_LOCATION, Long.MIN_VALUE);
 		page.set(Layouts.LONG, OFF_TYPE_BITMAP, 0L);
@@ -163,9 +192,51 @@ public final class AdjacencyBlock {
 		return (typeBitmap() & typeBit(typeId)) != 0;
 	}
 
-	/** True when no entry in this block can reference the given location. */
+	/** True when an entry in this block may reference the given location. */
 	public boolean mayContainLocation(long location) {
 		return location >= minLocation() && location <= maxLocation();
+	}
+
+	/** Whether {@link #typeBitmap()} describes every entry — see {@link #FLAG_TYPES_CACHED}. */
+	public boolean typeBitmapIsComplete() {
+		return (page.get(Layouts.BYTE, OFF_FLAGS) & FLAG_TYPES_CACHED) != 0;
+	}
+
+	/** Whether min/max bound neighbour locations — see {@link #FLAG_NO_MATERIALISED}. */
+	public boolean holdsNoMaterialisedEntry() {
+		return (page.get(Layouts.BYTE, OFF_FLAGS) & FLAG_NO_MATERIALISED) != 0;
+	}
+
+	/**
+	 * Whether a type-filtered read has to decode this block.
+	 * <p>
+	 * <b>The two ways of saying "yes" are not the same and the difference is the whole safety argument.</b> A block
+	 * whose bitmap is complete answers from the bitmap and a "no" is binding. A block whose bitmap is not complete
+	 * cannot answer at all, and "cannot answer" has to read as "may contain" — the bitmap of such a block is missing
+	 * the bits of the entries that cache no type, so its "no" is not a "no".
+	 *
+	 * @param typeIds
+	 *            the filter, or null for no filter, in which case every block is admitted
+	 */
+	public boolean admitsAnyType(java.util.Set<Integer> typeIds) {
+		if (typeIds == null || !typeBitmapIsComplete()) {
+			return true;
+		}
+		long bitmap = typeBitmap();
+		for (int typeId : typeIds) {
+			if ((bitmap & typeBit(typeId)) != 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Whether a search for a neighbour at the given location has to decode this block. Only a block that holds no
+	 * materialised entry can be ruled out, because only then does min/max bound neighbour locations.
+	 */
+	public boolean admitsNeighbour(long location) {
+		return !holdsNoMaterialisedEntry() || mayContainLocation(location);
 	}
 
 	public int freeBytes() {
@@ -196,6 +267,18 @@ public final class AdjacencyBlock {
 			page.set(Layouts.LONG, OFF_MAX_LOCATION, location);
 		}
 		page.set(Layouts.LONG, OFF_TYPE_BITMAP, typeBitmap() | typeBit(PackedEdge.typeId(edge)));
+		if (!PackedEdge.isMaterialised(edge)) {
+			// A lightweight entry always carries its real type and a neighbour location, so it withdraws neither claim.
+			return;
+		}
+		int withdraw = FLAG_NO_MATERIALISED;
+		if (PackedEdge.typeId(edge) == PackedEdge.TYPE_NOT_RECORDED) {
+			withdraw |= FLAG_TYPES_CACHED;
+		}
+		byte flags = page.get(Layouts.BYTE, OFF_FLAGS);
+		if ((flags & withdraw) != 0) {
+			page.set(Layouts.BYTE, OFF_FLAGS, (byte) (flags & ~withdraw));
+		}
 	}
 
 	/**
@@ -289,6 +372,11 @@ public final class AdjacencyBlock {
 		page.set(Layouts.LONG, OFF_MIN_LOCATION, Long.MAX_VALUE);
 		page.set(Layouts.LONG, OFF_MAX_LOCATION, Long.MIN_VALUE);
 		page.set(Layouts.LONG, OFF_TYPE_BITMAP, 0L);
+		// The derived flags are recomputed with the summary they describe, so a rewrite that drops the last
+		// type-less entry gets the block skipped again. FULL is a property of the block, not of its contents, and
+		// is preserved.
+		page.set(Layouts.BYTE, OFF_FLAGS,
+			(byte) ((page.get(Layouts.BYTE, OFF_FLAGS) & FLAG_FULL) | DERIVED_FLAGS));
 		for (int i = 0; i < count; i++) {
 			observe(entries[i]);
 		}

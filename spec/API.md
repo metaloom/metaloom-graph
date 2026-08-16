@@ -209,6 +209,28 @@ Type mismatch throws `PropertyTypeException` naming the key, the stored type and
 There is no implicit string coercion — that is what the PoC's `Map<String,String>` forced and it is
 the source of silent data loss.
 
+### 6.1 Finding nodes by something other than an id
+
+```java
+List<Long> people = store.nodesByLabel("Person");             // label index
+List<Long> found  = store.nodesByProperty("email", "a@b.c");  // property index, then verification
+store.createUniqueConstraint("email");                        // refused if the data already breaks it
+
+List<Neighbour> near = store.nearestByScan("Person", "embedding", query, 10, VectorMetric.COSINE);
+```
+
+`nearestByScan` is **exact and linear**: it reads every candidate's vector and compares it, with no
+index and no approximation. That is deliberate — it is the answer an approximate index gets measured
+against ([VECTOR.md §8](VECTOR.md)), so it must be computable whether or not one exists and must not
+share code with one. `label` may be null to scan every live node instead of probing the label index.
+
+Results come back **nearest first under the metric**, which is the part to rely on. `Neighbour.score`
+is the metric's own value — a similarity for `COSINE` and `DOT`, a distance for `EUCLIDEAN` — so
+sorting a result list on it without consulting `VectorMetric.higherIsNearer()` reverses two of the
+three. A node whose value is not a vector, or is a vector of a different length, is skipped rather
+than refused: a property key is free-form, and the refusal belongs on the write path of a declared
+index.
+
 ---
 
 ## 7. Maintenance and Introspection
@@ -351,6 +373,10 @@ scopes them for the calling thread rather than duplicating them.
 - [x] `createEdge` / `createRelationship` / `deleteEdge` / `deleteRelationship`
 - [x] `Properties` typed accessors, absent versus null
 - [x] `neighbours(direction, types)` and breadth-first `traverse(maxDepth)`
+- [x] `hasEdge(nodeId, neighbourId)` — "are these two connected", answered without materialising the
+      node's neighbours. Direction- and type-agnostic, stops at the first match, and skips the blocks
+      whose location range cannot hold the target
+      ([RELATIONSHIP_STORAGE.md §6.4](RELATIONSHIP_STORAGE.md))
 - [x] Maintenance: `checkpoint`, `verify`, `stats`
 - [x] Exception hierarchy per §8, plus `ConstraintViolationException`
 - [x] `createUniqueConstraint` / `uniqueConstraints`, durable across a reopen
@@ -388,5 +414,5 @@ scopes them for the calling thread rather than duplicating them.
 
 ---
 
-_Git HEAD revision: `e4601d1`_
-_Last updated: 2026-08-15 (label mutation added)_
+_Git HEAD revision: `8f178b4`_
+_Last updated: 2026-08-16 (nearestByScan)_

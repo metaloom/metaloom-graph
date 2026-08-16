@@ -34,6 +34,7 @@ import io.metaloom.graph.core.api.GraphStoreException;
 import io.metaloom.graph.core.api.GraphStoreOptions;
 import io.metaloom.graph.core.api.IoStats;
 import io.metaloom.graph.core.api.IsolationLevel;
+import io.metaloom.graph.core.api.Neighbour;
 import io.metaloom.graph.core.api.Properties;
 import io.metaloom.graph.core.api.ReadTransaction;
 import io.metaloom.graph.core.api.SnapshotStats;
@@ -42,6 +43,7 @@ import io.metaloom.graph.core.api.StoreClosedException;
 import io.metaloom.graph.core.api.StoreMetrics;
 import io.metaloom.graph.core.api.StoreStats;
 import io.metaloom.graph.core.api.Transaction;
+import io.metaloom.graph.core.api.VectorMetric;
 import io.metaloom.graph.core.api.VerifyLevel;
 import io.metaloom.graph.core.api.VerifyOptions;
 import io.metaloom.graph.core.catalog.Catalog;
@@ -714,6 +716,86 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	}
 
 	@Override
+	public List<Neighbour> nearestByScan(String label, String key, float[] query, int k, VectorMetric metric) {
+		if (query == null || query.length == 0) {
+			throw new IllegalArgumentException("A vector search needs a query vector");
+		}
+		if (k <= 0) {
+			throw new IllegalArgumentException("k must be positive, got " + k);
+		}
+		java.util.Objects.requireNonNull(metric, "metric");
+		checkOpen();
+		int keyId = catalog.lookupKey(key);
+		if (keyId == 0) {
+			// The key has never been written, so no node can carry it. Not an error: refusing would make a store that
+			// simply has no vectors yet fail rather than answer.
+			return List.of();
+		}
+		// A bounded max-heap on the ranking key: the worst kept candidate is at the head, so admitting one is a
+		// compare and a swap rather than a sort of every node in the store.
+		//
+		// The initial capacity is capped rather than taken from k. k is a caller's number, and `new
+		// PriorityQueue<>(Integer.MAX_VALUE)` allocates the whole backing array up front for a store that may hold
+		// three nodes — the same unbounded-allocation shape the format parsers are hardened against.
+		// Ties break on the lower node id rather than on whichever the scan happened to reach first. Equal distances
+		// are not a corner case here — a corpus with any repeated vector produces them — and this is the answer an
+		// approximate index gets compared against, so it has to be the same answer every run.
+		java.util.Comparator<Ranked> nearestFirst =
+			java.util.Comparator.comparingDouble(Ranked::rank).thenComparingLong(Ranked::nodeId);
+		java.util.PriorityQueue<Ranked> best = new java.util.PriorityQueue<>(Math.min(k, 1024),
+			nearestFirst.reversed());
+		java.util.function.LongPredicate candidate = nodeId -> {
+			Object stored = properties.read(nodes.propBlockId(nodeId), keyId);
+			if (stored instanceof float[] vector && vector.length == query.length) {
+				// One distance computation per candidate, not two: the rank is a sign flip away from the score, and
+				// this is the loop the whole operation is.
+				double score = metric.score(query, vector);
+				double rank = metric.higherIsNearer() ? -score : score;
+				if (best.size() < k) {
+					best.add(new Ranked(nodeId, rank, score));
+				} else {
+					Ranked worst = best.peek();
+					if (rank < worst.rank() || (rank == worst.rank() && nodeId < worst.nodeId())) {
+						best.poll();
+						best.add(new Ranked(nodeId, rank, score));
+					}
+				}
+			}
+			return true;
+		};
+		try {
+			// runRead rather than read, for the reason forEachNodeWhile gives: a scan is long, so it takes the latch
+			// outright instead of gambling on an optimistic pass it would usually lose — and taking it once means the
+			// whole scan sees one state of the store rather than a different one per candidate.
+			runRead(() -> {
+				if (label == null) {
+					segmentSets.get(Kind.NODE).forEachLiveIdWhile(candidate);
+				} else {
+					for (long nodeId : indexes.nodesByLabel(label)) {
+						if (nodes.exists(nodeId)) {
+							candidate.test(nodeId);
+						}
+					}
+				}
+			});
+		} catch (IOException e) {
+			throw new GraphStoreException("Vector scan over " + (label == null ? "every node" : ":" + label)
+				+ " failed", e);
+		}
+		List<Ranked> ordered = new ArrayList<>(best);
+		ordered.sort(nearestFirst);
+		List<Neighbour> result = new ArrayList<>(ordered.size());
+		for (Ranked ranked : ordered) {
+			result.add(new Neighbour(ranked.nodeId(), ranked.score()));
+		}
+		return result;
+	}
+
+	/** One candidate mid-scan: the ranking key the heap orders on, and the natural score the caller gets back. */
+	private record Ranked(long nodeId, double rank, double score) {
+	}
+
+	@Override
 	public boolean nodeExists(long nodeId) {
 		return read(() -> nodes.exists(nodeId));
 	}
@@ -937,10 +1019,33 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			requireNode(nodeId);
 			Set<Integer> typeIds = resolveTypes(types);
 			List<Edge> result = new ArrayList<>();
-			for (long packed : adjacency.edges(nodeId)) {
+			for (long packed : adjacency.edges(nodeId, typeIds)) {
 				materialise(nodeId, packed, direction, typeIds, result);
 			}
 			return result;
+		});
+	}
+
+	/**
+	 * Whether the two nodes are connected by any edge, in either direction and of any type.
+	 * <p>
+	 * A block whose recorded location range excludes the target is walked past without being decoded, and the walk
+	 * stops at the first match. This is the read-path use of {@code min_location} / {@code max_location}
+	 * (RELATIONSHIP_STORAGE.md §5.3); it prunes a chain rather than indexing it, so the cost is O(blocks).
+	 */
+	@Override
+	public boolean hasEdge(long nodeId, long neighbourId) {
+		return read(() -> {
+			requireNode(nodeId);
+			return adjacency.hasEdge(nodeId, neighbourId, packed -> {
+				long relId = liveRelationshipId(PackedEdge.relationshipId(packed));
+				if (ElementId.isNull(relId)) {
+					return false;
+				}
+				// A materialised entry names its relationship, not its neighbour, so only the record says who is at
+				// the other end. A self-loop matches when the caller asked about the node itself.
+				return rels.fromId(relId) == neighbourId || rels.toId(relId) == neighbourId;
+			});
 		});
 	}
 
@@ -994,7 +1099,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 						nodes.segments().prefetch(frontier, ahead);
 					}
 				}
-				for (long packed : adjacency.edges(nodeId)) {
+				for (long packed : adjacency.edges(nodeId, typeIds)) {
 					int before = result.size();
 					materialise(nodeId, packed, direction, typeIds, result);
 					for (int i = before; i < result.size(); i++) {

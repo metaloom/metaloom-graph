@@ -1,6 +1,7 @@
 package io.metaloom.graph.core.budget;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -19,6 +20,7 @@ import io.metaloom.graph.core.api.Transaction;
 import io.metaloom.graph.core.fixture.TempStore;
 import io.metaloom.graph.core.id.Kind;
 import io.metaloom.graph.core.store.GraphStoreImpl;
+import io.metaloom.graph.core.store.adj.PackedEdge;
 
 /**
  * Reads per operation, enforced as build failures.
@@ -170,8 +172,9 @@ public class ReadBudgetTest {
 			int blocks = impl.adjacencyStore().blockCount(hub);
 			IoStats stats = cost(impl, () -> store.neighbours(hub, Direction.OUT));
 
-			// Each block is read once to decode it and once to follow the chain pointer; the budget is that the scan
-			// is linear in blocks, not in edges. One read per edge is what the proof of concept did.
+			// One acquisition per block — the run from its first cell to the end of its page, which holds both the
+			// header and the payload — so the bound is loose on purpose. The budget is that the scan is linear in
+			// blocks, not in edges. One read per edge is what the proof of concept did.
 			assertTrue(stats.recordReads(Kind.ADJ) <= 2L * blocks + 2,
 				"a 100,000 edge scan must cost O(blocks), not O(edges): " + blocks + " blocks, " + stats);
 			assertTrue(stats.recordReads(Kind.ADJ) < 100_000 / 100,
@@ -222,6 +225,178 @@ public class ReadBudgetTest {
 			assertTrue(filtered.recordReads(Kind.REL) * 100L < unfiltered.recordReads(Kind.REL),
 				"filtering must be orders of magnitude cheaper, got " + filtered.recordReads(Kind.REL) + " against "
 					+ unfiltered.recordReads(Kind.REL));
+		}
+	}
+
+	/**
+	 * The IDX-3 claim: a type-filtered scan must walk past the blocks whose bitmap rules the filter out, instead of
+	 * decoding every block of the chain as it did.
+	 * <p>
+	 * <b>Read in the right unit.</b> The saving is in blocks <em>decoded</em>, not blocks read, and the assertion that
+	 * the two {@code ADJ} read counts are equal is as much the point as the one that the decode counts differ. A chain
+	 * is a linked list whose {@code next} pointer lives in each block's own header, so a walk acquires every block
+	 * before it can judge any of them — the record read is owed either way. What the skip removes is the varint decode
+	 * of up to 8,000 entries and the {@code long[]} they land in.
+	 */
+	@Test
+	public void testATypeFilteredScanSkipsTheBlocksWhoseBitmapExcludesTheType() throws Exception {
+		int common = 30_000;
+		int rare = 5;
+		try (GraphStore store = stores.open()) {
+			GraphStoreImpl impl = (GraphStoreImpl) store;
+			long hub;
+			try (Transaction txn = store.begin()) {
+				hub = store.createNode("Hub");
+				for (int i = 0; i < common; i++) {
+					store.createEdge(hub, "COMMON", store.createNode("Spoke"));
+				}
+				// Appended last, so they land in the head block and no older block's bitmap carries the RARE bit.
+				for (int i = 0; i < rare; i++) {
+					store.createEdge(hub, "RARE", store.createNode("Spoke"));
+				}
+				txn.commit();
+			}
+			int blocks = impl.adjacencyStore().blockCount(hub);
+			assertTrue(blocks >= 3, "the skip only exists on a chain; this node has " + blocks + " block(s)");
+			assertEquals(rare, store.neighbours(hub, Direction.OUT, java.util.Set.of("RARE")).size(),
+				"the filter must still return every rare edge");
+
+			IoStats unfiltered = cost(impl, () -> store.neighbours(hub, Direction.OUT));
+			IoStats filtered = cost(impl, () -> store.neighbours(hub, Direction.OUT, java.util.Set.of("RARE")));
+
+			assertEquals(blocks, unfiltered.adjacencyBlocksDecoded(),
+				"an unfiltered scan has to decode every block: " + unfiltered);
+			assertEquals(0, unfiltered.adjacencyBlocksSkipped(),
+				"and has nothing to skip on: " + unfiltered);
+
+			assertEquals(blocks, filtered.adjacencyBlocksDecoded() + filtered.adjacencyBlocksSkipped(),
+				"every block of the chain is accounted for as decoded or skipped: " + filtered);
+			assertTrue(filtered.adjacencyBlocksDecoded() < unfiltered.adjacencyBlocksDecoded(),
+				"a filtered scan must decode fewer blocks than an unfiltered one over the same node: "
+					+ filtered.adjacencyBlocksDecoded() + " against " + unfiltered.adjacencyBlocksDecoded());
+			// At most two, not exactly one: the rare edges are appended last and so sit in the head block, unless that
+			// block happened to fill while they were being written and pushed a new one in front of it.
+			assertTrue(filtered.adjacencyBlocksDecoded() <= 2,
+				"only the block that actually holds a RARE entry may be decoded: " + filtered);
+			assertTrue(filtered.adjacencyBlocksSkipped() >= blocks - 2,
+				"every other block must be skipped: " + filtered);
+
+			assertEquals(unfiltered.recordReads(Kind.ADJ), filtered.recordReads(Kind.ADJ),
+				"the chain pointer is in each block's header, so skipping saves the decode and not the read; "
+					+ "filtered=" + filtered + " unfiltered=" + unfiltered);
+		}
+	}
+
+	/**
+	 * The zero-type rule, in the place it can silently produce a wrong answer.
+	 * <p>
+	 * A materialised entry that caches no type contributes bit 0 to its block's bitmap rather than the bit of its real
+	 * type (RELATIONSHIP_STORAGE.md §3.1), so a block holding one is under-described by its own bitmap. Skipping on
+	 * that bitmap would drop a real edge from the answer — not a missed optimisation, a wrong result. The block
+	 * therefore records whether every materialised entry in it caches a type, and the skip only applies where it does.
+	 * <p>
+	 * The control hub is what makes this an assertion rather than an anecdote: both chains are filtered on a type
+	 * neither of them holds, and the one whose head block was written in the pre-cache shape is the one that still has
+	 * to decode it.
+	 */
+	@Test
+	public void testABlockHoldingAnEntryWithNoCachedTypeIsNeverSkipped() throws Exception {
+		int common = 20_000;
+		try (GraphStore store = stores.open()) {
+			GraphStoreImpl impl = (GraphStoreImpl) store;
+			long hub;
+			long control;
+			try (Transaction txn = store.begin()) {
+				// Interned so that the filter below resolves to a real type id rather than to nothing.
+				store.createEdge(store.createNode("N"), "ABSENT", store.createNode("N"));
+				hub = fanOut(store, "COMMON", common);
+				control = fanOut(store, "COMMON", common);
+				txn.commit();
+			}
+			long relId = store.createRelationship(hub, "RARE", store.createNode("Spoke"));
+			// Rewrite the hub's entry into the shape every materialised entry of a pre-IDX-2 store has: dir 3, type 0.
+			try (Transaction txn = store.begin()) {
+				assertTrue(impl.adjacencyStore().removeMaterialised(hub, relId));
+				impl.adjacencyStore().add(hub, PackedEdge.ofRelationship(relId));
+				txn.commit();
+			}
+			store.verify(io.metaloom.graph.core.api.VerifyLevel.FULL);
+
+			int blocks = impl.adjacencyStore().blockCount(hub);
+			assertTrue(blocks >= 2, "the skip only exists on a chain; this node has " + blocks + " block(s)");
+			assertEquals(1, store.neighbours(hub, Direction.OUT, java.util.Set.of("RARE")).size(),
+				"a block whose bitmap does not carry the RARE bit still holds a RARE edge, and skipping it would "
+					+ "drop that edge from the answer");
+
+			IoStats guarded = cost(impl, () -> store.neighbours(hub, Direction.OUT, java.util.Set.of("ABSENT")));
+			IoStats skipped =
+				cost(impl, () -> store.neighbours(control, Direction.OUT, java.util.Set.of("ABSENT")));
+
+			assertEquals(0, skipped.adjacencyBlocksDecoded(),
+				"a chain whose every entry caches its type is skipped whole on a type it does not hold: " + skipped);
+			assertEquals(1, guarded.adjacencyBlocksDecoded(),
+				"but the one block holding an entry that caches no type must be decoded even though its bitmap "
+					+ "excludes the filter: " + guarded);
+			assertEquals(blocks - 1, guarded.adjacencyBlocksSkipped(),
+				"and only that block: the rest of the chain is still skipped: " + guarded);
+		}
+	}
+
+	/** A hub with the given number of lightweight out-edges, each to a fresh node. */
+	private long fanOut(GraphStore store, String type, int degree) throws IOException {
+		long hub = store.createNode("Hub");
+		for (int i = 0; i < degree; i++) {
+			store.createEdge(hub, type, store.createNode("Spoke"));
+		}
+		return hub;
+	}
+
+	/**
+	 * {@code hasEdge} is the operation {@code min_location} / {@code max_location} were written for on the read path:
+	 * a block whose recorded range excludes the target cannot hold a lightweight entry naming it.
+	 * <p>
+	 * It is a pruned scan, not an index: RELATIONSHIP_STORAGE.md §5.3 used to claim O(log blocks) block reads and a
+	 * binary search, which the format does not support — blocks are pushed onto the head of the chain, so block order
+	 * is insertion order and there is nothing sorted to search over.
+	 */
+	@Test
+	public void testHasEdgeSkipsTheBlocksThatCannotHoldTheTarget() throws Exception {
+		int degree = 30_000;
+		try (GraphStore store = stores.open()) {
+			GraphStoreImpl impl = (GraphStoreImpl) store;
+			long hub;
+			long newest;
+			long stranger;
+			try (Transaction txn = store.begin()) {
+				hub = fanOut(store, "E", degree - 1);
+				newest = store.createNode("Spoke");
+				store.createEdge(hub, "E", newest);
+				// Created last, so its location is above every block's recorded maximum.
+				stranger = store.createNode("Stranger");
+				txn.commit();
+			}
+			int blocks = impl.adjacencyStore().blockCount(hub);
+			assertTrue(blocks >= 3, "the skip only exists on a chain; this node has " + blocks + " block(s)");
+
+			assertTrue(store.hasEdge(hub, newest), "the newest neighbour is an edge");
+			assertFalse(store.hasEdge(hub, stranger), "a node the hub was never linked to is not");
+
+			IoStats miss = cost(impl, () -> store.hasEdge(hub, stranger));
+			assertEquals(0, miss.adjacencyBlocksDecoded(),
+				"no block can hold a location above every recorded maximum, so none is decoded: " + miss);
+			assertEquals(blocks, miss.adjacencyBlocksSkipped(), "and all of them are skipped: " + miss);
+
+			IoStats hit = cost(impl, () -> store.hasEdge(hub, newest));
+			assertEquals(1, hit.adjacencyBlocksDecoded(),
+				"the newest neighbour is in the head block, and the walk stops at the first match: " + hit);
+
+			IoStats scan = cost(impl, () -> store.neighbours(hub, Direction.OUT));
+			assertEquals(scan.recordReads(Kind.ADJ), miss.recordReads(Kind.ADJ),
+				"a miss still acquires every block, because the chain pointer is inside each of them; what the range "
+					+ "check saves is the decode: " + miss + " against " + scan);
+			assertTrue(hit.recordReads(Kind.ADJ) < scan.recordReads(Kind.ADJ),
+				"a hit is the one case that does cut reads, by stopping at the first match: " + hit + " against "
+					+ scan);
 		}
 	}
 

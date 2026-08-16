@@ -136,7 +136,7 @@ Neither number is the point. The numbers that decide anything are the budgets an
 - [x] A materialised entry caches its relationship's type, so a type-filtered traversal reads a
       relationship record once per surviving candidate rather than once per entry
       ([RELATIONSHIP_STORAGE.md §3.1](RELATIONSHIP_STORAGE.md),
-      [IDX-2](INDEX_TASKS.md#idx-2--push-the-type-filter-into-adjacency-for-materialised-entries)).
+      [IDX-2](INDEX_TASKS.md#3-closed)).
       Compatible with format version 2: type id 0 means "not cached", which is what an older store's
       entries already hold
 - [x] `AdjacencyStore.defragment` (built in Phase 8)
@@ -172,7 +172,7 @@ that a steal policy cannot be made correct over a `MAP_SHARED` mapping.
 - [x] Index maintenance inside the transaction — an index update is part of the atomic unit
 - [x] Index rebuild, gated on entries per page rather than on slot liveness (Phase 8)
 - [x] Property values are keyed by a **content** hash, arrays and lists included — a `float[]` used to
-      be keyed by its identity hash ([INDEX_TASKS.md IDX-1](INDEX_TASKS.md#idx-1--a-float-property-is-indexed-under-a-non-deterministic-key))
+      be keyed by its identity hash ([INDEX_TASKS.md IDX-1](INDEX_TASKS.md#3-closed))
 - [x] Tests: `IndexTest` and `IndexKeyTest`, plus the index-vs-scan differential inside
       `ReferenceModelTest`
 
@@ -429,7 +429,10 @@ Ordered by phase. Each item says what it costs to leave undone.
 - [ ] Streaming `EdgeCursor` / `TraversalCursor` with prefetch. Traversal materialises its result today,
       so a traversal over a supernode is bounded by heap rather than by the caller's appetite. Needs
       Phase 6 for the prefetch to mean anything.
-- [ ] Type-bitmap skipping on the **read** path. The bitmap is maintained and used on delete only.
+- [x] Type-bitmap and min/max skipping on the **read** path — `AdjacencyStore.edges(nodeId, typeIds)`
+      and `hasEdge(a, b)`, gated by `ReadBudgetTest`
+      ([RELATIONSHIP_STORAGE.md §5.3](RELATIONSHIP_STORAGE.md)). It skips the *decode* of a block, not
+      its read: the chain pointer lives inside each block, so the walk acquires every one regardless.
 - [ ] `Bidirectionality` and `DegreeCounters` as standalone checkers — both are asserted inside
       `InvariantChecker`, but not separately runnable.
 
@@ -652,7 +655,12 @@ The whole suite passes with `metaloom.graph.native.enabled` both true and false.
       at degree 200,000 against 0.024 at degree 2,000**. Both improve with degree. The chain tier is
       the ceiling in theory; in practice nothing has reached it. Revisit only if a measurement, not
       an intuition, says so — [GRAPH_BENCHMARK.md](GRAPH_BENCHMARK.md) section 8
-- [ ] Vector index hook
+- [~] Vector search — **HNSW, being implemented here rather than delegated.** Six stages in
+      [VECTOR.md §7](VECTOR.md); stage 1 is built (`vector.cosine`/`dot`/`l2`, the namespaced-call
+      parser fold, `GraphStore.nearestByScan`, and a bound on the vector dimension in `ValueCodec` —
+      the last unchecked length field in the property codec). Stage 3 carries the format change: a
+      `VEC` kind whose record interleaves the vector with its links, and a property block that points
+      at it instead of at a blob
 - [ ] Concurrent split/merge under jcstress — jcstress is not in the offline repository
 - [ ] Crash-during-build test — needs the resumable build above
 

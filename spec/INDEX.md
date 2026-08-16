@@ -132,7 +132,7 @@ unique constraint on the key never fired. So `float[]` hashes by content, a list
 elements' `valueHash` rather than by `List::hashCode`, and any other array shape falls through to
 `Arrays.deepHashCode` rather than to `Object::hashCode`. That last branch is the one that matters
 next time: it is what stops the next array-shaped value type from reintroducing the defect
-([IDX-1](INDEX_TASKS.md#idx-1--a-float-property-is-indexed-under-a-non-deterministic-key)).
+([IDX-1](INDEX_TASKS.md#3-closed)).
 
 **The verification has to agree with the hash**, which is why it is `IndexCatalog.valueEquals` rather
 than `Objects.deepEquals` directly. `deepEquals` is deep for an array and shallow for everything
@@ -269,9 +269,9 @@ built for. What has no answer is "every `KNOWS` in the store", which costs a ful
 one: a supernode query starts from a node id and its cost is entirely in how its adjacency is
 enumerated — unskipped blocks and a fully materialised edge list. (Reading the relationship record
 *before* the type filter could reject it was the third of those costs, and
-[IDX-2](INDEX_TASKS.md#idx-2--push-the-type-filter-into-adjacency-for-materialised-entries) has since
+[IDX-2](INDEX_TASKS.md#3-closed) has since
 removed it: the adjacency entry caches the type.) [INDEX_TASKS.md §1](INDEX_TASKS.md) works that out
-with the numbers and routes it to three adjacency tasks, none of which is an index.
+with the numbers and routes what remains to two adjacency tasks, neither of which is an index.
 
 ---
 

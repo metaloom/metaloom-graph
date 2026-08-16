@@ -10,6 +10,11 @@ touches, and a task that grows past a paragraph of design gets its own file
 > ([RELATIONSHIP_STORAGE.md](RELATIONSHIP_STORAGE.md)), the cross-project backlog ordering
 > ([PROGRESS.md §5](PROGRESS.md)). A task that is picked up moves its checkbox in the spec of its
 > layer, not here.
+>
+> **A finished task leaves this file.** Its reasoning moves to the layer it changed, because that is
+> where the next reader of that code will look; a backlog entry marked "done" is a second copy that
+> goes stale. §3 is the ledger of what left and where it went. **Ids are never reused** — other specs
+> link to them, and IDX-3 stays IDX-3 after IDX-2 is gone.
 
 ---
 
@@ -17,15 +22,12 @@ touches, and a task that grows past a paragraph of design gets its own file
 
 | # | Task | Priority | Effort | Verdict |
 |---|---|---|---|---|
-| [IDX-1](#idx-1--a-float-property-is-indexed-under-a-non-deterministic-key) | `float[]` was indexed under an identity hash | **P0 — defect** | S | **Done.** Vectors are hashed by content; lists too |
-| [IDX-2](#idx-2--push-the-type-filter-into-adjacency-for-materialised-entries) | Type filter before the relationship read | **P1** | M | **Done.** The record is read once per surviving candidate |
-| [IDX-3](#idx-3--block-skipping-on-the-read-path) | Type-bitmap / min-max block skipping on reads | **P1** | S | Build. The metadata is already written and nothing reads it |
 | [IDX-4](#idx-4--a-streaming-neighbour-cursor) | Streaming neighbour cursor | **P1** | M | Build. A `LIMIT 1` over a supernode currently materialises every edge |
 | [IDX-5](#idx-5--a-relationship-scan-that-does-not-go-through-the-nodes) | `forEachRelationship` over the `REL` segment | P2 | S | Build. ~20 lines, and it removes most of the reason to want IDX-6 |
 | [IDX-6](#idx-6--a-relationship-type-index) | Relationship type index | P3 | L | **Do not build yet.** See §1 |
 | [IDX-7](#idx-7--composite-label-property-indexes) | Composite `(label, property)` indexes | P2 | M | Build when a workload has a label plus a low-selectivity property |
 | [IDX-8](#idx-8--statistics-enough-to-choose-a-label) | Per-label / per-key cardinality | P2 | M | Build with IDX-7 — it is what makes a choice between two indexes possible |
-| [IDX-9](#idx-9--vector-data) | Vector properties and ANN search | P3 | L | Explored separately in [VECTOR.md](VECTOR.md) |
+| [IDX-9](#idx-9--vector-data) | Vector properties and ANN search | P1 | L | **In progress** — HNSW, six stages, planned and tracked in [VECTOR.md §7](VECTOR.md) |
 
 ---
 
@@ -44,167 +46,19 @@ degree 10^6:
 |---|---|---|
 | Find `n` | one property probe, one verify | fine |
 | Read the block chain | ~124 blocks of 8 KiB, ~1 MiB, sequential-ish | fine — this is what the format is for |
-| Skip blocks that cannot hold `:RARE` | **not done** — every block is decoded | [IDX-3](#idx-3--block-skipping-on-the-read-path) |
+| Skip blocks that cannot hold `:RARE` | **fixed** — a block whose type bitmap admits no filtered type is walked past undecoded ([RELATIONSHIP_STORAGE.md §5.3](RELATIONSHIP_STORAGE.md)). It saves the decode, not the read: the chain pointer is inside each block | closed, §3 |
 | Materialise every entry into a `long[]`, then into `List<Edge>` | **10^6 longs and 10^6 `Edge` objects, before the caller sees the first row** | [IDX-4](#idx-4--a-streaming-neighbour-cursor) |
-| For each *materialised* entry, read the 64 byte `REL` record **and then** test the type | **fixed** — the entry caches its type, so the read is paid per surviving candidate | [IDX-2](#idx-2--push-the-type-filter-into-adjacency-for-materialised-entries) |
+| For each *materialised* entry, read the 64 byte `REL` record **and then** test the type | **fixed** — the entry caches its type ([RELATIONSHIP_STORAGE.md §3.1](RELATIONSHIP_STORAGE.md)), so the record is read once per surviving candidate | closed, §3 |
 
-The last row was the one that hurt, and it is worth being precise about why it existed.
-`GraphStoreImpl.materialise` read the relationship record before it could apply the type filter,
-because a materialised adjacency entry (`dir == 3`) did not carry its type — the type came from the
-record:
-
-```java
-// GraphStoreImpl.materialise, before IDX-2
-long relId = liveRelationshipId(PackedEdge.relationshipId(packed));
-int typeId = rels.typeId(relId);              // <- the read happens here
-if (typeIds != null && !typeIds.contains(typeId)) {
-    return;                                    // <- the filter happens after it
-}
-```
-
-The entry now caches the type and the filter runs first, off bits that were already decoded
-([RELATIONSHIP_STORAGE.md §3.1](RELATIONSHIP_STORAGE.md)). The two remaining rows are still open.
-
-A relationship type index would not fix any of those five rows. It answers "which relationships have
-type T" globally; the supernode query already knows which node it is on, and its problem is that the
-adjacency it holds is enumerated in full and unfiltered. **So the supernode work is IDX-2, IDX-3 and
-IDX-4, all of which are inside the adjacency layer, and none of which is an index.**
+Two of the three are now fixed, and the one that remains is the materialisation of every entry before
+the caller sees a row. None of the three is an index. A relationship type index answers "which
+relationships have type T" globally, while the supernode query already knows which node it is on —
+its problem is that the adjacency it holds is enumerated in full and unfiltered. **So the supernode
+work was IDX-3 and IDX-4, both inside the adjacency layer**, and only IDX-4 is left.
 
 The relationship index is worth building only when a workload really does ask the global question, and
 [IDX-5](#idx-5--a-relationship-scan-that-does-not-go-through-the-nodes) answers a large part of that
 question for a fraction of the cost. Its own entry says why it stays at P3.
-
----
-
-## IDX-1 — a `float[]` property is indexed under a non-deterministic key
-
-**Priority P0, and it was a defect rather than a gap. Fixed.**
-
-`IndexCatalog.valueHash` normalised the numeric types and hashed `String` and `byte[]` by content, and
-everything else fell through to `value.hashCode()` — which for a `float[]` is the identity hash, so
-every vector property was indexed under a key nothing could reproduce. Three symptoms, none of them
-noisy: an equality lookup on a vector returned nothing, a delete left the entry behind for
-`verify(FULL)`'s `NoDanglingRefs` to report at some later unrelated moment, and a unique constraint on
-a vector key never fired because `conflicts()` probed with the same unusable key. Queries never
-returned *wrong* nodes — the candidate verification handles arrays — so the whole cost was a missed
-answer and an index that leaked entries.
-
-**The decision this forced**, which [VECTOR.md §1.3](VECTOR.md) put here rather than answering itself:
-**vectors stay in the property tree, hashed by content.** Exact equality on a 768-float embedding is a
-narrow question and it is a well-defined one, it is what makes index maintenance sound, and skipping
-the value at the hook would have meant a value type the tree silently ignores — a second kind of
-silent miss in place of the first. It is not, and does not grow into, nearest-neighbour search;
-[VECTOR.md §7](VECTOR.md) stage 0 is where that story continues.
-
-**What changed:**
-
-- `float[]` hashes by `Arrays.hashCode`, which compares the same bits `Arrays.equals` does and so
-  agrees with the verification applied to every candidate.
-- A list hashes by mixing its elements' `valueHash` instead of by `List::hashCode`, which delegates to
-  its elements and inherited the defect from any array inside one.
-- The `default` branch routes any remaining array shape through `Arrays.deepHashCode`. That is the
-  branch that matters next: it stops the next array-shaped value type from reintroducing this.
-- `IndexCatalog.valueEquals` — `Objects.deepEquals` plus an element-wise walk of a list — replaces
-  `Objects.deepEquals` at the three sites that verify a candidate against a stored value
-  (`nodesByProperty`, `checkUnique`, `onPropertiesChanged`). Without it the hash found the entry for a
-  list holding a vector and the verification then threw the node away, which is the same silent miss
-  arriving one step later. Hash and equality are one decision made in two places
-  ([INDEX.md §3.2](INDEX.md)).
-
-**Verified by**: `IndexKeyTest` (equal `float[]`s, lists holding one, unnamed array shapes, and the
-numeric normalisation that was already there); `IndexTest.testAVectorPropertyIsFoundByItsValue` — which
-also asserts that create-then-delete puts `labelIndexSize()` and `propertyIndexSize()` back where they
-started — plus the list and update variants; `UniqueConstraintTest.testADuplicateVectorIsRefused`; and
-`ReferenceModelTest`, whose random workload now writes a vector property drawn from a small pool, so
-the differential comparison covers vector lookups over thousands of operations across rollbacks,
-crashes, a compaction and `verify(FULL)`. Reverting the `float[]` branch to the identity hash fails
-three of its four tests, which is the check that the workload has teeth.
-
----
-
-## IDX-2 — push the type filter into adjacency for materialised entries
-
-**Priority P1. Done.** The 14 type bits of a materialised adjacency entry were zero, so a
-type-filtered traversal over a supernode had to read a relationship record before it could decide
-whether the edge was even a candidate — one random 64 byte read per edge, for a query that may return
-nothing. The entry now caches its type, and the filter runs off the entry's own bits, so the read is
-paid **once per surviving candidate**.
-
-**The tombstone was the constraint that made this delicate.** `TOMBSTONE == -1L` was unreachable
-precisely *because* a materialised entry always carried type 0, so `dir=3, type=MAX_TYPE` could not
-be produced. `pack` now rejects exactly that one combination instead — a materialised entry may cache
-any type but `MAX_TYPE` — which keeps the tombstone unreachable through the constructors, caps the
-fast path at 16,382 distinct types, and needs no new bits.
-
-**No format version bump.** Type id `0` is reserved as "not recorded" alongside `MAX_TYPE`, which
-costs nothing: `Catalog` already hands out 0 for an unknown label, so no relationship has type 0. An
-older store's entries all hold zero, which under the new reading means what it meant then — read the
-record. Three rules follow, and each is a way this could have silently lost an edge:
-
-- **A zero is never a mismatch.** `PackedEdge.excludedByType` refuses to filter out a materialised
-  entry that caches no type. A false positive costs the record read that used to be unconditional; a
-  false negative drops a real edge from an answer.
-- **Deletion matches by relationship, not by value.** `AdjacencyStore.removeMaterialised` compares
-  through `PackedEdge.TYPE_AGNOSTIC_MASK`, because the entry on disk may hold either shape and
-  `deleteRelationship` builds only one of them. Matching exact bits would have left every older
-  entry behind as dangling adjacency — visible only later, as a `verify(FULL)` failure.
-- **A stale cache is corruption.** `InvariantChecker` compares every cached type against its record.
-
-**What it does not fix.** Direction still comes from the record: the 48 bit field holds the
-relationship's location rather than the neighbour's, so `outgoing = relFrom == fromNodeId` is not
-answerable from the entry and `Direction.OUT` with no type filter still reads every record. That is
-the right trade — the type filter is the selective one.
-
-**A note for [IDX-3](#idx-3--block-skipping-on-the-read-path)**: an entry that caches no type
-contributes bit 0 to its block's `type_bitmap`, not the bit of its real type. Block skipping on the
-read path must not skip on that bitmap alone for a chain that may hold pre-IDX-2 entries
-([RELATIONSHIP_STORAGE.md §8](RELATIONSHIP_STORAGE.md)).
-
-**Verified by**: `ReadBudgetTest.testATypeFilteredSupernodeReadsOnlyTheSurvivingRelationships`, which
-counts `Kind.REL` record touches for a filter matching 5 of 5,005 materialised edges on one node — 20
-touches, against 10,020 with the caching reverted, and against the unfiltered scan that still resolves
-every entry. `PackedEdgeTest` round-trips a cached type, pins both uncacheable type ids to the
-fallback, and asserts the tombstone is still unreachable through every constructor including the new
-one. `AdjacencyTierTest` covers the entry shape, the pre-IDX-2 shape traversing, filtering and
-deleting, and the stale cache that `verify(FULL)` must reject.
-
----
-
-## IDX-3 — block skipping on the read path
-
-**Priority P1, and the cheapest item on this list.** `AdjacencyBlock` already maintains a
-`type_bitmap` and `min_location` / `max_location` per block, updated on every append. Nothing on the
-read path consults them:
-
-- `mayContainType` has exactly one caller, `AdjacencyStore.remove`.
-- `mayContainLocation` has **no callers at all**.
-
-`AdjacencyStore.edges(nodeId)` walks the whole chain and decodes every block unconditionally.
-[RELATIONSHIP_STORAGE.md §10](RELATIONSHIP_STORAGE.md) already lists "Type-bitmap skipping on the read
-path" as unchecked; this is that item.
-
-**Shape.** A filtered variant, `edges(nodeId, Set<Integer> typeIds)`, which skips a block when the
-bitmap says no type in the filter can be present, and a `hasEdge(a, b)` that uses `mayContainLocation`
-to skip blocks that cannot reference the target — which is the operation
-[RELATIONSHIP_STORAGE.md §5.3](RELATIONSHIP_STORAGE.md) claims is `O(log blocks)` and which does not
-exist in the code at all.
-
-**Two honest limits.** The bitmap is 64 bits over `typeId & 63`, so past ~64 distinct types the
-false-positive rate makes skipping worth little; and skipping only pays on a *chain*, which starts
-above one page — roughly 8,000 entries. Below that there is one block and nothing to skip. So this is
-a supernode optimisation and has to be measured as one.
-
-**There is nothing to measure it with.** [RELATIONSHIP_STORAGE.md §9](RELATIONSHIP_STORAGE.md) lists
-`SupernodeTest` ("assert that a filtered scan on a rare type skips at least 90 percent of blocks") and
-`TraversalCostTest` ("an instrumented `IoEngine` counting device reads"), and neither class exists —
-§9 is a statement of intent whose names were never reconciled with the tree. The behaviour is covered
-elsewhere under other names (`AdjacencyTierTest`, `SpaceEfficiencyTest`, `SupernodeBenchmark`), but
-**block-read counting is not covered anywhere**, which is why nobody has noticed that the read path
-ignores the bitmap. Build the counting harness first; it is the deliverable IDX-2 and IDX-4 also need.
-
-**Done when**: a type-filtered traversal over a chain reads only the blocks whose bitmap admits the
-type, counted by an instrumented `IoEngine`; `mayContainLocation` has a caller; `hasEdge` exists or
-§5.3's `O(log blocks)` claim is corrected; §9's test list matches the classes that exist.
 
 ---
 
@@ -219,18 +73,20 @@ class and does not exist. The Cypher layer already has the right shape to consum
 and `forEachNodeWhile` exist precisely because "a scan of ten million nodes must not become a list of
 ten million rows", and the same argument applies one level down.
 
-**Interaction with the other three.** IDX-2 and IDX-3 reduce how much work each entry costs; IDX-4
-reduces how many entries are touched at all when the query stops early. IDX-2 is done; do IDX-3 next
-(it is small and the cursor should be built on the filtered path), then IDX-4. The cursor must apply
-the entry-level type filter IDX-2 added, which is `PackedEdge.excludedByType` — a cursor that
-re-derives the rule is a second place to get the "type 0 means not cached" case wrong.
+**Build it on the filtered path.** IDX-3 is done and reduced how many blocks are decoded; IDX-4
+reduces how many entries are touched at all when the query stops early. The cursor should walk the
+chain the way `AdjacencyStore.edges(nodeId, typeIds)` does — consulting `admitsAnyType` per block —
+rather than duplicating that walk, and it must apply the entry-level type filter through
+`PackedEdge.excludedByType` and not re-derive the rule: a second implementation is a second place to
+get "type 0 means not cached" wrong, and that mistake silently drops edges
+([RELATIONSHIP_STORAGE.md §3.1](RELATIONSHIP_STORAGE.md)).
 
 **Watch the read view.** `neighbours` runs inside `read(...)`, which may take the optimistic path and
 re-run the body. A cursor that outlives the call cannot do that — it needs the latch held outright,
 the way `forEachNodeWhile` uses `runRead` and documents why ("the consumer has side effects").
 
-**Done when**: IDX-3's read-counting harness shows a `LIMIT 1` over a degree-10^6 node reading one
-block; `neighbours(...)` is expressed in terms of the cursor rather than duplicating it.
+**Done when**: the read-counting harness shows a `LIMIT 1` over a degree-10^6 node reading one block;
+`neighbours(...)` is expressed in terms of the cursor rather than duplicating it.
 
 ---
 
@@ -322,7 +178,9 @@ value = nodeId
 
 Collisions are already survivable: `nodesByProperty` verifies every candidate against the stored
 property, and a composite lookup verifies the label as well. The verification is what makes hashing
-safe, and it is the same argument [INDEX.md §3.2](INDEX.md) makes for the property tree.
+safe, and it is the same argument [INDEX.md §3.2](INDEX.md) makes for the property tree — including
+the part that bites: the verification has to use `IndexCatalog.valueEquals`, the partner of
+`valueHash`, and not `Objects.deepEquals`.
 
 **Declaration, not implicit maintenance.** The two existing trees index everything automatically. A
 composite index must be *declared* — there are `labels × keys` possible pairs and indexing them all
@@ -385,15 +243,32 @@ rather than the result; the numbers are exposed on `StoreStats` so an operator c
 
 ## IDX-9 — vector data
 
-**Priority P3, explored in [VECTOR.md](VECTOR.md).** Vectors are already storable —
-`ValueCodec.T_VECTOR_F32`, blob-escaped, `Properties.getVector` — and nothing indexes one, which
-[INDEX.md §11](INDEX.md) lists as "Full text, spatial, vector". The short version of the separate
-file: an ANN index is a *declared* index over a `(label, property key)` pair, which makes it the same
-declaration machinery as IDX-7 and a completely different structure underneath, because nearest
-neighbour is not a prefix scan and no B+tree answers it.
+**Priority P1, in progress. The design and the stage list live in [VECTOR.md](VECTOR.md); this entry
+is a pointer, not a second copy.**
 
-IDX-1 is a prerequisite in the narrow sense that it decides what an equality lookup on a vector
-property even means today.
+Vectors were already storable — `ValueCodec.T_VECTOR_F32`, `Properties.getVector` — and an
+*exact-equality* lookup on one works, because the property tree hashes it by content
+([INDEX.md §3.2](INDEX.md)). What nothing did is nearest neighbour, which
+[INDEX.md §11](INDEX.md) lists as "Full text, spatial, vector".
+
+The decision is **HNSW**, in six stages ([VECTOR.md §7](VECTOR.md)). Two things about it belong here
+rather than only there, because they land on this file's subject matter:
+
+- **It is a declared index**, which makes it the same declaration machinery as
+  [IDX-7](#idx-7--composite-label-property-indexes) — a list on the catalog page past the unique-key
+  list, a backfill scan, and the `initialised()` re-derivation so that absence reads as "not declared"
+  rather than "corrupt". IDX-7 is no longer a prerequisite for it, but the two should share that
+  machinery rather than grow two of it.
+- **It needs both hooks to carry both halves of a node.** `onLabelsChanged` gets no properties and
+  `onPropertiesChanged` gets no labels, so a `(label, key)` index cannot maintain itself from either
+  one alone. The fix planned is a property loader and a label loader on `IndexCatalog`, wired in the
+  `GraphStoreImpl` constructor and never called when nothing is declared — which is worth knowing
+  before anybody widens those signatures for another reason.
+
+**Stage 1 is built**: the three `vector.*` Cypher functions, the parser fold that lets a namespaced
+name exist at all, `GraphStore.nearestByScan` — the exact answer an approximate index gets measured
+against — and a bound on the vector dimension in `ValueCodec`, which was the last unchecked length
+field in the property codec.
 
 ---
 
@@ -409,5 +284,18 @@ property even means today.
 
 ---
 
-_Git HEAD revision: `3a05a2a`_
-_Last updated: 2026-08-16_
+## 3. Closed
+
+The reasoning moved with the work; this is only the ledger, so that a spec still linking to one of
+these ids leads somewhere.
+
+| # | Task | Where it lives now |
+|---|---|---|
+| IDX-1 | A `float[]` property was indexed under its identity hash, so an equality lookup missed, a delete left the entry dangling and a unique constraint never fired. Fixed by hashing arrays and lists by content, with `IndexCatalog.valueEquals` as the matching verification | [INDEX.md §3.2](INDEX.md); tests in [TESTING.md](TESTING.md); the vectors-stay-in-the-property-tree decision it forced in [VECTOR.md §1.3](VECTOR.md) |
+| IDX-2 | A type-filtered supernode traversal read one 64 byte relationship record per *edge* to learn the type it was filtering on. Fixed by caching the type in the materialised adjacency entry, with `0` reserved for "not cached" so no format version bump was needed | [RELATIONSHIP_STORAGE.md §3.1](RELATIONSHIP_STORAGE.md) (and §6.2 for the tombstone argument, §8 for the three rules); budget in [TESTING.md §7](TESTING.md) |
+| IDX-3 | The `type_bitmap` and `min/max_location` a block maintains on every append were read only by the delete path, so a type-filtered scan of a supernode decoded every block of the chain and `hasEdge(a, b)` did not exist at all. Fixed by `edges(nodeId, typeIds)` and `hasEdge`, with two header flags saying when either summary may be trusted to rule something out — the bitmap under-describes a block holding an entry that caches no type, and the range mixes two address spaces in a block holding a materialised one. The saving is in blocks *decoded*; §5.3 says why it cannot be in blocks read, and corrects the O(log blocks) claim the section used to make | [RELATIONSHIP_STORAGE.md §5, §5.3, §6.4](RELATIONSHIP_STORAGE.md) (and §8 for the two skip rules); budget in [TESTING.md §7](TESTING.md) |
+
+---
+
+_Git HEAD revision: `8f178b4`_
+_Last updated: 2026-08-16 (IDX-3 closed out; §1's cost table and IDX-4's order-of-work note follow it)_

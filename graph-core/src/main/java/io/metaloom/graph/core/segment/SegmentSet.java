@@ -125,6 +125,11 @@ public final class SegmentSet implements AutoCloseable {
 		}
 	}
 
+	/** The store's counters, or null before {@link #counters(IoCounters)} has wired them. */
+	public IoCounters counters() {
+		return counters;
+	}
+
 	/** Points every segment, present and future, at the store's counters. */
 	public void counters(IoCounters counters) {
 		this.counters = counters;
