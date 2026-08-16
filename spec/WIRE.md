@@ -38,7 +38,7 @@ to the framing; it also names the one thing the losing arm did better, which sha
 | The **encoded payload** | **This.** Rows encode and flush in batches; neither end builds the whole result |
 | The **client's** memory | **This.** §5 |
 | **Time to first row** | **This.** The first batch goes out after ~64 KiB or 20 ms, not after the last row is found |
-| The executor's intermediate `List<Row>` | **Not this.** The engine is clause-at-a-time over a list, so a query's peak *server* memory is still its widest intermediate result. See [CYPHER.md](CYPHER.md) |
+| The executor's intermediate `List<Row>` | **Now bounded for a query whose every clause streams** — the executor pushes rows through to this transport instead of building a list, and a `LIMIT` reaches the scan. For anything with `ORDER BY`, `DISTINCT`, an aggregate, `RETURN *` or `UNION`, the peak *server* memory is still the widest intermediate result. [CYPHER.md §7.1](CYPHER.md) |
 | A **write** query | **Nothing streams.** Its rows are produced, its transaction commits, and only then does the first byte go out — §4.1 |
 
 `ORDER BY`, `DISTINCT`, aggregation and `UNION` buffer their whole input whatever the protocol does.

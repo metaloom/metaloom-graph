@@ -48,4 +48,22 @@ public interface QueryAbort {
 			? "the query exceeded its " + budgetMillis + " ms budget and was abandoned"
 			: null;
 	}
+
+	/**
+	 * Stops for whichever of two reasons arrives first.
+	 *
+	 * <p>
+	 * A query normally has one bound — its deadline — and gains a second when the server is shutting down. Composing
+	 * them here rather than at each call site keeps the engine's side unchanged: it still consults one signal.
+	 * </p>
+	 */
+	default QueryAbort or(QueryAbort other) {
+		if (other == NEVER) {
+			return this;
+		}
+		return () -> {
+			String reason = abortReason();
+			return reason != null ? reason : other.abortReason();
+		};
+	}
 }

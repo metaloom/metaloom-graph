@@ -104,9 +104,15 @@ public final class GraphServer implements AutoCloseable {
 	private final boolean allowWrite;
 	/** Past this, a query is abandoned rather than allowed to hold a worker thread and a read view indefinitely. */
 	private final long queryTimeoutMillis;
+	/** How long an abandoned query is given to unwind before the stores are closed regardless. */
+	private static final long ABORT_UNWIND_MILLIS = 2_000;
 	private HttpServer server;
 	/** Set by {@link #main} when the binary port is on, so that one shutdown hook closes both front ends. */
 	private WireServer wire;
+	/** Set once shutdown begins: new queries are refused rather than accepted and then abandoned. */
+	private final java.util.concurrent.atomic.AtomicBoolean closing = new java.util.concurrent.atomic.AtomicBoolean();
+	/** Queries on a worker thread right now. The store may not be closed while this is above zero. */
+	private final java.util.concurrent.atomic.AtomicInteger inFlight = new java.util.concurrent.atomic.AtomicInteger();
 
 	public GraphServer(GraphDatabases databases) {
 		this(databases, GraphDatabases.DEFAULT_NAME);
@@ -189,7 +195,9 @@ public final class GraphServer implements AutoCloseable {
 			server.wire = wire;
 		}
 
-		Runtime.getRuntime().addShutdownHook(new Thread(server::closeQuietly));
+		// Named, because a thread dump taken during a slow shutdown should say what is holding it. The hook is the
+		// only shutdown path for a server killed with SIGTERM, which is how every container runtime stops one.
+		Runtime.getRuntime().addShutdownHook(new Thread(server::closeQuietly, "graph-server-shutdown"));
 	}
 
 	/**
@@ -286,16 +294,29 @@ public final class GraphServer implements AutoCloseable {
 			return;
 		}
 
+		if (closing.get()) {
+			// 503 with Connection: close, so a client behind a load balancer is taken out of rotation rather than
+			// retried onto a server that is going away.
+			context.response().putHeader("connection", "close");
+			fail(context, 503, "shutdown", "The server is shutting down and is not accepting queries");
+			return;
+		}
+
 		String database = nameFor(context);
 
 		// executeBlocking, because a query is bounded by the data rather than by the request. Unordered, so two
 		// queries from one browser do not serialise behind each other.
+		inFlight.incrementAndGet();
 		vertx.<JsonObject>executeBlocking(() -> {
 			long started = System.nanoTime();
 			QueryAbort deadline = queryTimeoutMillis <= 0
 				? QueryAbort.NEVER
 				: QueryAbort.deadline(started + TimeUnit.MILLISECONDS.toNanos(queryTimeoutMillis),
 					queryTimeoutMillis);
+			// Composed rather than replaced: a query keeps its own budget and gains a second reason to stop. Without
+			// this a query with --query-timeout=0 would hold the store open for as long as it liked, and the shutdown
+			// would have nothing to do but wait for it.
+			deadline = deadline.or(this::shutdownReason);
 			// The streaming form even though this route materialises anyway: it is the one path through the engine,
 			// and it is the only one that can be stopped. `executeBlocking` cannot interrupt a task that has started,
 			// so without a cooperative check a timeout here would abandon the answer while the scan kept its thread
@@ -313,8 +334,14 @@ public final class GraphServer implements AutoCloseable {
 				}
 			}
 			return ResultJson.of(result, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
-		}, false).onSuccess(json -> context.json(json))
+		}, false).onComplete(outcome -> inFlight.decrementAndGet())
+			.onSuccess(json -> context.json(json))
 			.onFailure(error -> respondToFailure(context, error));
+	}
+
+	/** Why a running query should stop once shutdown has begun, or null while the server is up. */
+	private String shutdownReason() {
+		return closing.get() ? "the server is shutting down" : null;
 	}
 
 	/** Gathers a streamed result back into the materialised one this route answers with. */
@@ -575,24 +602,92 @@ public final class GraphServer implements AutoCloseable {
 
 	@Override
 	public void close() throws IOException {
+		shutdown(WireServer.DEFAULT_GRACE_MILLIS);
+	}
+
+	/**
+	 * Stops serving, lets running queries finish, and only then closes the stores.
+	 *
+	 * <p>
+	 * <b>The order is the safety property.</b> A store's segments are memory-mapped, and closing one unmaps them — so a
+	 * worker still inside a query at that moment is reading an address the process no longer owns. Refusing new work
+	 * first is what makes the set of in-flight queries shrink; waiting is what lets it reach zero; and the abort signal
+	 * is what stops a query with no deadline from holding the process open indefinitely, which would turn a shutdown
+	 * into a hang and get the server killed with {@code -9} instead.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>Nothing committed is at risk regardless.</b> The log is fsynced before any data file is touched, so a write
+	 * interrupted at any instant either committed or did not. What this buys is not durability — that is the log's job —
+	 * but a clean close: a checkpoint written, the log trimmed, the {@code LOCK} released, and no client left holding a
+	 * half-sent result with no explanation.
+	 * </p>
+	 *
+	 * <p>
+	 * Idempotent, because it is reachable from both the shutdown hook and an ordinary {@code close()} and a JVM exiting
+	 * on a signal runs both.
+	 * </p>
+	 */
+	public void shutdown(long graceMillis) throws IOException {
+		if (!closing.compareAndSet(false, true)) {
+			return;
+		}
 		if (wire != null) {
-			// Before the Vert.x it shares, and before the store both are reading.
-			wire.close();
+			// First, and with the same grace period: it holds worker threads of its own against the same stores.
+			wire.shutdown(graceMillis);
 		}
 		if (server != null) {
+			// After the flag, so anything accepted in between is refused with 503 rather than served and then cut off.
 			server.close().toCompletionStage().toCompletableFuture().join();
 		}
+
+		if (!awaitQuiet(graceMillis)) {
+			logger.warn("Shutting down with {} quer{} still running after {} ms; abandoning {}", inFlight.get(),
+				inFlight.get() == 1 ? "y" : "ies", graceMillis, inFlight.get() == 1 ? "it" : "them");
+			// The signal is already composed into every running query's abort. Give them a moment to notice it and
+			// unwind — each one closes its own read view or rolls back its own transaction on the way out.
+			if (!awaitQuiet(ABORT_UNWIND_MILLIS)) {
+				logger.warn("{} quer{} did not unwind; closing the stores anyway", inFlight.get(),
+					inFlight.get() == 1 ? "y has" : "ies have");
+			}
+		}
+
 		vertx.close().toCompletionStage().toCompletableFuture().join();
 		if (ownsDatabases) {
+			// Last. Every reader is gone by now, or has been given every chance to be.
 			databases.close();
 		}
 	}
 
+	/** @return true once no query is on a worker thread, false if the deadline passed first */
+	private boolean awaitQuiet(long millis) {
+		long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(millis);
+		while (inFlight.get() > 0) {
+			if (System.nanoTime() - deadline >= 0) {
+				return false;
+			}
+			java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
+		}
+		return true;
+	}
+
+	/** Whether this server has begun shutting down, and is therefore refusing new queries. */
+	public boolean isClosing() {
+		return closing.get();
+	}
+
 	private void closeQuietly() {
 		try {
+			logger.info("Shutting down: refusing new queries, then waiting up to {} ms for the running ones",
+				WireServer.DEFAULT_GRACE_MILLIS);
 			close();
+			logger.info("Shutdown complete; every store is checkpointed and unlocked");
 		} catch (IOException e) {
+			// Logged rather than rethrown: an exception out of a shutdown hook is printed by the JVM with no context
+			// and stops the remaining hooks from running.
 			logger.warn("Shutdown was not clean", e);
+		} catch (RuntimeException e) {
+			logger.warn("Shutdown failed", e);
 		}
 	}
 }

@@ -242,6 +242,39 @@ acknowledged commit is present.
 
 ---
 
+## 8.9 Shutting down
+
+`SIGTERM`, or a `close()`, runs an ordered shutdown rather than stopping where it is:
+
+1. new queries are refused — **503** on HTTP, `OVERLOADED` on the wire — so the set of in-flight ones
+   can only shrink;
+2. the listeners close;
+3. running queries are given **5 seconds** to finish;
+4. whatever is left is **abandoned** through the same abort signal a query deadline uses, so each one
+   unwinds, closes its own read view or rolls back its own transaction, and tells its client why;
+5. two more seconds for those to unwind, and then the stores are closed — checkpointed, log trimmed,
+   `LOCK` released.
+
+**The order is a safety property, not politeness.** Segment files are memory-mapped, so closing a store
+unmaps them; a worker still inside a query at that instant is reading an address the process no longer
+owns. Refusing, draining and aborting is what makes that impossible.
+
+**Step 4 is why a shutdown always completes.** A query with `--query-timeout=0`, or one whose client
+stopped reading, would otherwise hold the process open indefinitely — and a shutdown that does not
+finish is indistinguishable from a hang, which is what gets a server `kill -9`'d and loses the clean
+close entirely. `graph-server-shutdown` is the hook's thread name, so a thread dump during a slow one
+says what is holding it.
+
+**Durability does not depend on any of this.** The log is fsynced before any data file is touched, so a
+write interrupted at any instant — graceful, killed, or power-cut — either committed or did not. What a
+clean shutdown buys is a checkpoint written and the log trimmed, so the next start does less recovery
+work, and clients told what happened instead of a socket closing under them.
+
+`GraphStore.close()` takes the writer lock, so it can never run beside a half-applied commit even when
+a caller closes a store directly.
+
+---
+
 ## 9. Security Posture
 
 **A store directory is untrusted input.** The format parsers are hardened against a corrupt or hostile file:

@@ -9,6 +9,7 @@ import java.util.Map;
 import java.util.Set;
 
 import io.metaloom.graph.cypher.CypherStats;
+import io.metaloom.graph.cypher.RowSink;
 import io.metaloom.graph.cypher.ast.Ast;
 import io.metaloom.graph.cypher.func.Functions;
 
@@ -63,6 +64,221 @@ public final class QueryExecutor {
 		}
 		// One Writer serves every part, so the counters are the query's rather than the last part's.
 		return new Result(result.columns(), result.rows(), writer.stats());
+	}
+
+	// ---------------------------------------------------------------- the streaming path
+
+	/**
+	 * Runs a query straight into a sink, without ever holding its rows.
+	 *
+	 * <p>
+	 * Only when every clause of a single-part query streams — see {@link #streams}. Otherwise this materialises through
+	 * {@link #run} and pushes the result, which is what the whole engine did before this path existed, so the fallback
+	 * is not a degraded mode but the previous one.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>What this buys, and what it does not.</b> It bounds what the <em>executor</em> holds for the queries it
+	 * covers, and it lets a {@code LIMIT} stop the scan — which is a change in complexity, not a constant factor: ten
+	 * rows out of ten million nodes stops after ten. It does nothing for {@code ORDER BY}, {@code DISTINCT},
+	 * aggregation or {@code UNION}, which need their whole input by definition, and nothing for a write, which
+	 * materialises so that it can commit before delivering a row.
+	 * </p>
+	 */
+	public void stream(Ast.Query query, RowSink sink) {
+		if (query.parts().size() != 1 || !streams(query.parts().get(0))) {
+			Result result = run(query);
+			sink.columns(result.columns());
+			for (List<Object> row : result.rows()) {
+				if (!sink.row(row)) {
+					return;
+				}
+			}
+			sink.stats(result.stats());
+			return;
+		}
+
+		List<Ast.Clause> clauses = query.parts().get(0).clauses();
+		Ast.Return last = (Ast.Return) clauses.get(clauses.size() - 1);
+		List<String> columns = columnsOf(last.projection());
+		sink.columns(columns);
+
+		Row seed = new Row();
+		push(clauses, 0, seed, new Stage[clauses.size()], row -> {
+			List<Object> values = new ArrayList<>(columns.size());
+			for (String column : columns) {
+				values.add(row.get(column));
+			}
+			return sink.row(values);
+		});
+		// A read changes nothing, and only a read reaches here.
+		sink.stats(CypherStats.NONE);
+	}
+
+	/**
+	 * Whether every clause of this part can be run as a push stage.
+	 *
+	 * <p>
+	 * All or nothing rather than the longest streaming prefix. A blocking clause buffers its whole input whatever runs
+	 * above it, so pushing only the prefix would bound nothing — the one thing it could still buy is an early stop, and
+	 * a {@code LIMIT} before a blocking clause is rare enough not to be worth a second execution shape.
+	 * </p>
+	 */
+	private static boolean streams(Ast.SingleQuery part) {
+		List<Ast.Clause> clauses = part.clauses();
+		if (clauses.isEmpty() || !(clauses.get(clauses.size() - 1) instanceof Ast.Return)) {
+			return false;
+		}
+		for (Ast.Clause clause : clauses) {
+			boolean ok = switch (clause) {
+				case Ast.Match ignored -> true;
+				case Ast.Unwind ignored -> true;
+				case Ast.With with -> streams(with.projection());
+				case Ast.Return returning -> streams(returning.projection());
+				// A write materialises so that it can commit before a row is delivered, and its eager semantics come
+				// from the executor holding each clause's whole input. Pushing one would take both away silently.
+				case Ast.Create ignored -> false;
+				case Ast.SetClause ignored -> false;
+				case Ast.Remove ignored -> false;
+				case Ast.Delete ignored -> false;
+			};
+			if (!ok) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * A projection streams when its output does not depend on rows it has not seen.
+	 *
+	 * <p>
+	 * {@code ORDER BY} and {@code DISTINCT} need the whole input by definition, and so does an aggregate. {@code *}
+	 * looks harmless and is not: the star's column set is the union of the variable names across <em>every</em> row, so
+	 * the header cannot be written until the last row has been read — and the header goes out first.
+	 * </p>
+	 */
+	private static boolean streams(Ast.Projection projection) {
+		return !projection.star() && !projection.distinct() && projection.order().isEmpty()
+			&& !hasAggregate(projection.items());
+	}
+
+	private static List<String> columnsOf(Ast.Projection projection) {
+		List<String> columns = new ArrayList<>(projection.items().size());
+		for (Ast.ProjectionItem item : projection.items()) {
+			columns.add(item.alias());
+		}
+		return columns;
+	}
+
+	/** SKIP and LIMIT for one projection stage, resolved once, which is the only state a push stage carries. */
+	private static final class Stage {
+
+		private final long skip;
+		private final long limit;
+		private long skipped;
+		private long emitted;
+
+		Stage(long skip, long limit) {
+			this.skip = skip;
+			this.limit = limit;
+		}
+	}
+
+	/**
+	 * Runs one clause and hands each row it produces to the rest of the chain.
+	 *
+	 * <p>
+	 * Recursive over the clause list rather than a composed chain of lambdas, because a stage needs its index to find
+	 * its own SKIP and LIMIT counters, and because the stack this builds is one frame per clause — a depth set by the
+	 * query text, not by the data.
+	 * </p>
+	 *
+	 * @return false as soon as anything downstream has had enough
+	 */
+	private boolean push(List<Ast.Clause> clauses, int index, Row row, Stage[] stages, RowConsumer out) {
+		if (index == clauses.size()) {
+			return out.accept(row);
+		}
+		RowConsumer next = downstream -> push(clauses, index + 1, downstream, stages, out);
+
+		return switch (clauses.get(index)) {
+			case Ast.Match match -> matcher.match(match.pattern(), row,
+				matched -> !keeps(matched, match.where()) || next.accept(matched));
+			case Ast.Unwind unwind -> {
+				Object value = evaluator.evaluate(unwind.expression(), row);
+				if (value == null) {
+					// UNWIND null produces no rows, which is not the same as producing one null row.
+					yield true;
+				}
+				if (!(value instanceof List<?> list)) {
+					throw new CypherTypeException("UNWIND expects a list but got " + Values.typeName(value));
+				}
+				for (Object element : list) {
+					if (!next.accept(row.with(unwind.variable(), element))) {
+						yield false;
+					}
+				}
+				yield true;
+			}
+			// The WHERE goes *into* the projection stage rather than after it, because the list path filters before
+			// it slices: WITH n WHERE n.x > 5 LIMIT 3 means three of the rows that passed, not however many of the
+			// first three did. Applying them the other way round is a wrong answer that throws nothing.
+			case Ast.With with -> project(row, with.projection(), with.where(), stages, index, next);
+			case Ast.Return returning -> project(row, returning.projection(), null, stages, index, next);
+			default -> throw new IllegalStateException("Not a streaming clause: " + clauses.get(index));
+		};
+	}
+
+	/**
+	 * Projects one row and applies SKIP and LIMIT to it.
+	 *
+	 * <p>
+	 * The counters are per stage and survive across rows, which is what makes {@code SKIP 10 LIMIT 5} mean the same
+	 * thing here as it does over a list. Returning false at the limit is what reaches the scan.
+	 * </p>
+	 */
+	private boolean project(Row row, Ast.Projection projection, Ast.Expr where, Stage[] stages, int index,
+		RowConsumer out) {
+		Stage stage = stages[index];
+		if (stage == null) {
+			// SKIP and LIMIT are evaluated against an empty row in the list path, so they cannot depend on the data —
+			// which means once per stage rather than once per row.
+			stage = stages[index] = new Stage(
+				projection.skip() == null ? 0 : positive(projection.skip(), "SKIP"),
+				projection.limit() == null ? Long.MAX_VALUE : positive(projection.limit(), "LIMIT"));
+		}
+		if (stage.limit == 0) {
+			return false;
+		}
+
+		Row projected = new Row();
+		for (Ast.ProjectionItem item : projection.items()) {
+			projected = projected.with(item.alias(), evaluator.evaluate(item.expression(), row));
+		}
+		// The source row stays underneath, exactly as the list path does it, so a later clause can still see what an
+		// earlier one bound.
+		projected = row.merge(projected);
+
+		// Before the counters: a row the WHERE drops was never one of the rows SKIP and LIMIT are counting.
+		if (!keeps(projected, where)) {
+			return true;
+		}
+		if (stage.skipped < stage.skip) {
+			stage.skipped++;
+			return true;
+		}
+		if (!out.accept(projected)) {
+			return false;
+		}
+		// Checked after emitting rather than before, so the row that reaches the limit is still delivered and the one
+		// after it is never produced.
+		return ++stage.emitted < stage.limit;
+	}
+
+	private boolean keeps(Row row, Ast.Expr where) {
+		// A predicate that evaluates to null drops the row, exactly as false does. See Values.isTrue.
+		return where == null || Values.isTrue(evaluator.evaluate(where, row));
 	}
 
 	private Result runSingle(Ast.SingleQuery query) {

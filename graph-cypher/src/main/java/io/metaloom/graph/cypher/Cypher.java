@@ -137,15 +137,50 @@ public final class Cypher {
 		// of this query would be worse than being refused.
 		ReadTransaction view = store.hasReadTransaction() ? null : store.beginRead();
 		try {
-			QueryExecutor.Result result = new QueryExecutor(new GraphAccess(store, abort), parameters).run(parsed);
 			// Inside the try, so the sink sees every row while the view it was read under is still open. A sink that
 			// stops early simply ends the loop; that is an outcome, and the finally still closes the view.
-			deliver(result, sink, abort);
+			new QueryExecutor(new GraphAccess(store, abort), parameters).stream(parsed, abortChecking(sink, abort));
 		} finally {
 			if (view != null) {
 				view.close();
 			}
 		}
+	}
+
+	/**
+	 * Wraps a sink so the abort signal is consulted between rows as well as inside the scan.
+	 *
+	 * <p>
+	 * Both are needed and neither replaces the other. {@link GraphAccess} checks while it reads, which is what stops a
+	 * scan that has not produced a row yet; this checks while rows flow, which is what stops a query whose remaining
+	 * cost is in the sink rather than in the store.
+	 * </p>
+	 */
+	private static RowSink abortChecking(RowSink sink, QueryAbort abort) {
+		if (abort == QueryAbort.NEVER) {
+			return sink;
+		}
+		return new RowSink() {
+
+			@Override
+			public void columns(List<String> columns) {
+				sink.columns(columns);
+			}
+
+			@Override
+			public boolean row(List<Object> values) {
+				String reason = abort.abortReason();
+				if (reason != null) {
+					throw new QueryAbortedException(reason);
+				}
+				return sink.row(values);
+			}
+
+			@Override
+			public void stats(CypherStats stats) {
+				sink.stats(stats);
+			}
+		};
 	}
 
 	/**
@@ -187,6 +222,7 @@ public final class Cypher {
 				txn.commit();
 			}
 			deliver(result, sink, abort);
+			// Nothing streams here by design; see the javadoc above.
 		} catch (IOException e) {
 			throw new UncheckedIOException(e);
 		} finally {

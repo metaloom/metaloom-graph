@@ -292,10 +292,32 @@ that a steal policy cannot be made correct over a `MAP_SHARED` mapping.
       overlay, so an index probe inside `MERGE` sees rows the same statement created and the
       lock-and-retry dance other engines need does not arise
 
-**A constraint on the pending Stage 3 lazy executor prefix**: a push pipeline must never carry a write
-clause. The write clauses get openCypher's eager semantics for free from the executor materialising each
-clause — `MATCH (n) CREATE (:Copy)` structurally cannot feed the scan driving it — and a lazy prefix
-would take that away silently.
+**The constraint on the streaming executor** (Phase 16, now built): a push pipeline must never carry a
+write clause. The write clauses get openCypher's eager semantics for free from the executor materialising
+each clause — `MATCH (n) CREATE (:Copy)` structurally cannot feed the scan driving it — and streaming one
+would take that away silently. `QueryExecutor.streams` returns false for all four, and
+`LazyExecutionTest` asserts it.
+
+### Phase 16 — The streaming executor, and shutting down
+
+- [x] `GraphStore.forEachNodeWhile(LongPredicate)` — a scan that can be told it is finished. A separate
+      name rather than an overload, because a lambda whose body returns `boolean` matches
+      `LongConsumer` and `LongPredicate` equally and every existing caller would have become ambiguous
+- [x] `RowConsumer`, and a push chain from the seed to the sink. `PatternMatcher` seeds one node at a
+      time; everything after the seed is the list-based expansion unchanged, per seed row
+- [x] Clause classification: `MATCH`, `WHERE`, `UNWIND` and a projection with no star, `DISTINCT`,
+      `ORDER BY` or aggregate. All or nothing per query part — see [CYPHER.md §7.1](CYPHER.md)
+- [x] `SKIP`/`LIMIT` as per-stage counters, with the limit's false reaching the bitmap walk
+- [x] Graceful shutdown: refuse, drain, abort, close — [OPERATIONS.md §8.9](OPERATIONS.md).
+      `QueryAbort.or` composes the shutdown reason with the query's own deadline, so a query with no
+      timeout cannot hold the process open
+- [x] `GraphStore.close()` takes the writer lock, so it cannot run beside a half-applied commit
+- [x] Tests: `LazyExecutionTest`, `ShutdownTest`, and the two paths compared cell by cell
+- [ ] **`UNION ALL` could stream and does not.** Each part would push into the same sink in turn. Not
+      done because the parts must agree on their columns, which is checked by comparing the two
+      materialised results
+- [ ] **The longest streaming *prefix*** ahead of a blocking clause. Deliberately not built: a blocking
+      clause buffers its whole input anyway, so the prefix would bound nothing
 
 ### Phase 14 — Several databases
 

@@ -27,15 +27,22 @@ import io.metaloom.graph.core.fixture.TempStore;
  *
  * <p>
  * {@link RowSink#row} returning {@code false} stops delivery, and that is all it can do. A scan of every node reaches
- * the sink <b>once, at the end</b>, because the executor produces its whole result before the first row is pushed — so
- * a server whose only stopping mechanism is the sink would let an abandoned query run to completion, holding a worker
- * thread and a read view the entire time, and would only then discover nobody wanted the answer. That is precisely the
- * failure {@code QUERY_TIMEOUT_MILLIS} was declared to prevent and, before {@link QueryAbort}, could not.
+ * the sink <b>once, at the end</b> — so a server whose only stopping mechanism is the sink would let an abandoned query
+ * run to completion, holding a worker thread and a read view the entire time, and would only then discover nobody
+ * wanted the answer. That is precisely the failure {@code QUERY_TIMEOUT_MILLIS} was declared to prevent and, before
+ * {@link QueryAbort}, could not.
  * </p>
  *
  * <p>
- * The tests below therefore care about <em>where</em> the query stops, not just that it does: the scan must be
- * interrupted part way through, with rows still unread, and the read view must be closed on the way out.
+ * A <em>streaming</em> query pushes rows as it finds them, so there the between-rows check can stop it too — but only
+ * for a query that produces rows. A blocking one ({@code ORDER BY}, {@code DISTINCT}, an aggregate) still reaches the
+ * sink exactly once, at the end, and the in-scan check is the only thing that can reach it. Both are tested below,
+ * separately, because they are different mechanisms.
+ * </p>
+ *
+ * <p>
+ * The tests therefore care about <em>where</em> the query stops, not just that it does: the scan must be interrupted
+ * part way through, with rows still unread, and the read view must be closed on the way out.
  * </p>
  */
 @Tag("unit")
@@ -81,18 +88,36 @@ public class QueryAbortTest {
 
 	@Test
 	public void testAnAbortStopsTheScanBeforeItFinishes() throws Exception {
-		// Counts how many times the signal was consulted, and says stop on the second. If the abort were only
-		// checked between rows this would never fire at all, because a full scan produces no row until it is done.
+		// ORDER BY deliberately, because it blocks: the executor has to read every row before it can sort, so nothing
+		// reaches the sink until the query is done. That makes this test about the one check that can still fire —
+		// the one inside the scan. A streaming query would be stopped by the between-rows check instead, which is a
+		// different mechanism and is covered below.
 		AtomicInteger consulted = new AtomicInteger();
 		QueryAbort abort = () -> consulted.incrementAndGet() >= 2 ? "stopped on purpose" : null;
 
 		Collecting sink = new Collecting();
 		QueryAbortedException thrown = assertThrows(QueryAbortedException.class,
-			() -> Cypher.stream(store, Cypher.parse("MATCH (n) RETURN n"), Map.of(), sink, abort));
+			() -> Cypher.stream(store, Cypher.parse("MATCH (n) RETURN n ORDER BY n.n"), Map.of(), sink, abort));
 
 		assertEquals("stopped on purpose", thrown.getMessage(), "the reason travels verbatim to whoever reports it");
 		assertTrue(sink.rows.isEmpty(), "the scan must stop during execution, before a single row was delivered");
 		assertTrue(consulted.get() >= 2, "the signal has to be consulted while the scan runs, not once around it");
+	}
+
+	@Test
+	public void testAnAbortStopsAStreamingQueryPartWayThrough() throws Exception {
+		// A streaming query does deliver rows before it is abandoned, and that is not a defect — it is what streaming
+		// is. What must hold is that it stops *part way*: an abandoned query that ran to completion first would have
+		// held its worker and its read view for the whole scan, which is the failure the signal exists to prevent.
+		AtomicInteger consulted = new AtomicInteger();
+		QueryAbort abort = () -> consulted.incrementAndGet() >= 5 ? "stopped on purpose" : null;
+
+		Collecting sink = new Collecting();
+		assertThrows(QueryAbortedException.class,
+			() -> Cypher.stream(store, Cypher.parse("MATCH (n) RETURN n.name"), Map.of(), sink, abort));
+
+		assertTrue(sink.rows.size() < NODES / 2,
+			"the query must stop well short of the " + NODES + " rows it would have produced, got " + sink.rows.size());
 	}
 
 	@Test

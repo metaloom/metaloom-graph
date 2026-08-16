@@ -10,7 +10,7 @@ SSD. The defining design constraint:
 
 ## Status
 
-Durable, transactional, indexed, compacting, hardened, with snapshot isolation for readers, an openCypher subset that reads and writes, and a browser UI. 563 Java tests, 17 in the UI and 12 in the Rust crate, plus 30 browser cases on demand.
+Durable, transactional, indexed, compacting, hardened, with snapshot isolation for readers, an openCypher subset that reads and writes, and a browser UI. 584 Java tests, 17 in the UI and 12 in the Rust crate, plus 30 browser cases on demand.
 
 | | |
 |---|---|
@@ -269,7 +269,7 @@ during `mvn clean`. `graph-server` drives `npm` on the same terms — install, b
 jar.
 
 ```bash
-mvn test              # 563 tests across five modules, the UI's own 17, and the Rust crate's 12
+mvn test              # 584 tests across five modules, the UI's own 17, and the Rust crate's 12
 mvn test -Pslow       # adds the scaling curve, the soak and the long-running reader
 mvn test -Pbench      # adds the benchmarks and the performance gates
 mvn test -Pall-tests  # everything
@@ -280,7 +280,7 @@ mvn test -Phuge -Dtest=GraphScaleBenchmark   # 10M nodes + 20M edges: 11 min, 6.
 
 | Flag | |
 |---|---|
-| `-Dnative.skip=true` | Build with no native layer at all, even where `cargo` is present, **and do not load one that an earlier build left behind**. The whole suite passes on the pure-Java path — 563 tests, 23 skipped rather than 3 — and this is how that is checked. |
+| `-Dnative.skip=true` | Build with no native layer at all, even where `cargo` is present, **and do not load one that an earlier build left behind**. The whole suite passes on the pure-Java path — 584 tests, 23 skipped rather than 3 — and this is how that is checked. |
 | `-Dui.skip=true` | Build with no browser UI, even where `npm` is present. The API is unaffected and the index page says the bundle is missing. |
 | `-Poffline` | Passes cargo's and npm's offline flags, for warm caches with no network. Pairs with `mvn -o`. |
 | `-DskipTests` | Skips the Rust and UI tests too, not only the Java ones. |

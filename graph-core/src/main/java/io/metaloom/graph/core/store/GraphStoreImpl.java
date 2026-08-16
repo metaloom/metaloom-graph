@@ -1007,10 +1007,20 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 	@Override
 	public void forEachNode(java.util.function.LongConsumer consumer) {
+		forEachNodeWhile(id -> {
+			consumer.accept(id);
+			return true;
+		});
+	}
+
+	@Override
+	public boolean forEachNodeWhile(java.util.function.LongPredicate consumer) {
 		// runRead rather than read: a scan is long, so it takes the latch outright instead of gambling on an
 		// optimistic pass it would usually lose, and it must not be run twice — the consumer has side effects.
 		try {
-			runRead(() -> segmentSets.get(Kind.NODE).forEachLiveId(consumer));
+			boolean[] complete = { true };
+			runRead(() -> complete[0] = segmentSets.get(Kind.NODE).forEachLiveIdWhile(consumer));
+			return complete[0];
 		} catch (IOException e) {
 			throw new GraphStoreException("Node scan failed", e);
 		}
@@ -1466,6 +1476,23 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 	@Override
 	public void close() throws IOException {
+		if (closed) {
+			return;
+		}
+		// The writer lock, so close can never run beside a transaction that is half applied. A commit copies its pages
+		// into the mapping under the apply lock and then reclaims; unmapping a segment part way through that is not a
+		// recoverable state, it is a segfault. Taking the lock waits for the in-flight write instead — and because the
+		// lock is reentrant, a caller closing from inside its own transaction is not deadlocked by this, it simply
+		// closes a store whose transaction is about to be rolled back by the overlay being discarded.
+		writerLock.lock();
+		try {
+			closeUnderWriterLock();
+		} finally {
+			writerLock.unlock();
+		}
+	}
+
+	private void closeUnderWriterLock() throws IOException {
 		if (closed) {
 			return;
 		}

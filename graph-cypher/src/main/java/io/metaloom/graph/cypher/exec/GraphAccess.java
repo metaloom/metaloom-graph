@@ -107,6 +107,23 @@ public final class GraphAccess {
 		});
 	}
 
+	/**
+	 * The same scan, stopped as soon as the consumer has what it needs.
+	 *
+	 * <p>
+	 * This is the whole of what {@code LIMIT} buys in the streaming pipeline: without it, ten rows out of ten million
+	 * nodes still costs ten million bitmap probes and ten million generation decodes.
+	 * </p>
+	 *
+	 * @return false if the scan was stopped early
+	 */
+	public boolean forEachNodeWhile(java.util.function.LongPredicate consumer) {
+		return store.forEachNodeWhile(id -> {
+			checkAbort();
+			return consumer.test(id);
+		});
+	}
+
 	public List<Long> nodesByLabel(String label) {
 		checkAbort();
 		return store.nodesByLabel(label);

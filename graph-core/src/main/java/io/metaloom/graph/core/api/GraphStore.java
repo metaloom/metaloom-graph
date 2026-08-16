@@ -221,6 +221,31 @@ public interface GraphStore extends AutoCloseable {
 	 */
 	void forEachNode(java.util.function.LongConsumer consumer);
 
+	/**
+	 * The same scan, stopping as soon as the predicate returns false.
+	 *
+	 * <p>
+	 * This is what makes {@code LIMIT} cost what a reader expects. Without it a query wanting ten rows out of ten
+	 * million nodes walks all ten million — the scan has no way to be told it is finished, and the limit can only be
+	 * applied to a result that has already been built.
+	 * </p>
+	 *
+	 * <p>
+	 * A predicate rather than an exception thrown from the consumer, deliberately: {@code GraphStoreImpl}'s optimistic
+	 * read path catches {@code RuntimeException} and re-runs the operation, so control flow by exception would turn an
+	 * early stop into a repeat of the scan.
+	 * </p>
+	 *
+	 * <p>
+	 * A different name rather than an overload: a lambda whose body is an expression returning {@code boolean} —
+	 * {@code id -> ids.add(id)} is the obvious one — matches {@code LongConsumer} and {@code LongPredicate} equally,
+	 * and every existing caller would have become ambiguous at the call site.
+	 * </p>
+	 *
+	 * @return false if the predicate stopped the scan, true if every live node was visited
+	 */
+	boolean forEachNodeWhile(java.util.function.LongPredicate consumer);
+
 	/** Every node carrying the label, via the label index. */
 	List<Long> nodesByLabel(String label);
 

@@ -135,6 +135,19 @@ public final class WireServer implements AutoCloseable {
 	/** How long the producer parks before asking again whether the socket has drained. */
 	private static final long PARK_NANOS = TimeUnit.MICROSECONDS.toNanos(50);
 
+	/**
+	 * How long {@link #close()} lets a running query finish before abandoning it.
+	 *
+	 * <p>
+	 * Five seconds because a shutdown has its own deadline above it — a container runtime sends SIGKILL some seconds
+	 * after SIGTERM — and a grace period longer than that one buys nothing except a less clean death.
+	 * </p>
+	 */
+	public static final long DEFAULT_GRACE_MILLIS = 5_000;
+
+	/** How long an abandoned query is given to unwind before the store is closed regardless. */
+	private static final long ABORT_UNWIND_MILLIS = 2_000;
+
 	private final Vertx vertx;
 	private final boolean ownsVertx;
 	private final GraphDatabases databases;
@@ -158,6 +171,8 @@ public final class WireServer implements AutoCloseable {
 	 * </p>
 	 */
 	private final Map<GraphStore, Semaphore> writeGates = new ConcurrentHashMap<>();
+	/** Set once shutdown begins: new queries are refused, and the ones running are given a bounded chance to finish. */
+	private final AtomicBoolean closing = new AtomicBoolean();
 
 	private NetServer server;
 
@@ -250,14 +265,88 @@ public final class WireServer implements AutoCloseable {
 
 	@Override
 	public void close() {
+		shutdown(DEFAULT_GRACE_MILLIS);
+	}
+
+	/**
+	 * Stops accepting work, lets what is running finish, and only then lets go.
+	 *
+	 * <p>
+	 * The order is the whole of it. A store's segment files are memory-mapped, and closing one unmaps them: a worker
+	 * still inside a query when that happens is not reading stale data, it is reading an address that no longer belongs
+	 * to the process. So the store may only be closed once nothing is touching it, and this is what establishes that.
+	 * </p>
+	 *
+	 * <ol>
+	 * <li>Refuse new queries, so the set of in-flight ones can only shrink.
+	 * <li>Stop accepting connections.
+	 * <li>Wait for the running queries, up to the grace period. Most finish in microseconds.
+	 * <li>Abort whatever is left through the signal the engine already consults, which unwinds each query, closes its
+	 * read view or rolls back its transaction, and sends the client a terminal frame saying why.
+	 * <li>Wait again, briefly, for those to unwind.
+	 * </ol>
+	 *
+	 * <p>
+	 * <b>Aborting rather than waiting indefinitely is the point.</b> A query with no deadline, or one whose client has
+	 * stopped reading, would otherwise hold the process open for as long as it liked — and a shutdown that does not
+	 * complete is indistinguishable from a hang, which is what makes an operator reach for {@code kill -9} and lose the
+	 * clean close entirely.
+	 * </p>
+	 *
+	 * <p>
+	 * Nothing committed is at risk either way: the log is fsynced before any data file is touched, so a write killed at
+	 * any instant either committed or did not.
+	 * </p>
+	 *
+	 * @param graceMillis
+	 *            how long a running query may take to finish before it is abandoned. Zero abandons immediately
+	 */
+	public void shutdown(long graceMillis) {
+		if (!closing.compareAndSet(false, true)) {
+			return;
+		}
 		watchdog.shutdownNow();
 		if (server != null) {
+			// After the flag, so a query admitted between the two is still refused rather than half-served.
 			server.close().toCompletionStage().toCompletableFuture().join();
 		}
+
+		if (!awaitQuiet(graceMillis)) {
+			int remaining = running.size();
+			logger.warn("Shutting down with {} quer{} still running after {} ms; abandoning {}", remaining,
+				remaining == 1 ? "y" : "ies", graceMillis, remaining == 1 ? "it" : "them");
+			for (Stream stream : running.values()) {
+				stream.abortReason = "the server is shutting down";
+				stream.abortCode = WireError.OVERLOADED;
+			}
+			// The engine consults the signal on a fraction of store touches, so unwinding is quick but not instant.
+			if (!awaitQuiet(ABORT_UNWIND_MILLIS)) {
+				logger.warn("{} quer{} did not unwind; closing anyway", running.size(),
+					running.size() == 1 ? "y has" : "ies have");
+			}
+		}
+
 		workers.close();
 		if (ownsVertx) {
 			vertx.close().toCompletionStage().toCompletableFuture().join();
 		}
+	}
+
+	/** @return true once no query is running, false if the deadline passed first */
+	private boolean awaitQuiet(long millis) {
+		long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(millis);
+		while (!running.isEmpty()) {
+			if (System.nanoTime() - deadline >= 0) {
+				return false;
+			}
+			LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
+		}
+		return true;
+	}
+
+	/** Whether this server has begun shutting down, and is therefore refusing new queries. */
+	public boolean isClosing() {
+		return closing.get();
 	}
 
 	/**
@@ -435,6 +524,13 @@ public final class WireServer implements AutoCloseable {
 				return;
 			} catch (RuntimeException e) {
 				fail(streamId, WireError.INTERNAL, String.valueOf(e.getMessage()), 0, 0);
+				return;
+			}
+
+			if (closing.get()) {
+				// Refused rather than accepted and then abandoned a moment later: a client that is told now can
+				// reconnect somewhere else, where one cut off mid-result cannot tell a shutdown from a crash.
+				fail(streamId, WireError.OVERLOADED, "The server is shutting down and is not accepting queries", 0, 0);
 				return;
 			}
 

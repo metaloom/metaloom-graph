@@ -343,12 +343,16 @@ property equality → a label scan → a full node scan. So
 
 **Known costs, stated rather than discovered:**
 
-- **Rows are materialised per clause**, not streamed, so a query's peak memory is its widest
-  intermediate result and `LIMIT` does not stop the scan early. The shape was chosen because ORDER BY,
-  DISTINCT and aggregation all need their whole input anyway, and a pull-based tree has many more
-  places for a scoping bug to hide. **`Cypher.stream` does not change this** — it bounds what the
-  *caller* holds and when the first row arrives, not what the executor holds. [WIRE.md §0](WIRE.md)
-  states the same distinction from the transport's side, where it is easiest to overclaim.
+- **A query whose every clause streams is pushed, and `LIMIT` stops the scan.** `MATCH`, `WHERE`,
+  `UNWIND` and a projection with no `*`, no `DISTINCT`, no `ORDER BY` and no aggregate form a chain of
+  `Row -> boolean` consumers from the seed to the sink; a false anywhere in it reaches
+  `GraphStore.forEachNodeWhile` and stops the bitmap walk. That is a change in complexity rather than a
+  constant: ten rows out of ten million nodes reads ten. See §7.1.
+- **Everything else is still materialised per clause**, so its peak memory is its widest intermediate
+  result. `ORDER BY`, `DISTINCT`, aggregation and `UNION` need their whole input by definition;
+  `RETURN *` needs it to know its own columns; and a write materialises so that it can commit before
+  delivering a row. [WIRE.md §0](WIRE.md) states the same distinction from the transport's side, where
+  it is easiest to overclaim.
 - **DISTINCT is quadratic** in the number of distinct rows. It cannot use a hash set: `1` and `1.0`
   are the same Cypher value with different hash codes, and two nodes are equal by id rather than by
   contents.
@@ -360,6 +364,39 @@ property equality → a label scan → a full node scan. So
 - **Writers serialise on one lock per store**, engine-wide. A long write query blocks every other
   writer in the process, including embedded callers. The binary port bounds the wait so it is reported
   rather than endured ([WIRE.md](WIRE.md)).
+
+---
+
+### 7.1 What streams, and what cannot
+
+| Streams | Blocks, and why |
+|---|---|
+| `MATCH`, `WHERE`, `UNWIND` | `ORDER BY` — the first row out depends on the last row in |
+| `WITH` / `RETURN` projection | `DISTINCT` — cannot know a value is new without the ones before it |
+| `SKIP` / `LIMIT`, per stage | Any aggregate — same |
+| | `RETURN *` / `WITH *` — the column set is the union of variable names over *every* row, and the header goes out first |
+| | `UNION` (the deduplicating form). `UNION ALL` could stream and does not yet |
+| | Every write clause — §5.2 |
+
+**All or nothing per query part**, rather than the longest streaming prefix. A blocking clause buffers
+its whole input whatever runs above it, so pushing only the prefix would bound nothing; the one thing
+it could still buy is an early stop before the blocking clause, which is rare enough not to be worth a
+second execution shape.
+
+The fallback is not a degraded mode — it is what the whole engine did before this path existed, and
+`LazyExecutionTest` runs the same queries both ways and compares them cell by cell.
+
+**Push and not pull**, and the source is the reason rather than a preference: the unindexed seed is
+`forEachNode`, a callback. Inverting it into an iterator needs a thread to run it on, or eight bytes
+per live record materialised up front — which is precisely the case that would run out of memory.
+
+**A deviation from openCypher, found while writing this and recorded rather than changed.** In
+`WITH … SKIP … LIMIT … WHERE …` the clause order is openCypher's, but this engine has always *applied*
+the `WHERE` **before** the `SKIP` and `LIMIT`, where openCypher applies it after. So
+`WITH n LIMIT 3 WHERE n > 100` gives the first three rows above 100 here, and whatever of the first
+three rows is above 100 elsewhere. The streaming path was written to match the list path rather than
+the standard, because the two paths agreeing is the contract that stops a query changing its answer
+depending on its shape — but the deviation is real and belongs to both.
 
 ---
 
@@ -512,6 +549,7 @@ it still reads everything. Bind to localhost unless something else provides acce
 | `CypherWriteVersusApiTest` | 7 | Its inverse, and the load-bearing one for writes: run a write in Cypher, verify with the Java API, then `verify(FULL)` |
 | `CypherWriteTest` | 31 | Every write clause end to end, each finishing with `verify(FULL)` |
 | `CypherWriteTransactionTest` | 8 | §4.1: the transaction joined, the read view refused, a failed query leaving the segment files byte-identical, and a concurrent reader's snapshot unmoved |
+| `LazyExecutionTest` | 13 | §7.1: what stops the scan early — counted at the store rather than timed — what correctly does not, and the two paths agreeing cell by cell |
 | `VarLengthPathTest` | 8 | §3.2, against a graph where the difference shows |
 | `CypherSnapshotTest` | 4 | §4: views closed, joined, and a query atomic against a live writer |
 | `GraphServerTest` | 25 | The HTTP contract, both result shapes, the schema scan and its cache, the id-precision regression, and the write flag with its 403 |

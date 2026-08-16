@@ -62,11 +62,54 @@ public final class PatternMatcher {
 		return rows;
 	}
 
+	/**
+	 * The same expansion, pushed a row at a time and stoppable.
+	 *
+	 * <p>
+	 * The difference that matters is not the shape of the callback: it is that the <em>seed</em> is consumed one node
+	 * at a time rather than collected first. {@link #match(List, Row)} calls {@link #seed} for the leading pattern,
+	 * which for an unindexed {@code MATCH (n)} builds one row per live node before a single relationship is expanded —
+	 * so a query wanting ten rows out of ten million nodes pays for ten million either way. Here the scan stops as soon
+	 * as the consumer says so, and it says so as soon as a {@code LIMIT} downstream is satisfied.
+	 * </p>
+	 *
+	 * <p>
+	 * Everything after the seed is the list-based code unchanged, per seed row. That is deliberate: the expansion
+	 * carries per-row relationship-uniqueness sets and path accumulators in lockstep, and a second implementation of
+	 * that is a second place for a scoping bug to live.
+	 * </p>
+	 *
+	 * @return false if the consumer stopped the walk
+	 */
+	public boolean match(List<Ast.PatternPart> pattern, Row input, RowConsumer consumer) {
+		return matchFrom(pattern, 0, input, consumer);
+	}
+
+	private boolean matchFrom(List<Ast.PatternPart> pattern, int index, Row row, RowConsumer consumer) {
+		if (index == pattern.size()) {
+			return consumer.accept(row);
+		}
+		Ast.PatternPart part = pattern.get(index);
+		return seed(part.nodes().get(0), row, seeded -> {
+			for (Row expanded : expand(part, List.of(seeded))) {
+				if (!matchFrom(pattern, index + 1, expanded, consumer)) {
+					return false;
+				}
+			}
+			return true;
+		});
+	}
+
 	private List<Row> matchPart(Ast.PatternPart part, Row input) {
+		return expand(part, seed(part.nodes().get(0), input));
+	}
+
+	/** The relationship steps of one pattern part, from rows that already bind its leading node. */
+	private List<Row> expand(Ast.PatternPart part, List<Row> seedRows) {
 		List<Ast.NodePattern> nodes = part.nodes();
 		List<Ast.RelPattern> relationships = part.relationships();
 
-		List<Row> rows = seed(nodes.get(0), input);
+		List<Row> rows = seedRows;
 		// Relationships bound so far, per row, so that a pattern cannot traverse the same edge twice.
 		List<Set<Object>> usedPerRow = new ArrayList<>();
 		List<List<CypherNode>> pathNodes = new ArrayList<>();
@@ -186,6 +229,43 @@ public final class PatternMatcher {
 			}
 		});
 		return rows;
+	}
+
+	/**
+	 * The same seeding, pushed one row at a time.
+	 *
+	 * <p>
+	 * Same three access paths in the same order — a bound variable, then the index, then the scan — so the two forms
+	 * cannot choose differently. Only the scan can actually stop early; a candidate list from an index has already been
+	 * built by the time it is returned, and stopping the loop over it saves the reads but not the probe.
+	 * </p>
+	 *
+	 * @return false if the consumer stopped the seeding
+	 */
+	private boolean seed(Ast.NodePattern pattern, Row input, RowConsumer consumer) {
+		String name = anchorName(pattern);
+		if (input.has(name) && input.get(name) instanceof CypherNode bound) {
+			return !matches(pattern, bound, input) || consumer.accept(input);
+		}
+
+		List<Long> candidates = candidates(pattern, input);
+		if (candidates != null) {
+			for (long id : candidates) {
+				if (!graph.exists(id)) {
+					continue;
+				}
+				CypherNode node = graph.node(id);
+				if (matches(pattern, node, input) && !consumer.accept(input.with(name, node))) {
+					return false;
+				}
+			}
+			return true;
+		}
+
+		return graph.forEachNodeWhile(id -> {
+			CypherNode node = graph.node(id);
+			return !matches(pattern, node, input) || consumer.accept(input.with(name, node));
+		});
 	}
 
 	/**

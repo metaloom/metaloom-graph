@@ -641,16 +641,37 @@ public final class SegmentSet implements AutoCloseable {
 
 	/** Calls the consumer with the id of every live slot. The bitmap is the authority on what is live. */
 	public void forEachLiveId(java.util.function.LongConsumer consumer) {
+		forEachLiveIdWhile(id -> {
+			consumer.accept(id);
+			return true;
+		});
+	}
+
+	/**
+	 * Every live id, until the predicate says stop.
+	 *
+	 * <p>
+	 * The stopping form is what makes {@code LIMIT} cost what it should. Without it a query wanting ten rows out of ten
+	 * million nodes still walks ten million bitmap bits and decodes ten million generations, and the limit is applied to
+	 * a list that has already been built.
+	 * </p>
+	 *
+	 * @return false if the predicate stopped the scan, true if it ran to the end
+	 */
+	public boolean forEachLiveIdWhile(java.util.function.LongPredicate consumer) {
 		for (SegmentFile segment : segments) {
 			long high = segment.superblock().highWaterSlot();
 			FreeSlotBitmap bitmap = segment.freeSlots();
 			for (int slot = 0; slot < high; slot++) {
 				if (bitmap.isAllocated(slot)) {
 					int gen = readGen(segment, slot) & ElementId.MAX_GEN;
-					consumer.accept(ElementId.encode(kind, segment.segmentNumber(), slot, gen));
+					if (!consumer.test(ElementId.encode(kind, segment.segmentNumber(), slot, gen))) {
+						return false;
+					}
 				}
 			}
 		}
+		return true;
 	}
 
 	/**
