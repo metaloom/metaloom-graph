@@ -27,6 +27,7 @@ import org.slf4j.LoggerFactory;
 import io.metaloom.graph.core.api.CompactionOptions;
 import io.metaloom.graph.core.api.ConstraintViolationException;
 import io.metaloom.graph.core.api.CompactionReport;
+import io.metaloom.graph.core.api.CompositeIndex;
 import io.metaloom.graph.core.api.Direction;
 import io.metaloom.graph.core.api.Edge;
 import io.metaloom.graph.core.api.GraphStore;
@@ -599,7 +600,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		return write(() -> {
 			int[] labelIds = internLabels(labels);
 			Map<Integer, Object> keyed = props == null ? null : toKeyIds(props);
-			checkUnique(keyed, ElementId.NULL);
+			checkUnique(labelIds, keyed, ElementId.NULL);
 			long nodeId = nodes.create(labelIds, ElementId.NULL);
 			if (props != null && !props.isEmpty()) {
 				nodes.propBlockId(nodeId, properties.store(keyed, nodeId));
@@ -674,8 +675,14 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			}
 			int[] after = java.util.Arrays.copyOf(before, before.length + 1);
 			after[before.length] = labelId;
+			// A label-scoped unique constraint can be broken by the label rather than by the value: two nodes may
+			// legitimately share an email until the second one is told it is a :Person. Checked before the write, so a
+			// refusal leaves nothing behind — the same ordering createNode has and setNodeProperties does not.
+			if (indexes.hasUniqueComposite(labelId)) {
+				checkUnique(after, properties.read(nodes.propBlockId(nodeId)), nodeId);
+			}
 			nodes.labels(nodeId, after);
-			indexes.onLabelsChanged(nodeId, before, after);
+			indexes.onLabelsChanged(nodeId, before, after, () -> properties.read(nodes.propBlockId(nodeId)));
 			maintainVectorMembership(nodeId);
 			return true;
 		});
@@ -703,7 +710,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				}
 			}
 			nodes.labels(nodeId, after);
-			indexes.onLabelsChanged(nodeId, before, after);
+			indexes.onLabelsChanged(nodeId, before, after, () -> properties.read(nodes.propBlockId(nodeId)));
 			maintainVectorMembership(nodeId);
 			return true;
 		});
@@ -725,7 +732,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	 * before anything is refused — the index is keyed on a value hash, so an unverified conflict could be a collision
 	 * between two different values. Refusing a legitimate write is as bad as accepting an illegitimate one.
 	 */
-	private void checkUnique(Map<Integer, Object> properties, long excluding) {
+	private void checkUnique(int[] labelIds, Map<Integer, Object> properties, long excluding) {
 		if (properties == null || properties.isEmpty()) {
 			return;
 		}
@@ -740,6 +747,28 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				Object stored = this.properties.read(nodes.propBlockId(other), entry.getKey());
 				if (IndexCatalog.valueEquals(stored, normalise(entry.getValue()))) {
 					throw new ConstraintViolationException(catalog.key(entry.getKey()), entry.getValue(), other);
+				}
+			}
+		}
+		// The label-scoped half, over the declared composite indexes. The probe is the composite tree, so the
+		// candidates are already narrowed to nodes carrying the label — but the label is still verified per candidate,
+		// because the key is a hash of the triple and a collision would otherwise refuse a legitimate write.
+		for (IndexCatalog.Composite composite : indexes.composites()) {
+			if (!composite.unique() || !holdsLabel(labelIds, composite.labelId())) {
+				continue;
+			}
+			Object value = properties.get(composite.keyId());
+			if (value == null) {
+				continue;
+			}
+			for (long other : indexes.compositeConflicts(composite.labelId(), composite.keyId(), value, excluding)) {
+				if (!nodes.exists(other) || !nodes.hasLabel(other, composite.labelId())) {
+					continue;
+				}
+				Object stored = this.properties.read(nodes.propBlockId(other), composite.keyId());
+				if (IndexCatalog.valueEquals(stored, normalise(value))) {
+					throw new ConstraintViolationException(catalog.label(composite.labelId()),
+						catalog.key(composite.keyId()), value, other);
 				}
 			}
 		}
@@ -780,6 +809,113 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				names.add(catalog.key(keyId));
 			}
 			return names;
+		});
+	}
+
+	// ---------------------------------------------------------------- declared composite indexes
+
+	@Override
+	public void createIndex(String label, String key) throws IOException {
+		write(() -> {
+			int labelId = catalog.internLabel(label);
+			int keyId = catalog.internKey(key);
+			if (indexes.addCompositeIndex(labelId, keyId, false)) {
+				backfillComposite(labelId, keyId);
+			}
+			return null;
+		});
+	}
+
+	/**
+	 * Declares a label-scoped unique constraint, which is a composite index plus a flag.
+	 * <p>
+	 * The existing data is scanned first and the declaration refused if it is already false, exactly as the store-wide
+	 * form does — but only over the nodes carrying the label, which is the whole difference between the two.
+	 */
+	@Override
+	public void createUniqueConstraint(String label, String key) throws IOException {
+		write(() -> {
+			int labelId = catalog.internLabel(label);
+			int keyId = catalog.internKey(key);
+			Map<Object, Long> seen = new java.util.HashMap<>();
+			for (long nodeId : segmentSets.get(Kind.NODE).liveIds()) {
+				if (!nodes.hasLabel(nodeId, labelId)) {
+					continue;
+				}
+				Object value = properties.read(nodes.propBlockId(nodeId), keyId);
+				if (value == null) {
+					continue;
+				}
+				Object normalised = value instanceof byte[] bytes ? java.util.Arrays.toString(bytes) : value;
+				Long previous = seen.put(normalised, nodeId);
+				if (previous != null) {
+					throw new ConstraintViolationException(label, key, value, previous);
+				}
+			}
+			if (indexes.addCompositeIndex(labelId, keyId, true)) {
+				backfillComposite(labelId, keyId);
+			}
+			return null;
+		});
+	}
+
+	/**
+	 * Indexes every live node that already carries the label and the key.
+	 * <p>
+	 * A scan, like {@code createUniqueConstraint}'s: a declaration that only covered writes made after it would be an
+	 * index that silently answers with a subset, which is worse than no index at all. It runs in the declaring
+	 * transaction, so a rollback takes the declaration and its entries together.
+	 */
+	private void backfillComposite(int labelId, int keyId) throws IOException {
+		for (long nodeId : segmentSets.get(Kind.NODE).liveIds()) {
+			if (!nodes.hasLabel(nodeId, labelId)) {
+				continue;
+			}
+			Object value = properties.read(nodes.propBlockId(nodeId), keyId);
+			if (value != null) {
+				indexes.addCompositeEntry(nodeId, labelId, keyId, value);
+			}
+		}
+	}
+
+	@Override
+	public List<CompositeIndex> compositeIndexes() {
+		return read(indexes::compositeIndexes);
+	}
+
+	@Override
+	public boolean hasIndex(String label, String key) {
+		return read(() -> {
+			int labelId = catalog.lookupLabel(label);
+			int keyId = catalog.lookupKey(key);
+			return labelId != 0 && keyId != 0 && indexes.hasComposite(labelId, keyId);
+		});
+	}
+
+	@Override
+	public List<Long> nodesByLabelAndProperty(String label, String key, Object value) {
+		return read(() -> {
+			int labelId = catalog.lookupLabel(label);
+			int keyId = catalog.lookupKey(key);
+			if (labelId == 0 || keyId == 0 || value == null) {
+				return List.<Long> of();
+			}
+			// One probe when a composite index is declared; otherwise the property probe, filtered by the label. Both
+			// return the same answer — the declaration only decides how many candidates are read to produce it.
+			List<Long> candidates = indexes.hasComposite(labelId, keyId)
+				? indexes.nodesByLabelAndProperty(labelId, keyId, value)
+				: indexes.nodesByProperty(key, value);
+			List<Long> confirmed = new ArrayList<>(candidates.size());
+			for (long nodeId : candidates) {
+				if (!nodes.exists(nodeId) || !nodes.hasLabel(nodeId, labelId)) {
+					continue;
+				}
+				Object stored = properties.read(nodes.propBlockId(nodeId), keyId);
+				if (IndexCatalog.valueEquals(stored, normalise(value))) {
+					confirmed.add(nodeId);
+				}
+			}
+			return confirmed;
 		});
 	}
 
@@ -924,24 +1060,46 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		members = pending.stream().mapToLong(Long::longValue).toArray();
 
 		int batch = 0;
-		long linked = indexes.vectorBuiltCount(ord);
 		while (batch < members.length) {
 			int end = Math.min(batch + VECTOR_BUILD_BATCH, members.length);
 			int from = batch;
-			runWrite(() -> {
+
+			// The expensive half, outside the writer lock entirely: one beam search per member, against a read view.
+			HnswIndex.Plan[] plans = new HnswIndex.Plan[end - from];
+			runRead(() -> {
 				for (int i = from; i < end; i++) {
 					long vectorId = members[i];
-					// Re-checked rather than trusted: the work list was taken before this batch's transaction, and an
-					// ordinary write may have deleted the node or moved it out of the index since.
 					if (vectors.exists(vectorId) && vectors.indexOrdinal(vectorId) == ord) {
-						hnsw.insert(ord, definition, vectorId);
+						plans[i - from] = hnsw.plan(ord, definition, vectorId);
 					}
 				}
 			});
-			linked += end - batch;
+
+			long[] applied = { 0 };
+			runWrite(() -> {
+				for (int i = from; i < end; i++) {
+					long vectorId = members[i];
+					// Re-checked rather than trusted: the plans were made before this transaction, and an ordinary
+					// write may have deleted the node or moved it out of the index since.
+					if (!vectors.exists(vectorId) || vectors.indexOrdinal(vectorId) != ord) {
+						continue;
+					}
+					HnswIndex.Plan plan = plans[i - from];
+					if (plan == null) {
+						continue;
+					}
+					// A plan the graph has moved past is re-planned here, under the lock. That is the expensive path
+					// and it is meant to be rare: it fires when the entry point appeared or vanished since the plan,
+					// which in a build is essentially the first batch against an empty graph.
+					if (!hnsw.apply(ord, definition, vectorId, plan)) {
+						hnsw.insert(ord, definition, vectorId);
+					}
+					applied[0]++;
+				}
+				// In the same transaction as the links it counts, so a crash can never leave the mark ahead of them.
+				indexes.vectorBuiltCount(ord, indexes.vectorBuiltCount(ord) + applied[0]);
+			});
 			batch = end;
-			final long progress = linked;
-			runWrite(() -> indexes.vectorBuiltCount(ord, progress));
 		}
 		// Only now is the structure complete, and only now will a query be answered from it. A state flipped before
 		// the last batch would be an index that answers confidently with a subset.
@@ -949,12 +1107,43 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	}
 
 	/**
-	 * Members linked per transaction during a build.
+	 * Members planned against one read view and applied in one transaction.
+	 *
 	 * <p>
-	 * Each insert searches the graph built so far, so a batch is real work rather than a write burst; the size is a
-	 * compromise between commit overhead and how long one transaction holds the writer lock.
+	 * <b>This number is a measured compromise between two costs that pull in opposite directions</b>, and both halves
+	 * were measured before it was chosen ({@code VectorBuildBenchmark}, 100,000 members):
+	 * </p>
+	 *
+	 * <ul>
+	 * <li><b>Smaller batches cost throughput, and far more than expected.</b> The default sync mode is
+	 * {@code FSYNC_ON_COMMIT}, so a batch is a durable commit. At one member per commit the build measured
+	 * <b>130 inserts/s against 332</b> for the original — 21.3 hours against 8.4 for ten million — because the fsync
+	 * added roughly 4.7 ms to a 3 ms insert. Doing the obvious correct thing per member is two and a half times
+	 * slower, <em>and</em> worse for a competing writer, which waits on 95,000 tiny commits instead of a few hundred
+	 * larger ones.</li>
+	 * <li><b>Larger batches should cost recall.</b> Every member of a batch is planned against a graph containing none
+	 * of the others, so within a batch nobody links to anybody, and HNSW's structure comes from each insert searching
+	 * the graph the previous inserts built.</li>
+	 * </ul>
+	 *
+	 * <p>
+	 * <b>The second cost could not be measured, and that is stated rather than glossed.</b> {@code VectorRecallTest}
+	 * reports recall@10 of 1.0 at batch 32, 128 and 512 alike — at 512 over its 1,500-vector corpus a third of the
+	 * members are blind to each other per batch, and recall does not move. The test saturates, so it confirms there is
+	 * no gross regression and cannot choose between these values. The choice is therefore made on the two numbers that
+	 * do vary, and there 128 simply dominates 32: the same 250 ms worst-case stall — that figure turns out to be a
+	 * floor set by something other than the batch — with 17 percent more throughput, which is slightly better than
+	 * the original design managed while holding the lock for the search as well.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>The empty-graph case is not a recall question but a correctness one</b>, and it is handled rather than
+	 * tuned around: the members of the very first batch are all planned against an empty graph and would all
+	 * think themselves the entry point, leaving all but one with no links at all. {@code HnswIndex.apply} refuses a
+	 * plan whose view of "is there an entry point" no longer holds, and the build re-plans that member under the lock.
+	 * </p>
 	 */
-	private static final int VECTOR_BUILD_BATCH = 256;
+	private static final int VECTOR_BUILD_BATCH = Integer.getInteger("graph.vector.build.batch", 128);
 
 	/**
 	 * Makes a node a member of one declared index, refusing a vector the index cannot hold.
@@ -1200,12 +1389,13 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	public void setNodeProperties(long nodeId, Properties props) throws IOException {
 		write(() -> {
 			long old = nodes.propBlockId(nodeId);
+			int[] labelIds = nodes.labels(nodeId);
 			Map<Integer, Object> before = properties.read(old);
 			Map<Integer, Object> after = toKeyIds(props);
 			nodes.propBlockId(nodeId, properties.store(after, nodeId));
 			properties.free(old);
-			checkUnique(after, nodeId);
-			indexes.onPropertiesChanged(nodeId, before, after);
+			checkUnique(labelIds, after, nodeId);
+			indexes.onPropertiesChanged(nodeId, labelIds, before, after);
 			maintainVectorMembership(nodeId);
 			return null;
 		});

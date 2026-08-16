@@ -29,7 +29,7 @@ not**, in one place.
 | 4 — WAL, recovery, checkpoints | **Done**, as no-steal redo rather than ARIES | `RecoveryTest` |
 | 5 — Transactions | **Partial** — ACID, serialised writers, **snapshot isolation for readers**. No concurrent writers | `VisibilityTest`, `SnapshotIsolationTest`, `VacuumTest`, `ConcurrentReaderTest`, `RollbackTest` |
 | 6 — Native layer | **Done** except a second build target; `miri` and `fuzz` now installed and run | `NativeCodecTest`, `UringIoEngineTest`, `DirectWalTest`, `BlobCompressionTest`, `StatxTest`, `NativeBindingsTest` |
-| 7 — Indexes | **Done** for the label, property and unique B+trees | `IndexTest`, `UniqueConstraintTest` |
+| 7 — Indexes | **Done** for the label, property, composite and unique B+trees | `IndexTest`, `CompositeIndexTest`, `UniqueConstraintTest` |
 | 8 — Compaction and reclamation | **Done** except the p99 latency budget | `CompactionTest`, `CompactionCrashTest` |
 | 9 — Hardening | **Partial** — see §4.9; crash matrix **built**, no JMH, long runs not run | `CrashMatrixTest`, `WalFaultTest`; §6 of PHASE_STATUS |
 | 10 — MetaLoom integration | **Done** — built, measured, recommended against adopting | §6 below |
@@ -60,7 +60,7 @@ shades a single runnable jar.
 mvn clean install             # everything, including the native layer
 mvn test -Dnative.skip=true   # the pure-Java fallback: the same tests, 23 skipped rather than 3
 mvn -o -Poffline install      # warm cargo registry, no network
-mvn test                      # 749 tests, 0 failures, 3 skipped — plus the UI's 17 and 12 Rust tests
+mvn test                      # 774 tests, 0 failures, 3 skipped — plus the UI's 17 and 12 Rust tests
 mvn test -Pbench              # benchmarks, the structural gates, and the supernode gates
 mvn test -Pcrash              # kill -9, compaction crash injection, and the crash matrix
 mvn test -Pslow               # the soak harness and the long-running reader
@@ -173,8 +173,12 @@ that a steal policy cannot be made correct over a `MAP_SHARED` mapping.
 - [x] Index rebuild, gated on entries per page rather than on slot liveness (Phase 8)
 - [x] Property values are keyed by a **content** hash, arrays and lists included — a `float[]` used to
       be keyed by its identity hash ([INDEX_TASKS.md IDX-1](INDEX_TASKS.md#3-closed))
-- [x] Tests: `IndexTest` and `IndexKeyTest`, plus the index-vs-scan differential inside
-      `ReferenceModelTest`
+- [x] Composite index: declared `(label, key)` pairs, keyed on `mix64(labelId, keyId, valueHash)`,
+      backfilled at declaration and maintained by the same four hooks — which is also what makes a
+      **label-scoped** unique constraint expressible
+      ([INDEX.md §3.3](INDEX.md), [INDEX_TASKS.md IDX-7](INDEX_TASKS.md#3-closed))
+- [x] Tests: `IndexTest`, `IndexKeyTest` and `CompositeIndexTest`, the planner's choice in
+      `CompositeIndexPlanTest`, plus the index-vs-scan differential inside `ReferenceModelTest`
 
 ### Phase 8 — Compaction and space reclamation
 
@@ -641,6 +645,10 @@ The whole suite passes with `metaloom.graph.native.enabled` both true and false.
 
 ### 4.7 Phase 7 — Indexes
 
+- [x] **Label-scoped unique constraints** (`UniqueConstraintTest`). `createUniqueConstraint(label, key)`
+      says "no two `:Person` share an email", which the store-wide form cannot express at all. It is a
+      declared composite index plus a flag, so it is enforced on `addNodeLabel` as well as on a
+      property write — adding the label is the other way to break it
 - [x] **Unique property indexes** (`UniqueConstraintTest`). `createUniqueConstraint(key)` is durable,
       survives a reopen, is enforced on create and on update, and **verifies candidates against the
       stored value** before refusing — the index is keyed on a value hash, so an unverified conflict
@@ -680,9 +688,21 @@ trusting anything that depends on it, and skips when it does not. On ext4 or xfs
 
 ### 4.8 Phase 8 — Compaction
 
+- [ ] **Open defect: a compaction interleaved with a foreground writer can leave a `NODE` page whose
+      checksum does not match its contents.** `CompactionTest.testCompactionInterleavesWithForegroundWrites`
+      fails on its closing `verify(FULL)` with `PageCorrupt: Checksum mismatch in .../node-000000.seg
+      page N`, N varying per run, at a **measured 6 failures in 12 runs on a clean checkout of
+      `0970e6b`**. It passes far more often inside a full `mvn test` than run alone, which is why the
+      reactor has been green over it — a green run is not evidence here. This is the race between
+      batched relocation and a concurrent writer, and a checksum that disagrees with its page is
+      precisely what the checksum exists to catch, so it should be read as an engine defect until
+      shown otherwise rather than as a flaky test. **Diagnose it with a worktree and interleaved runs**:
+      a sequential A-then-B comparison of this test measures the machine's state as much as the code,
+      and gave 8/8 against 3/8 where interleaving gave 6/12 against 9/12.
 - [ ] Foreground p99 latency budget during compaction. Compaction takes the writer lock one batch at a
       time and `CompactionTest` shows a concurrent writer making progress throughout, but a p99 claim
-      needs a real latency harness.
+      needs a real latency harness — and the defect above has to be settled first, since it is the same
+      interleaving.
 - [ ] `StaleIdException` slow-path fallback through the forwarding map — **deliberately not built**.
       Making a batch atomic removes the need for it, which is what keeps the engine free of any
       indirection table.
@@ -833,5 +853,5 @@ Recorded so nobody re-opens them as oversights:
 
 ---
 
-_Git HEAD revision: `20f7e3d`_
-_Last updated: 2026-08-16 (IDX-4: the streaming neighbour cursor)_
+_Git HEAD revision: `0970e6b`_
+_Last updated: 2026-08-16 (IDX-7: the declared composite index)_

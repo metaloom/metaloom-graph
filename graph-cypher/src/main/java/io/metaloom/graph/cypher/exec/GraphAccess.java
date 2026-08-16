@@ -134,6 +134,17 @@ public final class GraphAccess {
 		return store.nodesByProperty(key, value);
 	}
 
+	/** Whether the store has a declared index over this label and key, which is what decides the access path. */
+	public boolean hasIndex(String label, String key) {
+		checkAbort();
+		return store.hasIndex(label, key);
+	}
+
+	public List<Long> nodesByLabelAndProperty(String label, String key, Object value) {
+		checkAbort();
+		return store.nodesByLabelAndProperty(label, key, value);
+	}
+
 	public List<String> uniqueConstraints() {
 		return store.uniqueConstraints();
 	}

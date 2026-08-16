@@ -226,12 +226,28 @@ List<Long> people = store.nodesByLabel("Person");             // label index
 List<Long> found  = store.nodesByProperty("email", "a@b.c");  // property index, then verification
 store.createUniqueConstraint("email");                        // refused if the data already breaks it
 
+store.createIndex("Person", "active");                        // declared, backfilled, and used by Cypher
+List<Long> active = store.nodesByLabelAndProperty("Person", "active", true);
+store.createUniqueConstraint("Person", "email");              // no two :Person, rather than no two nodes
+
 List<Neighbour> near = store.nearestByScan("Person", "embedding", query, 10, VectorMetric.COSINE);
 
 store.createVectorIndex(VectorIndexDefinition.of("Person", "embedding", 768, VectorMetric.COSINE));
 List<Neighbour> fast = store.nearest("Person", "embedding", query, 10, null);
 List<Neighbour> filtered = store.nearest("Person", "embedding", query, 10, id -> isActive(id));
 ```
+
+`createIndex(label, key)` is the one index that has to be **asked for**: the label and property
+indexes maintain themselves for everything, and a composite one is declared because there are
+`labels × keys` possible pairs ([INDEX.md §3.3](INDEX.md)). It scans and backfills before it returns,
+so the index is complete the moment it exists. `nodesByLabelAndProperty` answers the same question
+with or without a declaration — only the number of candidates read differs — so adding one changes a
+query's cost and never its result.
+
+`createUniqueConstraint(label, key)` is that declaration plus a flag, and it is the only way to say
+"no two `:Person` share an email"; the one-argument form is store-wide over every node. It is
+enforced on `addNodeLabel` as well as on a property write, because adding the label is the other way
+to break it.
 
 `createVectorIndex` needs a store created with `vectorDimensions(768)`: the vector and its links live
 in one fixed-size record, and that size is fixed at creation like the page size. It walks the label's
@@ -409,6 +425,9 @@ scopes them for the calling thread rather than duplicating them.
 - [x] Maintenance: `checkpoint`, `verify`, `stats`
 - [x] Exception hierarchy per §8, plus `ConstraintViolationException`
 - [x] `createUniqueConstraint` / `uniqueConstraints`, durable across a reopen
+- [x] `createIndex` / `hasIndex` / `compositeIndexes` / `nodesByLabelAndProperty` — the declared
+      `(label, key)` index, backfilled at declaration, and `createUniqueConstraint(label, key)` for
+      the label-scoped constraint it is what makes expressible
 - [x] `Transaction` with begin/commit/rollback, plus auto-commit for a mutation made outside one
 - [x] `UsageExampleTest`: the documented example, executable and asserting
 - [x] `beginRead` / `ReadTransaction` / `IsolationLevel` / `SnapshotStats` / `SnapshotTooOldException`
@@ -443,5 +462,5 @@ scopes them for the calling thread rather than duplicating them.
 
 ---
 
-_Git HEAD revision: `20f7e3d`_
-_Last updated: 2026-08-16 (IDX-4: the streaming neighbour cursor)_
+_Git HEAD revision: `0970e6b`_
+_Last updated: 2026-08-16 (IDX-7: createIndex, nodesByLabelAndProperty, label-scoped constraints)_

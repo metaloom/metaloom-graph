@@ -139,27 +139,41 @@ primitive, for a different reason.
   `mlg_ring_submit_read`, `mlg_ring_submit` and `mlg_ring_reap` are bound. `mlg_ring_submit_write`
   and `mlg_ring_submit_fsync` **are exported by the crate and not looked up in Java** — the write path
   is available in Rust and unreachable from Java.
+- **The crate has no ordering primitive.** Neither `submit_write` nor `submit_fsync` sets
+  `IOSQE_IO_LINK`, so the two cannot yet be submitted as an ordered pair. For a log that is a
+  correctness gap and not an optimisation gap — see [TASKS.md URING-3](TASKS.md).
 - **No completion is ever reaped on another thread.** `readBatch` submits and waits inside one call,
   which is a batch and not asynchrony. Real overlap with computation needs a caller that submits, does
   something else, and reaps later — and no such caller exists.
 - **Never run against a device under load**, or against anything but this machine's NVMe with a warm
   file. The 15x is a best case measured in favourable conditions.
 
+**The work items behind this list live in [TASKS.md](TASKS.md), URING-1 through URING-7** — what each
+gap would cost to close, what would change the verdict, and what "done" means. They are not repeated
+here.
+
 ## 6. The Caller It Is Waiting For
 
 ### 6.1 The write-ahead log, under group commit
 
 The WAL is the one part of the system that does I/O **through a descriptor** rather than through a
-mapping, and it already runs on `O_DIRECT` via `DirectIoEngine`, writing whole aligned blocks
-([WAL.md](WAL.md), `DirectWalTest`). `WalSyncMode.GROUP_COMMIT` already exists.
+mapping. Its direct path writes whole aligned blocks through `DirectIoEngine`
+([WAL.md](WAL.md), `DirectWalTest`), and `WalSyncMode.GROUP_COMMIT` already exists.
 
-That is exactly the ring's shape: several transactions' blocks plus the `fsync`, submitted together,
-one round trip instead of one per commit. The Rust side is already written for it —
-`submit_write` and `submit_fsync` are there. What is missing is the Java binding for those two, and a
-`WalWriter` that batches rather than writing each commit as it arrives.
+That is the ring's shape — several transactions' blocks plus the `fsync`, submitted together — but
+**the log as it stands does not present it**, in three ways that [TASKS.md §1](TASKS.md) sets out with
+the code references:
 
-The reason to expect a win here is not the 15x. It is that group commit's cost is dominated by the
-`fsync` round trip, and a linked write-then-fsync submission removes one of the two.
+- the direct path is **off by default** (`AUTO` resolves to buffered, deliberately, because
+  pad-to-block costs a block per fsync);
+- `DirectLog` already coalesces records into one aligned buffer, so a commit is typically one `pwrite`
+  and one `fsync` rather than the N scattered writes a ring merges;
+- commits **serialize on the writer lock**, so there is never more than one commit's bytes pending;
+  `GROUP_COMMIT` today skips fsyncs on an interval rather than grouping committers.
+
+So the WAL is still the most plausible first caller, and it is further away than "bind two functions".
+The prerequisite is [URING-2](TASKS.md) — durability outside the writer lock — which is worth doing
+for its own sake and would be, before the ring is involved at all.
 
 ### 6.2 A data path that is not a mapping
 
@@ -168,7 +182,8 @@ A mapping ties the engine to the OS page cache and its eviction policy, and give
 would make every page fetch a real read through a descriptor — and then `readBatch` has a caller on
 the hottest path in the system, and the 15x becomes a number about queries.
 
-That is a design change, not a wiring change, and it is not planned. The ring is kept because it is
+That is a design change, not a wiring change, and it is not planned
+([TASKS.md URING-7](TASKS.md), gated on the measurement in URING-6). The ring is kept because it is
 cheap to keep and expensive to rediscover.
 
 ## 7. Safety Rules
@@ -220,11 +235,12 @@ else ([GRAALVM.md §3](GRAALVM.md)).
 | `graph-core/src/main/java/…/nativelib/NativeBindings.java` | The `Cqe` layout and its ABI assertion |
 | `graph-core/src/test/java/…/nativelib/UringIoEngineTest.java` | Correctness and the measurement |
 
-Related: [NATIVE_FFM.md](NATIVE_FFM.md) for the capability list and the fallback contract,
+Related: [TASKS.md](TASKS.md) for the work items behind §5 and §6,
+[NATIVE_FFM.md](NATIVE_FFM.md) for the capability list and the fallback contract,
 [SSD_IO.md](SSD_IO.md) for where the engines sit in the I/O strategy, [WAL.md](WAL.md) for the caller
 in §6.1, [GRAALVM.md](GRAALVM.md) for the native binary.
 
 ---
 
-_Git HEAD revision: `78db6d5`_
-_Last updated: 2026-08-15_
+_Git HEAD revision: `0970e6b`_
+_Last updated: 2026-08-16 (work items deferred to TASKS.md; §6.1 corrected against the code)_

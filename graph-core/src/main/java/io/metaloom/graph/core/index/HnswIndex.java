@@ -73,24 +73,52 @@ public final class HnswIndex {
 		return Math.max(0, Math.min(level, maxLevel));
 	}
 
-	/** Adds a record to the graph. Idempotent: a record already marked linked is left alone. */
-	public void insert(int ord, VectorIndexDefinition definition, long vectorId) throws IOException {
+	/**
+	 * The links one insert would write, worked out without writing anything.
+	 *
+	 * <p>
+	 * This is the expensive half of an insert and it is <b>pure</b>, which is the entire point of separating it: at
+	 * {@code efConstruction=200} it is on the order of two thousand distance evaluations, and a bulk build that ran it
+	 * under the writer lock made a competing writer wait seconds ({@code VectorBuildBenchmark}). Computed in a read
+	 * view and applied in a short write, the lock is held for the writes alone.
+	 * </p>
+	 *
+	 * @param level
+	 *            the record's top layer, derived from the vector's own bytes and so stable across a rebuild
+	 * @param linksByLayer
+	 *            index {@code i} holds the chosen neighbours for layer {@code i}, so the array's length is
+	 *            {@code level + 1}. Empty when the graph was empty
+	 * @param foundEmptyGraph
+	 *            the graph had no usable entry point, so this record would become it. Re-checked on apply, because a
+	 *            plan made against an empty graph is worthless against a populated one
+	 * @param entryLevel
+	 *            the entry point's level when the plan was made, so apply can tell whether this record outranks it
+	 */
+	public record Plan(int level, long[][] linksByLayer, boolean foundEmptyGraph, int entryLevel) {
+	}
+
+	/**
+	 * Works out where a record belongs, reading only.
+	 *
+	 * <p>
+	 * Safe to run in a read view: it touches no page for writing and takes nothing from the catalog it does not
+	 * re-check on apply.
+	 * </p>
+	 *
+	 * @return null if the record is already linked and there is nothing to do
+	 */
+	public Plan plan(int ord, VectorIndexDefinition definition, long vectorId) {
 		if ((vectors.flags(vectorId) & VectorRecord.FLAG_LINKED) != 0) {
-			return;
+			return null;
 		}
 		int m = definition.m();
 		float[] vector = vectors.read(vectorId);
 		int level = levelOf(vector, m, vectors.maxLevel(m));
-		vectors.topLevel(vectorId, level);
 
 		long entry = catalog.vectorEntryPoint(ord);
 		int entryLevel = catalog.vectorMaxLevel(ord);
 		if (ElementId.isNull(entry) || !vectors.exists(entry)) {
-			// The first member, or the entry point was deleted and this is the first insert since. Either way the
-			// graph starts here.
-			catalog.vectorEntryPoint(ord, vectorId, level);
-			vectors.flags(vectorId, vectors.flags(vectorId) | VectorRecord.FLAG_LINKED);
-			return;
+			return new Plan(level, new long[0][], true, 0);
 		}
 
 		VectorMetric metric = definition.metric();
@@ -98,6 +126,7 @@ public final class HnswIndex {
 		for (int layer = entryLevel; layer > level; layer--) {
 			current = descend(current, vector, metric, layer, m);
 		}
+		long[][] linksByLayer = new long[level + 1][];
 		for (int layer = Math.min(entryLevel, level); layer >= 0; layer--) {
 			List<Candidate> found = searchLayer(current, vector, metric, definition.efConstruction(), layer, m);
 			List<Candidate> chosen = select(found, vectors.capacityAt(layer, m), vectorId, vector, metric);
@@ -105,20 +134,107 @@ public final class HnswIndex {
 			for (int i = 0; i < links.length; i++) {
 				links[i] = chosen.get(i).vectorId();
 			}
-			vectors.links(vectorId, layer, m, links);
-			// The back-links. Without them the graph is directed and a search that arrives from the other side never
-			// finds this record at all.
-			for (long neighbour : links) {
-				linkBack(neighbour, vectorId, layer, m, metric);
-			}
+			linksByLayer[layer] = links;
 			if (!found.isEmpty()) {
 				current = found.get(0).vectorId();
 			}
 		}
-		if (level > entryLevel) {
-			catalog.vectorEntryPoint(ord, vectorId, level);
+		for (int layer = 0; layer < linksByLayer.length; layer++) {
+			// Layers above the entry point's were never searched, and an unset element would be a null to remember
+			// about at every use site.
+			if (linksByLayer[layer] == null) {
+				linksByLayer[layer] = new long[0];
+			}
+		}
+		return new Plan(level, linksByLayer, false, entryLevel);
+	}
+
+	/**
+	 * Writes a plan into the graph. Must run in a write transaction, and does no searching.
+	 *
+	 * <p>
+	 * <b>Every id in the plan is re-checked here.</b> The plan was made against an earlier view and an ordinary write
+	 * may have deleted a chosen neighbour since; a link to a freed slot is exactly the dangling reference the
+	 * generation check exists to catch, and writing one deliberately would be worse than the deletion that caused it.
+	 * A neighbour that has gone is dropped rather than replaced — this is an approximate index, and one fewer link is a
+	 * recall question, while a stale link is a correctness one.
+	 * </p>
+	 *
+	 * @return false when the plan was made against a state too different to use, and the caller should re-plan
+	 */
+	public boolean apply(int ord, VectorIndexDefinition definition, long vectorId, Plan plan) {
+		if ((vectors.flags(vectorId) & VectorRecord.FLAG_LINKED) != 0) {
+			return true;
+		}
+		long entry = catalog.vectorEntryPoint(ord);
+		int entryLevel = catalog.vectorMaxLevel(ord);
+		boolean emptyNow = ElementId.isNull(entry) || !vectors.exists(entry);
+		if (plan.foundEmptyGraph() != emptyNow) {
+			// Either the graph gained an entry point while this was planned against nothing — in which case applying
+			// the plan would strand this record with no links at all — or it lost the one the plan was built on. Both
+			// are rare and both are answered by planning again against what is actually there.
+			return false;
+		}
+
+		int m = definition.m();
+		vectors.topLevel(vectorId, plan.level());
+		if (plan.foundEmptyGraph()) {
+			catalog.vectorEntryPoint(ord, vectorId, plan.level());
+			vectors.flags(vectorId, vectors.flags(vectorId) | VectorRecord.FLAG_LINKED);
+			return true;
+		}
+
+		VectorMetric metric = definition.metric();
+		for (int layer = 0; layer < plan.linksByLayer().length; layer++) {
+			long[] planned = plan.linksByLayer()[layer];
+			long[] links = new long[planned.length];
+			int kept = 0;
+			for (long neighbour : planned) {
+				if (vectors.exists(neighbour)) {
+					links[kept++] = neighbour;
+				}
+			}
+			if (kept < links.length) {
+				links = java.util.Arrays.copyOf(links, kept);
+			}
+			vectors.links(vectorId, layer, m, links);
+			// The back-links. Without them the graph is directed and a search that arrives from the other side never
+			// finds this record at all. These read the neighbour's own list, which is bounded by M and cheap; it is the
+			// beam search, not this, that had to leave the writer lock.
+			for (long neighbour : links) {
+				linkBack(neighbour, vectorId, layer, m, metric);
+			}
+		}
+		if (plan.level() > entryLevel) {
+			catalog.vectorEntryPoint(ord, vectorId, plan.level());
 		}
 		vectors.flags(vectorId, vectors.flags(vectorId) | VectorRecord.FLAG_LINKED);
+		return true;
+	}
+
+	/**
+	 * Adds a record to the graph, planning and writing in one go. Idempotent: a record already marked linked is left
+	 * alone.
+	 * <p>
+	 * This is the incremental path, used by the maintenance hooks, where the caller is already inside the write
+	 * transaction that made the record and one insert's search is the cost of one write. The bulk build splits the two
+	 * halves instead — see {@link #plan} for why.
+	 */
+	public void insert(int ord, VectorIndexDefinition definition, long vectorId) throws IOException {
+		Plan plan = plan(ord, definition, vectorId);
+		if (plan == null) {
+			return;
+		}
+		if (!apply(ord, definition, vectorId, plan)) {
+			// Unreachable as things stand — nothing can change the graph between these two calls, because they are in
+			// one transaction on the one writer thread. Handled rather than asserted because the alternative is a
+			// record silently left with no links, which no test would see and every later search would be worse for.
+			Plan again = plan(ord, definition, vectorId);
+			if (again != null && !apply(ord, definition, vectorId, again)) {
+				throw new IllegalStateException("Could not link vector record " + ElementId.toString(vectorId)
+					+ " into index " + ord + ": the graph's entry point changed twice inside one transaction");
+			}
+		}
 	}
 
 	/**

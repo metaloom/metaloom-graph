@@ -469,13 +469,22 @@ public final class PatternMatcher {
 	 * A candidate id list from an index, or null when only a full scan will do.
 	 *
 	 * <p>
-	 * An indexed property beats a label because it is far more selective, and the pattern's inline map is exactly the
-	 * equality predicate the property index answers. Only a literal-valued entry qualifies: one whose value depends on
-	 * the row cannot be probed before the row exists.
+	 * A <b>declared composite index</b> over one of the pattern's labels and one of its literal properties comes
+	 * first, because it answers the whole of {@code (n:Person {email: ...})} in one probe rather than probing the
+	 * property and then verifying the label per candidate. It is only ever preferred when it exists — an undeclared
+	 * pair would fall back to exactly the property probe below, so asking first costs a catalog read and never a scan.
+	 * </p>
+	 *
+	 * <p>
+	 * Otherwise an indexed property beats a label because it is far more selective, and the pattern's inline map is
+	 * exactly the equality predicate the property index answers. Only a literal-valued entry qualifies: one whose
+	 * value depends on the row cannot be probed before the row exists.
 	 * </p>
 	 */
 	private List<Long> candidates(Ast.NodePattern pattern, Row row) {
 		if (pattern.properties() != null && !pattern.properties().isEmpty()) {
+			String probeKey = null;
+			Object probeValue = null;
 			for (Map.Entry<String, Ast.Expr> entry : pattern.properties().entrySet()) {
 				Object value;
 				try {
@@ -483,9 +492,21 @@ public final class PatternMatcher {
 				} catch (RuntimeException e) {
 					continue;
 				}
-				if (value != null) {
-					return graph.nodesByProperty(entry.getKey(), value);
+				if (value == null) {
+					continue;
 				}
+				for (String label : pattern.labels()) {
+					if (graph.hasIndex(label, entry.getKey())) {
+						return graph.nodesByLabelAndProperty(label, entry.getKey(), value);
+					}
+				}
+				if (probeKey == null) {
+					probeKey = entry.getKey();
+					probeValue = value;
+				}
+			}
+			if (probeKey != null) {
+				return graph.nodesByProperty(probeKey, probeValue);
 			}
 		}
 		if (!pattern.labels().isEmpty()) {

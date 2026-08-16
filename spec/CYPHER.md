@@ -440,9 +440,15 @@ now there and rewrites only the difference. `hasWriteTransaction` is the third, 
 
 ## 7. Planning, and what it costs
 
-Start points, most selective first: a variable already bound by an earlier clause → an indexed
+Start points, most selective first: a variable already bound by an earlier clause → a **declared
+composite index** over one of the pattern's labels and one of its literal properties → an indexed
 property equality → a label scan → a full node scan. So
 `MATCH (a:Person {email:$e})-[:KNOWS]->(b)` is one index probe and one expansion.
+
+**The composite step is taken only when the pair has been declared** through
+`GraphStore.createIndex(label, key)` ([INDEX.md §3.3](INDEX.md)); an undeclared pair falls through to
+the property probe, which is what the planner did before. There is no Cypher DDL for a declaration —
+the query language uses an index it cannot create.
 
 **Known costs, stated rather than discovered:**
 
@@ -460,7 +466,9 @@ property equality → a label scan → a full node scan. So
   are the same Cypher value with different hash codes, and two nodes are equal by id rather than by
   contents.
 - **Only the first label of a pattern drives the scan**; the rest are verified per candidate. The
-  rarest would be the better choice, and the store does not expose per-label counts.
+  rarest would be the better choice, and the store does not expose per-label counts. A declared
+  composite index is the way to say which pair matters, because without statistics the planner cannot
+  work it out ([INDEX_TASKS.md IDX-8](INDEX_TASKS.md)).
 - **No join reordering.** A pattern is expanded left to right from its chosen seed.
 - **A write query is materialised end to end**, and commits before its first row is delivered (§4.1).
   Nothing about a write streams, and `Cypher.stream` does not change that.
@@ -790,5 +798,5 @@ previous bundle. Every assertion in the first run failed against markup that no 
 
 ---
 
-_Git HEAD revision: `8f178b4`_
+_Git HEAD revision: `0970e6b`_
 _Last updated: 2026-08-16 (HNSW vector search, stages 1 to 6)_

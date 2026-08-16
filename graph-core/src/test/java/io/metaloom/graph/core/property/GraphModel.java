@@ -149,6 +149,21 @@ public final class GraphModel {
 	}
 
 	/**
+	 * The composite lookup, as the dumbest correct implementation: every node that carries the label and holds the
+	 * value. The store answers it from one B+tree probe when the pair is declared and from the property tree when it
+	 * is not, and both have to agree with this.
+	 */
+	public Set<Long> nodesByLabelAndProperty(String label, String key, Object value) {
+		Set<Long> result = new TreeSet<>();
+		for (long id : nodesByProperty(key, value)) {
+			if (labels.getOrDefault(id, List.of()).contains(label)) {
+				result.add(id);
+			}
+		}
+		return result;
+	}
+
+	/**
 	 * The comparable form of a stored value.
 	 * <p>
 	 * Two things are folded here. The store widens every stored integer to a long, so the model has to compare the

@@ -24,8 +24,7 @@ touches, and a task that grows past a paragraph of design gets its own file
 |---|---|---|---|---|
 | [IDX-5](#idx-5--a-relationship-scan-that-does-not-go-through-the-nodes) | `forEachRelationship` over the `REL` segment | P2 | S | Build. ~20 lines, and it removes most of the reason to want IDX-6 |
 | [IDX-6](#idx-6--a-relationship-type-index) | Relationship type index | P3 | L | **Do not build yet.** See §1 |
-| [IDX-7](#idx-7--composite-label-property-indexes) | Composite `(label, property)` indexes | P2 | M | Build when a workload has a label plus a low-selectivity property |
-| [IDX-8](#idx-8--statistics-enough-to-choose-a-label) | Per-label / per-key cardinality | P2 | M | Build with IDX-7 — it is what makes a choice between two indexes possible |
+| [IDX-8](#idx-8--statistics-enough-to-choose-a-label) | Per-label / per-key cardinality | P2 | M | Build next — with IDX-7 built, it is what would let the planner *choose* an index rather than be told |
 
 ---
 
@@ -118,75 +117,24 @@ IDX-8 first — per-type counts are what would let anyone argue this from number
 intuition.
 
 **If it is ever built**, the design is settled by the existing machinery and does not need inventing:
-a third tree rooted in the catalog page (§4 of INDEX.md leaves offsets 32..63 free, past the offset-30
-generation trap), `k1 = typeId`, `k2 = relId`, maintained by two new hooks alongside the four that
-exist. Relationship *property* indexing is the same tree with `k1 = (keyId << 32) | valueHash` and the
+a fourth tree rooted in the catalog page — after the composite region, which ends at 3344
+([INDEX.md §4](INDEX.md)), and not in the 32..63 gap, past the offset-30 generation trap —
+`k1 = typeId`, `k2 = relId`, maintained by two new hooks alongside the four that exist. Relationship *property* indexing is the same tree with `k1 = (keyId << 32) | valueHash` and the
 same candidate verification — and it is strictly for materialised relationships, which is why
 [INDEX.md §6](INDEX.md) says there is no unique constraint on a relationship property.
 
 ---
 
-## IDX-7 — composite (label, property) indexes
 
-**Priority P2.** [INDEX.md §11](INDEX.md) states the case: `MATCH (n:Person {email: …})` is a property
-probe plus a label verification, where one probe would do. Two things make it worth more than that
-sentence suggests:
-
-- **A label-scoped unique constraint becomes possible.** Today `createUniqueConstraint(key)` is global
-  over every node in the store — "no two nodes share an email", not "no two `:Person` share an email".
-  The second is what applications actually mean, and it cannot be expressed at all right now.
-- **It is the honest fix for a low-selectivity property.** [INDEX.md §7](INDEX.md) records that a
-  property probe wins over a label scan unconditionally, "which is right almost always and wrong for a
-  property that is nearly constant". `{active: true}` on a store of ten million nodes returns five
-  million candidates, each of which is then read and verified. A composite key cuts that to the
-  labelled subset in one probe.
-
-**Key design.** Do not pack the fields into fixed sub-widths — label ids and key ids are `int`s from
-the dictionary, and a width choice made now becomes a format constraint forever. Hash the triple
-instead, which is what the property tree already does with its value:
-
-```
-k1 = mix64(labelId, keyId, valueHash(value))
-k2 = nodeId
-value = nodeId
-```
-
-Collisions are already survivable: `nodesByProperty` verifies every candidate against the stored
-property, and a composite lookup verifies the label as well. The verification is what makes hashing
-safe, and it is the same argument [INDEX.md §3.2](INDEX.md) makes for the property tree — including
-the part that bites: the verification has to use `IndexCatalog.valueEquals`, the partner of
-`valueHash`, and not `Objects.deepEquals`.
-
-**Declaration, not implicit maintenance.** The two existing trees index everything automatically. A
-composite index must be *declared* — there are `labels × keys` possible pairs and indexing them all
-would multiply the write cost of every node by the size of its label set. So:
-
-- a catalog list of `(labelId, keyId)` pairs, alongside the unique-constraint list at offset 64 —
-  note that list can already reach offset 1092 with 256 entries, so pick the new offsets after it, not
-  in the 32..63 gap if IDX-6 has claimed that;
-- `createIndex(label, key)` scans every live node and backfills, the way `addUniqueConstraint` scans
-  before declaring;
-- the four maintenance hooks consult the declared list — and `onLabelsChanged` becomes interesting for
-  the first time, because adding a label to a node now has to insert composite entries for every
-  declared key that node already carries;
-- `PatternMatcher.candidates` prefers a composite probe when the pattern carries both a label and a
-  literal-valued property, before its current property-then-label order.
-
-**The rollback trap.** `ensureInitialised` already documents that the catalog page can be allocated by
-a transaction that rolls back, which is why `catalogPageId` is a hint re-derived on every use. A
-declared-index list adds a second thing on that page whose absence must mean "not declared" rather
-than "corrupt". Reuse the same re-derivation rather than adding a parallel mechanism.
-
-**Done when**: `createIndex(label, key)` exists and backfills; the planner uses it and a test asserts
-the *choice* (not just the answer) — the existing tests would pass with the index ignored entirely;
-`ReferenceModelTest` covers a store with a composite index declared mid-workload; a label-scoped
-unique constraint either works or is explicitly out of scope in `INDEX.md §6`.
 
 ---
 
 ## IDX-8 — statistics, enough to choose a label
 
-**Priority P2, and IDX-7 is much less useful without it.** [INDEX.md §7](INDEX.md) is blunt about
+**Priority P2, and it is what IDX-7 leaves undone.** A composite index now exists
+([INDEX.md §3.3](INDEX.md)), but it has to be **declared**, because without a cardinality estimate the
+engine cannot tell a constant property from a selective one and so must be told which pairs are worth
+indexing. [INDEX.md §7](INDEX.md) is blunt about
 this: "the store does not expose any statistics at all — there is no cardinality estimate anywhere in
 this engine, and the planner is a fixed order rather than a cost model." Two consequences are already
 documented as known costs: only the first label of a pattern drives the scan, and a property probe
@@ -239,10 +187,11 @@ these ids leads somewhere.
 | IDX-1 | A `float[]` property was indexed under its identity hash, so an equality lookup missed, a delete left the entry dangling and a unique constraint never fired. Fixed by hashing arrays and lists by content, with `IndexCatalog.valueEquals` as the matching verification | [INDEX.md §3.2](INDEX.md); tests in [TESTING.md](TESTING.md); the vectors-stay-in-the-property-tree decision it forced in [VECTOR.md §1.3](VECTOR.md) |
 | IDX-2 | A type-filtered supernode traversal read one 64 byte relationship record per *edge* to learn the type it was filtering on. Fixed by caching the type in the materialised adjacency entry, with `0` reserved for "not cached" so no format version bump was needed | [RELATIONSHIP_STORAGE.md §3.1](RELATIONSHIP_STORAGE.md) (and §6.2 for the tombstone argument, §8 for the three rules); budget in [TESTING.md §7](TESTING.md) |
 | IDX-9 | Vectors were storable and not searchable. Built as **HNSW** in six stages: a `VEC` kind whose record interleaves a vector with its ANN links so a visited node costs one page read, a declared index over `(label, key)` maintained by the hooks, the graph itself with entry-point repair and the paper's diversity heuristic, a resumable batched build, and `CALL … YIELD`. The exact `nearestByScan` stayed, because an approximate index is only as good as the exact answer it is measured against | [VECTOR.md](VECTOR.md) — §7 for the stages and the three defects the tests found; [CYPHER.md §1.1](CYPHER.md) for the query surface; [PROPERTY_STORAGE.md §4](PROPERTY_STORAGE.md) for which of the two homes a vector gets |
+| IDX-7 | `MATCH (n:Person {email: …})` was a property probe plus a label verification, a low-selectivity property had no honest fast path, and a *label-scoped* unique constraint could not be expressed at all. Built as a third B+tree keyed on `mix64(labelId, keyId, valueHash(value))` — hashed rather than packed into sub-widths, so no width choice becomes a format constraint — **declared** rather than implicit, with a backfill scan at declaration and the four hooks consulting the declared list. `onLabelsChanged` became the interesting one: adding a label indexes the properties the node already carries | [INDEX.md §3.3](INDEX.md) (§4 for the page layout, §5 for the two hooks that grew an argument, §6 for the label-scoped constraint, §7 for the planner order); tests in [TESTING.md](TESTING.md) |
 | IDX-4 | `edges` returned a `long[]` and `neighbours` a `List<Edge>`, both fully built before the caller saw anything, so a `LIMIT 1` over a node of degree 10^6 paid for 10^6. Fixed with `EdgeCursor` / `NeighbourCursor`, which decode a block only when the previous one is exhausted; `edges` and `neighbours` became drains of the cursor, so the walk and its two filter levels stayed in one place. The cursor holds the read latch outright, because unlike a list it cannot be re-run by the optimistic read path — which makes closing it the caller's obligation | [RELATIONSHIP_STORAGE.md §5.4](RELATIONSHIP_STORAGE.md) (and §6.3 for both traversal forms); budget in [TESTING.md §7](TESTING.md) |
 | IDX-3 | The `type_bitmap` and `min/max_location` a block maintains on every append were read only by the delete path, so a type-filtered scan of a supernode decoded every block of the chain and `hasEdge(a, b)` did not exist at all. Fixed by `edges(nodeId, typeIds)` and `hasEdge`, with two header flags saying when either summary may be trusted to rule something out — the bitmap under-describes a block holding an entry that caches no type, and the range mixes two address spaces in a block holding a materialised one. The saving is in blocks *decoded*; §5.3 says why it cannot be in blocks read, and corrects the O(log blocks) claim the section used to make | [RELATIONSHIP_STORAGE.md §5, §5.3, §6.4](RELATIONSHIP_STORAGE.md) (and §8 for the two skip rules); budget in [TESTING.md §7](TESTING.md) |
 
 ---
 
-_Git HEAD revision: `20f7e3d`_
-_Last updated: 2026-08-16 (IDX-4: the streaming neighbour cursor)_
+_Git HEAD revision: `0970e6b`_
+_Last updated: 2026-08-16 (IDX-7 closed: the declared composite index)_

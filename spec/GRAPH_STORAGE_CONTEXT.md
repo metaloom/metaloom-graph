@@ -24,7 +24,7 @@ The defining design constraint is:
 > **An element id decodes arithmetically into the exact file and byte offset of its record.
 > Reading an element by id costs zero index probes and zero extra seeks.**
 
-**Status.** Phases 0 to 10 are implemented to varying depth; 749 tests pass here, plus 23 in the MetaLoom
+**Status.** Phases 0 to 10 are implemented to varying depth; 774 tests pass here, plus 23 in the MetaLoom
 integration. The engine is **durable**
 (write-ahead log, fsync before any data page is touched, redo recovery), **transactional** (commit,
 rollback, auto-commit), **indexed** (label and property B+trees, and an HNSW index for
@@ -74,7 +74,7 @@ GRAPH_STORAGE_CONTEXT.md (this file)
         ├─ FILE_FORMAT.md ............ segments, pages, records, on-disk layout
         ├─ RELATIONSHIP_STORAGE.md ... adjacency, traversal, edge compression
         ├─ PROPERTY_STORAGE.md ....... attributes, dictionaries, blobs
-        ├─ INDEX.md .................. the label and property B+trees, unique constraints
+        ├─ INDEX.md .................. the label, property and composite B+trees, unique constraints
         ├─ INDEX_TASKS.md ............ the work items behind INDEX.md's "not built" list
         ├─ VECTOR.md ................. vector records and the HNSW index over them
         ├─ TRANSACTIONS.md ........... ACID, snapshot isolation, page versions, CoW
@@ -85,6 +85,7 @@ GRAPH_STORAGE_CONTEXT.md (this file)
         ├─ SSD_IO.md ................. I/O strategy, seek avoidance, alignment
         ├─ NATIVE_FFM.md ............. the Java <-> native boundary
         ├─ IO_URING.md ............... the ring: what it buys, and why nothing calls it yet
+        ├─ TASKS.md .................. deferred work items, area-prefixed — currently URING-1..7
         ├─ GRAALVM.md ................ the native binary: FFM under native-image
         ├─ API.md .................... the public Java API
         ├─ TESTING.md ................ test setup, benchmarks, crash testing
@@ -103,7 +104,7 @@ GRAPH_STORAGE_CONTEXT.md (this file)
 | [FILE_FORMAT.md](FILE_FORMAT.md) | Store directory layout, manifest, segment anatomy, page metadata array, free-slot bitmap, node and relationship record layouts, versioning and compaction | Adjacency internals, property internals |
 | [RELATIONSHIP_STORAGE.md](RELATIONSHIP_STORAGE.md) | Inline edges, adjacency blocks, edge compression, lightweight edges, traversal cost model | Node record layout |
 | [PROPERTY_STORAGE.md](PROPERTY_STORAGE.md) | Property blocks, key and label dictionaries, value typing, inline vs blob, string dedup | Relationship storage; the property *index* (INDEX.md) |
-| [INDEX.md](INDEX.md) | The two secondary B+trees — label to node and hashed property value to node — their page layout, the candidate verification a hashed key requires, the four maintenance hooks, unique constraints, and why relationships are not indexed | How a property is stored (PROPERTY_STORAGE.md); which access path a query picks (CYPHER.md) |
+| [INDEX.md](INDEX.md) | The three secondary B+trees — label to node, hashed property value to node, and the declared `(label, key)` composite — their page layout, the candidate verification a hashed key requires, the four maintenance hooks, store-wide and label-scoped unique constraints, and why relationships are not indexed | How a property is stored (PROPERTY_STORAGE.md); which access path a query picks (CYPHER.md) |
 | [INDEX_TASKS.md](INDEX_TASKS.md) | The work items behind [INDEX.md §11](INDEX.md): for each unbuilt index, whether it is worth building, what it costs and what "done" means. Also the answer to "are unindexed relationships a supernode problem" — they are not, and §1 says what is | The design of anything on the list; the cross-project backlog order (PROGRESS.md §5) |
 | [VECTOR.md](VECTOR.md) | Vector data in the graph: the `VEC` record that holds a vector with its ANN links, the declared index over `(label, property key)`, the HNSW structure and its build, why no B+tree can answer a nearest-neighbour query, and the four shapes considered before HNSW was chosen | How a property value is encoded (PROPERTY_STORAGE.md) |
 | [CYPHER.md](CYPHER.md) | The openCypher subset, reads and writes: grammar, null semantics, where it differs from the engine, which transaction a query gets, why writes are off by default, the planner's costs, and the Vert.x HTTP server with its React and D3 graph browser | The public API; the binary streaming port (WIRE.md) |
@@ -114,7 +115,8 @@ GRAPH_STORAGE_CONTEXT.md (this file)
 | [WAL.md](WAL.md) | WAL record format, LSN semantics, group commit, ARIES recovery, checkpointing, log retention | Isolation semantics |
 | [SSD_IO.md](SSD_IO.md) | Seek-avoidance rules, alignment, page cache, prefetch, write amplification, TRIM, queue depth | Format details |
 | [NATIVE_FFM.md](NATIVE_FFM.md) | Which functions live in native code and why, the FFM binding rules, arena lifetimes, the pure-Java fallback contract | Storage semantics, and the two capabilities that have a file of their own |
-| [IO_URING.md](IO_URING.md) | Capability N1 on its own: the Rust ring, `UringIoEngine`, the 15x measurement and what it is not, why no caller exists, and the group-commit design that would be the first | The other native capabilities |
+| [IO_URING.md](IO_URING.md) | Capability N1 on its own: the Rust ring, `UringIoEngine`, the 15x measurement and what it is not, why no caller exists, and the group-commit design that would be the first | The other native capabilities; the work items behind its gaps (TASKS.md) |
+| [TASKS.md](TASKS.md) | Deferred work items with an area prefix: for each gap a spec identified and did not close, whether it is worth building, what it costs, what would change the verdict, and what "done" means. Currently the io_uring items, URING-1..7, including why the WAL is further from being the ring's first caller than [IO_URING.md §6.1](IO_URING.md) reads | The design of anything on the list; the index backlog (INDEX_TASKS.md); the cross-project backlog order (PROGRESS.md §5) |
 | [GRAALVM.md](GRAALVM.md) | Compiling the server to a native binary: what native-image does and does not support of the FFM API, downcall registration, the netty substitution, and what the binary costs against the jar | How the FFM layer works (NATIVE_FFM.md) |
 | [API.md](API.md) | The public Java API surface: `GraphStore`, transactions, cursors, traversal, element builders | Internals |
 | [TESTING.md](TESTING.md) | Test layout, fixtures, benchmark harness, crash and fault injection, invariant checkers | Implementation steps |
@@ -335,7 +337,7 @@ Full description in [ARCHITECTURE.md](ARCHITECTURE.md).
 | `PropertyStore` / `ValueCodec` | `io.metaloom.graph.core.store.prop` | Property blocks and typed value encoding |
 | `BlobStore` | `io.metaloom.graph.core.store.blob` | Page-sized extents for large values |
 | `AdjacencyStore` / `AdjacencyBlock` / `EdgeCodec` / `PackedEdge` | `io.metaloom.graph.core.store.adj` | The three adjacency tiers and the compressing codec |
-| `BTree` / `IndexCatalog` | `io.metaloom.graph.core.index` | The label and property B+trees, rooted in an index page; also the declared vector-index list |
+| `BTree` / `IndexCatalog` | `io.metaloom.graph.core.index` | The label, property and declared-composite B+trees, rooted in an index page; also the declared vector-index list |
 | `HnswIndex` | `io.metaloom.graph.core.index` | The approximate-nearest-neighbour graph over the vector records |
 | `VectorStore` / `VectorRecord` | `io.metaloom.graph.core.store.vec` | One fixed-size record per vector, holding the vector **and** its ANN links so a search visits a node in one read |
 | `Compactor` / `ForwardingMap` | `io.metaloom.graph.core.maintenance` | Record relocation and the reference rewrite; **the only thing that breaks an id** |
@@ -371,5 +373,5 @@ deliverables and exit criteria are in [PLAN.md](PLAN.md).
 
 ---
 
-_Git HEAD revision: `20f7e3d`_
-_Last updated: 2026-08-16 (IDX-4: the streaming neighbour cursor)_
+_Git HEAD revision: `0970e6b`_
+_Last updated: 2026-08-16 (IDX-7: the declared composite index)_

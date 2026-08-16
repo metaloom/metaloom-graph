@@ -61,6 +61,32 @@ public final class IndexCatalog {
 	private static final int VECTOR_ENTRY_BYTES = 64;
 	private static final int MAX_VECTOR_INDEXES = 16;
 
+	/**
+	 * The composite {@code (label, key)} index: a root pointer, a count, then that many fixed-size declarations.
+	 * <p>
+	 * Past the vector list, which reaches {@code 1156 + 64 * 16 = 2180} when it is full, and the whole region ends at
+	 * {@code 2320 + 16 * 64 = 3344} — inside the smallest page this engine allows, which is 4 KiB. The same rule as
+	 * everywhere else on this page applies: a field that moves is a format change, so each list is given room to grow
+	 * rather than packed against the next one.
+	 * <p>
+	 * A zeroed region reads as "no composite index is declared", which is what an older store's catalog page holds and
+	 * is exactly the right answer for one. The root is {@code NULL} until the first declaration, because a store that
+	 * declares none must not pay a page for a tree nothing writes to.
+	 */
+	private static final int OFF_COMPOSITE_ROOT = 2304;
+	private static final int OFF_COMPOSITE_COUNT = 2312;
+	private static final int OFF_COMPOSITE_ENTRIES = 2320;
+	private static final int COMPOSITE_ENTRY_BYTES = 16;
+	private static final int MAX_COMPOSITE_INDEXES = 64;
+
+	// Field offsets within one composite-index declaration.
+	private static final int CI_LABEL_ID = 0;
+	private static final int CI_KEY_ID = 4;
+	private static final int CI_FLAGS = 8;
+
+	/** Bit 0 of {@code CI_FLAGS}: the declaration is also a label-scoped unique constraint. */
+	private static final int CI_FLAG_UNIQUE = 1;
+
 	// Field offsets within one vector-index entry.
 	private static final int VI_LABEL_ID = 0;
 	private static final int VI_KEY_ID = 4;
@@ -216,6 +242,198 @@ public final class IndexCatalog {
 			}
 		}
 		return conflicting;
+	}
+
+	// ---------------------------------------------------------------- declared composite indexes
+
+	/**
+	 * One declared composite index, in the dictionary ids the maintenance hooks work in.
+	 *
+	 * @param labelId
+	 *            the label a node must carry for its property to be indexed here
+	 * @param keyId
+	 *            the property key
+	 * @param unique
+	 *            whether the declaration is also a <b>label-scoped</b> unique constraint
+	 */
+	public record Composite(int labelId, int keyId, boolean unique) {
+	}
+
+	private long compositeRoot() {
+		return segments.resolve(catalogPageId).get(Layouts.LONG, OFF_COMPOSITE_ROOT);
+	}
+
+	private void compositeRoot(long rootId) {
+		segments.mutable(catalogPageId).set(Layouts.LONG, OFF_COMPOSITE_ROOT, rootId);
+		segments.touched(catalogPageId);
+	}
+
+	/**
+	 * Declares an index over {@code (label, key)}, and reports whether this call is what declared it.
+	 * <p>
+	 * Unlike the two implicit trees, a composite index is <b>declared rather than maintained for everything</b>: there
+	 * are {@code labels x keys} possible pairs, and indexing them all would multiply the write cost of every node by
+	 * the size of its label set. So the hooks consult this list, and a pair that is not on it costs nothing at all.
+	 * <p>
+	 * Re-declaring an existing pair is not an error and returns {@code false}, which is what lets the caller skip the
+	 * backfill scan: the entries are already there. Asking for uniqueness on a pair declared without it upgrades the
+	 * declaration in place — the entries a unique check probes are the same ones.
+	 *
+	 * @return true if the pair was newly declared, so the caller still owes it a backfill
+	 */
+	public boolean addCompositeIndex(int labelId, int keyId, boolean unique) throws IOException {
+		if (labelId == 0 || keyId == 0) {
+			throw new IllegalArgumentException("A composite index needs an interned label and key, got "
+				+ labelId + " and " + keyId);
+		}
+		ensureInitialised();
+		List<Composite> existing = composites();
+		for (int i = 0; i < existing.size(); i++) {
+			Composite declared = existing.get(i);
+			if (declared.labelId() == labelId && declared.keyId() == keyId) {
+				if (unique && !declared.unique()) {
+					MemorySegment page = segments.mutable(catalogPageId);
+					page.set(Layouts.BYTE, OFF_COMPOSITE_ENTRIES + (long) i * COMPOSITE_ENTRY_BYTES + CI_FLAGS,
+						(byte) CI_FLAG_UNIQUE);
+					segments.touched(catalogPageId);
+				}
+				return false;
+			}
+		}
+		if (existing.size() >= MAX_COMPOSITE_INDEXES) {
+			throw new IllegalStateException("At most " + MAX_COMPOSITE_INDEXES + " composite indexes are supported");
+		}
+		// The tree is created with the first declaration rather than with the catalog page: a store that declares none
+		// must not pay a page for a tree nothing ever writes to.
+		if (ElementId.isNull(compositeRoot())) {
+			compositeRoot(tree.create());
+		}
+		MemorySegment page = segments.mutable(catalogPageId);
+		long base = OFF_COMPOSITE_ENTRIES + (long) existing.size() * COMPOSITE_ENTRY_BYTES;
+		page.set(Layouts.INT, base + CI_LABEL_ID, labelId);
+		page.set(Layouts.INT, base + CI_KEY_ID, keyId);
+		page.set(Layouts.BYTE, base + CI_FLAGS, (byte) (unique ? CI_FLAG_UNIQUE : 0));
+		page.set(Layouts.INT, OFF_COMPOSITE_COUNT, existing.size() + 1);
+		segments.touched(catalogPageId);
+		return true;
+	}
+
+	/**
+	 * Every declared composite index, in the ids the hooks work in.
+	 * <p>
+	 * Empty is the common case and the one that has to stay cheap, because every maintenance hook consults this list.
+	 */
+	public List<Composite> composites() {
+		if (!initialised()) {
+			return List.of();
+		}
+		MemorySegment page = segments.resolve(catalogPageId);
+		int count = page.get(Layouts.INT, OFF_COMPOSITE_COUNT);
+		if (count == 0) {
+			return List.of();
+		}
+		if (count < 0 || count > MAX_COMPOSITE_INDEXES) {
+			throw new io.metaloom.graph.core.api.PageCorruptException("The index catalog declares " + count
+				+ " composite indexes, which is outside 0.." + MAX_COMPOSITE_INDEXES);
+		}
+		List<Composite> declared = new java.util.ArrayList<>(count);
+		for (int i = 0; i < count; i++) {
+			long base = OFF_COMPOSITE_ENTRIES + (long) i * COMPOSITE_ENTRY_BYTES;
+			declared.add(new Composite(page.get(Layouts.INT, base + CI_LABEL_ID),
+				page.get(Layouts.INT, base + CI_KEY_ID),
+				(page.get(Layouts.BYTE, base + CI_FLAGS) & CI_FLAG_UNIQUE) != 0));
+		}
+		return declared;
+	}
+
+	/** Every declared composite index by name. */
+	public List<io.metaloom.graph.core.api.CompositeIndex> compositeIndexes() {
+		List<Composite> declared = composites();
+		List<io.metaloom.graph.core.api.CompositeIndex> named = new java.util.ArrayList<>(declared.size());
+		for (Composite composite : declared) {
+			named.add(new io.metaloom.graph.core.api.CompositeIndex(catalog.label(composite.labelId()),
+				catalog.key(composite.keyId()), composite.unique()));
+		}
+		return named;
+	}
+
+	public boolean hasComposite(int labelId, int keyId) {
+		for (Composite declared : composites()) {
+			if (declared.labelId() == labelId && declared.keyId() == keyId) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** Whether any declared composite index over this label is also a unique constraint. */
+	public boolean hasUniqueComposite(int labelId) {
+		for (Composite declared : composites()) {
+			if (declared.unique() && declared.labelId() == labelId) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Candidate nodes carrying the label and the value, in one probe.
+	 * <p>
+	 * Candidates, not answers: the key is a hash of the triple, so the caller verifies both the label and the value
+	 * against the stored record — with {@link #valueEquals}, which is the partner of {@link #valueHash}, and never with
+	 * {@code Objects.deepEquals} directly.
+	 */
+	public List<Long> nodesByLabelAndProperty(int labelId, int keyId, Object value) {
+		if (!initialised() || value == null || ElementId.isNull(compositeRoot())) {
+			return List.of();
+		}
+		return tree.scanPrefix(compositeRoot(), compositeKey(labelId, keyId, value));
+	}
+
+	/** The same probe by name, which is what a test and the planner-facing store method use. */
+	public List<Long> nodesByLabelAndProperty(String label, String key, Object value) {
+		int labelId = catalog.lookupLabel(label);
+		int keyId = catalog.lookupKey(key);
+		if (labelId == 0 || keyId == 0) {
+			return List.of();
+		}
+		return nodesByLabelAndProperty(labelId, keyId, value);
+	}
+
+	/** Candidates for a label-scoped unique check, excluding one element. */
+	public List<Long> compositeConflicts(int labelId, int keyId, Object value, long excluding) {
+		List<Long> conflicting = new java.util.ArrayList<>(1);
+		for (long id : nodesByLabelAndProperty(labelId, keyId, value)) {
+			if (id != excluding) {
+				conflicting.add(id);
+			}
+		}
+		return conflicting;
+	}
+
+	/**
+	 * Inserts one composite entry, which is how a declaration backfills the nodes that already exist.
+	 * <p>
+	 * Idempotent: the key is {@code (mix64(label, key, value), nodeId)} and {@code BTree.put} replaces an identical
+	 * key, so a backfill that runs twice leaves one entry rather than two.
+	 */
+	public void addCompositeEntry(long nodeId, int labelId, int keyId, Object value) throws IOException {
+		ensureInitialised();
+		compositePut(nodeId, labelId, keyId, value);
+	}
+
+	private void compositePut(long nodeId, int labelId, int keyId, Object value) throws IOException {
+		compositeRoot(tree.put(compositeRoot(), compositeKey(labelId, keyId, value), nodeId, nodeId));
+	}
+
+	private void compositeRemove(long nodeId, int labelId, int keyId, Object value) {
+		if (!ElementId.isNull(compositeRoot())) {
+			tree.remove(compositeRoot(), compositeKey(labelId, keyId, value), nodeId);
+		}
+	}
+
+	public long compositeIndexSize() {
+		return initialised() && !ElementId.isNull(compositeRoot()) ? tree.size(compositeRoot()) : 0;
 	}
 
 	// ---------------------------------------------------------------- declared vector indexes
@@ -413,6 +631,12 @@ public final class IndexCatalog {
 				propRoot(tree.put(propRoot(), propertyKey(entry.getKey(), entry.getValue()), nodeId, nodeId));
 			}
 		}
+		for (Composite declared : composites()) {
+			Object value = value(properties, declared.keyId());
+			if (value != null && holds(labelIds, declared.labelId())) {
+				compositePut(nodeId, declared.labelId(), declared.keyId(), value);
+			}
+		}
 	}
 
 	/** Removes the node from the index under every label it carried. Missing one leaves a dangling index entry. */
@@ -432,6 +656,16 @@ public final class IndexCatalog {
 				tree.remove(propRoot(), propertyKey(entry.getKey(), entry.getValue()), nodeId);
 			}
 		}
+		for (Composite declared : composites()) {
+			Object value = value(properties, declared.keyId());
+			if (value != null && holds(labelIds, declared.labelId())) {
+				compositeRemove(nodeId, declared.labelId(), declared.keyId(), value);
+			}
+		}
+	}
+
+	private static Object value(Map<Integer, Object> properties, int keyId) {
+		return properties == null ? null : properties.get(keyId);
 	}
 
 	/**
@@ -447,8 +681,17 @@ public final class IndexCatalog {
 	 * Both directions are needed and neither is optional: a label left in the tree makes {@code MATCH (n:Gone)} return
 	 * a node that no longer carries it, and a label missing from it makes {@code MATCH (n:Added)} silently miss one.
 	 * </p>
+	 *
+	 * <p>
+	 * <b>A composite index makes this hook interesting.</b> Adding a label to a node has to insert a composite entry
+	 * for every declared key that node <em>already</em> carries — the value did not change, but the pair
+	 * {@code (label, key)} it belongs under only came into existence with the label. Which is why the node's
+	 * properties are a parameter here at all; they are read through a supplier because nothing needs them until a
+	 * composite index is declared, and relabelling must not start reading property blocks in a store that has none.
+	 * </p>
 	 */
-	public void onLabelsChanged(long nodeId, int[] before, int[] after) throws IOException {
+	public void onLabelsChanged(long nodeId, int[] before, int[] after,
+		java.util.function.Supplier<Map<Integer, Object>> properties) throws IOException {
 		ensureInitialised();
 		for (int labelId : before) {
 			if (labelId != 0 && !holds(after, labelId)) {
@@ -460,9 +703,33 @@ public final class IndexCatalog {
 				labelRoot(tree.put(labelRoot(), labelId, nodeId, nodeId));
 			}
 		}
+		List<Composite> declared = composites();
+		if (declared.isEmpty()) {
+			return;
+		}
+		Map<Integer, Object> held = properties.get();
+		for (Composite composite : declared) {
+			boolean had = holds(before, composite.labelId());
+			boolean has = holds(after, composite.labelId());
+			if (had == has) {
+				continue;
+			}
+			Object value = value(held, composite.keyId());
+			if (value == null) {
+				continue;
+			}
+			if (has) {
+				compositePut(nodeId, composite.labelId(), composite.keyId(), value);
+			} else {
+				compositeRemove(nodeId, composite.labelId(), composite.keyId(), value);
+			}
+		}
 	}
 
 	private static boolean holds(int[] labelIds, int labelId) {
+		if (labelIds == null) {
+			return false;
+		}
 		for (int held : labelIds) {
 			if (held == labelId) {
 				return true;
@@ -471,7 +738,7 @@ public final class IndexCatalog {
 		return false;
 	}
 
-	public void onPropertiesChanged(long nodeId, Map<Integer, Object> before,
+	public void onPropertiesChanged(long nodeId, int[] labelIds, Map<Integer, Object> before,
 		Map<Integer, Object> after) throws IOException {
 		ensureInitialised();
 		for (Map.Entry<Integer, Object> entry : before.entrySet()) {
@@ -484,6 +751,22 @@ public final class IndexCatalog {
 			Object was = before.get(entry.getKey());
 			if (!valueEquals(was, entry.getValue())) {
 				propRoot(tree.put(propRoot(), propertyKey(entry.getKey(), entry.getValue()), nodeId, nodeId));
+			}
+		}
+		for (Composite composite : composites()) {
+			if (!holds(labelIds, composite.labelId())) {
+				continue;
+			}
+			Object was = value(before, composite.keyId());
+			Object now = value(after, composite.keyId());
+			if (valueEquals(was, now)) {
+				continue;
+			}
+			if (was != null) {
+				compositeRemove(nodeId, composite.labelId(), composite.keyId(), was);
+			}
+			if (now != null) {
+				compositePut(nodeId, composite.labelId(), composite.keyId(), now);
 			}
 		}
 	}
@@ -525,18 +808,27 @@ public final class IndexCatalog {
 	 * only reason it is affordable is that index ids are internal and never handed out. The caller is responsible for
 	 * re-inserting every node afterwards — a store whose index is reset and not refilled answers every indexed lookup
 	 * with nothing.
+	 * <p>
+	 * The composite tree is reset with them, but only if one was ever created. The <b>declarations survive</b>: they
+	 * live on the catalog page, not in the tree, so {@code onNodeCreated} refills the composite entries during the same
+	 * rebuild that refills the other two.
 	 */
 	public int resetTrees() throws IOException {
 		if (!initialised()) {
 			return 0;
 		}
+		boolean hadComposite = !ElementId.isNull(compositeRoot());
 		List<Long> pages = new java.util.ArrayList<>(tree.pages(labelRoot()));
 		pages.addAll(tree.pages(propRoot()));
+		if (hadComposite) {
+			pages.addAll(tree.pages(compositeRoot()));
+		}
 		for (long pageId : pages) {
 			segments.free(pageId);
 		}
 		labelRoot(tree.create());
 		propRoot(tree.create());
+		compositeRoot(hadComposite ? tree.create() : ElementId.NULL);
 		return pages.size();
 	}
 
@@ -569,6 +861,35 @@ public final class IndexCatalog {
 	 */
 	static long propertyKey(int keyId, Object value) {
 		return ((long) keyId << 32) | (valueHash(value) & 0xFFFFFFFFL);
+	}
+
+	/**
+	 * The 64 bit index key for a composite {@code (label, key, value)}: all three <b>hashed together</b>.
+	 * <p>
+	 * Deliberately not three fields packed into fixed sub-widths. A label id and a key id are {@code int}s handed out
+	 * by the dictionary, and a width chosen for them here would become a format constraint for the life of the store —
+	 * the moment one overflowed, every existing entry would be keyed under a scheme nothing could reproduce. Hashing
+	 * has no width to run out of, and it is what the property tree already does with its value.
+	 * <p>
+	 * Collisions are survivable for the same reason they are there: the caller verifies every candidate against the
+	 * stored record, and a composite lookup verifies the label as well as the value. The verification is what makes
+	 * hashing safe, and it has to use {@link #valueEquals} — the partner of {@link #valueHash} — rather than
+	 * {@code Objects.deepEquals}, which is shallow inside a list and would discard the very candidate the tree found.
+	 */
+	static long compositeKey(int labelId, int keyId, Object value) {
+		long pair = mix64(((long) labelId << 32) | (keyId & 0xFFFFFFFFL));
+		return mix64(pair ^ (valueHash(value) & 0xFFFFFFFFL));
+	}
+
+	/** The SplitMix64 finaliser: it spreads the three fields across the whole key rather than into three ranges. */
+	private static long mix64(long value) {
+		long x = value;
+		x ^= x >>> 33;
+		x *= 0xFF51AFD7ED558CCDL;
+		x ^= x >>> 33;
+		x *= 0xC4CEB9FE1A85EC53L;
+		x ^= x >>> 33;
+		return x;
 	}
 
 	/**

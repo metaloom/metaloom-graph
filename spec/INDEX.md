@@ -1,8 +1,8 @@
 # INDEX.md — the secondary indexes
 
-Two B+trees: **label → node** and **(property key, value) → node**. They exist so that
-`MATCH (n:Person {email: $e})` is a probe rather than a scan, and they are the only structures in this
-engine whose pages may be relocated freely.
+Three B+trees: **label → node**, **(property key, value) → node**, and a **declared
+(label, key, value) → node**. They exist so that `MATCH (n:Person {email: $e})` is a probe rather than
+a scan, and they are the only structures in this engine whose pages may be relocated freely.
 
 > **Do not put here**: the addressing invariant ([ID_ENCODING.md](ID_ENCODING.md)), the record layouts
 > ([FILE_FORMAT.md](FILE_FORMAT.md)), how a property value is encoded
@@ -16,11 +16,11 @@ engine whose pages may be relocated freely.
 
 | | |
 |---|---|
-| **What is indexed** | Node labels, node property values, node unique constraints |
+| **What is indexed** | Node labels, node property values, declared `(label, key)` pairs, node unique constraints — store-wide or label-scoped |
 | **What is not** | **Relationships — not by type, not by property.** Values are indexed by *hash*, so no ranges |
 | **Structure** | One B+tree per index, over `INDEX`-kind pages. `IndexCatalog` + `BTree` |
 | **Transactionality** | An index write is part of the same commit as the data write, through the same page overlay |
-| **Maintenance** | Four hooks on `IndexCatalog`, called from `GraphStoreImpl` |
+| **Maintenance** | Four hooks on `IndexCatalog`, called from `GraphStoreImpl`. The first two indexes are implicit; the composite one is maintained only for *declared* pairs |
 | **Rebuild** | `resetTrees()` — compaction rebuilds rather than relocating page by page |
 
 ---
@@ -79,7 +79,7 @@ not reason about the gap.
 
 ---
 
-## 3. The two indexes
+## 3. The three indexes
 
 ### 3.1 Label → node
 
@@ -152,20 +152,87 @@ being tuned — that is a different structure, explored in [VECTOR.md](VECTOR.md
 by hash, and a hash is deliberately not order-preserving. A range index would need the value's ordered
 bytes in the key, which is a different index and is not built.
 
+### 3.3 (label, property key, value) → node — declared
+
+```
+k1 = mix64(labelId, keyId, valueHash(value))     k2 = nodeId    value = nodeId
+```
+
+`MATCH (n:Person {email: …})` is a property probe plus a label verification, and one probe would do.
+This tree does it in one. Two things make it worth more than that sentence:
+
+- **A label-scoped unique constraint becomes expressible.** `createUniqueConstraint(key)` is global
+  over every node in the store — "no two nodes share an email". What an application means is "no two
+  `:Person` share an email", and until this tree existed there was nothing to build it on (§6).
+- **It is the honest fix for a low-selectivity property.** §7 records that a property probe beats a
+  label scan *unconditionally*, which is right almost always and wrong for a property that is nearly
+  constant. `{active: true}` over ten million nodes hands back five million candidates, each of which
+  is then read and verified against its label. A composite probe returns the labelled subset.
+
+**All three fields are hashed together, not packed into sub-widths.** A label id and a key id are
+`int`s handed out by the dictionary, and a width chosen for them here would become a format
+constraint for the life of the store: the moment one overflowed, every existing entry would be keyed
+under a scheme nothing could reproduce. A hash has no width to run out of, and it is what §3.2
+already does with its value. The mixing is the SplitMix64 finaliser, applied twice so the pair and
+the value both spread across the whole key.
+
+**Which makes the verification load-bearing twice over.** A composite lookup verifies the label *and*
+the value against the stored record, and the value comparison must be `IndexCatalog.valueEquals` —
+the partner of `valueHash`, per §3.2 — rather than `Objects.deepEquals`. Reaching for `deepEquals`
+here would find the entry and then discard the node it names, which is the same silent-miss failure
+IDX-1 cost.
+
+**It is declared, not implicit.** The other two trees index everything automatically; this one indexes
+only pairs someone asked for. There are `labels × keys` possible pairs, and maintaining them all would
+multiply the write cost of every node by the size of its label set. So:
+
+- the declared pairs live in the catalog page (§4), up to 64 of them, each with a unique flag;
+- `createIndex(label, key)` **scans every live node and backfills**, in the declaring transaction, the
+  way `addUniqueConstraint` scans before declaring. An index covering only writes made after it would
+  answer confidently with a subset, which is worse than no index at all;
+- the four maintenance hooks (§5) consult the declared list, so a store that has declared none pays a
+  catalog-page read per hook call and no tree work at all;
+- the tree's root is `NULL` until the first declaration, so a store with no composite index does not
+  own a page for one.
+
+**The answer does not depend on the declaration; only the cost does.**
+`GraphStore.nodesByLabelAndProperty` answers with the composite probe when the pair is declared and
+with a property probe plus a label filter when it is not. That is what makes the declaration safe to
+add or omit — and it is also why a test asserting the *answer* proves nothing about the index, which
+§10 comes back to.
+
+**There is no `dropIndex`.** A declaration can be added and upgraded to unique but not removed;
+clearing the slot would leave its entries in the tree, and removing them is a scan. Nothing has asked
+for it.
+
 ---
 
 ## 4. The catalog page, and why the roots are not in the manifest
 
-Both root pointers live in **slot 0 of `INDEX` segment 0** — a page that is itself an index page, and
+Every root pointer lives in **slot 0 of `INDEX` segment 0** — a page that is itself an index page, and
 therefore transactional.
 
 ```
- 0  8  magic
- 8  8  label_root
-16  8  prop_root
-64  4  unique_count
-68  N  unique key ids, 4 bytes each, up to 256
+   0  8  magic
+   8  8  label_root
+  16  8  prop_root
+  64  4  unique_count
+  68  N  unique key ids, 4 bytes each, up to 256          → ends at 1092
+1152  4  vector_count
+1156  N  vector index entries, 64 bytes each, up to 16    → ends at 2180
+2304  8  composite_root                                   NULL until the first declaration
+2312  4  composite_count
+2320  N  composite entries, 16 bytes each, up to 64:      → ends at 3344
+         0 4 label_id | 4 4 key_id | 8 1 flags (bit 0 = unique)
 ```
+
+**Each list starts past the last one rather than against it**, and the whole region ends inside 4 KiB,
+which is the smallest page this engine allows. A field that moves is a format change, so every list is
+given room to grow — and none of them goes anywhere near the gap at 32..63, for the reason §2.1 gives.
+
+**A zeroed region means "nothing declared"**, which is exactly what an older store's catalog page
+holds and exactly the right answer for one. That is the same convention the vector list uses and the
+same one `NULL_ID == 0` establishes everywhere else.
 
 Putting the roots in the manifest would have been the obvious choice and would have been wrong: the
 manifest is written at a **checkpoint**, not at every commit, so a crash between the two would leave
@@ -177,6 +244,11 @@ transaction, and that transaction can roll back — which frees the page and lea
 slot that is no longer allocated. So it is re-derived whenever it does not resolve, turning "the index
 was created by a transaction that was discarded" back into "there is no index yet" rather than a
 `StaleIdException` on the next lookup. `UsageExampleTest` found this.
+
+**Every list on this page inherits that**, and none of them may add a parallel mechanism for it. A
+declaration made by a transaction that rolls back has to read back as "not declared" rather than as
+corruption, and it does, because `composites()` and `uniqueKeys()` both go through the same
+`initialised()` re-derivation before they read a byte.
 
 **The index is created lazily**, on the first write that needs it. A store that has never been written
 to has no index pages at all.
@@ -190,14 +262,25 @@ an index update rolls back with the data update it belongs to.
 
 | Hook | Called from | What it does |
 |---|---|---|
-| `onNodeCreated(id, labelIds, properties)` | `createNode`, `Compactor` | One label entry per label, one property entry per key |
+| `onNodeCreated(id, labelIds, properties)` | `createNode`, `Compactor` | One label entry per label, one property entry per key, one composite entry per declared pair the node satisfies |
 | `onNodeDeleted(id, labelIds, properties)` | `deleteNode`, `Compactor` | Removes every one of them. Missing one leaves a dangling entry |
-| `onPropertiesChanged(id, before, after)` | `setNodeProperties` | Removes entries whose value changed, adds the new ones. Only the difference |
-| `onLabelsChanged(id, before, after)` | `addNodeLabel`, `removeNodeLabel` | Same, for labels |
+| `onPropertiesChanged(id, labelIds, before, after)` | `setNodeProperties` | Removes entries whose value changed, adds the new ones. Only the difference |
+| `onLabelsChanged(id, before, after, properties)` | `addNodeLabel`, `removeNodeLabel` | Same, for labels — plus a composite entry per declared key the node already carries |
 
 `onLabelsChanged` is the newest and was added with Cypher's `SET n:Label`
 ([CYPHER.md §5](CYPHER.md)). Before it there was no hook for a changed label set at all, because the
 engine had no way to change one: a label set could only be given at creation.
+
+**The composite index is what made the last two hooks take a fourth argument**, and the reason is
+asymmetric. A property change has to know the node's labels to tell which declared pairs it belongs
+to. A *label* change has to know the node's properties — because adding `:Person` to a node that
+already holds an email creates a `(Person, email)` entry although no value changed. That is the one
+case where relabelling does real index work rather than moving a label entry, and it is the case
+`onLabelsChanged` had never had to answer before.
+
+**The properties come in as a supplier**, evaluated only when something is declared. Nothing needs
+them otherwise, and a relabelling in a store with no composite index must not start reading property
+blocks to discover that.
 
 **Only the difference is rewritten.** Removing and reinserting every entry would give the same answer,
 but every dirtied index page is a byte run in the commit and an entry in every open reader's version
@@ -210,18 +293,33 @@ entries on one node, and the delete would remove one and leave the other.
 
 ## 6. Unique constraints
 
-`createUniqueConstraint(key)` — **on node properties only**. The key ids live in the catalog page
-(§4), up to 256 of them.
+Two forms, **on node properties only**:
 
-Declaring one **scans every live node first** and refuses if the data already breaks it, rather than
-declaring something that is already false.
+| | Declared by | Scope | Where it lives |
+|---|---|---|---|
+| Store-wide | `createUniqueConstraint(key)` | every node in the store | the key id list in the catalog page (§4), up to 256 |
+| Label-scoped | `createUniqueConstraint(label, key)` | the nodes carrying that label | a declared composite index (§3.3) with its unique flag set |
+
+Declaring either **scans the live data first** and refuses if it already breaks the constraint, rather
+than declaring something that is already false. The label-scoped scan covers only the nodes carrying
+the label, which is the whole difference between the two.
 
 Enforcement is `checkUnique`, which probes the index, verifies each candidate against the stored value,
-and raises `ConstraintViolationException` naming the key, the value and the node already holding it.
+and raises `ConstraintViolationException` naming the key, the value and the node already holding it —
+and the label as well, when there is one. The label-scoped half probes the composite tree, so its
+candidates already carry the label; it still verifies the label per candidate, because the key is a
+hash of the triple and a collision must not refuse a legitimate write.
 
-**Two ordering facts worth knowing before relying on it:**
+**A label-scoped constraint is also an index**, necessarily: it is a declared pair plus a flag, so
+declaring it makes `hasIndex(label, key)` true and gives the planner the probe. Declaring uniqueness
+over a pair that is already indexed upgrades the declaration in place rather than adding a second one
+— the entries a unique check probes are the entries that are already there.
+
+**Three ordering facts worth knowing before relying on it:**
 
 - `createNode` checks **before** allocating. A violation there leaves nothing behind.
+- `addNodeLabel` checks **before** writing the label, and only a label-scoped constraint can be broken
+  this way: two nodes may legitimately share an email until the second is told it is a `:Person`.
 - `setNodeProperties` checks **after** writing the new property block. A violation there leaves a
   partially applied write, so the transaction must be rolled back rather than caught and continued —
   which is exactly what the Cypher write path does ([CYPHER.md §5.2](CYPHER.md)).
@@ -238,9 +336,15 @@ index for one to be built on.
 The access paths, most selective first ([CYPHER.md §7](CYPHER.md)):
 
 1. a variable already bound by an earlier clause — verify, do not search;
-2. an **indexed property equality** from the pattern's inline map;
-3. a **label scan**;
-4. a full scan — `forEachNode`, and with a `LIMIT`, `forEachNodeWhile`, which stops.
+2. a **declared composite index** over one of the pattern's labels and one of its literal-valued
+   inline properties;
+3. an **indexed property equality** from the pattern's inline map;
+4. a **label scan**;
+5. a full scan — `forEachNode`, and with a `LIMIT`, `forEachNodeWhile`, which stops.
+
+Step 2 is only ever taken when the pair is declared, and asking costs a catalog read rather than a
+scan — an undeclared pair falls through to exactly the property probe at step 3, which is what the
+planner did before composite indexes existed.
 
 Two known costs, stated rather than discovered:
 
@@ -250,7 +354,9 @@ Two known costs, stated rather than discovered:
   cardinality estimate anywhere in this engine, and the planner is a fixed order rather than a
   cost model.
 - **A property probe wins over a label scan unconditionally**, which is right almost always and wrong
-  for a property that is nearly constant.
+  for a property that is nearly constant. §3.3 is the fix that is available today, and it is a
+  *declaration* rather than a decision the planner makes: without statistics the engine cannot tell a
+  constant property from a selective one, so it is told.
 
 ---
 
@@ -278,8 +384,10 @@ with the numbers and routes what remains to two adjacency tasks, neither of whic
 ## 9. Interaction with the rest of the engine
 
 - **Compaction** relocates node ids, so every index entry naming one must be rewritten.
-  `Compactor` does not do that entry by entry: it calls `resetTrees()`, which frees every page of both
-  trees, and re-inserts every node. Rebuilding is both simpler and denser than fixing up a parent
+  `Compactor` does not do that entry by entry: it calls `resetTrees()`, which frees every page of every
+  tree, and re-inserts every node. The composite *declarations* survive that, because they live on the
+  catalog page rather than in the tree — so the same `onNodeCreated` that refills the other two refills
+  them. Rebuilding is both simpler and denser than fixing up a parent
   pointer, a leaf sibling pointer and possibly a root pointer per page — and it is only affordable
   because **index ids are internal and never handed out**, which is the same fact that lets these pages
   relocate at all.
@@ -300,11 +408,13 @@ with the numbers and routes what remains to two adjacency tasks, neither of whic
 
 | | |
 |---|---|
-| `IndexTest` | The two trees end to end: lookup, update, delete, a rebuild, and the lazy first allocation |
-| `UniqueConstraintTest` | Declaration against data that already breaks it, enforcement on create and on update, and durability across a reopen |
+| `IndexTest` | The two implicit trees end to end: lookup, update, delete, a rebuild, and the lazy first allocation |
+| `CompositeIndexTest` | The declared tree: the backfill, all four hooks, a rolled-back declaration, a reopen, a compaction — and the **candidate counts**, because every assertion about the answer would pass with the index ignored |
+| `CompositeIndexPlanTest` | Which access path the Cypher planner takes, recorded through a proxy around `GraphStore`. The same reason: the answer does not distinguish the plans |
+| `UniqueConstraintTest` | Both forms: declaration against data that already breaks it, enforcement on create, on update and on a label change, and durability across a reopen |
 | `MultiLabelTest` | An entry per label rather than per node, spill in and out of the overflow block, and `addNodeLabel`/`removeNodeLabel` leaving the index exactly right |
 | `CompactionTest` | Ids move and both trees still answer — the case `resetTrees` exists for |
-| `ReferenceModelTest` | The differential that matters: every indexed lookup must equal what an in-memory reference model says, over a randomised workload |
+| `ReferenceModelTest` | The differential that matters: every indexed lookup must equal what an in-memory reference model says, over a randomised workload. Two composite indexes are declared **partway through** it, so the backfill and the hooks are both on trial — and the undeclared pairs check that the fallback path gives the same answer |
 | `CypherWriteVersusApiTest` | Write through Cypher, then verify with the API **and** `verify(FULL)`, whose `NoDanglingRefs` checker is what catches an index entry pointing at a freed slot |
 
 The load-bearing one is `ReferenceModelTest`: an index that agrees with itself proves nothing, and an
@@ -319,14 +429,16 @@ Each of these is a task with a verdict, an effort estimate and a definition of d
 [INDEX_TASKS.md](INDEX_TASKS.md).
 
 - **Range queries.** §3.2 — the key holds a hash, and a hash is not order-preserving.
-- **Composite indexes.** `(label, property)` as one key would make `MATCH (n:Person {email: …})` a
-  single probe instead of a probe plus a label verification. Nothing needs it yet — but it is also the
-  only way to express a *label-scoped* unique constraint
-  ([INDEX_TASKS.md IDX-7](INDEX_TASKS.md#idx-7--composite-label-property-indexes)).
+- **Dropping a composite index.** §3.3 — a declaration can be added and upgraded, not removed.
+- **Composite indexes over more than one property**, or over a relationship. §3.3 keys one label and
+  one key; `(label, k1, k2)` would be the same tree with a different mix, and nothing has asked.
+- **Cypher `CREATE INDEX`.** A composite index is declared through the Java API only. The planner
+  *uses* one ([CYPHER.md §7](CYPHER.md)), but the query language has no DDL for one.
 - **Relationship indexes.** §8, and [IDX-6](INDEX_TASKS.md#idx-6--a-relationship-type-index) for why
   the verdict is "not yet" rather than "eventually".
 - **Statistics.** No per-label counts, no cardinality estimates, no histograms — which is why §7's
-  planner is a fixed order rather than a cost model.
+  planner is a fixed order rather than a cost model, and why §3.3 has to be declared rather than
+  chosen ([IDX-8](INDEX_TASKS.md#idx-8--statistics-enough-to-choose-a-label)).
 - **Full text, spatial, vector.** The store can hold a `float[]` and the property tree answers an
   *exact-equality* lookup on one (§3.2), which is all it will ever answer: nothing does nearest
   neighbour. Vectors are explored in [VECTOR.md](VECTOR.md).
@@ -334,5 +446,5 @@ Each of these is a task with a verdict, an effort estimate and a definition of d
 
 ---
 
-_Git HEAD revision: `3a05a2a`_
-_Last updated: 2026-08-16_
+_Git HEAD revision: `0970e6b`_
+_Last updated: 2026-08-16 (IDX-7: the declared composite index and the label-scoped unique constraint)_

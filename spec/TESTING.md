@@ -3,7 +3,7 @@
 A storage engine is only as good as its evidence. This file defines how the project proves that it
 does not lose data.
 
-The suite today is 749 tests across the five modules — 366 in `graph-core`, 253 in `graph-cypher`, 22
+The suite today is 774 tests across the five modules — 385 in `graph-core`, 259 in `graph-cypher`, 22
 in `graph-protocol`, 2 in `graph-client`, 106 in `graph-server` — running in a few minutes, plus benchmarks, a soak, a scaling
 harness and a `kill -9` loop behind profiles and scripts. The PoC suite it replaced had one red test,
 three unbounded benchmarks living in the unit suite, and two tests that passed for reasons unrelated
@@ -80,6 +80,9 @@ src/test/java/io/metaloom/graph/core/
                  differential); VectorRecallTest — recall@k against the exact scan, **printed and
                  floored** rather than asserted equal, because an approximate index that always
                  agreed would be measured on data too small to approximate anything;
+                 CompositeIndexTest — the declared (label, property) index, whose load-bearing
+                 assertions are on candidate *counts* rather than answers, because the store returns
+                 the same answer with the index ignored ([INDEX.md §3.3](INDEX.md));
                  NeighbourCursorTest — the streaming traversal, with the list form as its oracle over
                  every shape of adjacency, because the two are built on one walk and the risk is that
                  they drift. What it asserts alone is what a cursor has and a list does not: a
@@ -133,7 +136,10 @@ graph-server/src/main/frontend/e2e/
   concurrency/   jcstress and custom harnesses
   crash/         fault-injection recovery tests
   invariant/     the checkers themselves plus their tests
-  bench/         BulkBenchmark, CodecProfileBenchmark and SupernodeBenchmark (tagged `bench`);
+  bench/         BulkBenchmark, CodecProfileBenchmark, SupernodeBenchmark and VectorBuildBenchmark
+                 (tagged `bench`) — the last of these reports two numbers rather than one, because a
+                 build's insert rate and the stall it inflicts on a competing writer are independent
+                 and a design can improve either at the other's expense (VECTOR.md 4.4.1);
                  GraphScaleBenchmark and GraphTraversalBenchmark (tagged `huge`, opt-in only)
   fixture/       graph generators, temp store rule, deterministic RNG
 ```
@@ -168,6 +174,11 @@ mvn test -Phuge -Dtest=GraphTraversalBenchmark
 # One node with 20,000 relationships, with gates asserting it does not degrade. Runs in -Pbench.
 mvn test -Pbench -Dtest=SupernodeBenchmark
 mvn test -Pbench -Dtest=SupernodeBenchmark -Dgraph.supernode.degree=200000
+
+# How fast a declared vector index builds, and how long a competing writer waits while it does.
+# The batch size is the knob the two numbers trade against each other; 32 is the measured default.
+mvn test -Pbench -Dtest=VectorBuildBenchmark
+mvn test -Pbench -Dtest=VectorBuildBenchmark -Dgraph.vector.build.batch=1 -Dgraph.vector.build.members=20000
 
 # Where the time inside a block read and write goes, which is how the SIMD question was settled.
 mvn test -Pbench -Dtest=CodecProfileBenchmark
@@ -456,7 +467,11 @@ diagnostic artefact and deleting it on failure is the most frustrating thing a t
 - [x] `CompactionTest` and `CompactionCrashTest`: survivors re-found without any held id, held ids
       proven stale-or-correct but never misresolved, and a failure injected at every compaction batch
 - [x] Reference-model differential harness (`GraphModel`, `ReferenceModelTest`), across rollbacks,
-      crashes and a compaction
+      crashes and a compaction — including two composite indexes declared partway through the
+      workload, so that a backfill over existing data and the hooks over later writes are both
+      compared against the model
+- [x] Access-path assertions where the answer cannot distinguish two plans
+      (`CompositeIndexPlanTest`, which records the executor's calls against a `GraphStore` proxy)
 - [x] Reads-per-operation budgets and write amplification, enforced as build failures
 - [x] Hostile and corrupt input against every format parser (`HostileInputTest`)
 - [x] Concurrency scaling curve to 32 threads, with the bottleneck identified at each knee
@@ -495,5 +510,6 @@ diagnostic artefact and deleting it on failure is the most frustrating thing a t
 
 ---
 
-_Git HEAD revision: `20f7e3d`_
-_Last updated: 2026-08-16 (IDX-4: the streaming neighbour cursor)_
+_Git HEAD revision: `0970e6b`_
+_Last updated: 2026-08-16 (IDX-7: CompositeIndexTest, CompositeIndexPlanTest, and the composite
+indexes declared mid-workload in ReferenceModelTest)_

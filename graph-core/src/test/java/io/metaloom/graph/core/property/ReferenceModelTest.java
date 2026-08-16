@@ -49,6 +49,19 @@ public class ReferenceModelTest {
 	private static final String[] TYPES = { "OWNS", "DEPICTS", "TAGGED", "DERIVED_FROM" };
 	private static final String[] KEYS = { "name", "size", "score", "active", "embedding" };
 
+	/**
+	 * The composite indexes declared partway through the workload.
+	 * <p>
+	 * Declared mid-run rather than up front, because the two halves of a declaration fail differently: a backfill that
+	 * misses a node already in the store, and a maintenance hook that misses one written afterwards. A store that was
+	 * indexed from empty would only ever exercise the second. The pairs are compared from the first batch, so the
+	 * fallback path — the same question answered without an index — is compared against the same model.
+	 */
+	private static final String[][] COMPOSITES = { { "Person", "name" }, { "Asset", "size" } };
+
+	/** The batch after which {@link #COMPOSITES} are declared: late enough that the backfill has work to do. */
+	private static final int DECLARE_AFTER_BATCH = 2;
+
 	@Test
 	public void testRandomOperationsMatchTheModel() throws Exception {
 		long seed = 20260813L;
@@ -105,6 +118,14 @@ public class ReferenceModelTest {
 					}
 				} finally {
 					txn.close();
+				}
+
+				if (batch == DECLARE_AFTER_BATCH) {
+					// Mid-workload, in its own auto-commit transaction: the backfill has to pick up everything already
+					// written, and the hooks everything written after.
+					for (String[] pair : COMPOSITES) {
+						store.createIndex(pair[0], pair[1]);
+					}
 				}
 
 				if (disruptions && random.nextInt(6) == 0) {
@@ -247,6 +268,20 @@ public class ReferenceModelTest {
 			for (Object value : sampleValues(model, key)) {
 				assertEquals(model.nodesByProperty(key, value), new TreeSet<>(store.nodesByProperty(key, value)),
 					where + ": the property index disagrees for " + key + "=" + value);
+			}
+		}
+		for (String[] pair : COMPOSITES) {
+			for (Object value : sampleValues(model, pair[1])) {
+				assertEquals(model.nodesByLabelAndProperty(pair[0], pair[1], value),
+					new TreeSet<>(store.nodesByLabelAndProperty(pair[0], pair[1], value)),
+					where + ": the composite index disagrees for :" + pair[0] + "." + pair[1] + "=" + value);
+			}
+			// The other labels are never declared, so this is the same question answered without an index — and it has
+			// to give the same answer, or the declaration would be changing results rather than only their cost.
+			for (String label : LABELS) {
+				assertEquals(model.nodesByLabelAndProperty(label, pair[1], "n0"),
+					new TreeSet<>(store.nodesByLabelAndProperty(label, pair[1], "n0")),
+					where + ": the undeclared composite path disagrees for :" + label + "." + pair[1]);
 			}
 		}
 		assertEquals(model.nodeIds().size(), store.stats().nodeCount(), where + ": live node count");

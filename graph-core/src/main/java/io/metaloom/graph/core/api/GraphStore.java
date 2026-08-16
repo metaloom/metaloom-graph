@@ -283,6 +283,43 @@ public interface GraphStore extends AutoCloseable {
 	List<Long> nodesByProperty(String key, Object value);
 
 	/**
+	 * Every node carrying the label <b>and</b> the property value.
+	 *
+	 * <p>
+	 * The answer does not depend on whether an index over the pair has been declared; only its cost does. With a
+	 * declaration this is one probe of the composite tree; without one it is a property probe followed by a label
+	 * verification per candidate, which for a low-selectivity property means reading every node that holds the value.
+	 * {@link #hasIndex} is how a planner tells the two apart before choosing.
+	 * </p>
+	 */
+	List<Long> nodesByLabelAndProperty(String label, String key, Object value);
+
+	/**
+	 * Declares an index over a label and a property key, and backfills it.
+	 *
+	 * <p>
+	 * The label and property indexes maintain themselves for everything; this one has to be asked for, because there
+	 * are {@code labels x keys} possible pairs and maintaining them all would multiply the write cost of every node by
+	 * the size of its label set. Declared, it makes {@code MATCH (n:Person {email: ...})} one probe instead of a
+	 * property probe plus a label verification — which matters most for a property that is <em>not</em> selective:
+	 * {@code {active: true}} over ten million nodes returns five million candidates to verify, and the composite probe
+	 * returns only the labelled ones.
+	 * </p>
+	 *
+	 * <p>
+	 * Every live node carrying the label and the key is indexed before the call returns, in the same transaction, so
+	 * the index is complete the moment it exists. Re-declaring an existing pair does nothing.
+	 * </p>
+	 */
+	void createIndex(String label, String key) throws IOException;
+
+	/** Whether an index over this label and key has been declared. */
+	boolean hasIndex(String label, String key);
+
+	/** Every declared composite index, in declaration order. */
+	List<CompositeIndex> compositeIndexes();
+
+	/**
 	 * Declares a property key unique across live nodes: a later write carrying a value another node already holds is
 	 * refused with {@link ConstraintViolationException}.
 	 * <p>
@@ -291,7 +328,25 @@ public interface GraphStore extends AutoCloseable {
 	 */
 	void createUniqueConstraint(String key) throws IOException;
 
-	/** Property keys currently declared unique. */
+	/**
+	 * Declares a property key unique <b>among the nodes carrying one label</b>: "no two {@code :Person} share an
+	 * email", which is what an application usually means and what {@link #createUniqueConstraint(String)} cannot say.
+	 *
+	 * <p>
+	 * A label-scoped constraint is a declared composite index plus a flag, so declaring one also gives the pair its
+	 * index — {@link #hasIndex} reports true afterwards and {@link #compositeIndexes} lists it as unique. As with the
+	 * store-wide form, the existing data is checked first and the declaration refused rather than recorded untrue; the
+	 * scan covers only the nodes carrying the label.
+	 * </p>
+	 *
+	 * <p>
+	 * It is enforced on a label change as well as on a property write: adding the label to a node that already holds a
+	 * value another labelled node has is refused, and refused before anything is written.
+	 * </p>
+	 */
+	void createUniqueConstraint(String label, String key) throws IOException;
+
+	/** Property keys currently declared unique across every node. Label-scoped ones are in {@link #compositeIndexes}. */
 	List<String> uniqueConstraints();
 
 	/**

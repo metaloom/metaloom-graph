@@ -9,7 +9,7 @@ Sections 1 to 4 are the reasoning, kept as written because the trade-offs did no
 plan and its outcome.
 
 > **Do not put here**: how a property value is encoded ([PROPERTY_STORAGE.md](PROPERTY_STORAGE.md)),
-> how the two existing B+trees work ([INDEX.md](INDEX.md)), the task list this came out of
+> how the three existing B+trees work ([INDEX.md](INDEX.md)), the task list this came out of
 > ([INDEX_TASKS.md](INDEX_TASKS.md)).
 
 ---
@@ -131,11 +131,10 @@ alone is decisive:
 - **Building it is expensive.** Indexing every `float[]` property that happens to be written would
   make an unrelated bulk load pay for an ANN build nobody asked for.
 
-So the declaration is `createVectorIndex(label, key, dimensions, metric, params)` — which is the same
-declaration machinery as
-[INDEX_TASKS.md IDX-7](INDEX_TASKS.md#idx-7--composite-label-property-indexes), a catalog list of
-declared `(labelId, keyId)` pairs plus a backfill scan, exactly as `addUniqueConstraint` scans before
-it declares. Build IDX-7 first and this reuses it.
+So the declaration is `createVectorIndex(label, key, dimensions, metric, params)` — the same
+declaration machinery the composite index uses ([INDEX.md §3.3](INDEX.md)): a catalog list of declared
+`(labelId, keyId)` pairs plus a backfill scan, exactly as `addUniqueConstraint` scans before it
+declares. The two lists are separate regions of the same catalog page and were built in that order.
 
 **Put the producing model in the declaration too.** Two models produce vectors of the same length in
 the same datatype and mean completely different things by them, and a distance between two of them is
@@ -269,12 +268,70 @@ Three costs, none of them small:
    distance computations, each needing a vector read — *inside* the write path. Building over ten
    million vectors single-threaded is the kind of number that turns into hours, and
    [reports/SCALE.md](reports/SCALE.md) is the cautionary precedent for finding that out after
-   building it.
+   building it. **This was measured rather than left as a worry — see §4.4.1, which is the one part
+   of this section that is no longer a prediction.**
 2. **Deletion is HNSW's known weak spot.** Removing a node from the layer graph without breaking
    connectivity means tombstoning and periodic rebuild — which this engine actually has a home for,
    since compaction already rebuilds both B+trees wholesale via `resetTrees` rather than relocating
    pages.
 3. **The vectors themselves still need §4.2**, so this is additive to that work, not an alternative.
+
+### 4.4.1 The build cost, measured — and why the obvious fix was wrong
+
+`VectorBuildBenchmark` builds 100,000 members at 128 dimensions and reports two numbers that have to
+be read together: the **insert rate**, which says whether a build is feasible, and the **longest wait
+a competing writer experiences**, which says whether it is usable on a live store. Throughput alone
+cannot tell a build that takes an hour politely from one that takes an hour with the lock held.
+
+The plan for this work carried an instruction — *measure the single-threaded insert rate at 100k
+before committing to the bulk build* — and a prescription: *search in `runRead` against a snapshot,
+write only the resulting link sets in `runWrite`*. The measurement is what showed the prescription was
+right in direction and wrong in granularity.
+
+| Build shape | Inserts/s | 10M would take | Longest writer stall | Commits | recall@10 |
+|---|---|---|---|---|---|
+| Search inside `runWrite`, 256 per commit | 332 | 8.37 h | **3,997 ms** | 321 | 1.0 |
+| Plan in a read view, **1 per commit** | **130** | **21.30 h** | 847 ms | 95,086 | 1.0 |
+| Plan in a read view, **32 per commit** | 290 | 9.57 h | 251 ms | 3,246 | 1.0 |
+| Plan in a read view, **128 per commit** — built | **339** | **8.19 h** | **250 ms** | 799 | 1.0 |
+
+**The second row is the finding.** Doing the prescribed thing at the granularity that seems most
+obviously correct — one member planned, one member applied — makes the build **two and a half times
+slower**. The default sync mode is `FSYNC_ON_COMMIT`, so every member becomes a durable commit, and
+the fsync adds roughly 4.7 ms to a 3 ms insert. It is also worse on the axis it was meant to improve:
+95,086 tiny commits contend for the lock harder than a few hundred larger ones do, so the longest
+stall is *higher* than at either batch size.
+
+**The last row is what is built, and it is not a trade.** It is faster than the original *and* stalls
+a competing writer for a sixteenth as long. That is the shape of the win: the beam search — 2,000
+distance evaluations — left the lock entirely, and what stayed behind is bounded by `M`.
+
+**Why the batch size is 128 and not 32.** Not for the reason the design predicted. The expectation was
+that larger batches would cost recall, because every member of a batch is planned against a graph
+containing none of the others and HNSW's structure comes entirely from each insert searching what the
+previous ones built. **That cost could not be measured**: `VectorRecallTest` reports recall@10 of 1.0
+at 32, 128 and 512 alike, and at 512 over its 1,500-vector corpus a third of the members are blind to
+each other per batch. The test saturates, so it establishes that there is no gross regression and
+cannot choose between these values — which is worth stating plainly rather than quoting 1.0 three
+times as if it were confirmation. The choice was made on the two numbers that do move, and 128
+dominates 32 on both. **The 250 ms stall is a floor set by something other than the batch**, since it
+does not change when the batch quadruples; what that floor is has not been chased.
+
+A corpus large enough to make recall discriminate between batch sizes is the measurement this section
+still wants, and it is the same gap §8 records about recall generally.
+
+**The empty-graph case is correctness, not recall, and is handled rather than tuned around.** The
+members of the very first batch are all planned against an empty graph and would all believe
+themselves the entry point, leaving every one but the last with no links at all — present in the
+index, returned by nothing. `HnswIndex.apply` therefore refuses any plan whose answer to "is there an
+entry point" no longer holds, and the build re-plans that member under the lock. It is the expensive
+path and it fires, in a build, essentially once.
+
+**What is still under the lock**: the back-links. `linkBack` reads a neighbour's own list and re-runs
+the diversity heuristic over it, which is bounded by `M` and cheap per link but is not free at 32
+links a layer — it is most of the 251 ms. Planning it as well is possible and is not obviously
+correct, because a neighbour's list changes as other members of the same batch link into it, and a
+stale plan there would silently drop links rather than merely choose worse ones.
 
 ### 4.5 Option D — do not build it here
 
@@ -388,8 +445,12 @@ Two things follow from the scale, and they changed the design rather than being 
   them, and a partial update is a silent wrong answer, which is exactly the IDX-1 failure class.
 - **The bulk build's searches run outside the writer lock.** §9's question 4, answered: an insert at
   `efConstruction = 200` is ~2,000 distance evaluations, and doing those under the single writer lock
-  is the "hours" number §4.4 warns about. The search runs in a read transaction against a snapshot and
-  only the resulting link sets are written.
+  is the "hours" number §4.4 warns about. `HnswIndex.plan` computes a member's links reading only, in
+  a read view; `HnswIndex.apply` writes them. **This shipped one stage late and the delay is worth
+  recording**: stage 6 was built with the search still inside `runWrite`, because the measurement that
+  was supposed to gate that decision had not been run. When it was run it found both that the original
+  cost a competing writer a **4 second** stall and that the obvious fix — one member per commit —
+  made the build **2.5x slower**. §4.4.1 has the table; the shipped shape plans 128 members per commit, and is both faster than the original and sixteen times kinder to a competing writer.
 
 | Stage | What | Status |
 |---|---|---|
@@ -473,7 +534,10 @@ The repository's existing culture applies directly, and one test class matters m
    table is the sizing that follows.
 3. ~~Where does the vector live once indexed?~~ **`VEC` only, never both** — §7.
 4. ~~Does an ANN build have to happen under the write lock?~~ **No, and it must not** — the search runs
-   in a read transaction, only the link sets are written (§7).
+   in a read transaction, only the link sets are written (§7). The follow-on question the answer hides
+   — *at what granularity?* — turned out to matter more than the original: per member it is 2.5x
+   slower than the design it replaced, and 128 per commit is both faster than it and 16x kinder to a
+   competing writer. Measured in §4.4.1.
 
 **Still open:**
 
@@ -490,5 +554,6 @@ The repository's existing culture applies directly, and one test class matters m
 
 ---
 
-_Git HEAD revision: `8f178b4`_
-_Last updated: 2026-08-16 (HNSW vector search, stages 1 to 6)_
+_Git HEAD revision: `0970e6b`_
+_Last updated: 2026-08-16 (IDX-7 closed, so §1.3's declaration machinery now cites INDEX.md; new §4.4.1: the bulk build's cost measured, the search moved out of
+the writer lock, and why one-member-per-commit — the obvious reading of the plan — was 2.5x slower)_
