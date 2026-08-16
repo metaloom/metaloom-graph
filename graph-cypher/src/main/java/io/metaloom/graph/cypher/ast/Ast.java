@@ -56,8 +56,8 @@ public final class Ast {
 
 		public boolean isWrite() {
 			for (Clause clause : clauses) {
-				if (clause instanceof Create || clause instanceof SetClause || clause instanceof Remove
-					|| clause instanceof Delete) {
+				if (clause instanceof Create || clause instanceof Merge || clause instanceof SetClause
+					|| clause instanceof Remove || clause instanceof Delete) {
 					return true;
 				}
 			}
@@ -65,7 +65,7 @@ public final class Ast {
 		}
 	}
 
-	public sealed interface Clause permits Match, Unwind, With, Return, Create, SetClause, Remove, Delete {
+	public sealed interface Clause permits Match, Unwind, With, Return, Create, Merge, SetClause, Remove, Delete {
 	}
 
 	/**
@@ -98,6 +98,23 @@ public final class Ast {
 	 * </p>
 	 */
 	public record Create(List<PatternPart> pattern) implements Clause {
+	}
+
+	/**
+	 * {@code MERGE (a:Person {name:$n}) ON CREATE SET a.at = timestamp()} — match the whole pattern, or create it.
+	 *
+	 * <p>
+	 * One pattern part rather than a list, which is openCypher's rule and not a simplification: MERGE's contract is
+	 * that the pattern matches <em>entirely</em> or is built <em>entirely</em>, and a comma-separated list has no
+	 * single answer to that. Write two MERGE clauses instead, which is the same thing said unambiguously.
+	 * </p>
+	 *
+	 * @param onCreate
+	 *            {@code ON CREATE SET …}, applied only to a pattern this clause built
+	 * @param onMatch
+	 *            {@code ON MATCH SET …}, applied only to rows the pattern found
+	 */
+	public record Merge(PatternPart pattern, List<SetItem> onCreate, List<SetItem> onMatch) implements Clause {
 	}
 
 	/**
@@ -176,10 +193,37 @@ public final class Ast {
 	 *
 	 * @param pathVariable
 	 *            set by {@code p = (a)-[]->(b)}, or null
+	 * @param selector
+	 *            which of the matching paths survive; {@link PathSelector#ALL} unless the part was wrapped in
+	 *            {@code shortestPath(…)} or {@code allShortestPaths(…)}
 	 * @param nodes
 	 *            always one more than {@code relationships}
 	 */
-	public record PatternPart(String pathVariable, List<NodePattern> nodes, List<RelPattern> relationships) {
+	public record PatternPart(String pathVariable, PathSelector selector, List<NodePattern> nodes,
+		List<RelPattern> relationships) {
+	}
+
+	/**
+	 * Which of the paths a pattern describes are kept.
+	 *
+	 * <p>
+	 * A property of the <em>pattern part</em> rather than a function of the path it binds, because it changes how the
+	 * part is matched and not what is done with the result: {@link #ALL} enumerates every route depth-first, the other
+	 * two search breadth-first and stop at the first distance that reaches each endpoint. Modelling it as a function
+	 * over paths would mean enumerating everything and then discarding almost all of it, which is the difference
+	 * between a bounded search and an exponential one.
+	 * </p>
+	 */
+	public enum PathSelector {
+
+		/** Every path the pattern matches, which is the default and what a bare pattern means. */
+		ALL,
+
+		/** {@code shortestPath(…)} — one path per pair of endpoints, of minimal length. */
+		SHORTEST,
+
+		/** {@code allShortestPaths(…)} — every path of minimal length, per pair of endpoints. */
+		ALL_SHORTEST
 	}
 
 	/**
@@ -267,8 +311,15 @@ public final class Ast {
 	}
 
 	/**
-	 * Parsed but rejected by the planner. Present so that {@code CASE} produces "not supported in this build" rather
-	 * than a bare syntax error, which would read as though the query were malformed.
+	 * {@code CASE}, in both of its forms.
+	 *
+	 * @param subject
+	 *            the simple form, {@code CASE x WHEN 1 THEN …}, where each {@code when} is compared to {@code x} for
+	 *            equality; null for the generic form, {@code CASE WHEN x > 1 THEN …}, where each is a predicate
+	 * @param whens
+	 *            the same length as {@code thens}, and at least one
+	 * @param otherwise
+	 *            {@code ELSE}, or null — in which case an unmatched CASE is null rather than an error
 	 */
 	public record Case(Expr subject, List<Expr> whens, List<Expr> thens, Expr otherwise) implements Expr {
 	}

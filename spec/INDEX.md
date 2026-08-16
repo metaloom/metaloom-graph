@@ -109,7 +109,7 @@ tree holds a hash and the caller **verifies every candidate** against the stored
 // GraphStoreImpl.nodesByProperty
 for (long nodeId : indexes.nodesByProperty(key, value)) {
     Object stored = properties.read(nodes.propBlockId(nodeId), keyId);
-    if (Objects.deepEquals(stored, normalise(value))) { confirmed.add(nodeId); }
+    if (IndexCatalog.valueEquals(stored, normalise(value))) { confirmed.add(nodeId); }
 }
 ```
 
@@ -122,6 +122,31 @@ collision would be as bad as accepting an illegitimate one.
 the same number hash the same, and `Float` and `Double` likewise. Without that, a property written as
 `1` and searched for as `1L` would miss — and would miss *silently*, which is the failure mode this
 whole layer exists to avoid.
+
+**`valueHash` depends on content and never on identity**, which is a separate statement and the one
+that costs something to keep true. `Object::hashCode` on an array is the identity hash, so a
+`float[]` property — the one value type that is always a fresh instance on the way in and another
+fresh instance on the way back out — was indexed under a key nothing could reproduce: the lookup
+missed the node, the delete missed the entry and left it dangling for `verify(FULL)` to find, and a
+unique constraint on the key never fired. So `float[]` hashes by content, a list hashes by mixing its
+elements' `valueHash` rather than by `List::hashCode`, and any other array shape falls through to
+`Arrays.deepHashCode` rather than to `Object::hashCode`. That last branch is the one that matters
+next time: it is what stops the next array-shaped value type from reintroducing the defect
+([IDX-1](INDEX_TASKS.md#idx-1--a-float-property-is-indexed-under-a-non-deterministic-key)).
+
+**The verification has to agree with the hash**, which is why it is `IndexCatalog.valueEquals` rather
+than `Objects.deepEquals` directly. `deepEquals` is deep for an array and shallow for everything
+else, so a list holding a `float[]` compares its elements by identity and discards the very candidate
+the tree just found. `valueEquals` is `deepEquals` plus an element-wise walk of a list, and it is the
+partner of `valueHash`: hash and equality are one decision made in two places, and a change to either
+that is not made to the other turns a found candidate into a silently dropped answer.
+
+**Hashing a vector is exact-equality only.** `nodesByProperty("embedding", v)` finds the node whose
+embedding is byte-identical to `v`, and index maintenance on that node is sound. Through Cypher it
+holds only when the parameter is itself a `float[]`: a vector *read back* through Cypher is rendered
+as a list of doubles, and searching with that list is searching for a different value
+([VECTOR.md §1.2](VECTOR.md)). None of this is nearest-neighbour search, and it does not become it by
+being tuned — that is a different structure, explored in [VECTOR.md](VECTOR.md).
 
 **Hashing is why there are no range queries.** `n.age > 30` cannot use this index: the tree is ordered
 by hash, and a hash is deliberately not order-preserving. A range index would need the value's ordered
@@ -242,9 +267,11 @@ built for. What has no answer is "every `KNOWS` in the store", which costs a ful
 
 **It is not the reason a high-degree node is slow**, which is the natural next assumption and a wrong
 one: a supernode query starts from a node id and its cost is entirely in how its adjacency is
-enumerated — unskipped blocks, a fully materialised edge list, and a relationship record read *before*
-the type filter can reject it. [INDEX_TASKS.md §1](INDEX_TASKS.md) works that out with the numbers and
-routes it to three adjacency tasks, none of which is an index.
+enumerated — unskipped blocks and a fully materialised edge list. (Reading the relationship record
+*before* the type filter could reject it was the third of those costs, and
+[IDX-2](INDEX_TASKS.md#idx-2--push-the-type-filter-into-adjacency-for-materialised-entries) has since
+removed it: the adjacency entry caches the type.) [INDEX_TASKS.md §1](INDEX_TASKS.md) works that out
+with the numbers and routes it to three adjacency tasks, none of which is an index.
 
 ---
 
@@ -300,13 +327,12 @@ Each of these is a task with a verdict, an effort estimate and a definition of d
   the verdict is "not yet" rather than "eventually".
 - **Statistics.** No per-label counts, no cardinality estimates, no histograms — which is why §7's
   planner is a fixed order rather than a cost model.
-- **Full text, spatial, vector.** The store can hold a `float[]`, and nothing indexes one. Vectors are
-  explored in [VECTOR.md](VECTOR.md); note that a `float[]` property is currently indexed under an
-  identity hash, which is a defect
-  ([IDX-1](INDEX_TASKS.md#idx-1--a-float-property-is-indexed-under-a-non-deterministic-key)).
+- **Full text, spatial, vector.** The store can hold a `float[]` and the property tree answers an
+  *exact-equality* lookup on one (§3.2), which is all it will ever answer: nothing does nearest
+  neighbour. Vectors are explored in [VECTOR.md](VECTOR.md).
 - **Index rebalancing on delete.** §2 — deferred to compaction.
 
 ---
 
-_Git HEAD revision: `e4601d1`_
-_Last updated: 2026-08-15_
+_Git HEAD revision: `3a05a2a`_
+_Last updated: 2026-08-16_

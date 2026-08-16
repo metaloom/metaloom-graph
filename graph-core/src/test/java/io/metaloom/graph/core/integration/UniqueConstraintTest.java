@@ -110,6 +110,31 @@ public class UniqueConstraintTest {
 		}
 	}
 
+	/**
+	 * A constraint on a vector property fires, which it could not while the value hashed to an identity.
+	 * <p>
+	 * {@code conflicts()} probes with the same key the maintenance hooks write, so an unreproducible key made the
+	 * probe return nothing and every duplicate was accepted — the quietest of the three symptoms of IDX-1.
+	 *
+	 * @see <a href="../../../../../../../../spec/INDEX_TASKS.md">spec/INDEX_TASKS.md</a> IDX-1
+	 */
+	@Test
+	public void testADuplicateVectorIsRefused() throws Exception {
+		try (GraphStore store = stores.open()) {
+			store.createUniqueConstraint("embedding");
+			long first = store.createNode("Face", Properties.of().set("embedding", new float[] { 1f, 2f, 3f }));
+
+			ConstraintViolationException failure = assertThrows(ConstraintViolationException.class,
+				() -> store.createNode("Face", Properties.of().set("embedding", new float[] { 1f, 2f, 3f })));
+			assertEquals(first, failure.existingId());
+
+			// A vector that differs in one component is a different value.
+			store.createNode("Face", Properties.of().set("embedding", new float[] { 1f, 2f, 4f }));
+			assertEquals(2, store.nodesByLabel("Face").size());
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
 	@Test
 	public void testTheConstraintSurvivesAReopen() throws Exception {
 		try (GraphStore store = stores.open()) {

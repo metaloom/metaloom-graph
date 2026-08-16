@@ -82,8 +82,40 @@ public final class Evaluator {
 			case Ast.Binary binary -> binary(binary, row);
 			case Ast.Comparison comparison -> comparison(comparison, row);
 			case Ast.FunctionCall call -> Functions.call(this, call, row);
-			case Ast.Case unused -> throw new CypherTypeException("CASE is not supported in this build");
+			case Ast.Case caseExpression -> caseValue(caseExpression, row);
 		};
+	}
+
+	/**
+	 * {@code CASE}, in both forms.
+	 *
+	 * <p>
+	 * <b>Only the branch that is taken is evaluated.</b> That is not an optimisation — it is what makes
+	 * {@code CASE WHEN n.d = 0 THEN 0 ELSE n.x / n.d END} mean what it says. Evaluating every {@code THEN} first would
+	 * divide by zero to produce a value the expression then discards.
+	 * </p>
+	 *
+	 * <p>
+	 * The simple form compares with {@link Values#equalKnown} under Cypher equality, so {@code 1} and {@code 1.0}
+	 * select the same branch. A null on either side selects <em>no</em> branch: null equals null is null rather than
+	 * true, so {@code CASE null WHEN null THEN 'a' ELSE 'b' END} is {@code 'b'} — which surprises people, and is the
+	 * same rule as everywhere else in §2.
+	 * </p>
+	 */
+	private Object caseValue(Ast.Case expression, Row row) {
+		Object subject = expression.subject() == null ? null : evaluate(expression.subject(), row);
+		for (int i = 0; i < expression.whens().size(); i++) {
+			Object when = evaluate(expression.whens().get(i), row);
+			boolean taken = expression.subject() == null
+				? Values.isTrue(when)
+				: subject != null && when != null && Values.equalKnown(subject, when);
+			if (taken) {
+				return evaluate(expression.thens().get(i), row);
+			}
+		}
+		// No ELSE means null, rather than an error: a CASE that matches nothing is a missing value, and the rest of
+		// the language already knows what to do with one.
+		return expression.otherwise() == null ? null : evaluate(expression.otherwise(), row);
 	}
 
 	private Object binary(Ast.Binary binary, Row row) {

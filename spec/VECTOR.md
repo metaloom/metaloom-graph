@@ -18,8 +18,8 @@ first.
 |---|---|
 | **Storable** | Yes — `ValueCodec.T_VECTOR_F32`, `Properties.getVector`, `float[]` of any length |
 | **Where** | Always the blob store: 13 bytes inline (tag, `int` dimension, `long` blob id) plus a blob extent |
-| **Indexed** | No. [INDEX.md §11](INDEX.md) lists "Full text, spatial, vector" as not built |
-| **Equality lookup** | Broken today — see §1.3 and [INDEX_TASKS.md IDX-1](INDEX_TASKS.md#idx-1--a-float-property-is-indexed-under-a-non-deterministic-key) |
+| **Indexed** | Only for exact equality, in the ordinary property tree. No ANN index — [INDEX.md §11](INDEX.md) |
+| **Equality lookup** | Works — the value is hashed by content, see §1.3 and [INDEX_TASKS.md IDX-1](INDEX_TASKS.md#idx-1--a-float-property-is-indexed-under-a-non-deterministic-key) |
 | **Cypher surface** | A vector comes back as a list of doubles; there is no distance function and no `CALL` |
 | **Decision** | Nothing is decided. §7 recommends a staged answer, of which stage 0 is not an index |
 
@@ -68,13 +68,26 @@ which is what an ANN query actually does, would not.
 There are no distance functions in `Functions.java`, and `CALL` is explicitly rejected by the parser —
 "CALL is not supported: this build has no procedure mechanism". Both matter for §6.
 
-### 1.3 The defect underneath all of it
+### 1.3 The defect underneath all of it, and the decision it forced
 
-`IndexCatalog.valueHash` falls through to `value.hashCode()` for `float[]`, which is the identity hash,
-so every vector property is indexed under a key nothing can reproduce. Full write-up and fix in
+`IndexCatalog.valueHash` used to fall through to `value.hashCode()` for `float[]`, which is the
+identity hash, so every vector property was indexed under a key nothing could reproduce: the lookup
+missed the node, the delete missed the entry, and a unique constraint on the key never fired. Full
+write-up in
 [INDEX_TASKS.md IDX-1](INDEX_TASKS.md#idx-1--a-float-property-is-indexed-under-a-non-deterministic-key).
-It is listed here because it forces a decision this file has to make anyway: **should a vector be in
-the property tree at all?**
+
+It is recorded here because fixing it forced the question this file has to answer anyway — **should a
+vector be in the property tree at all?** — and the answer taken was **yes, hashed by content**. A
+`float[]` hashes by `Arrays.hashCode`, a list by its elements' hashes, and the candidate verification
+walks lists element-wise so it agrees. The alternative was to skip vectors at the maintenance hooks and
+document them as unindexed; it was rejected because a value type the tree silently ignores is a second
+kind of silent miss, and because equality maintenance is what keeps `verify(FULL)` honest about a store
+holding embeddings.
+
+**That is exact equality and nothing more**, which §2 explains is nearly meaningless as a *search*: it
+finds the node written from a byte-identical array. It is worth having anyway — it makes maintenance
+sound and it costs one hash of the array on write — and it is not a step towards ANN. Everything from
+§2 on stands unchanged.
 
 ---
 
@@ -356,7 +369,7 @@ Staged, with a decision point after each stage rather than a plan that commits t
 
 | Stage | What | Why it is first |
 |---|---|---|
-| **0** | Fix [IDX-1](INDEX_TASKS.md#idx-1--a-float-property-is-indexed-under-a-non-deterministic-key); add `vector.cosine` / `dot` / `l2`; brute-force nearest-k over a label scan | No format change, no new structure, and it makes vector queries *possible* — which is the difference that matters. It is also the ground truth for everything after it |
+| **0** | ~~Fix [IDX-1](INDEX_TASKS.md#idx-1--a-float-property-is-indexed-under-a-non-deterministic-key)~~ **done**; still open: add `vector.cosine` / `dot` / `l2`; brute-force nearest-k over a label scan | No format change, no new structure, and it makes vector queries *possible* — which is the difference that matters. It is also the ground truth for everything after it |
 | **1** | Decide whether a use case exists that Option D cannot serve — specifically a graph predicate applied during the search | This is the actual decision, and it is not a technical one. Writing a second ANN implementation needs a reason a commodity library cannot supply |
 | **2** | The `VEC` kind and contiguous fixed-stride storage (§4.2), with the true dimension in the declaration | Turns the brute-force scan from scattered blob reads into a sequential one, and is a prerequisite for both B and C |
 | **3** | IVF (§4.3) | Cheapest real index, fits the write model and the I/O model, degrades to stage 2 rather than to wrong answers |
@@ -375,7 +388,8 @@ The repository's existing culture applies directly, and one test class matters m
 - **A brute-force reference model.** `ReferenceModelTest`'s argument — "an index that agrees with
   itself proves nothing" — is even stronger for an approximate index. Exact top-k computed in memory,
   compared against the index, reported as **recall@k** rather than as pass/fail, with a floor the
-  build fails below.
+  build fails below. Its workload already writes a vector property, so the exact-equality half of this
+  is in place and an ANN index would be extending a harness rather than starting one.
 - **Dimension and metric mismatch are refused**, not silently accepted: a 512-dim write into a 768-dim
   index, and a query vector of the wrong length.
 - **Maintenance completeness**: create, update the vector, relabel, delete — each followed by a query
@@ -404,5 +418,5 @@ The repository's existing culture applies directly, and one test class matters m
 
 ---
 
-_Git HEAD revision: `87cd46f`_
+_Git HEAD revision: `3a05a2a`_
 _Last updated: 2026-08-16_

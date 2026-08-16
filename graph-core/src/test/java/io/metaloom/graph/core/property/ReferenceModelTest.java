@@ -47,7 +47,7 @@ public class ReferenceModelTest {
 
 	private static final String[] LABELS = { "Person", "Asset", "Face", "Tag" };
 	private static final String[] TYPES = { "OWNS", "DEPICTS", "TAGGED", "DERIVED_FROM" };
-	private static final String[] KEYS = { "name", "size", "score", "active" };
+	private static final String[] KEYS = { "name", "size", "score", "active", "embedding" };
 
 	@Test
 	public void testRandomOperationsMatchTheModel() throws Exception {
@@ -297,6 +297,13 @@ public class ReferenceModelTest {
 		}
 		if (random.nextBoolean()) {
 			props.put("active", random.nextBoolean());
+		}
+		if (random.nextInt(4) == 0) {
+			// A vector, which is always blob-escaped and is the value type that used to be indexed under an identity
+			// hash — so it exercises the lookup, the delete and verify(FULL)'s dangling-reference check at once.
+			// Drawn from a small pool so that several nodes share one, which is what makes a lookup return a set.
+			float base = random.nextInt(6);
+			props.put("embedding", new float[] { base, base + 1f, base + 2f, base + 3f });
 		}
 		if (random.nextInt(20) == 0) {
 			// Past the 255 byte inline limit, so the value escapes into the blob store.

@@ -33,7 +33,7 @@ not**, in one place.
 | 8 — Compaction and reclamation | **Done** except the p99 latency budget | `CompactionTest`, `CompactionCrashTest` |
 | 9 — Hardening | **Partial** — see §4.9; crash matrix **built**, no JMH, long runs not run | `CrashMatrixTest`, `WalFaultTest`; §6 of PHASE_STATUS |
 | 10 — MetaLoom integration | **Done** — built, measured, recommended against adopting | §6 below |
-| 11 — Query language | **Done** for an openCypher subset in its own module, reads and writes, with a single-jar Vert.x server and a React and D3 graph browser. `MERGE`, `FOREACH` and `OPTIONAL MATCH` refused by name | [CYPHER.md](CYPHER.md); `CypherVersusApiTest`, `CypherWriteVersusApiTest`, `NullSemanticsTest`, `e2e/graph-browser.spec.ts` |
+| 11 — Query language | **Done** for an openCypher subset in its own module, reads and writes, with a single-jar Vert.x server and a React and D3 graph browser. `FOREACH` and `OPTIONAL MATCH` refused by name | [CYPHER.md](CYPHER.md); `CypherVersusApiTest`, `CypherWriteVersusApiTest`, `NullSemanticsTest`, `e2e/graph-browser.spec.ts` |
 | 12 — GraalVM native image | **Done** — the server builds to a 38 MB standalone binary, FFM and all, behind `-Pgraalvm` | [GRAALVM.md](GRAALVM.md); `ForeignDowncallMetadataTest`, `tools/native-image.sh` |
 | 13 — Binary streaming port | **Done** for stage 1: a framed TCP protocol and a Java client that stream rows as the engine produces them. The *executor* still materialises — see below | [WIRE.md](WIRE.md), [TRANSPORT_DECISION.md](TRANSPORT_DECISION.md); `WireVersusEmbeddedTest`, `WireServerTest`, `WireDecoderHostileInputTest` |
 | 14 — Several databases | **Done** — one directory per database under a root, selectable from the client, the HTTP routes and the browser UI | [DATABASES.md](DATABASES.md); `GraphDatabasesTest`, `DatabaseRoutesTest` |
@@ -42,7 +42,7 @@ not**, in one place.
 transactional, indexed, compacting, with snapshot isolation for readers, a Cypher query
 language that reads **and writes**, a browser UI, a streaming binary port and several databases under one root — and it
 holds its answers against a reference model, against real SQL, against its own Java API, and now over its own wire. It
-is **not** usable where concurrent writers, `MERGE`, an online backup or an authenticated network are requirements.
+is **not** usable where concurrent writers, `OPTIONAL MATCH`, an online backup or an authenticated network are requirements.
 None of those exists and none is faked.
 
 ---
@@ -133,6 +133,12 @@ Neither number is the point. The numbers that decide anything are the budgets an
 - [x] Degree counters, asserted against actual adjacency
 - [x] Breadth-first `traverse` with depth, direction, type filter and node uniqueness
 - [x] Lightweight edges and materialised relationships in one chain
+- [x] A materialised entry caches its relationship's type, so a type-filtered traversal reads a
+      relationship record once per surviving candidate rather than once per entry
+      ([RELATIONSHIP_STORAGE.md §3.1](RELATIONSHIP_STORAGE.md),
+      [IDX-2](INDEX_TASKS.md#idx-2--push-the-type-filter-into-adjacency-for-materialised-entries)).
+      Compatible with format version 2: type id 0 means "not cached", which is what an older store's
+      entries already hold
 - [x] `AdjacencyStore.defragment` (built in Phase 8)
 - [x] **Cell-based adjacency blocks**: a block is a run of 512 byte cells that doubles as the node
       fills, so degree 3 costs 512 bytes rather than a page. Format version 2
@@ -165,7 +171,10 @@ that a steal policy cannot be made correct over a `MAP_SHARED` mapping.
 - [x] Property index: `(key_id, value) -> element ids`
 - [x] Index maintenance inside the transaction — an index update is part of the atomic unit
 - [x] Index rebuild, gated on entries per page rather than on slot liveness (Phase 8)
-- [x] Tests: `IndexTest`, plus the index-vs-scan differential inside `ReferenceModelTest`
+- [x] Property values are keyed by a **content** hash, arrays and lists included — a `float[]` used to
+      be keyed by its identity hash ([INDEX_TASKS.md IDX-1](INDEX_TASKS.md#idx-1--a-float-property-is-indexed-under-a-non-deterministic-key))
+- [x] Tests: `IndexTest` and `IndexKeyTest`, plus the index-vs-scan differential inside
+      `ReferenceModelTest`
 
 ### Phase 8 — Compaction and space reclamation
 
@@ -272,8 +281,8 @@ that a steal policy cannot be made correct over a `MAP_SHARED` mapping.
 ### Phase 15 — Cypher writes
 
 - [x] `CREATE`, `SET`, `REMOVE`, `DELETE` and `DETACH DELETE`, with `RETURN` optional for a write and
-      required for a read. `MERGE`, `FOREACH`, `LOAD CSV` and `CALL` still refused at parse time, each
-      by name with a caret
+      required for a read. `FOREACH`, `LOAD CSV` and `CALL` refused at parse time, each by name with a
+      caret (`MERGE` was too, until Phase 17 built it)
 - [x] `Ast.Query.isWrite()`, so both servers can refuse a write on the event loop and `Cypher.stream`
       can choose a transaction over a read view without running anything first
 - [x] One transaction per write query, joined when the caller holds one, **committed before the first
@@ -287,10 +296,10 @@ that a steal policy cannot be made correct over a `MAP_SHARED` mapping.
 - [x] `SchemaScanner.invalidate()`, called after a committed write, and the UI refetching the sidebar
 - [x] `WireError.READ_ONLY` and `WireError.CONSTRAINT_VIOLATION`; a write permit per store so the wait
       for the engine's writer lock has a deadline and a name
-- [ ] **`MERGE`.** The one clause left. Worth recording that it is *easier* here than elsewhere:
-      writers serialise on one lock and a write transaction reads its own writes through the same
-      overlay, so an index probe inside `MERGE` sees rows the same statement created and the
-      lock-and-retry dance other engines need does not arise
+- [x] **`MERGE`** — built in Phase 17, and the prediction recorded here held: it is *easier* here than
+      elsewhere, because writers serialise on one lock and a write transaction reads its own writes
+      through the same overlay, so an index probe inside `MERGE` sees rows the same statement created
+      and the lock-and-retry dance other engines need does not arise
 
 **The constraint on the streaming executor** (Phase 16, now built): a push pipeline must never carry a
 write clause. The write clauses get openCypher's eager semantics for free from the executor materialising
@@ -312,14 +321,31 @@ would take that away silently. `QueryExecutor.streams` returns false for all fou
       Cypher® is a registered trademark of Neo4j, Inc. openCypher itself is Apache 2.0, so there is no
       licence-compatibility question; the live constraint is naming, not copyright
 - [x] `CypherCorpusTest` over `test-data/`: four openCypher dumps and 29 queries whose counts were
-      derived elsewhere and proven against Neo4j — [CYPHER.md §9.2](CYPHER.md). **13 agree, 16 are
-      refused by name, none is wrong.** The refusals concentrate in `MERGE` and `CASE`; implementing
-      those two would bring 15 of the 16 into range
-- [x] `shortestPath` and `allShortestPaths` refused **by name**. [CYPHER.md §5.3](CYPHER.md) had
-      always claimed they were, and the corpus found that they were not — the message was "expected a
-      node pattern but found an identifier"
-- [ ] **`CASE`.** The AST node exists and is never constructed; the executor throws on it. It is what
-      blocks the `03-social` dump, and it is a smaller piece of work than `MERGE`
+      derived elsewhere and proven against Neo4j — [CYPHER.md §9.2](CYPHER.md). **All four dumps import
+      and all 29 queries agree.** The corpus is what identified `shortestPath`, `CASE` and `MERGE` as
+      the three features this subset was furthest from openCypher on, rather than a guess about what to
+      build next — and all three are now built
+- [x] `shortestPath` and `allShortestPaths` **built**, breadth-first — [CYPHER.md §7.2](CYPHER.md).
+      They arrived by way of a spec claim that was false: §5.5 had always listed them as refused by
+      name, the corpus found the parser in fact said "expected a node pattern but found an identifier",
+      and naming them properly then made the one thing they were blocking visible as a refusal.
+      `PatternPart.selector` carries the choice, so the search is how the part is *matched* rather than
+      a filter over what it produced. `ShortestPathTest` checks it against the depth-first enumeration
+      over every pair in a diamond graph
+- [x] **`CASE`**, both forms — [CYPHER.md §5.4](CYPHER.md). The AST node had existed unconstructed since
+      the parser was written. Two rules carry the weight and neither throws when broken: only the branch
+      taken is evaluated, and null follows §2 — in the simple form a null subject matches no `WHEN`,
+      including `WHEN null`
+- [x] **`MERGE`**, with `ON CREATE SET` / `ON MATCH SET` — [CYPHER.md §5.3](CYPHER.md). It reuses the
+      pattern matcher for the match and `CREATE`'s builder for the create, so its only new semantics are
+      which branch runs. It was predicted to be *easier* here than elsewhere and that held: writers
+      serialise on one lock and a write transaction reads its own writes, so a MERGE sees rows the same
+      statement created and the lock-and-retry dance other engines need never arises.
+      `MergeTest` pins the whole-pattern rule; the corpus runs the MERGE-only dump **twice** and asserts
+      not a count moves, which is the sharper test — a MERGE creating duplicates imports perfectly once
+- [x] The corpus bar is no longer a count at all: every query must agree, every dataset in the catalogue
+      must be covered, and each import must pass `verify(FULL)`. Two rounds of raising a threshold were
+      two rounds of leaving slack a regression could hide in
 
 ### Phase 16 — The streaming executor, and shutting down
 
@@ -792,5 +818,5 @@ Recorded so nobody re-opens them as oversights:
 
 ---
 
-_Git HEAD revision: `e4601d1`_
-_Last updated: 2026-08-15 (phase 15: Cypher writes)_
+_Git HEAD revision: `3a05a2a`_
+_Last updated: 2026-08-16 (phase 15 plus IDX-2)_

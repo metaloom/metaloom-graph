@@ -668,7 +668,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 					continue;
 				}
 				Object stored = this.properties.read(nodes.propBlockId(other), entry.getKey());
-				if (java.util.Objects.deepEquals(stored, normalise(entry.getValue()))) {
+				if (IndexCatalog.valueEquals(stored, normalise(entry.getValue()))) {
 					throw new ConstraintViolationException(catalog.key(entry.getKey()), entry.getValue(), other);
 				}
 			}
@@ -844,7 +844,9 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			if (props != null && !props.isEmpty()) {
 				rels.propBlockId(relId, properties.store(toKeyIds(props), relId));
 			}
-			long entry = PackedEdge.ofRelationship(relId);
+			// The entry caches the type, which is what lets a type-filtered traversal skip it without the random read
+			// its record costs. Direction is not cacheable — see PackedEdge.
+			long entry = PackedEdge.ofRelationship(relId, typeId);
 			adjacency.add(fromId, entry);
 			if (toId != fromId) {
 				// A materialised entry carries no direction of its own — it is resolved from the relationship's
@@ -904,14 +906,16 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	private void deleteRelationshipInternal(long relationshipId) throws IOException {
 		long fromId = rels.fromId(relationshipId);
 		long toId = rels.toId(relationshipId);
-		long entry = PackedEdge.ofRelationship(relationshipId);
+		// Matched by the relationship it names rather than by its whole packed value: the type field of a materialised
+		// entry is a cache, and a store written before the cache existed holds zero there where a fresh one holds the
+		// type. Matching on the exact bits would leave those entries behind as dangling adjacency.
 		if (nodes.exists(fromId)) {
-			adjacency.remove(fromId, entry);
+			adjacency.removeMaterialised(fromId, relationshipId);
 			nodes.degreeDelta(fromId, -1, 0);
 		}
 		if (nodes.exists(toId)) {
 			if (toId != fromId) {
-				adjacency.remove(toId, entry);
+				adjacency.removeMaterialised(toId, relationshipId);
 			}
 			// A self-loop's single entry is already gone; only its incoming counter is still owed.
 			nodes.degreeDelta(toId, 0, -1);
@@ -1043,7 +1047,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 					continue;
 				}
 				Object stored = properties.read(nodes.propBlockId(nodeId), keyId);
-				if (java.util.Objects.deepEquals(stored, normalise(value))) {
+				if (IndexCatalog.valueEquals(stored, normalise(value))) {
 					confirmed.add(nodeId);
 				}
 			}
@@ -1060,16 +1064,26 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 	/**
 	 * Appends the API edges one adjacency entry stands for, which is usually one and is two for a materialised
-	 * self-loop. A materialised entry costs one extra 64 byte read, which is the right place to pay it since its
-	 * properties live there too.
+	 * self-loop. A surviving materialised entry costs one extra 64 byte read, which is the right place to pay it since
+	 * its properties live there too.
+	 * <p>
+	 * <b>The type filter runs first, off the entry's own bits.</b> That is what keeps a type-filtered traversal over a
+	 * supernode from paying a random read per edge for a query that may match none of them: the read is now paid per
+	 * <em>surviving candidate</em> rather than per entry. An entry that caches no type still falls through to the
+	 * record, which is what every entry of an older store does.
 	 */
 	private void materialise(long fromNodeId, long packed, Direction direction, Set<Integer> typeIds,
 		List<Edge> out) {
+		if (PackedEdge.excludedByType(packed, typeIds)) {
+			return;
+		}
 		if (PackedEdge.isMaterialised(packed)) {
 			long relId = liveRelationshipId(PackedEdge.relationshipId(packed));
 			if (ElementId.isNull(relId)) {
 				return;
 			}
+			// Still checked against the record: an entry that cached no type has not been filtered yet, and one that
+			// did is being confirmed against the authority its cache stands in for.
 			int typeId = rels.typeId(relId);
 			if (typeIds != null && !typeIds.contains(typeId)) {
 				return;
@@ -1099,10 +1113,8 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		if (!direction.matches(dirCode)) {
 			return;
 		}
+		// The type filter has already run above: a lightweight entry always carries its own type.
 		int typeId = PackedEdge.typeId(packed);
-		if (typeIds != null && !typeIds.contains(typeId)) {
-			return;
-		}
 		long neighbour = liveNodeId(PackedEdge.neighbourId(packed));
 		if (ElementId.isNull(neighbour)) {
 			return;

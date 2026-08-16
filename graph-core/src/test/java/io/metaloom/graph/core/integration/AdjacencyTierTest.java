@@ -261,4 +261,94 @@ public class AdjacencyTierTest {
 			store.verify();
 		}
 	}
+
+	/**
+	 * A materialised entry caches the type its relationship record holds, so that a type-filtered traversal can discard
+	 * it without the random read the record costs (IDX-2).
+	 */
+	@Test
+	public void testAMaterialisedEntryCachesItsType() throws Exception {
+		try (GraphStore store = stores.open()) {
+			GraphStoreImpl impl = (GraphStoreImpl) store;
+			long a = store.createNode("A");
+			long relId = store.createRelationship(a, "T", store.createNode("B"));
+			int typeId = impl.catalog().lookupLabel("T");
+			assertTrue(typeId > 0, "the type must be interned");
+
+			long[] entries = impl.adjacencyStore().edges(a);
+			// Degree one, so the single entry is still inline in the node record.
+			assertEquals(1, entries.length);
+			assertEquals(typeId, io.metaloom.graph.core.store.adj.PackedEdge.typeId(entries[0]),
+				"the entry must carry the type the record holds");
+			assertTrue(io.metaloom.graph.core.store.adj.PackedEdge.isMaterialised(entries[0]));
+			assertEquals(relId, io.metaloom.graph.core.id.ElementId.withGen(
+				io.metaloom.graph.core.store.adj.PackedEdge.relationshipId(entries[0]),
+				io.metaloom.graph.core.id.ElementId.gen(relId)),
+				"and still name the relationship");
+			store.verify(io.metaloom.graph.core.api.VerifyLevel.FULL);
+		}
+	}
+
+	/**
+	 * An entry that caches <b>no</b> type — the shape every materialised entry of a store written before IDX-2 has —
+	 * must still traverse, survive a type filter, and delete.
+	 * <p>
+	 * That compatibility is the whole reason type id 0 rather than a format version bump marks "not recorded": the old
+	 * bytes keep meaning what they always meant. Deleting is the delicate half, because an adjacency entry is removed
+	 * by matching its packed value and the value written today differs from the one on disk in exactly these bits.
+	 */
+	@Test
+	public void testAnEntryWithNoCachedTypeStillTraversesAndDeletes() throws Exception {
+		try (GraphStore store = stores.open()) {
+			GraphStoreImpl impl = (GraphStoreImpl) store;
+			long a = store.createNode("A");
+			long b = store.createNode("B");
+			long relId = store.createRelationship(a, "T", b);
+
+			// Rewrite both endpoints' entries into the older shape: dir 3, type 0, the relationship's location.
+			try (io.metaloom.graph.core.api.Transaction txn = store.begin()) {
+				for (long endpoint : new long[] { a, b }) {
+					assertTrue(impl.adjacencyStore().removeMaterialised(endpoint, relId));
+					impl.adjacencyStore().add(endpoint,
+						io.metaloom.graph.core.store.adj.PackedEdge.ofRelationship(relId));
+				}
+				txn.commit();
+			}
+			store.verify(io.metaloom.graph.core.api.VerifyLevel.FULL);
+
+			assertEquals(1, store.neighbours(a, Direction.OUT, Set.of("T")).size(),
+				"an entry that caches no type must fall through to the record rather than be filtered out");
+			assertEquals(0, store.neighbours(a, Direction.OUT, Set.of("OTHER")).size(),
+				"and must still be filtered on what the record actually says");
+
+			store.deleteRelationship(relId);
+			assertEquals(0, store.neighbours(a, Direction.OUT).size(), "the old-shaped entry must be removable");
+			assertEquals(0, store.neighbours(b, Direction.IN).size());
+			assertEquals(0, store.degreeOut(a));
+			assertEquals(0, store.degreeIn(b));
+			store.verify(io.metaloom.graph.core.api.VerifyLevel.FULL);
+		}
+	}
+
+	/** A stale cached type is corruption, not a slow path: the traversal would drop a real edge from its answer. */
+	@Test
+	public void testAStaleCachedTypeIsCaughtByVerify() throws Exception {
+		try (GraphStore store = stores.open()) {
+			GraphStoreImpl impl = (GraphStoreImpl) store;
+			long a = store.createNode("A");
+			long relId = store.createRelationship(a, "T", store.createNode("B"));
+			store.verify(io.metaloom.graph.core.api.VerifyLevel.FULL);
+
+			try (io.metaloom.graph.core.api.Transaction txn = store.begin()) {
+				assertTrue(impl.adjacencyStore().removeMaterialised(a, relId));
+				impl.adjacencyStore().add(a,
+					io.metaloom.graph.core.store.adj.PackedEdge.ofRelationship(relId, 4242));
+				txn.commit();
+			}
+			io.metaloom.graph.core.api.GraphStoreException failure = org.junit.jupiter.api.Assertions.assertThrows(
+				io.metaloom.graph.core.api.GraphStoreException.class,
+				() -> store.verify(io.metaloom.graph.core.api.VerifyLevel.FULL));
+			assertTrue(failure.getMessage().contains("caches type"), failure.getMessage());
+		}
+	}
 }

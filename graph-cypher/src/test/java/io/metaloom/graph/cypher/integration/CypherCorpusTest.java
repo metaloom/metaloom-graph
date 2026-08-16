@@ -13,7 +13,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
 import io.metaloom.graph.core.api.GraphStore;
-import io.metaloom.graph.core.api.Transaction;
 import io.metaloom.graph.core.api.VerifyLevel;
 import io.metaloom.graph.core.fixture.TempStore;
 import io.metaloom.graph.cypher.Cypher;
@@ -30,24 +29,26 @@ import io.metaloom.graph.cypher.CypherResult;
  * written for openCypher, gets the openCypher answer here.
  * </p>
  *
- * <h2>Three outcomes, and only one of them is allowed to be silent</h2>
+ * <h2>Three outcomes, and none of them is allowed to be silent</h2>
  *
  * <p>
- * This engine implements a documented <em>subset</em>, so some of the corpus is expected not to run. That makes the
- * classification the point of the test rather than an accommodation:
+ * This engine implements a documented <em>subset</em>, so the classification is the point of the test rather than an
+ * accommodation:
  * </p>
  *
  * <ul>
- * <li><b>Agreed</b> — ran, and both counts match. What the coverage floors below are counted from.
+ * <li><b>Agreed</b> — ran, and both counts match.
  * <li><b>Refused</b> — the parser rejected it by name, which is the documented contract for anything outside the
- * subset. Acceptable, and reported so the gap is visible rather than absorbed.
+ * subset. Reported so the gap is visible rather than absorbed.
  * <li><b>Wrong or broken</b> — ran and disagreed, or failed for any reason other than a named refusal. Always a
  * failure. A wrong count is the defect this whole corpus exists to catch, because nothing about it throws.
  * </ul>
  *
  * <p>
- * The floors are what stop the test degenerating. Without them an engine whose parser refused everything would be
- * perfectly green, which is the failure mode a test like this invites.
+ * <b>All 29 now agree, so the bar is that and not a threshold.</b> It was two counts while parts of the corpus were
+ * out of reach; a threshold could only hide a regression now. The refused outcome stays in place because the subset is
+ * still a subset — a query added to the catalogue tomorrow may well fall outside it, and it should be reported rather
+ * than counted as a failure of this engine to parse valid Cypher.
  * </p>
  *
  * @see <a href="../../../../../../../../../test-data/README.md">test-data/README.md</a>
@@ -60,21 +61,19 @@ public class CypherCorpusTest {
 	TempStore stores = new TempStore();
 
 	/**
-	 * Datasets that must import completely, with the totals the corpus states.
+	 * Every dataset, with the node and relationship totals its own README states.
 	 *
 	 * <p>
-	 * Named rather than discovered, because "every dataset that happens to import" is a floor that falls on its own
-	 * when something breaks. The other two are asserted separately, by the reason they cannot be imported.
+	 * Named here rather than discovered from the directory, so that the counts are a second source rather than
+	 * whatever the import happened to produce — and {@link #testEveryDatasetInTheCatalogueIsCovered} then asserts this
+	 * list has not fallen behind the catalogue.
 	 * </p>
 	 */
-	private static final Map<String, long[]> IMPORTABLE = Map.of(
+	private static final Map<String, long[]> DATASETS = Map.of(
 		"01-movies", new long[] { 29, 52 },
-		"02-transit", new long[] { 27, 64 });
-
-	/** Datasets the dump itself puts outside the subset, with the clause that does it. */
-	private static final Map<String, String> NOT_IMPORTABLE = Map.of(
-		"03-social", "CASE",
-		"04-supply-chain", "MERGE");
+		"02-transit", new long[] { 27, 64 },
+		"03-social", new long[] { 188, 570 },
+		"04-supply-chain", new long[] { 136, 352 });
 
 	private enum Outcome {
 		AGREED, REFUSED, WRONG
@@ -86,8 +85,8 @@ public class CypherCorpusTest {
 	// ---------------------------------------------------------------- importing
 
 	@Test
-	public void testTheDumpsThisEngineCanRunImportCompletely() throws Exception {
-		for (Map.Entry<String, long[]> entry : IMPORTABLE.entrySet()) {
+	public void testEveryDumpImportsCompletely() throws Exception {
+		for (Map.Entry<String, long[]> entry : DATASETS.entrySet()) {
 			try (GraphStore store = freshStore(entry.getKey())) {
 				int statements = importInto(store, entry.getKey());
 				assertTrue(statements > 0, entry.getKey() + " produced no statements; the splitter is broken");
@@ -103,24 +102,48 @@ public class CypherCorpusTest {
 		}
 	}
 
+	/**
+	 * The catalogue against the list above, so a fifth dataset cannot arrive unnoticed.
+	 *
+	 * <p>
+	 * Without this, adding a dump and its queries to {@code test-data/} would leave {@link #DATASETS} behind and the
+	 * import test would quietly cover three quarters of the corpus while reporting success.
+	 * </p>
+	 */
 	@Test
-	public void testTheDumpsItCannotRunAreRefusedByName() throws Exception {
-		for (Map.Entry<String, String> entry : NOT_IMPORTABLE.entrySet()) {
-			try (GraphStore store = freshStore(entry.getKey())) {
-				RuntimeException thrown = null;
-				try {
-					importInto(store, entry.getKey());
-				} catch (RuntimeException e) {
-					thrown = e;
-				}
-				assertTrue(thrown != null, entry.getKey() + " imported unexpectedly — update this test and the spec");
-				assertTrue(thrown.getMessage().contains(entry.getValue()),
-					entry.getKey() + " must be refused with a message naming " + entry.getValue()
-						+ ", got: " + thrown.getMessage());
-				// A refusal, not a half-import: the failing statement's transaction rolled back, and the ones before
-				// it committed, which is exactly what a script of separate statements means.
-				store.verify(VerifyLevel.FULL);
-			}
+	public void testEveryDatasetInTheCatalogueIsCovered() {
+		assertEquals(Corpus.datasets(), DATASETS.keySet(),
+			"the catalogue and this test's expected totals name different datasets");
+	}
+
+	/**
+	 * The supply-chain dump run twice, which is what it was written to survive.
+	 *
+	 * <p>
+	 * It is {@code MERGE}-only and deliberately idempotent: node identity is the business key in the MERGE pattern and
+	 * everything else is written with {@code ON CREATE SET}, so a second run must not change a single count or rewrite
+	 * a single property. That is a much sharper test of MERGE than any single run — a MERGE that quietly created
+	 * duplicates would import perfectly the first time and double the graph the second.
+	 * </p>
+	 */
+	@Test
+	public void testTheMergeOnlyDumpIsIdempotent() throws Exception {
+		try (GraphStore store = freshStore("04-supply-chain")) {
+			importInto(store, "04-supply-chain");
+			long nodes = countNodes(store);
+			long relationships = countRelationships(store);
+			Object reference = Cypher.query(store,
+				"MATCH (s:Supplier {supplierId: 3}) RETURN s.name AS name").row(0).get("name");
+
+			importInto(store, "04-supply-chain");
+
+			assertEquals(nodes, countNodes(store), "a second run of a MERGE-only dump created nodes");
+			assertEquals(relationships, countRelationships(store),
+				"a second run of a MERGE-only dump created relationships");
+			assertEquals(reference, Cypher.query(store,
+				"MATCH (s:Supplier {supplierId: 3}) RETURN s.name AS name").row(0).get("name"),
+				"ON CREATE SET ran on a node that was matched rather than created");
+			store.verify(VerifyLevel.FULL);
 		}
 	}
 
@@ -151,14 +174,6 @@ public class CypherCorpusTest {
 		}
 
 		for (Map.Entry<String, List<Corpus.Query>> entry : byDataset.entrySet()) {
-			if (!IMPORTABLE.containsKey(entry.getKey())) {
-				// Its dump cannot be imported, so its queries have nothing to run against. Counted as refused
-				// against the dataset rather than pretended to have been tried.
-				for (Corpus.Query query : entry.getValue()) {
-					results.add(new Checked(query, Outcome.REFUSED, "the dataset itself is outside the subset"));
-				}
-				continue;
-			}
 			try (GraphStore store = freshStore(entry.getKey())) {
 				importInto(store, entry.getKey());
 				for (Corpus.Query query : entry.getValue()) {
@@ -173,16 +188,13 @@ public class CypherCorpusTest {
 		assertTrue(wrong.isEmpty(), wrong.size() + " quer" + (wrong.size() == 1 ? "y" : "ies")
 			+ " ran and gave the wrong answer:\n" + describe(wrong));
 
-		// The floors. An engine that refused everything would satisfy the assertion above perfectly.
-		long agreed = results.stream().filter(c -> c.outcome() == Outcome.AGREED).count();
-		assertTrue(agreed >= 12, "only " + agreed + " of " + results.size() + " corpus queries ran and agreed; "
-			+ "this floor exists so that a regression which merely stops queries parsing cannot pass");
-		for (String dataset : IMPORTABLE.keySet()) {
-			long ok = results.stream()
-				.filter(c -> c.query().dataset().equals(dataset) && c.outcome() == Outcome.AGREED)
-				.count();
-			assertTrue(ok >= 5, dataset + " contributed only " + ok + " agreeing queries");
-		}
+		// The bar, and an engine that refused everything would satisfy the assertion above perfectly. It was a pair of
+		// counts while parts of the corpus were out of reach; all 29 agree now, so a threshold could only hide a
+		// regression. A refusal here is a feature this build had and lost.
+		List<Checked> shortfall = results.stream().filter(c -> c.outcome() != Outcome.AGREED).toList();
+		assertTrue(shortfall.isEmpty(), shortfall.size() + " quer" + (shortfall.size() == 1 ? "y" : "ies")
+			+ " stopped agreeing:\n" + describe(shortfall));
+		assertEquals(29, results.size(), "the catalogue changed size; check the count in spec/CYPHER.md §9.2");
 	}
 
 	/**

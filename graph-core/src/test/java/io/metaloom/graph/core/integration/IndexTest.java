@@ -16,6 +16,7 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.Properties;
 import io.metaloom.graph.core.api.Transaction;
+import io.metaloom.graph.core.api.VerifyLevel;
 import io.metaloom.graph.core.fixture.TempStore;
 import io.metaloom.graph.core.store.GraphStoreImpl;
 
@@ -171,6 +172,86 @@ public class IndexTest {
 			assertEquals(List.of(kept), store.nodesByLabel("Person"));
 			assertEquals(List.of(kept), store.nodesByProperty("name", "kept"));
 			store.verify();
+		}
+	}
+
+	/**
+	 * A vector property is indexed by content, so an equality lookup finds it and a delete takes its entry with it.
+	 * <p>
+	 * Both halves used to fail, and neither made a noise: {@code float[].hashCode()} is the identity hash, so the
+	 * lookup hashed the caller's array and matched nothing, and the delete hashed a third array — the one read back
+	 * from the store — and left the entry behind for {@code verify(FULL)} to find later as a dangling reference.
+	 *
+	 * @see <a href="../../../../../../../../spec/INDEX_TASKS.md">spec/INDEX_TASKS.md</a> IDX-1
+	 */
+	@Test
+	public void testAVectorPropertyIsFoundByItsValue() throws Exception {
+		try (GraphStore store = stores.open()) {
+			GraphStoreImpl impl = (GraphStoreImpl) store;
+			long labelsBefore = impl.indexCatalog().labelIndexSize();
+			long propsBefore = impl.indexCatalog().propertyIndexSize();
+
+			float[] embedding = { 0.5f, -1.25f, 3f, 0f };
+			long id = store.createNode("Face", Properties.of().set("embedding", embedding));
+			long other = store.createNode("Face", Properties.of().set("embedding", new float[] { 9f, 9f }));
+
+			// A different instance holding the same values — the case the identity hash could never answer.
+			assertEquals(List.of(id), store.nodesByProperty("embedding", new float[] { 0.5f, -1.25f, 3f, 0f }));
+			assertEquals(List.of(other), store.nodesByProperty("embedding", new float[] { 9f, 9f }));
+			assertEquals(List.of(), store.nodesByProperty("embedding", new float[] { 0.5f, -1.25f, 3f }));
+			store.verify(VerifyLevel.FULL);
+
+			store.deleteNode(id);
+			store.deleteNode(other);
+			assertEquals(List.of(), store.nodesByProperty("embedding", embedding));
+			assertEquals(labelsBefore, impl.indexCatalog().labelIndexSize(), "a label entry outlived its node");
+			assertEquals(propsBefore, impl.indexCatalog().propertyIndexSize(), "a vector entry outlived its node");
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	/** A vector inside a list is the same defect one level down: {@code List::hashCode} delegates to its elements. */
+	@Test
+	public void testAListHoldingAVectorIsFoundByItsValue() throws Exception {
+		try (GraphStore store = stores.open()) {
+			GraphStoreImpl impl = (GraphStoreImpl) store;
+			long propsBefore = impl.indexCatalog().propertyIndexSize();
+
+			long id = store.createNode("Face",
+				Properties.of().set("embeddings", List.of(new float[] { 1f, 2f }, new float[] { 3f, 4f })));
+			assertEquals(List.of(id), store.nodesByProperty("embeddings",
+				List.of(new float[] { 1f, 2f }, new float[] { 3f, 4f })));
+			assertEquals(List.of(), store.nodesByProperty("embeddings", List.of(new float[] { 1f, 2f })));
+
+			store.deleteNode(id);
+			assertEquals(propsBefore, impl.indexCatalog().propertyIndexSize());
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	/** A list of integers reads back as a list of longs, so the lookup has to widen inside the list as well. */
+	@Test
+	public void testAListOfIntegersIsFoundByItsValue() throws Exception {
+		try (GraphStore store = stores.open()) {
+			long id = store.createNode("N", Properties.of().set("tags", List.of(1, 2, 3)));
+			assertEquals(List.of(id), store.nodesByProperty("tags", List.of(1, 2, 3)));
+			assertEquals(List.of(id), store.nodesByProperty("tags", List.of(1L, 2L, 3L)));
+			assertEquals(List.of(), store.nodesByProperty("tags", List.of(1, 2)));
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	/** The property value changes but the array instance does not — the update hook has to see the difference. */
+	@Test
+	public void testAVectorPropertyFollowsAnUpdate() throws Exception {
+		try (GraphStore store = stores.open()) {
+			long id = store.createNode("Face", Properties.of().set("embedding", new float[] { 1f, 2f }));
+			store.setNodeProperties(id, Properties.of().set("embedding", new float[] { 7f, 8f }));
+
+			assertEquals(List.of(), store.nodesByProperty("embedding", new float[] { 1f, 2f }),
+				"the stale entry must be gone");
+			assertEquals(List.of(id), store.nodesByProperty("embedding", new float[] { 7f, 8f }));
+			store.verify(VerifyLevel.FULL);
 		}
 	}
 

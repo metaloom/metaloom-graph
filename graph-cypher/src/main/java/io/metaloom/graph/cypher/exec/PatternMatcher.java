@@ -1,7 +1,9 @@
 package io.metaloom.graph.cypher.exec;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -33,6 +35,16 @@ import io.metaloom.graph.cypher.value.CypherRelationship;
  * Cypher, which wants one row per distinct <em>path</em> under <em>relationship</em> uniqueness. The two differ
  * whenever a graph has more than one route between the same pair of nodes: traverse reports the node once, Cypher
  * reports every route. {@code VarLengthPathTest} pins the difference down against a graph where it shows.
+ * </p>
+ *
+ * <h2>Shortest paths</h2>
+ *
+ * <p>
+ * {@code shortestPath(…)} and {@code allShortestPaths(…)} are a different algorithm rather than a filter over the one
+ * above — breadth-first, one expansion per node, described at {@link #search}. Keeping them apart is the point: the
+ * depth-first enumeration is exponential in the bound by design, because every path <em>is</em> the answer there, and
+ * running it to then discard all but the shortest would make a search that is linear in the graph quadratic in the
+ * number of routes through it.
  * </p>
  */
 public final class PatternMatcher {
@@ -106,6 +118,9 @@ public final class PatternMatcher {
 
 	/** The relationship steps of one pattern part, from rows that already bind its leading node. */
 	private List<Row> expand(Ast.PatternPart part, List<Row> seedRows) {
+		if (part.selector() != Ast.PathSelector.ALL) {
+			return shortest(part, seedRows);
+		}
 		List<Ast.NodePattern> nodes = part.nodes();
 		List<Ast.RelPattern> relationships = part.relationships();
 
@@ -195,6 +210,188 @@ public final class PatternMatcher {
 			return bound;
 		}
 		return rows;
+	}
+
+	// ---------------------------------------------------------------- shortest paths
+
+	/**
+	 * {@code shortestPath(…)} and {@code allShortestPaths(…)}, which replace the enumeration above with a search.
+	 *
+	 * <p>
+	 * The shape is the same as {@link #expand}'s — one row per path, binding the relationship variable, the far node
+	 * and the path variable — but nothing else about it is. Enumerating every path and keeping the shortest would be
+	 * correct and unusable: the number of paths through a graph grows exponentially with the bound, which is precisely
+	 * why {@code shortestPath} exists as its own construct rather than as {@code ORDER BY length(p) LIMIT 1}.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>One row per pair of endpoints.</b> Both ends are patterns, not necessarily single nodes, so a search from one
+	 * start may reach several nodes that satisfy the end pattern — each at its own distance, each contributing its own
+	 * shortest path. That is openCypher's rule and it is why the search cannot stop at the first node it reaches.
+	 * </p>
+	 */
+	private List<Row> shortest(Ast.PatternPart part, List<Row> seedRows) {
+		Ast.NodePattern startPattern = part.nodes().get(0);
+		Ast.NodePattern endPattern = part.nodes().get(1);
+		Ast.RelPattern relationship = part.relationships().get(0);
+		boolean everyShortest = part.selector() == Ast.PathSelector.ALL_SHORTEST;
+		String endName = anchorName(endPattern);
+
+		List<Row> out = new ArrayList<>();
+		for (Row row : seedRows) {
+			CypherNode from = (CypherNode) row.get(anchorName(startPattern));
+			// An end already bound by an earlier clause narrows the search to one destination rather than filtering
+			// afterwards, which for allShortestPaths is the difference between enumerating one node's routes and
+			// every reachable node's.
+			Long endId = row.has(endName) && row.get(endName) instanceof CypherNode already ? already.id() : null;
+
+			for (CypherPath path : search(from, endPattern, endId, relationship, row, everyShortest)) {
+				Row bound = row;
+				if (relationship.variable() != null) {
+					bound = bound.with(relationship.variable(), relationship.range() == null
+						? path.relationships().get(0)
+						: new ArrayList<Object>(path.relationships()));
+				}
+				if (endId == null) {
+					bound = bound.with(endName, path.end());
+				}
+				if (part.pathVariable() != null) {
+					bound = bound.with(part.pathVariable(), path);
+				}
+				out.add(bound);
+			}
+		}
+		return out;
+	}
+
+	/**
+	 * Breadth-first from the start node, recording how each node was first reached.
+	 *
+	 * <p>
+	 * Breadth-first is what makes the answer shortest: a node's distance is fixed the moment it is first seen, so the
+	 * routes reconstructed backwards from it are minimal by construction. It also makes the uniqueness rule free —
+	 * distance strictly increases along any reconstructed route, so no node and therefore no relationship can appear in
+	 * one twice, and the {@code used} bookkeeping the depth-first walk needs has nothing to do here.
+	 * </p>
+	 *
+	 * <p>
+	 * The cost is bounded by the graph rather than by the number of paths: every node is expanded at most once. What is
+	 * <em>not</em> bounded is {@code allShortestPaths}' output, which is the number of minimal routes — that is the
+	 * answer the caller asked for, so it is enumerated rather than capped, and noted in spec/CYPHER.md.
+	 * </p>
+	 *
+	 * @param endId
+	 *            the only destination worth reporting, or null when the end pattern is not already bound
+	 */
+	private List<CypherPath> search(CypherNode from, Ast.NodePattern endPattern, Long endId, Ast.RelPattern pattern,
+		Row row, boolean everyShortest) {
+		int min = pattern.range() == null ? 1 : pattern.range().min();
+		int max = pattern.range() == null ? 1 : pattern.range().max();
+
+		// Insertion-ordered so that the rows come out in discovery order rather than in whatever order a hash gives,
+		// which is what keeps a result stable between runs.
+		Map<Long, Integer> distance = new LinkedHashMap<>();
+		Map<Long, List<Arrival>> arrivals = new HashMap<>();
+		distance.put(from.id(), 0);
+
+		List<Long> frontier = new ArrayList<>();
+		frontier.add(from.id());
+		for (int depth = 1; depth <= max && !frontier.isEmpty(); depth++) {
+			List<Long> next = new ArrayList<>();
+			for (long at : frontier) {
+				for (GraphAccess.Expansion expansion : graph.expand(at, direction(pattern), types(pattern))) {
+					// An inline map on the relationship restricts which edges may be crossed, so it is applied here
+					// rather than to the finished path: an edge it excludes must not shorten the route.
+					if (!propertiesMatch(pattern.properties(), List.of(expansion.relationship()), row)) {
+						continue;
+					}
+					long to = expansion.neighbourId();
+					Integer known = distance.get(to);
+					if (known == null) {
+						distance.put(to, depth);
+						next.add(to);
+					} else if (known != depth || !everyShortest) {
+						// Already reached, by a route no longer than this one. A second arrival at the same depth is a
+						// second shortest path, which only allShortestPaths wants; a shorter one wins outright.
+						continue;
+					}
+					arrivals.computeIfAbsent(to, ignored -> new ArrayList<>())
+						.add(new Arrival(at, to, expansion.relationship()));
+				}
+			}
+			frontier = next;
+		}
+
+		List<CypherPath> paths = new ArrayList<>();
+		Map<Long, List<List<Arrival>>> memo = new HashMap<>();
+		for (Map.Entry<Long, Integer> reached : distance.entrySet()) {
+			int hops = reached.getValue();
+			if (hops < min || hops > max) {
+				// Only a zero-hop entry — the start node itself — can be below the minimum, and it is a match when the
+				// range allows a length of nothing.
+				continue;
+			}
+			if (endId != null && reached.getKey().longValue() != endId.longValue()) {
+				continue;
+			}
+			CypherNode node = graph.node(reached.getKey());
+			if (!matches(endPattern, node, row)) {
+				continue;
+			}
+			for (List<Arrival> route : routes(reached.getKey(), arrivals, memo)) {
+				paths.add(materialise(from, route));
+			}
+		}
+		return paths;
+	}
+
+	/** How one node was reached from another: the step, kept backwards so a route can be rebuilt from its end. */
+	private record Arrival(long fromId, long toId, CypherRelationship relationship) {
+	}
+
+	/**
+	 * Every minimal route to a node, rebuilt backwards through the arrivals.
+	 *
+	 * <p>
+	 * Memoised across the destinations of one search rather than recomputed per destination: the routes to a node are
+	 * shared by every route that passes through it, and without the memo a diamond-shaped graph recomputes its whole
+	 * upper half once per branch. For {@code shortestPath} there is exactly one arrival per node and this is a walk
+	 * back down a chain.
+	 * </p>
+	 */
+	private List<List<Arrival>> routes(long to, Map<Long, List<Arrival>> arrivals,
+		Map<Long, List<List<Arrival>>> memo) {
+		List<List<Arrival>> known = memo.get(to);
+		if (known != null) {
+			return known;
+		}
+		List<List<Arrival>> out = new ArrayList<>();
+		List<Arrival> reached = arrivals.get(to);
+		if (reached == null) {
+			// The start node, which was never arrived at: one route, of no steps at all.
+			out.add(List.of());
+		} else {
+			for (Arrival arrival : reached) {
+				for (List<Arrival> prefix : routes(arrival.fromId(), arrivals, memo)) {
+					List<Arrival> route = new ArrayList<>(prefix);
+					route.add(arrival);
+					out.add(route);
+				}
+			}
+		}
+		memo.put(to, out);
+		return out;
+	}
+
+	private CypherPath materialise(CypherNode from, List<Arrival> route) {
+		List<CypherNode> nodes = new ArrayList<>(route.size() + 1);
+		List<CypherRelationship> relationships = new ArrayList<>(route.size());
+		nodes.add(from);
+		for (Arrival arrival : route) {
+			relationships.add(arrival.relationship());
+			nodes.add(graph.node(arrival.toId()));
+		}
+		return new CypherPath(List.copyOf(nodes), List.copyOf(relationships));
 	}
 
 	// ---------------------------------------------------------------- seeding

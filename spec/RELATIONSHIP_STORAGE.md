@@ -63,7 +63,7 @@ Both inline edges and adjacency entries are logically the same tuple, packed int
 
 | Field | Bits | Meaning |
 |-------|------|---------|
-| `dir` | 2 | 0 = outgoing, 1 = incoming, 2 = undirected, 3 = reserved |
+| `dir` | 2 | 0 = outgoing, 1 = incoming, 2 = undirected, 3 = materialised (§4) |
 | `type` | 14 | interned relationship type id (16,384 distinct types) |
 | `neighbour` | 48 | the neighbour node's `segment:24 | slot:24` — the id without kind and generation |
 
@@ -74,6 +74,43 @@ neighbour record's `gen` field, which you are about to read anyway.
 
 A type id beyond 14 bits, or an edge that carries properties, escalates to a **materialised edge**
 (§4).
+
+### 3.1 The type of a materialised entry is a cache
+
+A materialised entry's 48 bits hold a relationship location, and the relationship record is the
+authority on its type, direction and endpoints. The entry **also carries the type**, as a cache, and
+that is the difference between a type-filtered traversal of a supernode costing one random 64 byte
+read per *edge* and one per *surviving candidate*
+([IDX-2](INDEX_TASKS.md#idx-2--push-the-type-filter-into-adjacency-for-materialised-entries)).
+
+Two values are reserved, and neither costs a real type:
+
+| Stored `type` | Meaning |
+|---|---|
+| `0` (`PackedEdge.TYPE_NOT_RECORDED`) | not cached — read the record. `Catalog` hands out label id 0 for "unknown", so no relationship has type 0 |
+| `MAX_TYPE` (16383) | never stored on a materialised entry; a relationship of that type falls back to `0` |
+
+`MAX_TYPE` is excluded because it is the one value that would make the entry reachable: the
+tombstone is all-ones, which is `dir = 3, type = MAX_TYPE, location = MAX_LOCATION`, and `pack`
+rejecting that combination is the whole of the tombstone-unreachability argument (§6.2). So the
+cache holds 16,382 distinct types and everything else reads the record, exactly as before.
+
+**Reserving `0` rather than bumping the format version is what makes this backward compatible.**
+Every materialised entry of an older store holds zero, which under this reading means "not cached" —
+which is what those stores meant. Three consequences follow, and all three are load-bearing:
+
+- A filter must **never** exclude an entry whose cached type is 0. A false positive costs the record
+  read that used to be unconditional; a false negative silently drops an edge from an answer
+  (`PackedEdge.excludedByType`).
+- Deletion matches a materialised entry **by the relationship it names**, ignoring the type field
+  (`AdjacencyStore.removeMaterialised`, `PackedEdge.TYPE_AGNOSTIC_MASK`). Matching the whole packed
+  value would walk past an older store's entries and leave them behind as dangling adjacency.
+- A cached type that disagrees with its record is corruption, and `InvariantChecker` reports it.
+
+**Direction is not cached and cannot be.** The 48 bit field holds the relationship's location, not
+the neighbour's, so `outgoing = rel.from == thisNode` is only answerable from the record. A
+`Direction.OUT` traversal with no type filter therefore still reads every record. That is the right
+trade: the type filter is the selective one, and after it has run the surviving candidates are few.
 
 **Why direction is per-entry rather than per-block**: it lets one block hold both directions for a
 node, which halves the block count for the common case of a node with a few edges each way, and it
@@ -270,8 +307,14 @@ The entry is replaced with a tombstone and the block is rewritten without it.
 **The tombstone is the all-ones value `-1L`, not location 0.** Location 0 is the perfectly valid
 location of slot 0 in segment 0, which is the first node any store creates — treating it as a
 tombstone silently drops every edge touching that node. `-1L` decodes as `dir = 3, type = MAX_TYPE`,
-and `PackedEdge.pack` rejects a materialised entry with a non-zero type, so the value is unreachable
-through the constructors.
+and `PackedEdge.pack` rejects a materialised entry carrying type `MAX_TYPE`, so the value is
+unreachable through the constructors (§3.1).
+
+**A materialised entry is deleted by the relationship it names, not by its packed value**
+(`AdjacencyStore.removeMaterialised`). Its type field is a cache and the bits on disk may hold either
+the type or the "not cached" zero; an exact-value match would find only one of the two shapes. The
+block skip that a value match gets from `type_bitmap` is given up for those removals — `min/max
+location` still applies, and it is the selective one for a delete that already knows its target.
 
 Deleting a node deletes all of its edges, which requires visiting each neighbour's adjacency to
 remove the mirror entry. For a dense node this is expensive and is therefore performed **lazily**:
@@ -290,7 +333,15 @@ Cursor c = tx.neighbours(nodeId, Direction.OUT, typeFilter);
 3. Walk the block chain. For each block: check `type_bitmap` and `min/max` against the filter, skip
    or decode. Issue a prefetch for `next_block_id` before decoding the current block, so the device
    and the CPU overlap.
-4. For entries with `dir == 3`, read the relationship record.
+4. Apply the type filter to every decoded entry from its own bits, which is free. A lightweight entry
+   always carries its type; a materialised one carries it unless it caches none (§3.1).
+5. For the entries with `dir == 3` that survived step 4, read the relationship record and confirm the
+   type against it.
+
+Step 4 exists so that step 5 runs once per **surviving candidate** rather than once per entry. On a
+supernode of materialised edges, a filter matching five of five thousand costs five record reads
+instead of five thousand; `ReadBudgetTest.testATypeFilteredSupernodeReadsOnlyTheSurvivingRelationships`
+measures exactly that, in `Kind.REL` record touches.
 
 Prefetch depth is configurable; with the io_uring engine the cursor keeps several block reads in
 flight, which is the only way to saturate an NVMe device from a single traversal thread. See
@@ -329,6 +380,14 @@ The numbers are estimates, but the orders of magnitude are structural, not tunin
   `degree_out` silently changes traversal plans. The invariant checker recounts them.
 - **The type bitmap is a filter, not an index.** False positives are fine; false negatives are
   corruption.
+- **A materialised entry's type is a cache; type 0 means "not cached", not "type 0".** Never filter
+  an entry out on the strength of a zero, and never match one by its exact packed value (§3.1).
+- **The type bitmap under-describes an entry that caches no type**: such an entry contributes bit 0,
+  not the bit of its real type. Block skipping on the read path
+  ([IDX-3](INDEX_TASKS.md#idx-3--block-skipping-on-the-read-path)) must therefore not skip a block on
+  the type bitmap alone unless every materialised entry in it caches a type — which is true of blocks
+  written since IDX-2 and false of a store restored from before it. Skipping is an optimisation; a
+  skipped block that held a match is a wrong answer.
 - **Deleting a supernode is slow.** That is the accepted trade for making the common case free. If a
   workload deletes supernodes frequently, that is a signal to build the Phase 7 B+tree adjacency.
 
@@ -337,7 +396,8 @@ The numbers are estimates, but the orders of magnitude are structural, not tunin
 ## 9. Test Setup
 
 - `PackedEdgeTest`: round trip all four `dir` values, all 14 type bits, and 48-bit neighbours at 0,
-  1, max.
+  1, max; a materialised entry round-tripping its cached type; the two uncacheable type ids falling
+  back to "not recorded"; the tombstone still unreachable through every constructor.
 - `AdjacencyBlockTest`: fill a block in layout 0, seal to layout 1, decode, assert set equality with
   the input, for random and for adversarial (all-max-delta) inputs.
 - `EdgeCodecFuzzTest`: property-based — any multiset of edges encodes and decodes to itself; the
@@ -377,16 +437,20 @@ The numbers are estimates, but the orders of magnitude are structural, not tunin
 - [ ] Type-bitmap skipping on the read path —
       [IDX-3](INDEX_TASKS.md#idx-3--block-skipping-on-the-read-path). The metadata is written on every
       append and `mayContainType` has one caller, `remove`; `mayContainLocation` has none
-- [ ] The type filter applied before the relationship record is read —
+- [x] The type filter applied before the relationship record is read —
       [IDX-2](INDEX_TASKS.md#idx-2--push-the-type-filter-into-adjacency-for-materialised-entries). A
-      materialised entry's 14 type bits are unused, so a type-filtered traversal over a supernode of
-      materialised edges costs one random 64 byte read per edge, whether or not it matches
+      materialised entry caches its type (§3.1), so the record is read once per surviving candidate
+      rather than once per entry: 5 reads rather than 5,000 for a filter matching 5 of 5,005, measured
+      by `ReadBudgetTest.testATypeFilteredSupernodeReadsOnlyTheSurvivingRelationships`. Direction is
+      still record-only, so an unfiltered `Direction.OUT` scan reads every record
 - [ ] Lazy mirror-entry cleanup in vacuum (Phase 5)
 - [ ] B+tree adjacency for extreme supernodes (Phase 7)
 
 The three adjacency items above are what a "supernode is slow" report actually resolves to; the
 missing relationship index is a different problem with a different victim
-([INDEX_TASKS.md §1](INDEX_TASKS.md)).
+([INDEX_TASKS.md §1](INDEX_TASKS.md)). One of the three is now done, and the two that remain — block
+skipping and the streaming cursor — reduce how many entries are decoded and how many are touched at
+all, where IDX-2 reduced what each one costs.
 
 ---
 
@@ -402,5 +466,5 @@ missing relationship index is a different problem with a different victim
 
 ---
 
-_Git HEAD revision: `c016a41`_
-_Last updated: 2026-08-13 (synced with the Phase 0 to 3 implementation)_
+_Git HEAD revision: `3a05a2a`_
+_Last updated: 2026-08-16 (§3.1, §6.2, §6.3, §8, §9 and §10 synced with IDX-2)_

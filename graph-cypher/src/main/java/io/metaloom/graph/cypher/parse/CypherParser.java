@@ -76,6 +76,8 @@ public final class CypherParser {
 				clauses.add(withClause());
 			} else if (token.isKeyword("CREATE")) {
 				clauses.add(createClause());
+			} else if (token.isKeyword("MERGE")) {
+				clauses.add(mergeClause());
 			} else if (token.isKeyword("SET")) {
 				clauses.add(setClause());
 			} else if (token.isKeyword("REMOVE")) {
@@ -117,8 +119,6 @@ public final class CypherParser {
 			return null;
 		}
 		return switch (token.text()) {
-			case "MERGE" -> "MERGE is not supported: it needs match-or-create over a whole pattern, with ON CREATE "
-				+ "and ON MATCH. Use MATCH and CREATE, or the Java API";
 			case "FOREACH" -> "FOREACH is not supported: use UNWIND, which this build does implement";
 			case "LOAD" -> "LOAD CSV is not supported: this build has no file-reading mechanism";
 			case "CALL" -> "CALL is not supported: this build has no procedure mechanism";
@@ -274,23 +274,80 @@ public final class CypherParser {
 	private Ast.PatternPart creatablePart() {
 		Token at = peek();
 		Ast.PatternPart part = patternPart();
+		refuseUnbuildable(at, part, "CREATE", false);
+		return part;
+	}
+
+	/**
+	 * @param allowUndirected
+	 *            true for MERGE, which may be written {@code (a)-[:R]-(b)}: undirected there is a question — does an
+	 *            edge either way already exist — and openCypher answers it by matching both ways and creating
+	 *            left to right. CREATE has no question to ask, so an arrowless relationship there is an omission
+	 */
+	private void refuseUnbuildable(Token at, Ast.PatternPart part, String clause, boolean allowUndirected) {
+		if (part.selector() != Ast.PathSelector.ALL) {
+			throw error(at, clause + " cannot take a shortest-path pattern: it describes a search through a graph "
+				+ "rather than a graph to build");
+		}
 		for (Ast.RelPattern relationship : part.relationships()) {
 			if (relationship.range() != null) {
-				throw error(at, "CREATE cannot take a variable-length pattern: it does not say how many "
+				throw error(at, clause + " cannot take a variable-length pattern: it does not say how many "
 					+ "relationships to create");
 			}
-			if (relationship.direction() == Direction.BOTH) {
-				throw error(at, "CREATE needs a direction on every relationship: write -> or <-");
+			if (!allowUndirected && relationship.direction() == Direction.BOTH) {
+				throw error(at, clause + " needs a direction on every relationship: write -> or <-");
 			}
 			if (relationship.types().isEmpty()) {
-				throw error(at, "CREATE needs a type on every relationship, as in -[:KNOWS]->");
+				throw error(at, clause + " needs a type on every relationship, as in -[:KNOWS]->");
 			}
 			if (relationship.types().size() > 1) {
-				throw error(at, "CREATE creates one relationship, so it takes one type rather than the choice "
+				throw error(at, clause + " creates one relationship, so it takes one type rather than the choice "
 					+ String.join("|", relationship.types()));
 			}
 		}
-		return part;
+	}
+
+	/**
+	 * {@code MERGE Pattern [ON CREATE SET …] [ON MATCH SET …]}, in either order and either alone.
+	 *
+	 * <p>
+	 * One pattern part, and the comma is refused with its own message rather than left to fail as an unexpected token:
+	 * a list looks like it should work, and what it would have to mean — match all of it or build all of it — is
+	 * exactly what MERGE cannot say about several independent patterns.
+	 * </p>
+	 */
+	private Ast.Merge mergeClause() {
+		expectKeyword("MERGE");
+		Token at = peek();
+		Ast.PatternPart pattern = patternPart();
+		refuseUnbuildable(at, pattern, "MERGE", true);
+		if (peek().isSymbol(",")) {
+			throw error(peek(), "MERGE takes one pattern: it matches the whole of it or builds the whole of it, and "
+				+ "a comma-separated list has no single answer to that. Write one MERGE for each");
+		}
+
+		List<Ast.SetItem> onCreate = new ArrayList<>();
+		List<Ast.SetItem> onMatch = new ArrayList<>();
+		while (peek().isKeyword("ON")) {
+			take();
+			boolean creating;
+			if (peek().isKeyword("CREATE")) {
+				creating = true;
+			} else if (peek().isKeyword("MATCH")) {
+				creating = false;
+			} else {
+				throw error(peek(), "Expected CREATE or MATCH after ON but found " + describe(peek()));
+			}
+			take();
+			expectKeyword("SET");
+			List<Ast.SetItem> items = creating ? onCreate : onMatch;
+			items.add(setItem());
+			while (peek().isSymbol(",")) {
+				take();
+				items.add(setItem());
+			}
+		}
+		return new Ast.Merge(pattern, onCreate, onMatch);
 	}
 
 	private Ast.SetClause setClause() {
@@ -391,7 +448,50 @@ public final class CypherParser {
 			pathVariable = take().text();
 			take();
 		}
-		refusePathFunction();
+
+		Token at = peek();
+		Ast.PathSelector selector = pathSelector();
+		if (selector == Ast.PathSelector.ALL) {
+			return chain(pathVariable, selector);
+		}
+		// The name and its opening parenthesis are already taken; what follows is an ordinary pattern.
+		Ast.PatternPart part = chain(pathVariable, selector);
+		expectSymbol(")", "the end of " + at.text() + "(...)");
+		return shortestPathPart(at, part);
+	}
+
+	/**
+	 * {@code shortestPath} and {@code allShortestPaths}, which look like function calls and are not.
+	 *
+	 * <p>
+	 * They take a <em>pattern</em> rather than an expression, so nothing in the expression grammar can reach them and
+	 * they have to be recognised here, where a pattern is expected. Both names are ordinary identifiers to the lexer —
+	 * a graph may legitimately have a property called {@code shortestPath} — so the trailing parenthesis is part of the
+	 * test rather than the name alone.
+	 * </p>
+	 *
+	 * @return the selector, having consumed the name and its opening parenthesis, or {@link Ast.PathSelector#ALL}
+	 *         having consumed nothing
+	 */
+	private Ast.PathSelector pathSelector() {
+		Token token = peek();
+		if (token.type() != Token.Type.IDENTIFIER || !peekAt(1).isSymbol("(")) {
+			return Ast.PathSelector.ALL;
+		}
+		Ast.PathSelector selector = switch (token.text()) {
+			case "shortestPath" -> Ast.PathSelector.SHORTEST;
+			case "allShortestPaths" -> Ast.PathSelector.ALL_SHORTEST;
+			default -> Ast.PathSelector.ALL;
+		};
+		if (selector != Ast.PathSelector.ALL) {
+			take();
+			take();
+		}
+		return selector;
+	}
+
+	/** The node-relationship-node chain itself, which is the same grammar inside and outside a path function. */
+	private Ast.PatternPart chain(String pathVariable, Ast.PathSelector selector) {
 		List<Ast.NodePattern> nodes = new ArrayList<>();
 		List<Ast.RelPattern> relationships = new ArrayList<>();
 		nodes.add(nodePattern());
@@ -399,29 +499,32 @@ public final class CypherParser {
 			relationships.add(relPattern());
 			nodes.add(nodePattern());
 		}
-		return new Ast.PatternPart(pathVariable, nodes, relationships);
+		return new Ast.PatternPart(pathVariable, selector, nodes, relationships);
 	}
 
 	/**
-	 * {@code shortestPath} and {@code allShortestPaths} refused where a pattern was expected.
+	 * The two shapes a shortest-path search cannot be asked for.
 	 *
 	 * <p>
-	 * They look like function calls and are not — they take a pattern rather than an expression, so nothing else in the
-	 * grammar reaches them and without this the message is "expected a node pattern but found an identifier", which
-	 * describes the parser's position rather than the feature. spec/CYPHER.md has always listed both as refused by
-	 * name; this is what makes that true. Found by the {@code test-data} corpus, whose {@code t-07} is a shortest-path
-	 * query.
+	 * Both are openCypher's own restrictions rather than this build's. A search runs between <em>two</em> endpoints, so
+	 * a longer chain has no single pair to search between; and the search works outward from the start one distance at
+	 * a time, so a minimum above one would mean finding the shortest path and then rejecting it for being short — which
+	 * is a filter over all paths, not a shortest-path search, and the plain pattern already expresses it.
 	 * </p>
 	 */
-	private void refusePathFunction() {
-		Token token = peek();
-		if (token.type() != Token.Type.IDENTIFIER || !peekAt(1).isSymbol("(")) {
-			return;
+	private Ast.PatternPart shortestPathPart(Token at, Ast.PatternPart part) {
+		String name = at.text();
+		if (part.relationships().size() != 1) {
+			throw error(at, name + " takes a pattern with exactly one relationship, as in "
+				+ "(a)-[:TYPE*..10]-(b); this one has " + part.relationships().size());
 		}
-		if (token.text().equals("shortestPath") || token.text().equals("allShortestPaths")) {
-			throw error(token, token.text() + " is not supported: this build has no shortest-path search. A "
-				+ "variable-length pattern such as -[:TYPE*1..10]- finds every path rather than the shortest");
+		Ast.Range range = part.relationships().get(0).range();
+		if (range != null && range.min() > 1) {
+			throw error(at, name + " takes a minimum length of 0 or 1, not " + range.min()
+				+ ": it searches outward from the start node, so a longer minimum is a filter over every path "
+				+ "rather than a shortest-path search");
 		}
+		return part;
 	}
 
 	private boolean isRelationshipStart() {
@@ -764,7 +867,7 @@ public final class CypherParser {
 						return new Ast.Literal(null);
 					}
 					case "CASE" -> {
-						throw error(token, "CASE is not supported in this build");
+						return caseExpression();
 					}
 					case "ALL", "ANY", "NONE", "SINGLE" -> {
 						throw error(token, token.text() + " predicates are not supported in this build");
@@ -801,7 +904,52 @@ public final class CypherParser {
 		}
 	}
 
+	/**
+	 * {@code CASE}, in both forms, told apart by what follows the keyword.
+	 *
+	 * <pre>
+	 * CASE n.grade WHEN 'A' THEN 4 WHEN 'B' THEN 3 ELSE 0 END     -- simple:  compared for equality
+	 * CASE WHEN n.score &gt; 90 THEN 'A' WHEN n.score &gt; 80 THEN 'B' END  -- generic: each is a predicate
+	 * </pre>
+	 *
+	 * <p>
+	 * A {@code WHEN} straight after the keyword means there is no subject; anything else is one. That is the whole
+	 * distinction, and it is unambiguous because a subject expression can never begin with {@code WHEN}.
+	 * </p>
+	 */
+	private Expr caseExpression() {
+		Token at = peek();
+		expectKeyword("CASE");
+		Expr subject = peek().isKeyword("WHEN") ? null : expression();
+
+		List<Expr> whens = new ArrayList<>();
+		List<Expr> thens = new ArrayList<>();
+		while (peek().isKeyword("WHEN")) {
+			take();
+			whens.add(expression());
+			expectKeyword("THEN");
+			thens.add(expression());
+		}
+		if (whens.isEmpty()) {
+			throw error(at, "CASE needs at least one WHEN ... THEN ...");
+		}
+
+		Expr otherwise = null;
+		if (peek().isKeyword("ELSE")) {
+			take();
+			otherwise = expression();
+		}
+		expectKeyword("END");
+		return new Ast.Case(subject, whens, thens, otherwise);
+	}
+
 	private Expr functionCall(String name) {
+		if (name.equals("shortestPath") || name.equals("allShortestPaths")) {
+			// It parses as a function call here and its argument is a pattern, so the error would otherwise be about
+			// the arrow rather than about where the call is allowed to appear.
+			throw error(previous(), name + " belongs in a MATCH pattern rather than in an expression, as in "
+				+ "MATCH p = " + name + "((a)-[:TYPE*..10]-(b))");
+		}
 		expectSymbol("(", "a function call");
 		boolean distinct = false;
 		List<Expr> arguments = new ArrayList<>();

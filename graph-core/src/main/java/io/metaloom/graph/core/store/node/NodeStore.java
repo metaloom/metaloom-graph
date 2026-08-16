@@ -335,10 +335,23 @@ public final class NodeStore {
 
 	/** Removes an inline edge by value, keeping the remaining entries packed. */
 	public boolean removeInlineEdge(long id, long packedEdge) {
+		return removeInlineEdge(id, packedEdge, -1L);
+	}
+
+	/**
+	 * Removes the first inline edge that matches {@code packedEdge} through {@code mask}, keeping the remaining
+	 * entries packed.
+	 * <p>
+	 * The mask is how a caller removes an entry it can only partly name — the adjacency store matches a materialised
+	 * entry by the relationship it points at while ignoring the type cached beside it. The layout of the fields stays
+	 * the adjacency store's business; this only compares.
+	 */
+	public boolean removeInlineEdge(long id, long packedEdge, long mask) {
+		long probe = packedEdge & mask;
 		MemorySegment record = mutable(id);
 		int count = Byte.toUnsignedInt(record.get(Layouts.BYTE, OFF_INLINE_COUNT));
 		for (int i = 0; i < count; i++) {
-			if (record.get(Layouts.LONG, OFF_INLINE_EDGE_0 + 8L * i) == packedEdge) {
+			if ((record.get(Layouts.LONG, OFF_INLINE_EDGE_0 + 8L * i) & mask) == probe) {
 				for (int j = i; j < count - 1; j++) {
 					record.set(Layouts.LONG, OFF_INLINE_EDGE_0 + 8L * j,
 						record.get(Layouts.LONG, OFF_INLINE_EDGE_0 + 8L * (j + 1)));

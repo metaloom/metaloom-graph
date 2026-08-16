@@ -182,7 +182,8 @@ public class CypherParserTest {
 		assertTrue(assertThrows(CypherSyntaxException.class,
 			() -> CypherParser.parse("OPTIONAL MATCH (n) RETURN n")).getMessage().contains("OPTIONAL MATCH"));
 		assertTrue(assertThrows(CypherSyntaxException.class,
-			() -> CypherParser.parse("RETURN CASE WHEN true THEN 1 ELSE 2 END")).getMessage().contains("CASE"));
+			() -> CypherParser.parse("MATCH (n) WHERE ALL(x IN n.xs WHERE x > 0) RETURN n")).getMessage()
+				.contains("ALL predicates are not supported"));
 	}
 
 	/**
@@ -195,14 +196,10 @@ public class CypherParserTest {
 	 */
 	@Test
 	public void testTheRemainingWriteClausesAreRefusedByName() {
-		CypherSyntaxException merge = assertThrows(CypherSyntaxException.class,
-			() -> CypherParser.parse("MERGE (n:Person {name: 'Ada'}) RETURN n"));
-		assertTrue(merge.getMessage().contains("MERGE is not supported"), merge.getMessage());
-		assertEquals(1, merge.column(), "and points at the clause");
-
-		assertTrue(assertThrows(CypherSyntaxException.class,
-			() -> CypherParser.parse("MATCH (n) FOREACH (x IN [1] | SET n.x = x)")).getMessage()
-				.contains("FOREACH is not supported"));
+		CypherSyntaxException foreach = assertThrows(CypherSyntaxException.class,
+			() -> CypherParser.parse("MATCH (n) FOREACH (x IN [1] | SET n.x = x)"));
+		assertTrue(foreach.getMessage().contains("FOREACH is not supported"), foreach.getMessage());
+		assertEquals(11, foreach.column(), "and points at the clause");
 		assertTrue(assertThrows(CypherSyntaxException.class,
 			() -> CypherParser.parse("LOAD CSV FROM 'f.csv' AS row RETURN row")).getMessage()
 				.contains("LOAD CSV is not supported"));

@@ -33,7 +33,9 @@ public final class QueryExecutor {
 	public QueryExecutor(GraphAccess graph, Map<String, Object> parameters) {
 		this.evaluator = new Evaluator(graph, parameters);
 		this.matcher = new PatternMatcher(evaluator);
-		this.writer = new Writer(graph, evaluator);
+		// MERGE has to match before it can decide whether to create, so the writer gets the same matcher rather than
+		// one of its own — a second instance would be a second place for the pattern rules to drift.
+		this.writer = new Writer(graph, evaluator, matcher);
 	}
 
 	/**
@@ -138,6 +140,7 @@ public final class QueryExecutor {
 				// A write materialises so that it can commit before a row is delivered, and its eager semantics come
 				// from the executor holding each clause's whole input. Pushing one would take both away silently.
 				case Ast.Create ignored -> false;
+				case Ast.Merge ignored -> false;
 				case Ast.SetClause ignored -> false;
 				case Ast.Remove ignored -> false;
 				case Ast.Delete ignored -> false;
@@ -331,6 +334,7 @@ public final class QueryExecutor {
 				// Each of these consumes the materialised list and produces one, which is what gives the write clauses
 				// openCypher's eager semantics for nothing: a CREATE cannot feed the MATCH that is driving it.
 				case Ast.Create create -> rows = writer.create(create, rows);
+				case Ast.Merge merge -> rows = writer.merge(merge, rows);
 				case Ast.SetClause set -> rows = writer.set(set, rows);
 				case Ast.Remove remove -> rows = writer.remove(remove, rows);
 				case Ast.Delete delete -> rows = writer.delete(delete, rows);
@@ -433,6 +437,11 @@ public final class QueryExecutor {
 	}
 
 	private static boolean containsAggregate(Ast.Expr expression) {
+		// CASE's subject and ELSE are both optional, so null is an ordinary input here rather than a mistake — and a
+		// switch over a null selector throws.
+		if (expression == null) {
+			return false;
+		}
 		return switch (expression) {
 			case Ast.FunctionCall call -> Functions.isAggregate(call.name())
 				|| call.arguments().stream().anyMatch(QueryExecutor::containsAggregate);
@@ -443,6 +452,12 @@ public final class QueryExecutor {
 			case Ast.Property property -> containsAggregate(property.target());
 			case Ast.Index index -> containsAggregate(index.target()) || containsAggregate(index.index());
 			case Ast.ListLiteral list -> list.elements().stream().anyMatch(QueryExecutor::containsAggregate);
+			// `sum(CASE WHEN x THEN 1 ELSE 0 END)` is caught by the FunctionCall arm above; this is the other way
+			// round — an aggregate inside a branch, as in `CASE WHEN $wanted THEN count(*) ELSE 0 END`.
+			case Ast.Case branch -> containsAggregate(branch.subject())
+				|| branch.whens().stream().anyMatch(QueryExecutor::containsAggregate)
+				|| branch.thens().stream().anyMatch(QueryExecutor::containsAggregate)
+				|| containsAggregate(branch.otherwise());
 			default -> false;
 		};
 	}
@@ -516,6 +531,26 @@ public final class QueryExecutor {
 		if (expression instanceof Ast.Unary unary) {
 			Object operand = foldAggregate(unary.operand(), group);
 			return unary.op() == Ast.Op.NOT ? Values.not(operand) : Values.negate(operand);
+		}
+		// `CASE WHEN $wanted THEN count(*) ELSE 0 END` — the aggregate is inside a branch rather than around the CASE,
+		// which is the other way round from the common `sum(CASE … END)`. The branch is chosen against the first row,
+		// on the same reasoning as the fallback below, and only the branch taken is then folded.
+		if (expression instanceof Ast.Case branch && containsAggregate(branch)) {
+			if (group.isEmpty()) {
+				return null;
+			}
+			Row first = group.get(0);
+			Object subject = branch.subject() == null ? null : evaluator.evaluate(branch.subject(), first);
+			for (int i = 0; i < branch.whens().size(); i++) {
+				Object when = evaluator.evaluate(branch.whens().get(i), first);
+				boolean taken = branch.subject() == null
+					? Values.isTrue(when)
+					: subject != null && when != null && Values.equalKnown(subject, when);
+				if (taken) {
+					return foldAggregate(branch.thens().get(i), group);
+				}
+			}
+			return branch.otherwise() == null ? null : foldAggregate(branch.otherwise(), group);
 		}
 		// A plain expression inside an aggregating projection is evaluated against the first row of the group; it is
 		// constant across the group by construction, because it is one of the grouping keys.

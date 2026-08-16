@@ -120,10 +120,23 @@ public final class GraphModel {
 		return result;
 	}
 
-	/** The store widens every stored integer to a long, so the model has to compare the same way. */
+	/**
+	 * The comparable form of a stored value.
+	 * <p>
+	 * Two things are folded here. The store widens every stored integer to a long, so the model has to compare the
+	 * same way. And an array compares by identity, which would make every vector property differ from itself the
+	 * moment it was read back from the store — so a {@code float[]} becomes a list, which compares by content.
+	 */
 	public static Object normalise(Object value) {
 		if (value instanceof Byte || value instanceof Short || value instanceof Integer) {
 			return ((Number) value).longValue();
+		}
+		if (value instanceof float[] vector) {
+			List<Float> list = new ArrayList<>(vector.length);
+			for (float component : vector) {
+				list.add(component);
+			}
+			return list;
 		}
 		return value;
 	}

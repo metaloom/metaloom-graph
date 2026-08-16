@@ -137,6 +137,14 @@ public final class InvariantChecker {
 							+ " has an adjacency entry for a dead relationship");
 						continue;
 					}
+					// The type cached in the entry is what a type-filtered traversal decides on before it reads the
+					// record, so a stale one does not slow a query down — it silently drops an edge from its answer.
+					int cachedType = PackedEdge.typeId(edge);
+					if (cachedType != PackedEdge.TYPE_NOT_RECORDED && cachedType != rels.typeId(relId)) {
+						violations.add("Node " + ElementId.toString(nodeId) + " caches type " + cachedType
+							+ " for relationship " + ElementId.toString(relId) + ", whose record says "
+							+ rels.typeId(relId));
+					}
 					if (rels.fromId(relId) == nodeId && rels.toId(relId) == nodeId) {
 						// A self-loop is one stored entry standing for both an outgoing and an incoming edge.
 						outSeen++;

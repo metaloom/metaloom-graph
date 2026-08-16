@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -274,13 +275,13 @@ public final class IndexCatalog {
 		ensureInitialised();
 		for (Map.Entry<Integer, Object> entry : before.entrySet()) {
 			Object now = after.get(entry.getKey());
-			if (!java.util.Objects.deepEquals(now, entry.getValue())) {
+			if (!valueEquals(now, entry.getValue())) {
 				tree.remove(propRoot(), propertyKey(entry.getKey(), entry.getValue()), nodeId);
 			}
 		}
 		for (Map.Entry<Integer, Object> entry : after.entrySet()) {
 			Object was = before.get(entry.getKey());
-			if (!java.util.Objects.deepEquals(was, entry.getValue())) {
+			if (!valueEquals(was, entry.getValue())) {
 				propRoot(tree.put(propRoot(), propertyKey(entry.getKey(), entry.getValue()), nodeId, nodeId));
 			}
 		}
@@ -369,6 +370,22 @@ public final class IndexCatalog {
 		return ((long) keyId << 32) | (valueHash(value) & 0xFFFFFFFFL);
 	}
 
+	/**
+	 * A hash that depends only on the <b>content</b> of the value, never on the identity of the object holding it.
+	 * <p>
+	 * That is the whole contract, and every branch below exists because some type breaks it by default. The numeric
+	 * branches normalise across the widths, so a property written as {@code 1} and searched for as {@code 1L} agrees.
+	 * The array branches exist because {@code Object::hashCode} on an array is the identity hash: a {@code float[]}
+	 * used to land in the {@code default} case, so every vector property was indexed under a key nothing could
+	 * reproduce — the lookup missed the node, and the delete missed the entry and left it dangling. A list gets the
+	 * same treatment recursively rather than {@code List::hashCode}, because a list's hash delegates to its elements
+	 * and so inherits the problem from any array inside it.
+	 * <p>
+	 * Vectors are hashed by content rather than skipped at the maintenance hooks, which is the narrow half of the
+	 * decision in <a href="../../../../../../../../spec/VECTOR.md">spec/VECTOR.md</a>: it makes an exact-equality
+	 * lookup on a vector work and index maintenance sound. It is not nearest-neighbour search and never becomes it —
+	 * that is a different structure, not a differently-keyed tree.
+	 */
 	static int valueHash(Object value) {
 		if (value == null) {
 			return 0;
@@ -385,8 +402,60 @@ public final class IndexCatalog {
 			case Double d -> Double.hashCode(d);
 			case Instant i -> Long.hashCode(i.getEpochSecond() * 1_000_000L + i.getNano() / 1000L);
 			case UUID u -> Long.hashCode(u.getMostSignificantBits() ^ u.getLeastSignificantBits());
-			default -> value.hashCode();
+			// Arrays.hashCode(float[]) compares the same bits Arrays.equals does, so it agrees with the
+			// Objects.deepEquals verification the caller applies to every candidate.
+			case float[] v -> Arrays.hashCode(v);
+			case List<?> list -> listHash(list);
+			// Any other array shape — a value type added later, or one nested in a list. deepHashCode dispatches on
+			// the component type, so this keeps the next array-shaped value from reintroducing the identity hash.
+			default -> value.getClass().isArray() ? Arrays.deepHashCode(new Object[] { value }) : value.hashCode();
 		};
+	}
+
+	/**
+	 * Value equality as the index means it, and the partner of {@link #valueHash}: the two must agree, or a candidate
+	 * the tree found is thrown away by the verification that was supposed to confirm it.
+	 * <p>
+	 * {@link java.util.Objects#deepEquals} is deep for an array and shallow for everything else, so a list holding a
+	 * {@code float[]} compares its elements with {@code Object::equals} and reports two identical embeddings as
+	 * different. That is the same defect as the identity hash, one level down, and it has the same symptom: a lookup
+	 * that finds the entry and then silently discards the node it names.
+	 * <p>
+	 * The integer widths are normalised here for the same reason they are in {@link #valueHash}: the store widens
+	 * every stored integer to a {@code long}, so a list written as {@code [1, 2]} comes back as a list of longs and
+	 * would otherwise never equal the one the caller searched with.
+	 */
+	public static boolean valueEquals(Object a, Object b) {
+		if (a instanceof List<?> listA && b instanceof List<?> listB) {
+			if (listA.size() != listB.size()) {
+				return false;
+			}
+			java.util.Iterator<?> itA = listA.iterator();
+			java.util.Iterator<?> itB = listB.iterator();
+			while (itA.hasNext()) {
+				if (!valueEquals(itA.next(), itB.next())) {
+					return false;
+				}
+			}
+			return true;
+		}
+		return java.util.Objects.deepEquals(widen(a), widen(b));
+	}
+
+	private static Object widen(Object value) {
+		if (value instanceof Byte || value instanceof Short || value instanceof Integer) {
+			return ((Number) value).longValue();
+		}
+		return value;
+	}
+
+	/** {@code List::hashCode}'s mixing, with every element routed back through {@link #valueHash}. */
+	private static int listHash(List<?> list) {
+		int h = 1;
+		for (Object element : list) {
+			h = 31 * h + valueHash(element);
+		}
+		return h;
 	}
 
 	private static int hash(byte[] data) {

@@ -46,6 +46,53 @@ public class PackedEdgeTest {
 		long edge = PackedEdge.ofRelationship(relId);
 		assertTrue(PackedEdge.isMaterialised(edge));
 		assertEquals(relId, ElementId.withGen(PackedEdge.relationshipId(edge), 3));
+		assertEquals(PackedEdge.TYPE_NOT_RECORDED, PackedEdge.typeId(edge));
+	}
+
+	/** The IDX-2 fast path: a materialised entry carries the type a traversal filters on. */
+	@Test
+	public void testAMaterialisedEntryRoundTripsItsCachedType() {
+		long relId = ElementId.encode(Kind.REL, 1, 42, 3);
+		for (int type : new int[] { 1, 2, 8191, PackedEdge.MAX_TYPE - 1 }) {
+			long edge = PackedEdge.ofRelationship(relId, type);
+			assertTrue(PackedEdge.isMaterialised(edge), "dir must still say materialised for type " + type);
+			assertEquals(type, PackedEdge.typeId(edge));
+			assertEquals(relId, ElementId.withGen(PackedEdge.relationshipId(edge), 3),
+				"the location must survive the type sharing the word");
+			assertFalse(PackedEdge.isTombstone(edge));
+		}
+	}
+
+	/**
+	 * The two type ids that cannot be cached. {@link PackedEdge#MAX_TYPE} is what keeps the tombstone unreachable, and
+	 * 0 is not a real type — {@code Catalog} hands it out for "unknown" — which is what makes it free to use as the
+	 * "not recorded" marker an older store's entries already hold.
+	 */
+	@Test
+	public void testAnUncacheableTypeFallsBackToReadingTheRecord() {
+		long relId = ElementId.encode(Kind.REL, 1, 42, 3);
+		assertEquals(PackedEdge.TYPE_NOT_RECORDED, PackedEdge.typeId(PackedEdge.ofRelationship(relId, 0)));
+		assertEquals(PackedEdge.TYPE_NOT_RECORDED,
+			PackedEdge.typeId(PackedEdge.ofRelationship(relId, PackedEdge.MAX_TYPE)));
+		// A type id read out of a corrupt record must degrade to "read the record", not break the caller.
+		assertEquals(PackedEdge.TYPE_NOT_RECORDED, PackedEdge.typeId(PackedEdge.ofRelationship(relId, -7)));
+		assertEquals(PackedEdge.TYPE_NOT_RECORDED,
+			PackedEdge.typeId(PackedEdge.ofRelationship(relId, Integer.MAX_VALUE)));
+	}
+
+	/** A cached type is a hint: an entry that has none must never be filtered out on the strength of it. */
+	@Test
+	public void testAnEntryWithNoCachedTypeSurvivesEveryTypeFilter() {
+		long relId = ElementId.encode(Kind.REL, 1, 42, 3);
+		java.util.Set<Integer> filter = java.util.Set.of(7);
+		assertFalse(PackedEdge.excludedByType(PackedEdge.ofRelationship(relId), filter));
+		assertFalse(PackedEdge.excludedByType(PackedEdge.ofRelationship(relId, 7), filter));
+		assertTrue(PackedEdge.excludedByType(PackedEdge.ofRelationship(relId, 8), filter));
+		// A lightweight entry always carries its own type, so type 0 there is a genuine mismatch.
+		assertTrue(PackedEdge.excludedByType(PackedEdge.pack(PackedEdge.DIR_OUT, 0, 5), filter));
+		assertFalse(PackedEdge.excludedByType(PackedEdge.pack(PackedEdge.DIR_OUT, 7, 5), filter));
+		// No filter excludes nothing.
+		assertFalse(PackedEdge.excludedByType(PackedEdge.pack(PackedEdge.DIR_OUT, 8, 5), null));
 	}
 
 	@Test
@@ -56,14 +103,36 @@ public class PackedEdgeTest {
 		assertFalse(PackedEdge.isTombstone(PackedEdge.pack(0, 0, 0)));
 		assertFalse(PackedEdge.isTombstone(
 			PackedEdge.ofRelationship(ElementId.encode(Kind.REL, 0, 0, 1))));
-		// The tombstone bit pattern needs dir 3 with a non-zero type, which pack rejects.
+		// The tombstone bit pattern needs dir 3 with an all-ones type, which pack rejects — including at the one
+		// location where the rest of the word is already all ones.
 		assertThrows(IllegalArgumentException.class,
 			() -> PackedEdge.pack(PackedEdge.DIR_MATERIALISED, PackedEdge.MAX_TYPE, PackedEdge.MAX_LOCATION));
+		assertThrows(IllegalArgumentException.class,
+			() -> PackedEdge.pack(PackedEdge.DIR_MATERIALISED, PackedEdge.MAX_TYPE, 1));
+		// And the constructor that takes a type must never route around that check.
+		assertFalse(PackedEdge.isTombstone(
+			PackedEdge.ofRelationship(ElementId.fromLocation(Kind.REL, PackedEdge.MAX_LOCATION),
+				PackedEdge.MAX_TYPE)));
 	}
 
 	@Test
 	public void testTypeBeyondFourteenBitsIsRejected() {
 		assertThrows(IllegalArgumentException.class,
 			() -> PackedEdge.pack(0, PackedEdge.MAX_TYPE + 1, 1));
+	}
+
+	/** Masked matching is how a delete finds an entry whose cached type it does not know. */
+	@Test
+	public void testTheTypeAgnosticMaskComparesEverythingButTheType() {
+		long relId = ElementId.encode(Kind.REL, 1, 42, 3);
+		long cached = PackedEdge.ofRelationship(relId, 9);
+		long plain = PackedEdge.ofRelationship(relId);
+		assertEquals(plain & PackedEdge.TYPE_AGNOSTIC_MASK, cached & PackedEdge.TYPE_AGNOSTIC_MASK);
+		long other = PackedEdge.ofRelationship(ElementId.encode(Kind.REL, 1, 43, 3), 9);
+		assertFalse((other & PackedEdge.TYPE_AGNOSTIC_MASK) == (cached & PackedEdge.TYPE_AGNOSTIC_MASK),
+			"a different relationship must not match");
+		assertFalse((PackedEdge.pack(PackedEdge.DIR_OUT, 9, PackedEdge.location(cached))
+			& PackedEdge.TYPE_AGNOSTIC_MASK) == (cached & PackedEdge.TYPE_AGNOSTIC_MASK),
+			"the direction stays part of the match");
 	}
 }

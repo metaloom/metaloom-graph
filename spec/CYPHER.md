@@ -31,12 +31,13 @@ for (CypherRow row : result) {
 ```
 Query        := SingleQuery (UNION [ALL] SingleQuery)*
 SingleQuery  := Clause+ [Return]          -- Return is required unless the query writes
-Clause       := Match | Unwind | With | Create | Set | Remove | Delete
+Clause       := Match | Unwind | With | Create | Merge | Set | Remove | Delete
 Match        := MATCH Pattern [WHERE Expr]
 Unwind       := UNWIND Expr AS Variable
 With         := WITH Projection [WHERE Expr]
 Return       := RETURN Projection
 Create       := CREATE Pattern
+Merge        := MERGE PatternPart (ON (CREATE | MATCH) SET SetItem (',' SetItem)*)*
 Set          := SET SetItem (',' SetItem)*
 SetItem      := Variable '.' Key '=' Expr | Variable (':' Label)+
               | Variable '=' Expr | Variable '+=' Expr
@@ -46,7 +47,9 @@ Delete       := [DETACH] DELETE Expr (',' Expr)*
 Projection   := [DISTINCT] ('*' | Item (',' Item)*) [ORDER BY SortItem+] [SKIP Expr] [LIMIT Expr]
 Item         := Expr [AS Variable]
 Pattern      := PatternPart (',' PatternPart)*
-PatternPart  := [Variable '='] NodePattern (RelPattern NodePattern)*
+PatternPart  := [Variable '='] (PathSearch '(' Chain ')' | Chain)
+PathSearch   := shortestPath | allShortestPaths        -- MATCH only; one relationship; min 0 or 1
+Chain        := NodePattern (RelPattern NodePattern)*
 NodePattern  := '(' [Variable] (':' Label)* [MapLiteral] ')'
 RelPattern   := ('-' | '<-') ['[' [Variable] [':' Type ('|' Type)*] ['*' Range] [MapLiteral] ']'] ('-' | '->')
 Range        := [Int] ['..' [Int]]
@@ -203,6 +206,7 @@ its counts from the data rather than the dictionary precisely because of this (�
 
 ```
 CREATE (a:Person {name: $name})-[:KNOWS {since: 2020}]->(b:Person {name: 'Bob'})
+MERGE (n:Person {email: $e}) ON CREATE SET n.at = timestamp() ON MATCH SET n.seen = true
 MATCH (n:Person) SET n.age = 35, n:Employee, n += {city: 'Bonn'}
 MATCH (n:Person) REMOVE n.age, n:Employee
 MATCH (n:Person)-[r:KNOWS]->() DELETE r
@@ -267,17 +271,67 @@ property stores a string. The query language cannot write those three types at a
 **A constraint violation aborts the whole query.** `setNodeProperties` checks uniqueness *after*
 mutating, so a violation leaves a partially applied write; it is never caught and continued.
 
+### 5.3 `MERGE` matches the whole pattern, or builds the whole pattern
+
+```
+MERGE (s:Supplier {supplierId: sid}) ON CREATE SET s.name = 'Supplier ' + toString(sid)
+MATCH (s:Supplier) MATCH (p:Part) MERGE (s)-[r:SUPPLIES]->(p) ON CREATE SET r.primary = true
+```
+
+**The whole of it is the rule, and it is where MERGE surprises people.** `MERGE (a:A)-[:R]->(b:B)`
+against a graph holding an `:A` and a `:B` but no `:R` between them creates a *second* `:A`, a *second*
+`:B` and the relationship — the pattern as a whole did not match, and MERGE has no notion of matching
+part of one. Binding the endpoints first, as the second line above does, is how the intended thing is
+said. This is correct openCypher and a well-known way to double a graph by accident, so it is asserted
+rather than only written down (`MergeTest.testAPatternMatchesEntirelyOrIsBuiltEntirely`).
+
+The rest:
+
+- **One pattern part, not a list.** A comma is refused with its own message: "match all of it or build
+  all of it" has no single answer across several independent patterns. Write one `MERGE` for each.
+- **`ON CREATE SET` / `ON MATCH SET`**, either, both, in either order. Each is an ordinary `SET` applied
+  to the rows of just that branch, so it shares every rule in §5.2 — including one store write per
+  element per branch.
+- **A match returns every match.** `MERGE (n:Person)` against three of them is three rows, not a choice.
+- **The created relationship is materialised**, as `CREATE`'s is, so `ON CREATE SET r.x` works.
+- **Undirected is allowed here and refused in `CREATE`**, because it means something: `MERGE (a)-[:R]-(b)`
+  asks whether an edge exists *either way*, and creates one left to right if none does. `CREATE` has no
+  question to ask, so an arrowless relationship there is an omission.
+
+**Why it is idempotent inside one query.** Rows are processed in order and each match reads the store as
+it is *now*, so a row merging a key an earlier row created finds it rather than creating a second. That
+rests on a writer reading the current mapping rather than a fixed view ([TRANSACTIONS.md](TRANSACTIONS.md)) —
+the same property that gives a write transaction read-your-writes. **This is the one place a write clause
+sees what the same query wrote**; the eagerness above still holds for the rows *driving* the clause,
+which were fixed before it started.
+
+### 5.4 `CASE`
+
+```
+CASE WHEN n.score >= 80 THEN 'high' WHEN n.score >= 0 THEN 'low' ELSE 'unknown' END
+CASE n.grade WHEN 'A' THEN 4 WHEN 'B' THEN 3 ELSE 0 END
+```
+
+Both forms, told apart by whether `WHEN` follows the keyword immediately. Two things about it are easy
+to get wrong in ways that throw nothing:
+
+- **Only the branch that is taken is evaluated.** Not an optimisation — it is what makes
+  `CASE WHEN n.d = 0 THEN 0 ELSE n.x / n.d END` a guard rather than a decoration.
+- **Null follows §2.** No matching branch and no `ELSE` is null, not an error. A null predicate is not
+  true. And in the simple form a null subject matches *no* `WHEN`, including `WHEN null`, because
+  equality with null is null rather than true — `IS NULL` is how that question is actually asked.
+
+The simple form compares under Cypher equality, so `1` and `1.0` select the same branch.
+
 ---
 
-## 5.3 What is not built, and why
+### 5.5 What is not built, and why
 
 | | Reason |
 |---|---|
-| `MERGE` | Match-or-create over a whole pattern, plus `ON CREATE` / `ON MATCH`. Note it would be *easier* here than elsewhere: writers serialise on one lock and a write transaction reads its own writes, so the lock-and-retry dance other engines need does not arise |
 | `FOREACH` | `UNWIND` covers the common case |
 | `OPTIONAL MATCH` | Needs null-padding semantics through the rest of the pipeline |
-| `CASE`, list comprehensions, map projections, pattern comprehensions | Not built |
-| `shortestPath`, `allShortestPaths` | Not built |
+| List comprehensions, map projections, pattern comprehensions | Not built |
 | `ALL`/`ANY`/`NONE`/`SINGLE` predicates, `EXISTS` subqueries | Not built |
 | `CALL`, procedures, `LOAD CSV` | No procedure mechanism exists |
 | Temporal and spatial types | The store has `Instant`; Cypher's temporal algebra is not implemented |
@@ -292,10 +346,9 @@ Unexpected '>' in an expression (1:32)
 ```
 
 ```
-MERGE (n:Person {name: 'Ada'}) RETURN n
-^
-MERGE is not supported: it needs match-or-create over a whole pattern, with ON CREATE and ON MATCH.
-Use MATCH and CREATE, or the Java API (1:1)
+MATCH (n) FOREACH (x IN [1] | SET n.x = x)
+          ^
+FOREACH is not supported: use UNWIND, which this build does implement (1:11)
 ```
 
 `CREATE` refuses three patterns MATCH accepts, each with its own reason, because none describes a
@@ -397,6 +450,50 @@ the `WHERE` **before** the `SKIP` and `LIMIT`, where openCypher applies it after
 three rows is above 100 elsewhere. The streaming path was written to match the list path rather than
 the standard, because the two paths agreeing is the contract that stops a query changing its answer
 depending on its shape — but the deviation is real and belongs to both.
+
+---
+
+### 7.2 Shortest paths are a search, not a filter
+
+```
+MATCH p = shortestPath((a:Station {name:'Airport'})-[:CONNECTS*..10]-(b:Station {name:'Zoo'}))
+RETURN size(nodes(p)) AS nodes, size(relationships(p)) AS rels
+```
+
+`shortestPath(…)` and `allShortestPaths(…)` wrap one pattern part and change **how it is matched**. They
+are a property of the part in the AST (`PatternPart.selector`) rather than a function over the paths it
+produces, and that is the whole design decision: the depth-first enumeration behind `-[*1..10]-` is
+exponential in the bound *by intent*, because there every path is the answer. Running it and keeping the
+minimum would make a search that is linear in the graph quadratic in the number of routes through it.
+
+So the two constructs run a **breadth-first search** instead — one expansion per node, distance fixed on
+first sight, routes rebuilt backwards from the end. Three consequences worth stating:
+
+- **Relationship uniqueness is free.** Distance strictly increases along any rebuilt route, so no node
+  and therefore no relationship can appear in one twice. The `used` bookkeeping the depth-first walk
+  carries has nothing to do here.
+- **One row per pair of endpoints, not per query.** Both ends are *patterns*, so a search may reach
+  several nodes that satisfy the end pattern, each at its own distance and each contributing its own
+  shortest path. The search therefore cannot stop at the first node it matches — which is the obvious
+  shortcut and the wrong answer.
+- **`allShortestPaths` output is not bounded by the graph.** The walk is, but the number of minimal
+  routes is not; it is enumerated rather than capped, because it is what the caller asked for.
+
+Restrictions, all of them openCypher's rather than this build's, refused at parse time by name:
+
+| | |
+|---|---|
+| Exactly one relationship | A search runs between two endpoints; a longer chain names no single pair |
+| Minimum of 0 or 1 | The walk goes outward one distance at a time. A higher minimum means finding the shortest route and rejecting it for being short — a filter over every path, which the plain pattern already expresses |
+| `MATCH` only | Refused in `CREATE` (it describes a search, not a graph to build) and in an expression, where it would otherwise fail on the arrow inside its own argument |
+
+An inline map on the relationship — `-[:R* {open:true}]-` — restricts **which edges may be crossed**
+rather than which finished paths survive, so an excluded edge cannot shorten the route.
+
+`ShortestPathTest` runs both constructs against the depth-first enumeration over every pair in a diamond
+graph: the search's length must equal the minimum of the enumeration's, and `allShortestPaths`' row count
+must equal how many of the enumerated routes have that length. That is the assertion which would survive
+a rewrite of the search.
 
 ---
 
@@ -582,27 +679,40 @@ whose expectations this project did not author, which is a different kind of evi
 in §9.
 
 `CypherCorpusTest` imports each dump and runs its queries, classifying every one as **agreed**,
-**refused by name**, or **wrong** — and only the last is a failure, because the subset is documented.
-Two floors stop that from degenerating: at least twelve queries must agree overall and at least five per
-importable dataset. Without them an engine whose parser refused everything would be perfectly green,
-which is exactly the failure a tolerant test invites.
+**refused by name**, or **wrong** — and only the last was ever a failure, because the subset is
+documented.
 
-Where it stands today:
+**All four dumps import and all 29 queries agree.**
 
 | | |
 |---|---|
-| `01-movies` | Imports. 7 of 7 queries agree |
-| `02-transit` | Imports. 6 of 7 agree; `t-07` needs `shortestPath` |
-| `03-social` | **Cannot import** — the dump generates properties with `CASE` |
-| `04-supply-chain` | **Cannot import** — the dump is `MERGE` only, deliberately, to be idempotent |
+| `01-movies` | 29 nodes / 52 relationships. 7 of 7 queries agree |
+| `02-transit` | 27 / 64. 7 of 7 |
+| `03-social` | 188 / 570. 8 of 8 |
+| `04-supply-chain` | 136 / 352. 7 of 7 |
 
-**13 of 29 agree, 16 are refused, none is wrong.** The refusals are the honest measure of the distance
-between this subset and openCypher 9, and they are concentrated in two features: `MERGE` (§5.3) and
-`CASE`. Implementing those two would bring 15 of the 16 into range.
+So the bar is that, and not a threshold. It was a pair of counts while parts of the corpus were out of
+reach — first twelve queries overall, then every query over an importable dataset — and each time the
+number was raised the slack it allowed became a place a regression could hide. Now: every query agrees,
+every dataset in the catalogue is covered (asserted separately, so a fifth dump cannot arrive
+unnoticed), and each store is checked with `verify(FULL)` after its import. The *refused* outcome stays
+in the classification because the subset is still a subset — a query added tomorrow may fall outside it,
+and that should be reported rather than counted as a failure to parse valid Cypher.
 
-It has already earned itself: `t-07` was failing as *wrong* rather than refused, because `shortestPath`
-was listed in §5.3 as refused by name and in fact produced "expected a node pattern but found an
-identifier". The parser now names it.
+**`04-supply-chain` is run twice.** It is `MERGE`-only and deliberately idempotent, so a second run must
+not change a count or rewrite a property. That is a far sharper test of MERGE than any single statement:
+one that quietly created duplicates would import perfectly the first time and double the graph the
+second.
+
+The corpus has earned itself three times, all on the two features it was blocking:
+
+1. `t-07` failed as **wrong** rather than refused, because §5.5 listed `shortestPath` as refused by name
+   and the parser in fact produced "expected a node pattern but found an identifier" — a spec claim no
+   test had ever checked.
+2. `t-07` then failed as **refused**, which is what prompted §7.2 and the breadth-first search behind it.
+3. Two whole dumps could not be imported at all, one needing `CASE` (§5.4) and one `MERGE` (§5.3) — the
+   two clauses this subset was furthest from openCypher on, identified by a corpus rather than by
+   guesswork about what to build next.
 
 ### 9.1 The browser suite
 

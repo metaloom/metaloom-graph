@@ -17,7 +17,7 @@ import io.metaloom.graph.cypher.value.CypherPath;
 import io.metaloom.graph.cypher.value.CypherRelationship;
 
 /**
- * The four write clauses, and the bookkeeping they share.
+ * The five write clauses, and the bookkeeping they share.
  *
  * <p>
  * One instance per query, because two things have to outlive a single clause: the counters that become
@@ -50,6 +50,7 @@ final class Writer {
 
 	private final GraphAccess graph;
 	private final Evaluator evaluator;
+	private final PatternMatcher matcher;
 
 	private final Set<Long> deletedNodes = new HashSet<>();
 	private final Set<Long> deletedRelationships = new HashSet<>();
@@ -62,9 +63,10 @@ final class Writer {
 	private long labelsAdded;
 	private long labelsRemoved;
 
-	Writer(GraphAccess graph, Evaluator evaluator) {
+	Writer(GraphAccess graph, Evaluator evaluator, PatternMatcher matcher) {
 		this.graph = graph;
 		this.evaluator = evaluator;
+		this.matcher = matcher;
 	}
 
 	CypherStats stats() {
@@ -87,10 +89,14 @@ final class Writer {
 	}
 
 	private Row createPart(Ast.PatternPart part, Row row) {
+		return createPart(part, row, "CREATE");
+	}
+
+	private Row createPart(Ast.PatternPart part, Row row, String clause) {
 		Row current = row;
 		List<CypherNode> nodes = new ArrayList<>(part.nodes().size());
 		for (Ast.NodePattern pattern : part.nodes()) {
-			CypherNode node = createOrReuse(pattern, current);
+			CypherNode node = createOrReuse(pattern, current, clause);
 			nodes.add(node);
 			if (pattern.variable() != null && !current.has(pattern.variable())) {
 				current = current.with(pattern.variable(), node);
@@ -135,16 +141,16 @@ final class Writer {
 	 * intention.
 	 * </p>
 	 */
-	private CypherNode createOrReuse(Ast.NodePattern pattern, Row row) {
+	private CypherNode createOrReuse(Ast.NodePattern pattern, Row row, String clause) {
 		if (pattern.variable() != null && row.has(pattern.variable())) {
 			Object bound = row.get(pattern.variable());
 			if (!(bound instanceof CypherNode node)) {
-				throw new CypherTypeException("CREATE cannot use '" + pattern.variable() + "' as a node: it is bound "
+				throw new CypherTypeException(clause + " cannot use '" + pattern.variable() + "' as a node: it is bound "
 					+ "to " + Values.typeName(bound));
 			}
 			if (!pattern.labels().isEmpty() || (pattern.properties() != null && !pattern.properties().isEmpty())) {
-				throw new CypherTypeException("'" + pattern.variable() + "' is already bound, so CREATE cannot give "
-					+ "it labels or properties; use SET to change an existing node");
+				throw new CypherTypeException("'" + pattern.variable() + "' is already bound, so " + clause
+					+ " cannot give it labels or properties; use SET to change an existing node");
 			}
 			refuseIfDeleted(node.id(), "a relationship");
 			return node;
@@ -174,6 +180,81 @@ final class Writer {
 			}
 		}
 		return values;
+	}
+
+	// ---------------------------------------------------------------- MERGE
+
+	/**
+	 * Match the whole pattern, or build the whole pattern.
+	 *
+	 * <p>
+	 * <b>The whole of it is the rule, and it is where MERGE surprises people.</b> {@code MERGE (a:A)-[:R]->(b:B)}
+	 * against a graph that has an {@code :A} and a {@code :B} but no {@code :R} between them creates a <em>new</em>
+	 * {@code :A}, a <em>new</em> {@code :B} and the relationship — because the pattern as a whole did not match, and
+	 * MERGE has no notion of matching part of it. Binding the endpoints first, as
+	 * {@code MATCH (a:A) MATCH (b:B) MERGE (a)-[:R]->(b)} does, is how the intended thing is said, and is what the
+	 * supply-chain corpus dump does throughout.
+	 * </p>
+	 *
+	 * <h2>Why this is idempotent within one query</h2>
+	 *
+	 * <p>
+	 * Rows are processed in order and each match reads the store as it is <em>now</em>, so a row that merges the same
+	 * key as an earlier row finds what that row created rather than creating a second one. That works because a writer
+	 * reads the current mapping rather than a fixed view — the same property that gives a write transaction
+	 * read-your-writes ({@code spec/TRANSACTIONS.md}). It is what lets the corpus dump be run twice with no change to a
+	 * single count, which is the whole point of a MERGE-only script.
+	 * </p>
+	 *
+	 * <p>
+	 * Note that this is the one place a write clause looks at what the same query has written. The eagerness described
+	 * above still holds for the rows <em>driving</em> the clause: those were fixed before it started.
+	 * </p>
+	 */
+	List<Row> merge(Ast.Merge clause, List<Row> rows) {
+		List<Row> out = new ArrayList<>(rows.size());
+		for (Row row : rows) {
+			List<Row> matched = matcher.match(List.of(clause.pattern()), row);
+			if (!matched.isEmpty()) {
+				out.addAll(apply(clause.onMatch(), matched));
+			} else {
+				out.addAll(apply(clause.onCreate(), List.of(createPart(buildable(clause.pattern()), row, "MERGE"))));
+			}
+		}
+		return out;
+	}
+
+	/** {@code ON CREATE SET} / {@code ON MATCH SET}, which is an ordinary SET over just the rows of one branch. */
+	private List<Row> apply(List<Ast.SetItem> items, List<Row> rows) {
+		return items.isEmpty() ? rows : set(new Ast.SetClause(items), rows);
+	}
+
+	/**
+	 * The pattern as something to build.
+	 *
+	 * <p>
+	 * MERGE may be written undirected — {@code MERGE (a)-[:R]-(b)} asks whether an edge exists either way — but a
+	 * relationship has to be created pointing somewhere. openCypher's answer is left to right, so an arrowless pattern
+	 * becomes a rightwards one here and nowhere else: matching has already happened by the time this is called, and it
+	 * used the pattern as written.
+	 * </p>
+	 */
+	private static Ast.PatternPart buildable(Ast.PatternPart part) {
+		boolean undirected = false;
+		for (Ast.RelPattern relationship : part.relationships()) {
+			undirected |= relationship.direction() == Ast.Direction.BOTH;
+		}
+		if (!undirected) {
+			return part;
+		}
+		List<Ast.RelPattern> directed = new ArrayList<>(part.relationships().size());
+		for (Ast.RelPattern relationship : part.relationships()) {
+			directed.add(relationship.direction() == Ast.Direction.BOTH
+				? new Ast.RelPattern(relationship.variable(), relationship.types(), relationship.properties(),
+					Ast.Direction.RIGHT, relationship.range())
+				: relationship);
+		}
+		return new Ast.PatternPart(part.pathVariable(), part.selector(), part.nodes(), directed);
 	}
 
 	// ---------------------------------------------------------------- SET and REMOVE

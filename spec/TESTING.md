@@ -83,6 +83,10 @@ graph-cypher/src/test/java/io/metaloom/graph/cypher/
                  CypherWriteTest, CypherWriteTransactionTest — every write clause, and where a write
                  query's transaction comes from
                  LazyExecutionTest — what the streaming executor stops early and what it must not
+                 ShortestPathTest — the breadth-first search, checked against the depth-first
+                 enumeration it replaces over every pair in one graph
+                 MergeTest — match-or-create, and mostly about the second run rather than the first
+                 CaseTest — both forms, the laziness rule, and null
   integration/   CypherCorpusTest — the test-data/ corpus: four openCypher dumps and 29 queries whose
                  counts were derived elsewhere and proven against Neo4j, so its expectations are the
                  only ones in this repository that this project did not write
@@ -203,6 +207,13 @@ The **reference model** is built: `GraphModel` is a naive `HashMap`-based in-mem
 same semantics, and `ReferenceModelTest` applies a seeded random operation sequence to both, comparing
 labels, properties, degrees, neighbour multisets, both indexes and the live counts after every batch
 — across rolled-back transactions, simulated crashes and a compaction.
+
+Its property values are chosen for the paths they take rather than for variety: a long string that
+escapes the 255 byte inline limit into the blob store, and a `float[]` drawn from a small pool so that
+several nodes share one. The vector is there because it is the value type whose index key used to
+depend on the array's identity — reverting that hash to `System.identityHashCode` fails three of this
+class's four tests, which is how the workload is known to cover it
+([INDEX_TASKS.md IDX-1](INDEX_TASKS.md#idx-1--a-float-property-is-indexed-under-a-non-deterministic-key)).
 
 It earned its reputation on the first run. Two defects, neither of which any hand-written test in the
 suite had found:
@@ -350,6 +361,7 @@ each phase's numbers. Absolute targets to aim at, on a mid-range NVMe device, an
 | Node insert, durable, group commit | > 200k ops/s | **17k.** Missed by an order of magnitude; group commit still fsyncs once per interval and does not batch across writers, because there is only one writer |
 | Neighbour enumeration, degree 2 | 0 adjacency reads | **0**, gated |
 | Neighbour enumeration, degree 4000 | 1 adjacency read | **1**, gated |
+| Type-filtered scan over materialised edges | relationship reads proportional to the *survivors*, not the degree | **20 REL touches for 5 survivors of 5,005**, gated ([IDX-2](INDEX_TASKS.md#idx-2--push-the-type-filter-into-adjacency-for-materialised-entries)) |
 | Bytes per property-free edge | < 4 (both directions, amortised) | **2.0 to 2.5** |
 | Bytes per node with two small properties | < 140 | **128** |
 | Write amplification, mixed workload | < 3x | **1.70x**, gated |
@@ -464,5 +476,5 @@ diagnostic artefact and deleting it on failure is the most frustrating thing a t
 
 ---
 
-_Git HEAD revision: `e4601d1`_
-_Last updated: 2026-08-15_
+_Git HEAD revision: `3a05a2a`_
+_Last updated: 2026-08-16 (IDX-2 read budget)_

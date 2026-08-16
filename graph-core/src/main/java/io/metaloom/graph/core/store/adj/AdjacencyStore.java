@@ -261,7 +261,25 @@ public final class AdjacencyStore {
 
 	/** Removes one entry. Returns false if the node had no such entry. */
 	public boolean remove(long nodeId, long packedEdge) {
-		if (nodes.removeInlineEdge(nodeId, packedEdge)) {
+		return remove(nodeId, packedEdge, false);
+	}
+
+	/**
+	 * Removes the entry naming a materialised relationship, whatever type it caches.
+	 * <p>
+	 * A materialised entry's type field is a cache of the relationship record's type and deletion must not depend on
+	 * it: an entry written before the cache existed holds {@link PackedEdge#TYPE_NOT_RECORDED} where a fresh one holds
+	 * the type, and matching the whole packed value would walk straight past the older form and leave it behind as
+	 * dangling adjacency.
+	 */
+	public boolean removeMaterialised(long nodeId, long relationshipId) {
+		return remove(nodeId, PackedEdge.ofRelationship(relationshipId), true);
+	}
+
+	private boolean remove(long nodeId, long packedEdge, boolean ignoreType) {
+		long mask = ignoreType ? PackedEdge.TYPE_AGNOSTIC_MASK : -1L;
+		long probe = packedEdge & mask;
+		if (nodes.removeInlineEdge(nodeId, packedEdge, mask)) {
 			return true;
 		}
 		long blockId = nodes.adjHeadId(nodeId);
@@ -269,12 +287,17 @@ public final class AdjacencyStore {
 		long limit = chainLimit();
 		while (!ElementId.isNull(blockId)) {
 			AdjacencyBlock current = block(step(nodeId, blockId, ++hops, limit));
+			// The type bitmap can only be consulted when the type is part of the match; a masked-out type would make
+			// the bitmap answer a question the probe is not asking, and its "no" is binding.
 			if (current.mayContainLocation(PackedEdge.location(packedEdge))
-				&& current.mayContainType(PackedEdge.typeId(packedEdge))) {
+				&& (ignoreType || current.mayContainType(PackedEdge.typeId(packedEdge)))) {
 				long[] entries = current.readAll();
 				boolean found = false;
 				for (int i = 0; i < entries.length; i++) {
-					if (entries[i] == packedEdge) {
+					// The tombstone is excluded explicitly. Masking the type out of it leaves dir 3 with an all-ones
+					// location, which is a value a probe could in principle carry, and re-tombstoning an already dead
+					// entry would report a removal that did not happen.
+					if (!PackedEdge.isTombstone(entries[i]) && (entries[i] & mask) == probe) {
 						entries[i] = PackedEdge.TOMBSTONE;
 						found = true;
 						break;

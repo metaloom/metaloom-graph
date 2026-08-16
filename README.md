@@ -10,19 +10,19 @@ SSD. The defining design constraint:
 
 ## Status
 
-Durable, transactional, indexed, compacting, hardened, with snapshot isolation for readers, an openCypher subset that reads and writes, and a browser UI. 584 Java tests, 17 in the UI and 12 in the Rust crate, plus 30 browser cases on demand.
+Durable, transactional, indexed, compacting, hardened, with snapshot isolation for readers, an openCypher subset that reads and writes, and a browser UI. 642 Java tests, 17 in the UI and 12 in the Rust crate, plus 30 browser cases on demand.
 
 | | |
 |---|---|
 | **Durability** | Write-ahead log. Every commit is fsynced *before* it touches a data file, so uncommitted data cannot reach disk and recovery is a single redo pass. |
-| **Query language** | An openCypher subset — `MATCH` with variable-length paths, `WHERE`, `RETURN`, `WITH`, `UNWIND`, aggregation, parameters, and `CREATE` / `SET` / `REMOVE` / `DELETE` — in its own module, plus a single-jar Vert.x server and a React and D3 graph browser. Writes are off on both ports unless the server is started with `--allow-write`. [spec/CYPHER.md](spec/CYPHER.md) |
+| **Query language** | An openCypher subset — `MATCH` with variable-length paths and `shortestPath` / `allShortestPaths`, `WHERE`, `RETURN`, `WITH`, `UNWIND`, `CASE`, aggregation, parameters, and `CREATE` / `MERGE` / `SET` / `REMOVE` / `DELETE` — in its own module, plus a single-jar Vert.x server and a React and D3 graph browser. Writes are off on both ports unless the server is started with `--allow-write`. [spec/CYPHER.md](spec/CYPHER.md) |
 | **Transactions** | `begin` / `commit` / `rollback`, plus auto-commit for single operations. |
 | **Isolation** | One writer at a time; many concurrent readers. `store.beginRead()` gives a reader **MVCC snapshot isolation** — a view fixed at one instant across many reads, while the writer keeps committing. Reads take no lock and scale to 10x at 32 threads; writes are flat by design. **No concurrent writers.** |
 | **Indexes** | Label and property B+trees, unique constraints, and an index-versus-scan differential test. |
 | **Space reclamation** | Two halves. `reclaim()` punches all-free pages and breaks no ids. `compact()` relocates records to close holes within pages, rewrites every internal reference, and pulls the high water marks down; it is the one operation that invalidates ids. A store churned to a tenth of its slots comes back to 0.95 liveness. |
 | **Native layer** | Rust via FFM, with `cargo test` and `clippy -D warnings` inside `mvn test`. **io_uring is 12.4x** over a `pread` loop on 64 scattered reads — the one capability the JVM cannot approach. The hot-loop codecs are not: 1.38x on edges, 7.8x *slower* on CRC32C. |
 | **Hardening** | Reads-per-operation and write-amplification budgets enforced as build failures; a differential harness against an in-memory model across crashes and compaction; every format parser tested against corrupt and hostile input; a `kill -9` loop that checks acknowledged commits. |
-| **Not there** | No concurrent writers, no `MERGE`, no backup mechanism, no repair tool, no authentication on either port. [spec/OPERATIONS.md](spec/OPERATIONS.md) says so plainly. |
+| **Not there** | No concurrent writers, no `OPTIONAL MATCH`, no backup mechanism, no repair tool, no authentication on either port. [spec/OPERATIONS.md](spec/OPERATIONS.md) says so plainly. |
 | **Adjacency sizing** | A block is a run of 512 byte cells that doubles as the node fills, so degree 3 costs 512 bytes rather than a page. Fixing this took a 10M-node random graph from 61 GiB to 6.2 GiB and its load from 43 to 11 minutes. [spec/reports/SCALE.md](spec/reports/SCALE.md) has the before and after. |
 
 What is done and what is left, as one checklist: [spec/PROGRESS.md](spec/PROGRESS.md). The reason for

@@ -179,6 +179,52 @@ public class ReadBudgetTest {
 		}
 	}
 
+	/**
+	 * The IDX-2 claim, in the only unit that matters: a type-filtered traversal over a supernode of <b>materialised</b>
+	 * edges must read the relationship records of the edges that <em>survive</em> the filter, not of every edge it
+	 * walks past.
+	 * <p>
+	 * Before the type was cached in the adjacency entry, the filter could not run until the record had been read, so a
+	 * query for five rare edges among five thousand paid five thousand random 64 byte reads — the supernode cost this
+	 * whole line of work is about. Each surviving candidate still costs four REL touches: its generation, its type, and
+	 * its two endpoints.
+	 */
+	@Test
+	public void testATypeFilteredSupernodeReadsOnlyTheSurvivingRelationships() throws Exception {
+		int common = 5000;
+		int rare = 5;
+		try (GraphStore store = stores.open()) {
+			GraphStoreImpl impl = (GraphStoreImpl) store;
+			long hub;
+			try (Transaction txn = store.begin()) {
+				hub = store.createNode("Hub");
+				for (int i = 0; i < common; i++) {
+					store.createRelationship(hub, "COMMON", store.createNode("Spoke"));
+				}
+				for (int i = 0; i < rare; i++) {
+					store.createRelationship(hub, "RARE", store.createNode("Spoke"));
+				}
+				txn.commit();
+			}
+			assertEquals(rare, store.neighbours(hub, Direction.OUT, java.util.Set.of("RARE")).size(),
+				"the filter must still return every rare edge");
+
+			IoStats filtered = cost(impl, () -> store.neighbours(hub, Direction.OUT, java.util.Set.of("RARE")));
+			assertTrue(filtered.recordReads(Kind.REL) <= 4L * rare,
+				"a filtered scan must read only the surviving relationship records, at most four touches each: "
+					+ filtered);
+
+			// The contrast is the point: with no filter every entry is resolved, which is what the filtered scan used
+			// to cost as well.
+			IoStats unfiltered = cost(impl, () -> store.neighbours(hub, Direction.OUT));
+			assertTrue(unfiltered.recordReads(Kind.REL) >= common,
+				"an unfiltered scan does resolve every entry: " + unfiltered);
+			assertTrue(filtered.recordReads(Kind.REL) * 100L < unfiltered.recordReads(Kind.REL),
+				"filtering must be orders of magnitude cheaper, got " + filtered.recordReads(Kind.REL) + " against "
+					+ unfiltered.recordReads(Kind.REL));
+		}
+	}
+
 	// ---------------------------------------------------------------- indexed lookup
 
 	@Test
