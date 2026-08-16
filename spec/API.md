@@ -229,6 +229,7 @@ store.createUniqueConstraint("email");                        // refused if the 
 store.createIndex("Person", "active");                        // declared, backfilled, and used by Cypher
 List<Long> active = store.nodesByLabelAndProperty("Person", "active", true);
 store.createUniqueConstraint("Person", "email");              // no two :Person, rather than no two nodes
+store.dropIndex("Person", "active");                          // and its entries, in the same transaction
 
 List<Neighbour> near = store.nearestByScan("Person", "embedding", query, 10, VectorMetric.COSINE);
 
@@ -425,9 +426,11 @@ scopes them for the calling thread rather than duplicating them.
 - [x] Maintenance: `checkpoint`, `verify`, `stats`
 - [x] Exception hierarchy per §8, plus `ConstraintViolationException`
 - [x] `createUniqueConstraint` / `uniqueConstraints`, durable across a reopen
-- [x] `createIndex` / `hasIndex` / `compositeIndexes` / `nodesByLabelAndProperty` — the declared
-      `(label, key)` index, backfilled at declaration, and `createUniqueConstraint(label, key)` for
-      the label-scoped constraint it is what makes expressible
+- [x] `createIndex` / `dropIndex` / `hasIndex` / `compositeIndexes` / `nodesByLabelAndProperty` — the
+      declared `(label, key)` index, backfilled at declaration and swept at drop, and
+      `createUniqueConstraint(label, key)` for the label-scoped constraint it is what makes
+      expressible. Reachable over HTTP and from the browser UI, which the query language is not:
+      there is no `CREATE INDEX` in the Cypher subset ([CYPHER.md §8](CYPHER.md))
 - [x] `Transaction` with begin/commit/rollback, plus auto-commit for a mutation made outside one
 - [x] `UsageExampleTest`: the documented example, executable and asserting
 - [x] `beginRead` / `ReadTransaction` / `IsolationLevel` / `SnapshotStats` / `SnapshotTooOldException`

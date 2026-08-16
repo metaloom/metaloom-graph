@@ -319,6 +319,67 @@ public final class IndexCatalog {
 	}
 
 	/**
+	 * Removes a declaration, and reports whether there was one.
+	 * <p>
+	 * <b>The list compacts</b>: everything after the removed entry shifts down and the count drops, so the declarations
+	 * keep the order they were made in. That is the opposite of what the vector list does, and the difference is what
+	 * a position <i>means</i>. A vector index's ordinal is its identity — every {@code VEC} record names it — so moving
+	 * one would silently reassign its members, which is why that list keeps its holes instead. Nothing anywhere names a
+	 * composite index by position: its entries are keyed on {@code mix64(labelId, keyId, valueHash)}, so this list is
+	 * free to be dense, and staying in declaration order is worth the memmove of at most a kilobyte on one page.
+	 * <p>
+	 * When the last declaration goes, so does the tree — every page freed and the root back to {@code NULL}, which is
+	 * where it started. A store that has dropped its only composite index is indistinguishable from one that never
+	 * declared it, which is the state the rest of this class already handles.
+	 * <p>
+	 * <b>The caller removes the entries first.</b> This only edits the declaration; a call that skipped the entry sweep
+	 * would leave every entry of that pair in the tree with nothing left to say which pair they belonged to.
+	 */
+	public boolean removeCompositeIndex(int labelId, int keyId) throws IOException {
+		if (!initialised()) {
+			return false;
+		}
+		List<Composite> existing = composites();
+		int at = -1;
+		for (int i = 0; i < existing.size(); i++) {
+			if (existing.get(i).labelId() == labelId && existing.get(i).keyId() == keyId) {
+				at = i;
+				break;
+			}
+		}
+		if (at < 0) {
+			return false;
+		}
+		MemorySegment page = segments.mutable(catalogPageId);
+		int last = existing.size() - 1;
+		for (int i = at; i < last; i++) {
+			Composite moved = existing.get(i + 1);
+			long base = OFF_COMPOSITE_ENTRIES + (long) i * COMPOSITE_ENTRY_BYTES;
+			page.set(Layouts.INT, base + CI_LABEL_ID, moved.labelId());
+			page.set(Layouts.INT, base + CI_KEY_ID, moved.keyId());
+			page.set(Layouts.BYTE, base + CI_FLAGS, (byte) (moved.unique() ? CI_FLAG_UNIQUE : 0));
+		}
+		page.asSlice(OFF_COMPOSITE_ENTRIES + (long) last * COMPOSITE_ENTRY_BYTES, COMPOSITE_ENTRY_BYTES)
+			.fill((byte) 0);
+		page.set(Layouts.INT, OFF_COMPOSITE_COUNT, last);
+		segments.touched(catalogPageId);
+		if (last == 0 && !ElementId.isNull(compositeRoot())) {
+			for (long pageId : tree.pages(compositeRoot())) {
+				segments.free(pageId);
+			}
+			compositeRoot(ElementId.NULL);
+		}
+		return true;
+	}
+
+	/** Removes one composite entry, which is how a dropped declaration gives its entries back. */
+	public void removeCompositeEntry(long nodeId, int labelId, int keyId, Object value) {
+		if (initialised()) {
+			compositeRemove(nodeId, labelId, keyId, value);
+		}
+	}
+
+	/**
 	 * Every declared composite index, in the ids the hooks work in.
 	 * <p>
 	 * Empty is the common case and the one that has to stay cheap, because every maintenance hook consults this list.

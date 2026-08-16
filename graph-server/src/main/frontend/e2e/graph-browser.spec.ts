@@ -133,6 +133,87 @@ test.describe('sidebar', () => {
   });
 });
 
+// ------------------------------------------------------------------ declared indexes
+
+/**
+ * The one panel that changes the store's *schema* rather than reading it.
+ *
+ * There is no `CREATE INDEX` in this Cypher subset, so this panel is the only way to declare one without writing
+ * Java — which makes it the only place these assertions can be made through the surface a user actually has.
+ *
+ * Every test here cleans up after itself through the API rather than the UI. The demo store is shared by the whole
+ * file and outlives the run (`target/e2e-store`), so a declaration left behind would change what the next run sees.
+ */
+test.describe('indexes', () => {
+  const PAIRS = [['Airport', 'code'], ['Airport', 'international']];
+
+  test.afterEach(async ({ request }) => {
+    for (const [label, key] of PAIRS) {
+      await request.delete(`api/indexes/${label}/${key}`).catch(() => undefined);
+    }
+  });
+
+  async function declare(page: Page, label: string, key: string, unique = false): Promise<void> {
+    await page.getByTestId('new-index').click();
+    await page.getByLabel('Index label').fill(label);
+    await page.getByLabel('Index property key').fill(key);
+    if (unique) {
+      await page.getByRole('checkbox', { name: 'unique' }).check();
+    }
+    await page.getByTestId('create-index').click();
+  }
+
+  test('declares a composite index and lists it', async ({ page }) => {
+    await declare(page, 'Airport', 'code');
+
+    const row = page.getByTestId('indexes').locator('li[data-index="Airport.code"]');
+    await expect(row).toContainText(':Airport.code');
+    await expect(row.locator('.uniqueTag')).toHaveCount(0);
+    await expect(page.getByTestId('index-error')).toHaveCount(0);
+  });
+
+  test('a unique declaration is enforced on the next write', async ({ page }) => {
+    await declare(page, 'Airport', 'code', true);
+    await expect(page.getByTestId('indexes').locator('li[data-index="Airport.code"] .uniqueTag'))
+      .toHaveText('unique');
+
+    // 'LHR' is already taken, so this is refused — which is why running a CREATE against the shared demo store here
+    // is safe: a violation leaves nothing behind.
+    await run(page, "CREATE (a:Airport {code: 'LHR', name: 'Duplicate'}) RETURN a");
+    await expect(page.getByTestId('error')).toContainText(':Airport.code');
+  });
+
+  test('a unique declaration over data that already breaks it is refused, in the panel', async ({ page }) => {
+    // Every airport is `international: true`, so this constraint has never been true and declaring it must fail
+    // rather than record something untrue. The message names the node already holding the value.
+    await declare(page, 'Airport', 'international', true);
+
+    await expect(page.getByTestId('index-error')).toContainText('international');
+    await expect(page.getByTestId('indexes').locator('li[data-index="Airport.international"]')).toHaveCount(0);
+  });
+
+  test('clicking an index writes a query that uses it', async ({ page }) => {
+    await declare(page, 'Airport', 'code');
+    await page.getByTestId('indexes').locator('li[data-index="Airport.code"] button').first().click();
+
+    // Written, not run: the probe needs a value only the user has, and running it now would return nothing and read
+    // as a broken index.
+    await expect(page.getByTestId('query-input')).toHaveValue(/MATCH \(n:Airport \{code: 'value'\}\)/);
+    await expect(nodes(page)).toHaveCount(0);
+  });
+
+  test('dropping it takes it out of the list', async ({ page }) => {
+    await declare(page, 'Airport', 'code');
+    page.once('dialog', dialog => void dialog.accept());
+    await page.getByTestId('drop-Airport.code').click();
+
+    await expect(page.getByTestId('indexes').locator('li[data-index="Airport.code"]')).toHaveCount(0);
+    // And the store still answers the same question, by the slower path.
+    await run(page, "MATCH (a:Airport {code: 'LHR'}) RETURN a");
+    await expect(nodes(page)).toHaveCount(1);
+  });
+});
+
 // ------------------------------------------------------------------ cypher
 
 test.describe('cypher', () => {

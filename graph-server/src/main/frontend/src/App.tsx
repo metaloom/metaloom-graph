@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
-  ApiError, createDatabase, dropDatabase, fetchDatabases, fetchSchema, fetchStats, runQuery,
-  type DatabaseList, type QueryResult, type Schema, type Stats
+  ApiError, createDatabase, createIndex, dropDatabase, dropIndex, fetchDatabases, fetchIndexes, fetchSchema,
+  fetchStats, runQuery,
+  type DatabaseList, type IndexList, type QueryResult, type Schema, type Stats
 } from './api';
 import { applyResult, clear, emptyGraph, removeNode, type GraphData, type MergeMode } from './model/graph';
 import { DatabasePicker } from './components/DatabasePicker';
@@ -23,6 +24,8 @@ export function App() {
   const [schemaError, setSchemaError] = useState<string | null>(null);
   const [schemaLoading, setSchemaLoading] = useState(false);
   const [stats, setStats] = useState<Stats | null>(null);
+  const [indexes, setIndexes] = useState<IndexList | null>(null);
+  const [indexError, setIndexError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<ApiError | null>(null);
   const [status, setStatus] = useState<string | null>(null);
@@ -46,6 +49,43 @@ export function App() {
     }
   }, []);
 
+  /**
+   * The declared indexes of one database.
+   *
+   * Its own fetch rather than a field on the schema: the schema is a cached scan of the data and this is one catalog
+   * page, so folding them together would either stale the declarations or make listing three of them cost a scan.
+   */
+  const loadIndexes = useCallback(async (name: string) => {
+    try {
+      setIndexes(await fetchIndexes(name));
+      setIndexError(null);
+    } catch (failure) {
+      setIndexError(failure instanceof Error ? failure.message : String(failure));
+    }
+  }, []);
+
+  const declareIndex = useCallback(async (label: string, key: string, unique: boolean) => {
+    try {
+      await createIndex(label, key, unique, database);
+      setIndexError(null);
+      await loadIndexes(database);
+    } catch (failure) {
+      // Shown in the panel rather than the query bar: declaring a unique index over data that already breaks it is
+      // refused with a message naming the two nodes, and that message is the most useful thing on the screen.
+      setIndexError(failure instanceof Error ? failure.message : String(failure));
+    }
+  }, [database, loadIndexes]);
+
+  const removeIndex = useCallback(async (label: string, key: string) => {
+    try {
+      await dropIndex(label, key, database);
+      setIndexError(null);
+      await loadIndexes(database);
+    } catch (failure) {
+      setIndexError(failure instanceof Error ? failure.message : String(failure));
+    }
+  }, [database, loadIndexes]);
+
   const loadDatabases = useCallback(async (): Promise<DatabaseList | null> => {
     try {
       const list = await fetchDatabases();
@@ -65,8 +105,9 @@ export function App() {
       const initial = list?.default ?? '';
       setDatabase(initial);
       await loadSchema(initial, false);
+      await loadIndexes(initial);
     })();
-  }, [loadDatabases, loadSchema]);
+  }, [loadDatabases, loadSchema, loadIndexes]);
 
   /**
    * Switching database clears the canvas.
@@ -81,9 +122,11 @@ export function App() {
     setSelected(null);
     setStatus(null);
     setError(null);
+    setIndexError(null);
     await loadSchema(name, false);
+    await loadIndexes(name);
     await loadDatabases();
-  }, [loadSchema, loadDatabases]);
+  }, [loadSchema, loadIndexes, loadDatabases]);
 
   const addDatabase = useCallback(async (name: string) => {
     try {
@@ -183,10 +226,18 @@ export function App() {
           schema={schema}
           schemaError={schemaError}
           schemaLoading={schemaLoading}
-          onRefreshSchema={() => void loadSchema(database, true)}
+          onRefreshSchema={() => { void loadSchema(database, true); void loadIndexes(database); }}
           onPickLabel={label => pick(`MATCH (n:${escapeName(label)})\nRETURN n\nLIMIT 100`)}
           onPickType={type => pick(`MATCH (a)-[r:${escapeName(type)}]->(b)\nRETURN a, r, b\nLIMIT 100`)}
           stats={stats}
+          indexes={indexes}
+          indexError={indexError}
+          onCreateIndex={(label, key, unique) => void declareIndex(label, key, unique)}
+          onDropIndex={(label, key) => void removeIndex(label, key)}
+          onPickIndex={(label, key) =>
+            // Set, not run: a probe needs a value only the user has, so running it now would return nothing and read
+            // as a broken index. The template is what the index answers in one probe.
+            setQuery(`MATCH (n:${escapeName(label)} {${escapeName(key)}: 'value'})\nRETURN n\nLIMIT 100`)}
           graph={graph}
           selected={selected}
           onSelect={setSelected}

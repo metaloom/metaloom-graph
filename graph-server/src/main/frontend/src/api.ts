@@ -90,6 +90,26 @@ export interface DatabaseList {
   allowWrite: boolean;
 }
 
+/**
+ * One declared composite index.
+ *
+ * `unique` is not a separate concept from the index: a label-scoped unique constraint *is* a declaration with a flag,
+ * so dropping the index drops the constraint. The UI has to say that before it offers the button.
+ */
+export interface CompositeIndex {
+  label: string;
+  key: string;
+  unique: boolean;
+}
+
+export interface IndexList {
+  database: string;
+  indexes: CompositeIndex[];
+  /** Property keys unique across every node, whatever its labels. Declared through the Java API only. */
+  uniqueConstraints: string[];
+  allowWrite: boolean;
+}
+
 export interface Stats {
   database: string;
   nodes: number;
@@ -193,4 +213,32 @@ export async function createDatabase(name: string): Promise<void> {
 
 export async function dropDatabase(name: string): Promise<void> {
   await parse<unknown>(await fetch(`api/databases/${encodeURIComponent(name)}`, { method: 'DELETE' }));
+}
+
+export async function fetchIndexes(database = ''): Promise<IndexList> {
+  return parse<IndexList>(await fetch(scoped('api/indexes', database)));
+}
+
+export async function createIndex(
+  label: string,
+  key: string,
+  unique: boolean,
+  database = ''
+): Promise<void> {
+  await parse<unknown>(await fetch(scoped('api/indexes', database), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ label, key, unique })
+  }));
+}
+
+/**
+ * The pair is the identity, so it is two path segments rather than a generated id.
+ *
+ * Both are encoded: a label or a key may hold a slash or a space — the grammar backtick-quotes exactly those names —
+ * and an unencoded one would address a route that does not exist.
+ */
+export async function dropIndex(label: string, key: string, database = ''): Promise<void> {
+  const path = `api/indexes/${encodeURIComponent(label)}/${encodeURIComponent(key)}`;
+  await parse<unknown>(await fetch(scoped(path, database), { method: 'DELETE' }));
 }

@@ -201,9 +201,17 @@ with a property probe plus a label filter when it is not. That is what makes the
 add or omit — and it is also why a test asserting the *answer* proves nothing about the index, which
 §10 comes back to.
 
-**There is no `dropIndex`.** A declaration can be added and upgraded to unique but not removed;
-clearing the slot would leave its entries in the tree, and removing them is a scan. Nothing has asked
-for it.
+**`dropIndex(label, key)` removes a declaration and its entries**, which is the backfill run backwards:
+a scan of the labelled nodes, removing one entry each. Dropping the *last* declaration skips that
+entirely — no other pair is left in the tree, so every page is freed and the root goes back to `NULL`,
+which is where a store with no composite index starts. Refused, rather than quietly successful, when
+the pair was never declared: "there was nothing to drop" is a different outcome from "dropped", and a
+typo in a label should not read as success.
+
+**The declaration list compacts, and the vector list does not.** Dropping shifts the entries after it
+down, so declarations keep the order they were made in and a UI can list them stably. The vector list
+keeps its holes instead, because there an ordinal *is* an identity — every `VEC` record names one, so
+moving a declaration would silently reassign its members. Nothing names a composite index by position.
 
 ---
 
@@ -315,6 +323,12 @@ declaring it makes `hasIndex(label, key)` true and gives the planner the probe. 
 over a pair that is already indexed upgrades the declaration in place rather than adding a second one
 — the entries a unique check probes are the entries that are already there.
 
+**Which is why `dropIndex` drops the constraint too**, and says so. They are one declaration and not
+an index with a constraint on top, so the alternative to dropping both is a constraint that can never
+be removed — worse than one that states plainly what removing it does. The browser UI spells it out in
+the confirmation ([CYPHER.md §8.2](CYPHER.md)); a store-wide constraint still cannot be removed at
+all.
+
 **Three ordering facts worth knowing before relying on it:**
 
 - `createNode` checks **before** allocating. A violation there leaves nothing behind.
@@ -409,7 +423,8 @@ with the numbers and routes what remains to two adjacency tasks, neither of whic
 | | |
 |---|---|
 | `IndexTest` | The two implicit trees end to end: lookup, update, delete, a rebuild, and the lazy first allocation |
-| `CompositeIndexTest` | The declared tree: the backfill, all four hooks, a rolled-back declaration, a reopen, a compaction — and the **candidate counts**, because every assertion about the answer would pass with the index ignored |
+| `CompositeIndexTest` | The declared tree: the backfill, all four hooks, dropping one of several and the last one, a rolled-back declaration and a rolled-back drop, a reopen, a compaction — and the **candidate counts**, because every assertion about the answer would pass with the index ignored |
+| `IndexRoutesTest` | The HTTP surface (`/api/indexes`), including that a declaration made over HTTP is the one the engine enforces on the next write, and that a path segment carrying a space or a slash addresses the index it names |
 | `CompositeIndexPlanTest` | Which access path the Cypher planner takes, recorded through a proxy around `GraphStore`. The same reason: the answer does not distinguish the plans |
 | `UniqueConstraintTest` | Both forms: declaration against data that already breaks it, enforcement on create, on update and on a label change, and durability across a reopen |
 | `MultiLabelTest` | An entry per label rather than per node, spill in and out of the overflow block, and `addNodeLabel`/`removeNodeLabel` leaving the index exactly right |
@@ -429,7 +444,8 @@ Each of these is a task with a verdict, an effort estimate and a definition of d
 [INDEX_TASKS.md](INDEX_TASKS.md).
 
 - **Range queries.** §3.2 — the key holds a hash, and a hash is not order-preserving.
-- **Dropping a composite index.** §3.3 — a declaration can be added and upgraded, not removed.
+- **Removing a store-wide unique constraint.** §6 — the key-id list only grows. A label-scoped one is
+  removable, because it is a composite declaration and `dropIndex` takes it.
 - **Composite indexes over more than one property**, or over a relationship. §3.3 keys one label and
   one key; `(label, k1, k2)` would be the same tree with a different mix, and nothing has asked.
 - **Cypher `CREATE INDEX`.** A composite index is declared through the Java API only. The planner
@@ -447,4 +463,4 @@ Each of these is a task with a verdict, an effort estimate and a definition of d
 ---
 
 _Git HEAD revision: `0970e6b`_
-_Last updated: 2026-08-16 (IDX-7: the declared composite index and the label-scoped unique constraint)_
+_Last updated: 2026-08-16 (IDX-7: the declared composite index, its drop, and the label-scoped unique constraint)_

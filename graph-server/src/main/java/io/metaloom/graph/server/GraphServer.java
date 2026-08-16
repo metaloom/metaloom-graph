@@ -11,6 +11,7 @@ import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.metaloom.graph.core.api.CompositeIndex;
 import io.metaloom.graph.core.api.ConstraintViolationException;
 import io.metaloom.graph.core.api.GraphDatabases;
 import io.metaloom.graph.core.api.GraphStore;
@@ -237,6 +238,12 @@ public final class GraphServer implements AutoCloseable {
 		router.put("/api/databases/:name").handler(this::createDatabase);
 		router.delete("/api/databases/:name").handler(this::dropDatabase);
 
+		// The declared composite indexes of one database. A collection, so it takes ?database= like everything else,
+		// and one of them is named by its two path segments — the pair is the identity, not a generated id.
+		router.get("/api/indexes").handler(this::listIndexes);
+		router.post("/api/indexes").handler(this::createIndex);
+		router.delete("/api/indexes/:label/:key").handler(this::dropIndex);
+
 		if (uiIsBundled()) {
 			// Cached in production, never in a build tree: an edited UI file should show up on reload.
 			router.route("/*").handler(StaticHandler.create("webroot").setCachingEnabled(false).setIndexPage("index.html"));
@@ -389,6 +396,9 @@ public final class GraphServer implements AutoCloseable {
 			// 404 and not 409: the name is wrong, so listing or creating is the next step. A 409 would say the store
 			// refused and invite a retry that cannot work.
 			case NoSuchDatabaseException missing -> fail(context, 404, "database", missing.getMessage());
+			// 404 for the same reason, one resource down: the pair is not declared, so listing is the next step and
+			// a retry of this request never becomes right.
+			case NoSuchIndexException missing -> fail(context, 404, "index", missing.getMessage());
 			case IllegalArgumentException invalid -> fail(context, 400, "database", invalid.getMessage());
 			// 409 and named separately from a generic store failure: a unique constraint is about the data the caller
 			// sent meeting data that is already there, and the message names the key, the value and the node holding
@@ -563,6 +573,142 @@ public final class GraphServer implements AutoCloseable {
 			return new JsonObject().put("name", name).put("dropped", true);
 		}, false).onSuccess(dropped -> context.json(dropped))
 			.onFailure(error -> respondToFailure(context, error));
+	}
+
+	// ---------------------------------------------------------------- composite indexes
+
+	/**
+	 * The declared {@code (label, key)} indexes of one database.
+	 *
+	 * <p>
+	 * Not part of {@code /api/schema}, and the reason is that they are different questions answered at different
+	 * costs. The schema is a <b>scan</b> of the data, cached for a minute because it is O(nodes + edges); the declared
+	 * indexes are a read of one catalog page and are exact right now. Folding them together would either put a
+	 * one-page read behind a minute of cache or make a panel that lists three declarations pay for a full scan.
+	 * </p>
+	 *
+	 * <p>
+	 * {@code allowWrite} rides along for the same reason the database list carries it: a UI that cannot know whether
+	 * this server accepts writes offers buttons whose every click comes back 403.
+	 * </p>
+	 */
+	private void listIndexes(RoutingContext context) {
+		GraphStore store;
+		String name;
+		try {
+			name = nameFor(context);
+			store = storeFor(context);
+		} catch (RuntimeException e) {
+			respondToFailure(context, e);
+			return;
+		}
+		vertx.<JsonObject> executeBlocking(() -> {
+			JsonArray indexes = new JsonArray();
+			for (CompositeIndex index : store.compositeIndexes()) {
+				indexes.add(new JsonObject()
+					.put("label", index.label())
+					.put("key", index.key())
+					.put("unique", index.unique()));
+			}
+			JsonArray constraints = new JsonArray();
+			for (String key : store.uniqueConstraints()) {
+				constraints.add(key);
+			}
+			return new JsonObject()
+				.put("database", name)
+				.put("indexes", indexes)
+				// The store-wide constraints beside them, because "no two nodes share an email" and "no two :Person
+				// do" are the same decision made at two scopes, and a panel that showed only one of them would read
+				// as if the other did not exist.
+				.put("uniqueConstraints", constraints)
+				.put("allowWrite", allowWrite);
+		}, false).onSuccess(context::json).onFailure(error -> respondToFailure(context, error));
+	}
+
+	/**
+	 * Declares a composite index, optionally as a label-scoped unique constraint.
+	 *
+	 * <p>
+	 * <b>Behind {@code --allow-write}</b>, because it writes: the declaration goes on the catalog page and the
+	 * backfill scan puts an entry in the tree for every live node that satisfies the pair. It is a smaller write than
+	 * a Cypher {@code CREATE}, but it is not a read, and this port has no authentication.
+	 * </p>
+	 *
+	 * <p>
+	 * A duplicate declaration is a 200 rather than a 409: {@code createIndex} is idempotent by design, and answering
+	 * "conflict" would invite a retry that changes nothing. Declaring uniqueness over data that already breaks it is
+	 * the real conflict, and that arrives as the 409 {@link ConstraintViolationException} already maps to.
+	 * </p>
+	 */
+	private void createIndex(RoutingContext context) {
+		JsonObject body = context.body().asJsonObject();
+		String label = body == null ? null : body.getString("label");
+		String key = body == null ? null : body.getString("key");
+		if (label == null || label.isBlank() || key == null || key.isBlank()) {
+			fail(context, 400, "empty", "Send {\"label\": \"Person\", \"key\": \"email\", \"unique\": false}");
+			return;
+		}
+		if (!allowWrite) {
+			fail(context, 403, "forbidden", "This server was started without --allow-write, so it will not declare"
+				+ " an index. Restart it with the flag.");
+			return;
+		}
+		boolean unique = body.getBoolean("unique", false);
+		GraphStore store;
+		try {
+			store = storeFor(context);
+		} catch (RuntimeException e) {
+			respondToFailure(context, e);
+			return;
+		}
+		vertx.<JsonObject> executeBlocking(() -> {
+			if (unique) {
+				store.createUniqueConstraint(label, key);
+			} else {
+				store.createIndex(label, key);
+			}
+			logger.info("Declared a composite index on :{}.{}{}", label, key, unique ? " (unique)" : "");
+			return new JsonObject().put("label", label).put("key", key).put("unique", unique).put("created", true);
+		}, false).onSuccess(context::json).onFailure(error -> respondToFailure(context, error));
+	}
+
+	/**
+	 * Drops a declared composite index and every entry it owns.
+	 *
+	 * <p>
+	 * Behind {@code --allow-write} rather than {@code --allow-drop}: this destroys an index, which the store can
+	 * rebuild from the data with one call, and not a database, which nothing can bring back. The flags are about how
+	 * much a mistake costs.
+	 * </p>
+	 *
+	 * <p>
+	 * If the declaration is a label-scoped unique constraint, that goes with it — the two are one declaration
+	 * ([INDEX.md §6]). The UI says so before it sends this.
+	 * </p>
+	 */
+	private void dropIndex(RoutingContext context) {
+		String label = context.pathParam("label");
+		String key = context.pathParam("key");
+		if (!allowWrite) {
+			fail(context, 403, "forbidden", "This server was started without --allow-write, so it will not drop an"
+				+ " index. Restart it with the flag.");
+			return;
+		}
+		GraphStore store;
+		try {
+			store = storeFor(context);
+		} catch (RuntimeException e) {
+			respondToFailure(context, e);
+			return;
+		}
+		vertx.<JsonObject> executeBlocking(() -> {
+			if (!store.hasIndex(label, key)) {
+				throw new NoSuchIndexException("No index on :" + label + "." + key);
+			}
+			store.dropIndex(label, key);
+			logger.info("Dropped the composite index on :{}.{}", label, key);
+			return new JsonObject().put("label", label).put("key", key).put("dropped", true);
+		}, false).onSuccess(context::json).onFailure(error -> respondToFailure(context, error));
 	}
 
 	private static void fail(RoutingContext context, int status, String kind, String message) {

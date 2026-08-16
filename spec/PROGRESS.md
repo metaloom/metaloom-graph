@@ -60,7 +60,7 @@ shades a single runnable jar.
 mvn clean install             # everything, including the native layer
 mvn test -Dnative.skip=true   # the pure-Java fallback: the same tests, 23 skipped rather than 3
 mvn -o -Poffline install      # warm cargo registry, no network
-mvn test                      # 774 tests, 0 failures, 3 skipped — plus the UI's 17 and 12 Rust tests
+mvn test                      # 795 tests, 0 failures, 3 skipped — plus the UI's 17 and 12 Rust tests
 mvn test -Pbench              # benchmarks, the structural gates, and the supernode gates
 mvn test -Pcrash              # kill -9, compaction crash injection, and the crash matrix
 mvn test -Pslow               # the soak harness and the long-running reader
@@ -174,11 +174,15 @@ that a steal policy cannot be made correct over a `MAP_SHARED` mapping.
 - [x] Property values are keyed by a **content** hash, arrays and lists included — a `float[]` used to
       be keyed by its identity hash ([INDEX_TASKS.md IDX-1](INDEX_TASKS.md#3-closed))
 - [x] Composite index: declared `(label, key)` pairs, keyed on `mix64(labelId, keyId, valueHash)`,
-      backfilled at declaration and maintained by the same four hooks — which is also what makes a
-      **label-scoped** unique constraint expressible
+      backfilled at declaration, swept at `dropIndex`, and maintained by the same four hooks — which is
+      also what makes a **label-scoped** unique constraint expressible
       ([INDEX.md §3.3](INDEX.md), [INDEX_TASKS.md IDX-7](INDEX_TASKS.md#3-closed))
 - [x] Tests: `IndexTest`, `IndexKeyTest` and `CompositeIndexTest`, the planner's choice in
-      `CompositeIndexPlanTest`, plus the index-vs-scan differential inside `ReferenceModelTest`
+      `CompositeIndexPlanTest`, the HTTP surface in `IndexRoutesTest`, plus the index-vs-scan
+      differential inside `ReferenceModelTest`
+- [x] Declaring, listing and dropping a composite index over HTTP and from the browser UI — the query
+      language has no `CREATE INDEX`, so this is the only surface for it that is not Java
+      ([CYPHER.md §8](CYPHER.md))
 
 ### Phase 8 — Compaction and space reclamation
 
@@ -854,4 +858,4 @@ Recorded so nobody re-opens them as oversights:
 ---
 
 _Git HEAD revision: `0970e6b`_
-_Last updated: 2026-08-16 (IDX-7: the declared composite index)_
+_Last updated: 2026-08-16 (IDX-7: the declared composite index, dropIndex, and its HTTP and UI surface)_

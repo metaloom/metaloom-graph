@@ -313,6 +313,26 @@ public interface GraphStore extends AutoCloseable {
 	 */
 	void createIndex(String label, String key) throws IOException;
 
+	/**
+	 * Drops a declared composite index and every entry it owns.
+	 *
+	 * <p>
+	 * Removing the entries is a scan of the labelled nodes, the mirror of the backfill {@link #createIndex} runs —
+	 * except when this is the last declaration, where the tree holds nothing else and is freed whole.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>If the declaration is a label-scoped unique constraint, that goes too</b>: the two are one declaration, not
+	 * an index with a constraint on top ({@link #createUniqueConstraint(String, String)}). The alternative would be a
+	 * constraint with no way to remove it.
+	 * </p>
+	 *
+	 * @throws IllegalArgumentException
+	 *             if no index over the pair is declared — "there was nothing to drop" is a different outcome from
+	 *             "dropped", and silently succeeding would hide a typo in a label
+	 */
+	void dropIndex(String label, String key) throws IOException;
+
 	/** Whether an index over this label and key has been declared. */
 	boolean hasIndex(String label, String key);
 

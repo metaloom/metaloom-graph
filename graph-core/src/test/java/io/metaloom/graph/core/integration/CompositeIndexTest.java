@@ -2,6 +2,7 @@ package io.metaloom.graph.core.integration;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayList;
@@ -15,6 +16,7 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 
 import io.metaloom.graph.core.api.CompactionOptions;
 import io.metaloom.graph.core.api.CompositeIndex;
+import io.metaloom.graph.core.api.ConstraintViolationException;
 import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.Properties;
 import io.metaloom.graph.core.api.Transaction;
@@ -303,6 +305,162 @@ public class CompositeIndexTest {
 			assertEquals(List.of(person), store.nodesByLabelAndProperty("Person", "city", "Berlin"));
 			assertEquals(List.of(company), store.nodesByLabelAndProperty("Company", "city", "Berlin"));
 			assertEquals(2, ((GraphStoreImpl) store).indexCatalog().compositeIndexSize());
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	// ---------------------------------------------------------------- dropping
+
+	/** Dropping gives the entries back and leaves the store answering as if the index had never been declared. */
+	@Test
+	public void testDroppingRemovesTheEntriesAndTheDeclaration() throws Exception {
+		try (GraphStore store = stores.open()) {
+			GraphStoreImpl impl = (GraphStoreImpl) store;
+			List<Long> people = new ArrayList<>();
+			try (Transaction txn = store.begin()) {
+				for (int i = 0; i < 100; i++) {
+					long id = store.createNode("Person", Properties.of().set("city", "Berlin"));
+					people.add(id);
+				}
+				txn.commit();
+			}
+			store.createIndex("Person", "city");
+			assertEquals(100, impl.indexCatalog().compositeIndexSize());
+
+			store.dropIndex("Person", "city");
+			assertFalse(store.hasIndex("Person", "city"));
+			assertEquals(List.of(), store.compositeIndexes());
+			assertEquals(0, impl.indexCatalog().compositeIndexSize(), "the entries must go with the declaration");
+			// The answer is unchanged; only the path to it is.
+			assertEquals(new HashSet<>(people), new HashSet<>(store.nodesByLabelAndProperty("Person", "city", "Berlin")));
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	/** Dropping one of several leaves the others intact — entries included. */
+	@Test
+	public void testDroppingOneLeavesTheOthers() throws Exception {
+		try (GraphStore store = stores.open()) {
+			GraphStoreImpl impl = (GraphStoreImpl) store;
+			long person = store.createNode("Person", Properties.of().set("city", "Berlin"));
+			long company = store.createNode("Company", Properties.of().set("city", "Berlin"));
+			store.createIndex("Person", "city");
+			store.createIndex("Company", "city");
+			store.createIndex("Person", "name");
+			assertEquals(2, impl.indexCatalog().compositeIndexSize());
+
+			store.dropIndex("Person", "city");
+
+			assertFalse(store.hasIndex("Person", "city"));
+			assertTrue(store.hasIndex("Company", "city"));
+			assertTrue(store.hasIndex("Person", "name"), "the compacting list must not lose the entries it shifts");
+			assertEquals(List.of(new CompositeIndex("Company", "city", false),
+				new CompositeIndex("Person", "name", false)), store.compositeIndexes(),
+				"the survivors keep the order they were declared in");
+			assertEquals(1, impl.indexCatalog().compositeIndexSize(), "only the dropped pair's entries go");
+			assertEquals(List.of(company), store.nodesByLabelAndProperty("Company", "city", "Berlin"));
+			assertEquals(List.of(person), store.nodesByLabelAndProperty("Person", "city", "Berlin"));
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	/** The tree comes back after the last declaration was dropped, which is the state a fresh store is in. */
+	@Test
+	public void testTheIndexCanBeDeclaredAgainAfterADrop() throws Exception {
+		try (GraphStore store = stores.open()) {
+			long id = store.createNode("Person", Properties.of().set("city", "Berlin"));
+			store.createIndex("Person", "city");
+			store.dropIndex("Person", "city");
+
+			store.createIndex("Person", "city");
+			assertEquals(List.of(id), store.nodesByLabelAndProperty("Person", "city", "Berlin"),
+				"the second declaration has to backfill exactly as the first did");
+			assertEquals(1, ((GraphStoreImpl) store).indexCatalog().compositeIndexSize());
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	/** Writes after a drop must not keep maintaining an index nothing declares. */
+	@Test
+	public void testTheHooksStopAfterADrop() throws Exception {
+		try (GraphStore store = stores.open()) {
+			GraphStoreImpl impl = (GraphStoreImpl) store;
+			store.createIndex("Person", "city");
+			store.createIndex("Person", "name");
+			store.dropIndex("Person", "city");
+
+			long id = store.createNode("Person", Properties.of().set("city", "Berlin").set("name", "wes"));
+			assertEquals(1, impl.indexCatalog().compositeIndexSize(), "only the surviving pair may be maintained");
+			assertEquals(List.of(id), store.nodesByLabelAndProperty("Person", "name", "wes"));
+			store.deleteNode(id);
+			assertEquals(0, impl.indexCatalog().compositeIndexSize());
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	/** A label-scoped unique constraint is one declaration with its index, so dropping it drops the constraint. */
+	@Test
+	public void testDroppingAUniqueDeclarationDropsTheConstraint() throws Exception {
+		try (GraphStore store = stores.open()) {
+			store.createUniqueConstraint("Person", "email");
+			store.createNode("Person", Properties.of().set("email", "wes@example.com"));
+			assertThrows(ConstraintViolationException.class,
+				() -> store.createNode("Person", Properties.of().set("email", "wes@example.com")));
+
+			store.dropIndex("Person", "email");
+			assertEquals(List.of(), store.compositeIndexes());
+			store.createNode("Person", Properties.of().set("email", "wes@example.com"));
+			assertEquals(2, store.nodesByLabelAndProperty("Person", "email", "wes@example.com").size());
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	/** Dropping what was never declared names the pair rather than succeeding quietly. */
+	@Test
+	public void testDroppingAnUndeclaredPairIsRefused() throws Exception {
+		try (GraphStore store = stores.open()) {
+			assertThrows(IllegalArgumentException.class, () -> store.dropIndex("Person", "city"));
+			store.createIndex("Person", "city");
+			assertThrows(IllegalArgumentException.class, () -> store.dropIndex("Person", "cityy"));
+			assertThrows(IllegalArgumentException.class, () -> store.dropIndex("Persson", "city"));
+			assertTrue(store.hasIndex("Person", "city"));
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	/** A rolled-back drop keeps the index, entries and all. */
+	@Test
+	public void testARolledBackDropKeepsTheIndex() throws Exception {
+		try (GraphStore store = stores.open()) {
+			long id = store.createNode("Person", Properties.of().set("city", "Berlin"));
+			store.createIndex("Person", "city");
+			store.createIndex("Person", "name");
+
+			try (Transaction txn = store.begin()) {
+				store.dropIndex("Person", "city");
+				// No commit.
+			}
+
+			assertTrue(store.hasIndex("Person", "city"));
+			assertEquals(List.of(id), store.nodesByLabelAndProperty("Person", "city", "Berlin"),
+				"a discarded drop must leave the entries where they were");
+			assertEquals(1, ((GraphStoreImpl) store).indexCatalog().compositeIndexSize());
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	@Test
+	public void testADropSurvivesAReopen() throws Exception {
+		try (GraphStore store = stores.open()) {
+			store.createNode("Person", Properties.of().set("city", "Berlin"));
+			store.createIndex("Person", "city");
+			store.dropIndex("Person", "city");
+			store.checkpoint();
+		}
+		try (GraphStore store = stores.open()) {
+			assertFalse(store.hasIndex("Person", "city"));
+			assertEquals(List.of(), store.compositeIndexes());
+			assertEquals(1, store.nodesByLabelAndProperty("Person", "city", "Berlin").size());
 			store.verify(VerifyLevel.FULL);
 		}
 	}

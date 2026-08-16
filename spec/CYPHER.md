@@ -584,6 +584,8 @@ query and the engine has no notion of a second store.
 | `GET /api/stats` | Node and relationship counts, labels, storage bytes, open views, and which database answered |
 | `GET /api/databases` | Every database under the root, which is the default, and whether dropping and writing are enabled |
 | `PUT /api/databases/{name}` | Creates one. `DELETE` drops it, and only with `--allow-drop` |
+| `GET /api/indexes` | The declared composite indexes of one database, the store-wide unique keys beside them, and whether writing is enabled |
+| `POST /api/indexes` | `{"label": "...", "key": "...", "unique": false}` declares one, backfill included. `DELETE /api/indexes/{label}/{key}` drops it. Both need `--allow-write` |
 | `GET /` | The UI |
 
 One result serves both views: the table is the rows, and the graph is built by walking every value in
@@ -617,6 +619,14 @@ outgoing edges. Outgoing only, or every relationship would be counted twice. It 
 runs on a worker thread inside a snapshot view, and is cached for 60 s; the response carries
 `elapsedMillis` and `cached` so the UI can say which answer it is showing.
 
+**The index routes are the one schema surface the query language does not have.** There is no
+`CREATE INDEX` in this subset: the planner *uses* a declared composite index
+([INDEX.md §3.3](INDEX.md)) and cannot declare one, so before these routes a declaration was a Java
+call and a browser could not make one at all. They are behind `--allow-write` rather than
+`--allow-drop`, because dropping an index destroys something the store rebuilds from the data with one
+call, and dropping a database does not. They are deliberately not folded into `/api/schema`: that is a
+cached scan of the *data*, and a declaration is a read of one catalog page and is exact right now.
+
 ### 8.2 The browser UI
 
 A React application under `graph-server/src/main/frontend`, bundled by Vite straight into
@@ -627,7 +637,7 @@ every API route and the index page says so rather than returning a 404.
 
 | | |
 |---|---|
-| Left | Labels and relationship types with counts, each one clickable into a query; below it the inspector — the selected node's labels and properties, or the selected relationship's, with its incident relationships as links to walk |
+| Left | Labels and relationship types with counts, each one clickable into a query; below them the declared indexes, with a form to declare one and a Drop beside each; below that the inspector — the selected node's labels and properties, or the selected relationship's, with its incident relationships as links to walk |
 | Above | The query editor. Ctrl/Cmd+Enter runs it. **Replace** or **Merge** decides what a result does to the canvas |
 | Right | The force layout: colour per label and per relationship type, the type written on each line, drag, zoom, fit |
 
@@ -641,6 +651,11 @@ Three decisions worth recording:
   it is given, so a fresh object per result would drop every position and the whole picture would jump
   each time a query mentioned a node already on screen. `model/graph.ts` mutates the existing object in
   place and its tests assert object identity, which is the only way to state that rule.
+- **The index panel writes a query rather than running one.** Clicking a declared index fills the
+  editor with `MATCH (n:Person {email: 'value'})` and stops there, because the probe needs a value only
+  the user has — running it would return nothing and read as a broken index. Dropping one asks for a
+  confirmation rather than the typed name a database drop demands, and says outright when the
+  declaration is also a unique constraint, because that constraint goes with it.
 - **A dangling link is held, not dropped.** The server can only judge drawability within one result. In
   merge mode a link whose far end arrives two queries later is drawn then — which is what makes it
   possible to build a picture one query at a time. Held links are capped, newest kept.
@@ -799,4 +814,4 @@ previous bundle. Every assertion in the first run failed against markup that no 
 ---
 
 _Git HEAD revision: `0970e6b`_
-_Last updated: 2026-08-16 (HNSW vector search, stages 1 to 6)_
+_Last updated: 2026-08-16 (the /api/indexes routes and the sidebar's index panel)_

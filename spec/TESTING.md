@@ -3,8 +3,8 @@
 A storage engine is only as good as its evidence. This file defines how the project proves that it
 does not lose data.
 
-The suite today is 774 tests across the five modules — 385 in `graph-core`, 259 in `graph-cypher`, 22
-in `graph-protocol`, 2 in `graph-client`, 106 in `graph-server` — running in a few minutes, plus benchmarks, a soak, a scaling
+The suite today is 795 tests across the five modules — 393 in `graph-core`, 259 in `graph-cypher`, 22
+in `graph-protocol`, 2 in `graph-client`, 119 in `graph-server` — running in a few minutes, plus benchmarks, a soak, a scaling
 harness and a `kill -9` loop behind profiles and scripts. The PoC suite it replaced had one red test,
 three unbounded benchmarks living in the unit suite, and two tests that passed for reasons unrelated
 to what they asserted ([CURRENT_STATE.md §5](CURRENT_STATE.md#5-test-reality-check)).
@@ -124,6 +124,9 @@ graph-server/src/test/java/io/metaloom/graph/server/
                  demo/DemoDataTest — the generated air route graph the browser suite drives
                  DatabaseRoutesTest — listing, ?database= reaching a different store, 400 vs 404,
                  create, and drop refused without the flag
+                 IndexRoutesTest — the composite-index routes: declaring over HTTP is the declaration
+                 the engine then enforces, dropping takes the constraint with it, and a label holding
+                 a space or a slash survives the round trip through two path segments
   wire/          the binary port: WireVersusEmbeddedTest compares 27 queries in process against over
                  the wire cell by cell; WireServerTest covers overload, cancel, a deadline against a
                  client that stopped reading, and openViews() == 0 after every test
@@ -132,7 +135,9 @@ graph-server/src/main/frontend/src/model/*.test.ts
                  identity, and that a label's colour is a function of its name. Run by `mvn test`
                  through npm, so they are in the same suite as everything else
 graph-server/src/main/frontend/e2e/
-                 Playwright, against the real server over a real store. Opt-in: `npm run e2e`
+                 Playwright, against the real server over a real store. Opt-in: `npm run e2e`.
+                 35 specs, including the index panel — the only place a composite index can be
+                 declared, enforced and dropped through the surface a user actually has
   concurrency/   jcstress and custom harnesses
   crash/         fault-injection recovery tests
   invariant/     the checkers themselves plus their tests

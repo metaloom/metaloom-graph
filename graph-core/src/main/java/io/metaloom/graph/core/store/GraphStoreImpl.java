@@ -878,6 +878,45 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		}
 	}
 
+	/**
+	 * Drops a declaration and every entry it owns.
+	 * <p>
+	 * The entries go first, by the same scan the backfill runs — which is the honest cost of the operation and the
+	 * reason it is a call rather than a flag. Dropping the <b>last</b> declaration is cheaper than that: the tree has
+	 * no other pair left in it, so it is freed whole.
+	 * <p>
+	 * <b>A label-scoped unique constraint is dropped with its index</b>, because in this engine they are one
+	 * declaration and not two ({@link #createUniqueConstraint(String, String)}). That is deliberate rather than
+	 * incidental: the alternative is a constraint that cannot be removed at all, which is worse than one that says
+	 * plainly what removing it does.
+	 */
+	@Override
+	public void dropIndex(String label, String key) throws IOException {
+		write(() -> {
+			int labelId = catalog.lookupLabel(label);
+			int keyId = catalog.lookupKey(key);
+			if (labelId == 0 || keyId == 0 || !indexes.hasComposite(labelId, keyId)) {
+				throw new IllegalArgumentException("No index on :" + label + "." + key);
+			}
+			// The entries first, while the declaration is still there to say which pair they belong to. Skipped when
+			// this is the last declaration: removeCompositeIndex frees the whole tree, which is the same result for
+			// the cost of freeing its pages instead of reading every labelled node.
+			if (indexes.composites().size() > 1) {
+				for (long nodeId : segmentSets.get(Kind.NODE).liveIds()) {
+					if (!nodes.hasLabel(nodeId, labelId)) {
+						continue;
+					}
+					Object value = properties.read(nodes.propBlockId(nodeId), keyId);
+					if (value != null) {
+						indexes.removeCompositeEntry(nodeId, labelId, keyId, value);
+					}
+				}
+			}
+			indexes.removeCompositeIndex(labelId, keyId);
+			return null;
+		});
+	}
+
 	@Override
 	public List<CompositeIndex> compositeIndexes() {
 		return read(indexes::compositeIndexes);

@@ -1,7 +1,8 @@
-import type { Schema, Stats } from '../api';
+import type { IndexList, Schema, Stats } from '../api';
 import type { GraphData } from '../model/graph';
 import { colorOfNode, nodeColor, relColor } from '../model/colors';
 import type { Selected } from '../selection';
+import { IndexPanel } from './IndexPanel';
 import { Inspector } from './Inspector';
 
 interface Props {
@@ -12,6 +13,11 @@ interface Props {
   onPickLabel: (label: string) => void;
   onPickType: (type: string) => void;
   stats: Stats | null;
+  indexes: IndexList | null;
+  indexError: string | null;
+  onCreateIndex: (label: string, key: string, unique: boolean) => void;
+  onDropIndex: (label: string, key: string) => void;
+  onPickIndex: (label: string, key: string) => void;
   graph: GraphData;
   selected: Selected | null;
   onSelect: (selected: Selected | null) => void;
@@ -91,6 +97,15 @@ export function Sidebar(props: Props) {
           </p>
         )}
       </div>
+
+      <IndexPanel
+        indexes={props.indexes}
+        busy={schemaLoading}
+        error={props.indexError}
+        onCreate={props.onCreateIndex}
+        onDrop={props.onDropIndex}
+        onPick={props.onPickIndex}
+      />
 
       <Inspector graph={props.graph} selected={props.selected} onSelect={props.onSelect} onRemove={props.onRemove} />
     </aside>
