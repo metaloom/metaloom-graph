@@ -372,10 +372,21 @@ The numbers are estimates, but the orders of magnitude are structural, not tunin
       entries, dropping tombstones and packing the survivors. Breaks no ids, since block ids are
       internal, so it runs before any record relocation
 - [ ] Native SIMD codec + differential test against Java (Phase 6)
-- [ ] Traversal cursor with prefetch (Phase 6, needs the io_uring engine)
-- [ ] Type-bitmap skipping on the read path
+- [ ] Traversal cursor with prefetch (Phase 6, needs the io_uring engine) —
+      [IDX-4](INDEX_TASKS.md#idx-4--a-streaming-neighbour-cursor)
+- [ ] Type-bitmap skipping on the read path —
+      [IDX-3](INDEX_TASKS.md#idx-3--block-skipping-on-the-read-path). The metadata is written on every
+      append and `mayContainType` has one caller, `remove`; `mayContainLocation` has none
+- [ ] The type filter applied before the relationship record is read —
+      [IDX-2](INDEX_TASKS.md#idx-2--push-the-type-filter-into-adjacency-for-materialised-entries). A
+      materialised entry's 14 type bits are unused, so a type-filtered traversal over a supernode of
+      materialised edges costs one random 64 byte read per edge, whether or not it matches
 - [ ] Lazy mirror-entry cleanup in vacuum (Phase 5)
 - [ ] B+tree adjacency for extreme supernodes (Phase 7)
+
+The three adjacency items above are what a "supernode is slow" report actually resolves to; the
+missing relationship index is a different problem with a different victim
+([INDEX_TASKS.md §1](INDEX_TASKS.md)).
 
 ---
 

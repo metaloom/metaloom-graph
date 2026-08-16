@@ -240,6 +240,12 @@ list is itself the index for the common question — *the relationships of this 
 [RELATIONSHIP_STORAGE.md](RELATIONSHIP_STORAGE.md) covers, and it is the shape of query the engine is
 built for. What has no answer is "every `KNOWS` in the store", which costs a full scan.
 
+**It is not the reason a high-degree node is slow**, which is the natural next assumption and a wrong
+one: a supernode query starts from a node id and its cost is entirely in how its adjacency is
+enumerated — unskipped blocks, a fully materialised edge list, and a relationship record read *before*
+the type filter can reject it. [INDEX_TASKS.md §1](INDEX_TASKS.md) works that out with the numbers and
+routes it to three adjacency tasks, none of which is an index.
+
 ---
 
 ## 9. Interaction with the rest of the engine
@@ -282,13 +288,22 @@ have.
 
 ## 11. Not built
 
+Each of these is a task with a verdict, an effort estimate and a definition of done in
+[INDEX_TASKS.md](INDEX_TASKS.md).
+
 - **Range queries.** §3.2 — the key holds a hash, and a hash is not order-preserving.
 - **Composite indexes.** `(label, property)` as one key would make `MATCH (n:Person {email: …})` a
-  single probe instead of a probe plus a label verification. Nothing needs it yet.
-- **Relationship indexes.** §8.
+  single probe instead of a probe plus a label verification. Nothing needs it yet — but it is also the
+  only way to express a *label-scoped* unique constraint
+  ([INDEX_TASKS.md IDX-7](INDEX_TASKS.md#idx-7--composite-label-property-indexes)).
+- **Relationship indexes.** §8, and [IDX-6](INDEX_TASKS.md#idx-6--a-relationship-type-index) for why
+  the verdict is "not yet" rather than "eventually".
 - **Statistics.** No per-label counts, no cardinality estimates, no histograms — which is why §7's
   planner is a fixed order rather than a cost model.
-- **Full text, spatial, vector.** The store can hold a `float[]`, and nothing indexes one.
+- **Full text, spatial, vector.** The store can hold a `float[]`, and nothing indexes one. Vectors are
+  explored in [VECTOR.md](VECTOR.md); note that a `float[]` property is currently indexed under an
+  identity hash, which is a defect
+  ([IDX-1](INDEX_TASKS.md#idx-1--a-float-property-is-indexed-under-a-non-deterministic-key)).
 - **Index rebalancing on delete.** §2 — deferred to compaction.
 
 ---

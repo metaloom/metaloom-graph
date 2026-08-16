@@ -298,6 +298,29 @@ each clause — `MATCH (n) CREATE (:Copy)` structurally cannot feed the scan dri
 would take that away silently. `QueryExecutor.streams` returns false for all four, and
 `LazyExecutionTest` asserts it.
 
+### Phase 17 — Licensing, and an external corpus
+
+- [x] `LICENSE` (verbatim Apache 2.0) and `NOTICE` at the root, and a `<licenses>` block in the reactor
+      pom. The project was already Apache 2.0 by inheritance from `io.metaloom:maven-parent`, but
+      nothing in the checkout said so — a licence discoverable only by resolving a parent from a
+      private repository is not discoverable
+- [x] The shaded jar carries both: `ApacheNoticeResourceTransformer` merges every dependency's NOTICE
+      (section 4(d)), and the licence text is copied into `META-INF` because
+      `ApacheLicenseResourceTransformer` strips every LICENSE it finds
+- [x] The openCypher position recorded in `NOTICE` and the README: no openCypher source, grammar file
+      or TCK is included — the lexer, parser and executor are an independent implementation — and
+      Cypher® is a registered trademark of Neo4j, Inc. openCypher itself is Apache 2.0, so there is no
+      licence-compatibility question; the live constraint is naming, not copyright
+- [x] `CypherCorpusTest` over `test-data/`: four openCypher dumps and 29 queries whose counts were
+      derived elsewhere and proven against Neo4j — [CYPHER.md §9.2](CYPHER.md). **13 agree, 16 are
+      refused by name, none is wrong.** The refusals concentrate in `MERGE` and `CASE`; implementing
+      those two would bring 15 of the 16 into range
+- [x] `shortestPath` and `allShortestPaths` refused **by name**. [CYPHER.md §5.3](CYPHER.md) had
+      always claimed they were, and the corpus found that they were not — the message was "expected a
+      node pattern but found an identifier"
+- [ ] **`CASE`.** The AST node exists and is never constructed; the executor throws on it. It is what
+      blocks the `03-social` dump, and it is a smaller piece of work than `MERGE`
+
 ### Phase 16 — The streaming executor, and shutting down
 
 - [x] `GraphStore.forEachNodeWhile(LongPredicate)` — a scan that can be told it is finished. A separate

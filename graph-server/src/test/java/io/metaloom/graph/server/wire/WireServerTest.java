@@ -19,6 +19,7 @@ import java.time.Duration;
 import java.util.List;
 
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -88,6 +89,34 @@ public class WireServerTest {
 		}
 	}
 
+	/** Event loops alive before this class ran, so the check below measures what this class leaked and nothing else. */
+	private static int eventLoopsAtStart;
+
+	@BeforeAll
+	public static void countEventLoops() {
+		eventLoopsAtStart = eventLoops();
+	}
+
+	/**
+	 * Live Vert.x event loop threads.
+	 *
+	 * <p>
+	 * A leaked Vert.x is invisible to every other assertion in this class — the tests pass, and the JVM slowly fills
+	 * with acceptor threads, event loops and worker pools until something unrelated hangs under load. That is not a
+	 * hypothetical: passing a caller-owned Vert.x to a server that therefore never closed it leaked one per test here,
+	 * and it surfaced as a suite that was green in isolation and hung for twenty-five minutes inside a full build.
+	 * </p>
+	 */
+	private static int eventLoops() {
+		int count = 0;
+		for (Thread thread : Thread.getAllStackTraces().keySet()) {
+			if (thread.getName().startsWith("vert.x-eventloop") || thread.getName().startsWith("vert.x-acceptor")) {
+				count++;
+			}
+		}
+		return count;
+	}
+
 	@AfterEach
 	public void stop() throws Exception {
 		if (server != null) {
@@ -99,6 +128,15 @@ public class WireServerTest {
 			assertEquals(0, store.snapshotStats().openViews(), "a read view outlived its query");
 			databases.close();
 		}
+
+		// Shutdown is asynchronous, so allow a moment before concluding that a thread is leaked rather than late.
+		int alive = eventLoops();
+		for (int i = 0; i < 100 && alive > eventLoopsAtStart + 2; i++) {
+			Thread.sleep(20);
+			alive = eventLoops();
+		}
+		assertTrue(alive <= eventLoopsAtStart + 2, "this test leaked a Vert.x: " + alive
+			+ " event loop threads are alive against " + eventLoopsAtStart + " before the class started");
 	}
 
 	private void listen(WireServerOptions options) {
@@ -106,8 +144,8 @@ public class WireServerTest {
 	}
 
 	private void listen(WireServerOptions options, boolean allowWrite) {
-		server = new WireServer(io.vertx.core.Vertx.vertx(), databases, GraphDatabases.DEFAULT_NAME,
-			options.withPort(0), allowWrite);
+		// The owning constructor: this server must close the Vert.x it runs on, or every test leaks one.
+		server = new WireServer(databases, GraphDatabases.DEFAULT_NAME, options.withPort(0), allowWrite);
 		port = server.listen().toCompletionStage().toCompletableFuture().join();
 	}
 

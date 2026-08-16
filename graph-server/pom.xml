@@ -213,6 +213,30 @@
                                 </transformer>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer" />
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheLicenseResourceTransformer" />
+                                <!--
+                                    Merges the NOTICE of every Apache-2.0 dependency the uber jar swallows — Vert.x,
+                                    Netty, SLF4J — into one. Section 4(d) of that licence requires carrying them, and
+                                    without this transformer the shade plugin keeps whichever it happened to unpack
+                                    last and silently drops the rest.
+                                -->
+                                <!--
+                                    The licence text itself. It has to be injected here rather than copied into
+                                    src/main/resources, because ApacheLicenseResourceTransformer above strips every
+                                    META-INF/LICENSE it sees — including this module's own, which is the obvious way
+                                    to do it and silently does not work. That transformer exists to collapse the
+                                    dozen identical copies the dependencies bring, and it assumes the build supplies
+                                    its own separately. Section 4(a) of the licence is what requires one to be there.
+                                -->
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.IncludeResourceTransformer">
+                                    <file>${project.basedir}/../LICENSE</file>
+                                    <resource>META-INF/LICENSE</resource>
+                                </transformer>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheNoticeResourceTransformer">
+                                    <projectName>Graph Storage</projectName>
+                                    <organizationName>MetaLoom</organizationName>
+                                    <organizationURL>https://github.com/metaloom/graph-storage-ffm-poc</organizationURL>
+                                    <inceptionYear>2024</inceptionYear>
+                                </transformer>
                             </transformers>
                         </configuration>
                     </execution>

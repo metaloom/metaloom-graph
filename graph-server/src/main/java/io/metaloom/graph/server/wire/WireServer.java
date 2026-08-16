@@ -184,6 +184,22 @@ public final class WireServer implements AutoCloseable {
 		this(Vertx.vertx(), true, databases, defaultDatabase, options, false);
 	}
 
+	/**
+	 * A server that owns its Vert.x, and closes it.
+	 *
+	 * <p>
+	 * The distinction is not decoration. The overload below takes a Vert.x the caller owns and deliberately does
+	 * <em>not</em> close it, because the HTTP server shares one. Reaching for that overload just to pass this flag
+	 * leaks an acceptor thread, an event loop and a worker pool per instance — which is exactly what happened when
+	 * {@code allowWrite} was added, and which showed up not as a failure but as a suite that passed in isolation and
+	 * hung under load with a dozen Vert.x instances still resident.
+	 * </p>
+	 */
+	public WireServer(GraphDatabases databases, String defaultDatabase, WireServerOptions options,
+		boolean allowWrite) {
+		this(Vertx.vertx(), true, databases, defaultDatabase, options, allowWrite);
+	}
+
 	/** For a caller that already runs a Vert.x instance — the HTTP server, for one. */
 	public WireServer(Vertx vertx, GraphDatabases databases, String defaultDatabase, WireServerOptions options) {
 		this(vertx, false, databases, defaultDatabase, options, false);

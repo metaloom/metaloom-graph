@@ -341,3 +341,13 @@ to monitor, and an explicit list of what is missing.
 spec file, carries the cheat sheet and the conventions, and links the phased plan in
 [spec/PLAN.md](spec/PLAN.md). [spec/CURRENT_STATE.md](spec/CURRENT_STATE.md) records the proof of
 concept this replaced, including its defect register.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+The query language is an independent partial implementation of Cypher, written against the language as
+published by the [openCypher project](https://opencypher.org/) (itself Apache 2.0). No openCypher
+source, grammar file or TCK is included here. Cypher® and Neo4j® are registered trademarks of Neo4j,
+Inc.; this project is not endorsed by or affiliated with them, and its subset is not an openCypher
+Implementers Group approved implementation.

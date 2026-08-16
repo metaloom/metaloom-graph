@@ -1,0 +1,30 @@
+dataset,query_id,description,cypher,expected_nodes,expected_relationships
+01-movies,m-01,Whole graph totals,"MATCH (n) WITH count(n) AS nodes MATCH ()-[r]->() RETURN nodes, count(r) AS rels",29,52
+01-movies,m-02,All movie nodes,"MATCH (m:Movie) RETURN count(m) AS nodes, 0 AS rels",8,0
+01-movies,m-03,Actors and the movies they acted in,"MATCH (p:Person)-[r:ACTED_IN]->(m:Movie) RETURN count(DISTINCT p) + count(DISTINCT m) AS nodes, count(r) AS rels",17,21
+01-movies,m-04,Genres of movies released before 2000,"MATCH (m:Movie)-[r:IN_GENRE]->(g:Genre) WHERE m.released < 2000 RETURN count(DISTINCT m) + count(DISTINCT g) AS nodes, count(r) AS rels",10,8
+01-movies,m-05,Director to movie to genre paths,"MATCH (d:Person)-[r1:DIRECTED]->(m:Movie)-[r2:IN_GENRE]->(g:Genre) RETURN count(DISTINCT d) + count(DISTINCT m) + count(DISTINCT g) AS nodes, count(DISTINCT r1) + count(DISTINCT r2) AS rels",17,23
+01-movies,m-06,Actors in Warner Bros. productions,"MATCH (s:Studio {name: 'Warner Bros.'})<-[r1:PRODUCED_BY]-(m:Movie)<-[r2:ACTED_IN]-(a:Person) RETURN count(DISTINCT s) + count(DISTINCT m) + count(DISTINCT a) AS nodes, count(DISTINCT r1) + count(DISTINCT r2) AS rels",11,18
+01-movies,m-07,Movies in the Romance genre,"MATCH (g:Genre {name: 'Romance'})<-[r:IN_GENRE]-(m:Movie) RETURN count(DISTINCT g) + count(DISTINCT m) AS nodes, count(r) AS rels",5,4
+02-transit,t-01,Whole graph totals,"MATCH (n) WITH count(n) AS nodes MATCH ()-[r]->() RETURN nodes, count(r) AS rels",27,64
+02-transit,t-02,Stations in fare Zone 1,"MATCH (s:Station)-[r:IN_ZONE]->(z:Zone {name: 'Zone 1'}) RETURN count(DISTINCT s) + count(DISTINCT z) AS nodes, count(r) AS rels",8,7
+02-transit,t-03,Stations served by the Red line,"MATCH (s:Station)-[r:SERVED_BY]->(l:Line {name: 'Red'}) RETURN count(DISTINCT s) + count(DISTINCT l) AS nodes, count(r) AS rels",8,7
+02-transit,t-04,Interchange stations served by more than one line,"MATCH (s:Station)-[r:SERVED_BY]->(:Line) WITH s, count(r) AS lineCount WHERE lineCount > 1 RETURN count(s) AS nodes, sum(lineCount) AS rels",4,8
+02-transit,t-05,Direct neighbours of Central,"MATCH (c:Station {name: 'Central'})-[r:CONNECTS]-(n:Station) RETURN count(DISTINCT c) + count(DISTINCT n) AS nodes, count(r) AS rels",5,4
+02-transit,t-06,Everything within two track segments of Central,"MATCH (a:Station {name: 'Central'})-[r1:CONNECTS]-(b:Station)-[r2:CONNECTS]-(c:Station) WHERE c <> a WITH collect(DISTINCT a) + collect(DISTINCT b) + collect(DISTINCT c) AS ns, collect(DISTINCT r1) + collect(DISTINCT r2) AS rs UNWIND ns AS n WITH rs, count(DISTINCT n) AS nodes UNWIND rs AS r RETURN nodes, count(DISTINCT r) AS rels",13,12
+02-transit,t-07,Shortest route from Airport to Zoo,"MATCH p = shortestPath((a:Station {name: 'Airport'})-[:CONNECTS*..10]-(b:Station {name: 'Zoo'})) RETURN size(nodes(p)) AS nodes, size(relationships(p)) AS rels",8,7
+03-social,s-01,Whole graph totals,"MATCH (n) WITH count(n) AS nodes MATCH ()-[r]->() RETURN nodes, count(r) AS rels",188,570
+03-social,s-02,All user nodes,"MATCH (u:User) RETURN count(u) AS nodes, 0 AS rels",60,0
+03-social,s-03,Authors and their posts,"MATCH (u:User)-[r:POSTED]->(p:Post) RETURN count(DISTINCT u) + count(DISTINCT p) AS nodes, count(r) AS rels",180,120
+03-social,s-04,Posts carrying the music tag,"MATCH (p:Post)-[r:TAGGED]->(t:Tag {name: 'music'}) RETURN count(DISTINCT p) + count(DISTINCT t) AS nodes, count(r) AS rels",31,30
+03-social,s-05,Users following each other back,"MATCH (a:User)-[r1:FOLLOWS]->(b:User)-[r2:FOLLOWS]->(a) WHERE a.userId < b.userId WITH collect(DISTINCT a) + collect(DISTINCT b) AS ns, collect(DISTINCT r1) + collect(DISTINCT r2) AS rs UNWIND ns AS n WITH rs, count(DISTINCT n) AS nodes UNWIND rs AS r RETURN nodes, count(DISTINCT r) AS rels",12,12
+03-social,s-06,Who liked the posts of user 7,"MATCH (author:User {userId: 7})-[r1:POSTED]->(p:Post)<-[r2:LIKES]-(liker:User) RETURN count(DISTINCT author) + count(DISTINCT p) + count(DISTINCT liker) AS nodes, count(DISTINCT r1) + count(DISTINCT r2) AS rels",6,5
+03-social,s-07,Posts liked at least twice,"MATCH (:User)-[r:LIKES]->(p:Post) WITH p, count(r) AS likeCount WHERE likeCount >= 2 RETURN count(p) AS nodes, sum(likeCount) AS rels",60,120
+03-social,s-08,Follow graph two hops out of user 0,"MATCH (a:User {userId: 0})-[r1:FOLLOWS]->(b:User)-[r2:FOLLOWS]->(c:User) WITH collect(DISTINCT a) + collect(DISTINCT b) + collect(DISTINCT c) AS ns, collect(DISTINCT r1) + collect(DISTINCT r2) AS rs UNWIND ns AS n WITH rs, count(DISTINCT n) AS nodes UNWIND rs AS r RETURN nodes, count(DISTINCT r) AS rels",7,6
+04-supply-chain,c-01,Whole graph totals,"MATCH (n) WITH count(n) AS nodes MATCH ()-[r]->() RETURN nodes, count(r) AS rels",136,352
+04-supply-chain,c-02,All product nodes,"MATCH (q:Product) RETURN count(q) AS nodes, 0 AS rels",20,0
+04-supply-chain,c-03,Products and the parts they contain,"MATCH (q:Product)-[r:CONTAINS]->(p:Part) RETURN count(DISTINCT q) + count(DISTINCT p) AS nodes, count(r) AS rels",80,80
+04-supply-chain,c-04,Dual sourced parts with more than one supplier,"MATCH (:Supplier)-[r:SUPPLIES]->(p:Part) WITH p, count(r) AS sources WHERE sources > 1 RETURN count(p) AS nodes, sum(sources) AS rels",12,24
+04-supply-chain,c-05,Shipments leaving warehouse 0 and their cargo,"MATCH (w:Warehouse {warehouseId: 0})<-[r1:SHIPPED_FROM]-(s:Shipment)-[r2:CARRIES]->(p:Part) RETURN count(DISTINCT w) + count(DISTINCT s) + count(DISTINCT p) AS nodes, count(DISTINCT r1) + count(DISTINCT r2) AS rels",13,12
+04-supply-chain,c-06,Kitchen products down to the warehouses holding their parts,"MATCH (c:Category {name: 'Kitchen'})<-[r1:IN_CATEGORY]-(q:Product)-[r2:CONTAINS]->(p:Part)-[r3:STORED_IN]->(w:Warehouse) RETURN count(DISTINCT c) + count(DISTINCT q) + count(DISTINCT p) + count(DISTINCT w) AS nodes, count(DISTINCT r1) + count(DISTINCT r2) + count(DISTINCT r3) AS rels",24,27
+04-supply-chain,c-07,Storage locations of critical parts,"MATCH (p:Part)-[r:STORED_IN]->(w:Warehouse) WHERE p.critical RETURN count(DISTINCT p) + count(DISTINCT w) AS nodes, count(r) AS rels",17,9

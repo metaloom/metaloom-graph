@@ -391,6 +391,7 @@ public final class CypherParser {
 			pathVariable = take().text();
 			take();
 		}
+		refusePathFunction();
 		List<Ast.NodePattern> nodes = new ArrayList<>();
 		List<Ast.RelPattern> relationships = new ArrayList<>();
 		nodes.add(nodePattern());
@@ -399,6 +400,28 @@ public final class CypherParser {
 			nodes.add(nodePattern());
 		}
 		return new Ast.PatternPart(pathVariable, nodes, relationships);
+	}
+
+	/**
+	 * {@code shortestPath} and {@code allShortestPaths} refused where a pattern was expected.
+	 *
+	 * <p>
+	 * They look like function calls and are not — they take a pattern rather than an expression, so nothing else in the
+	 * grammar reaches them and without this the message is "expected a node pattern but found an identifier", which
+	 * describes the parser's position rather than the feature. spec/CYPHER.md has always listed both as refused by
+	 * name; this is what makes that true. Found by the {@code test-data} corpus, whose {@code t-07} is a shortest-path
+	 * query.
+	 * </p>
+	 */
+	private void refusePathFunction() {
+		Token token = peek();
+		if (token.type() != Token.Type.IDENTIFIER || !peekAt(1).isSymbol("(")) {
+			return;
+		}
+		if (token.text().equals("shortestPath") || token.text().equals("allShortestPaths")) {
+			throw error(token, token.text() + " is not supported: this build has no shortest-path search. A "
+				+ "variable-length pattern such as -[:TYPE*1..10]- finds every path rather than the shortest");
+		}
 	}
 
 	private boolean isRelationshipStart() {

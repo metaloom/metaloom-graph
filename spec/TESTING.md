@@ -82,6 +82,10 @@ graph-cypher/src/test/java/io/metaloom/graph/cypher/
                  second oracle entirely outside the query layer
                  CypherWriteTest, CypherWriteTransactionTest — every write clause, and where a write
                  query's transaction comes from
+                 LazyExecutionTest — what the streaming executor stops early and what it must not
+  integration/   CypherCorpusTest — the test-data/ corpus: four openCypher dumps and 29 queries whose
+                 counts were derived elsewhere and proven against Neo4j, so its expectations are the
+                 only ones in this repository that this project did not write
   integration/   ...and GraphDatabasesTest — several stores under one root, whose traversal cases are
                  the security test for the whole multi-database feature
 graph-protocol/src/test/java/io/metaloom/graph/protocol/
@@ -395,6 +399,14 @@ diagnostic artefact and deleting it on failure is the most frustrating thing a t
   anything else.
 - **The `vm.max_map_count` note in `GraphStorageTest` disappears with D1.** If a future test needs it
   again, that is a design regression, not an environment issue.
+- **A test that starts a server must close what that server owns.** `WireServer` has two constructor
+  families: one takes a Vert.x the caller owns and deliberately does not close it, because the HTTP
+  server shares one; the other creates its own and does. Reaching for the first in a test leaks an
+  acceptor thread, an event loop and a worker pool *per test method*, and **not one assertion in the
+  suite can see it** — the tests stay green and the JVM fills up until something unrelated hangs. It
+  happened: twenty-five leaked Vert.x instances turned a five-second class into a build that hung for
+  twenty-five minutes, passed in isolation, and reproduced only under load. `WireServerTest` now
+  counts live event loops after every test, which is the only kind of assertion that catches this.
 
 ---
 

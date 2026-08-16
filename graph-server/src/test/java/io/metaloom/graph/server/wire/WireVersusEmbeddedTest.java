@@ -117,8 +117,7 @@ public class WireVersusEmbeddedTest {
 		databases = GraphDatabases.open(stores.path().resolve("root"));
 		store = databases.database(GraphDatabases.DEFAULT_NAME);
 		seed(store);
-		server = new WireServer(io.vertx.core.Vertx.vertx(), databases, GraphDatabases.DEFAULT_NAME,
-			WireServerOptions.defaults().withPort(0), true);
+		server = new WireServer(databases, GraphDatabases.DEFAULT_NAME, WireServerOptions.defaults().withPort(0), true);
 		int port = server.listen().toCompletionStage().toCompletableFuture().join();
 		client = GraphClient.connect("127.0.0.1", port);
 	}

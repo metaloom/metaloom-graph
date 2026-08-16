@@ -549,7 +549,8 @@ it still reads everything. Bind to localhost unless something else provides acce
 | `CypherWriteVersusApiTest` | 7 | Its inverse, and the load-bearing one for writes: run a write in Cypher, verify with the Java API, then `verify(FULL)` |
 | `CypherWriteTest` | 31 | Every write clause end to end, each finishing with `verify(FULL)` |
 | `CypherWriteTransactionTest` | 8 | §4.1: the transaction joined, the read view refused, a failed query leaving the segment files byte-identical, and a concurrent reader's snapshot unmoved |
-| `LazyExecutionTest` | 13 | §7.1: what stops the scan early — counted at the store rather than timed — what correctly does not, and the two paths agreeing cell by cell |
+| `LazyExecutionTest` | 14 | §7.1: what stops the scan early — counted at the store rather than timed — what correctly does not, and the two paths agreeing cell by cell |
+| `integration/CypherCorpusTest` | 4 | The `test-data/` corpus: four openCypher dumps and 29 queries whose counts were derived elsewhere and proven against Neo4j. See §9.2 |
 | `VarLengthPathTest` | 8 | §3.2, against a graph where the difference shows |
 | `CypherSnapshotTest` | 4 | §4: views closed, joined, and a query atomic against a live writer |
 | `GraphServerTest` | 25 | The HTTP contract, both result shapes, the schema scan and its cache, the id-precision regression, and the write flag with its 403 |
@@ -571,6 +572,37 @@ The query layer's version of that is: seed a random graph, and require every que
 what the Java API computes directly. The graph is seeded rather than chosen, so it contains the shapes
 an author would not have thought to write — nodes with several labels and none, missing properties,
 parallel edges, self-loops, and a mix of materialised and lightweight relationships.
+
+### 9.2 The external corpus
+
+`test-data/` holds four graph dumps written in plain openCypher and a catalogue of 29 queries with the
+node and relationship counts each must return. Neither was written against this engine: the counts were
+derived from the generation rules and then proven against a real Neo4j. That makes it the only test here
+whose expectations this project did not author, which is a different kind of evidence from everything
+in §9.
+
+`CypherCorpusTest` imports each dump and runs its queries, classifying every one as **agreed**,
+**refused by name**, or **wrong** — and only the last is a failure, because the subset is documented.
+Two floors stop that from degenerating: at least twelve queries must agree overall and at least five per
+importable dataset. Without them an engine whose parser refused everything would be perfectly green,
+which is exactly the failure a tolerant test invites.
+
+Where it stands today:
+
+| | |
+|---|---|
+| `01-movies` | Imports. 7 of 7 queries agree |
+| `02-transit` | Imports. 6 of 7 agree; `t-07` needs `shortestPath` |
+| `03-social` | **Cannot import** — the dump generates properties with `CASE` |
+| `04-supply-chain` | **Cannot import** — the dump is `MERGE` only, deliberately, to be idempotent |
+
+**13 of 29 agree, 16 are refused, none is wrong.** The refusals are the honest measure of the distance
+between this subset and openCypher 9, and they are concentrated in two features: `MERGE` (§5.3) and
+`CASE`. Implementing those two would bring 15 of the 16 into range.
+
+It has already earned itself: `t-07` was failing as *wrong* rather than refused, because `shortestPath`
+was listed in §5.3 as refused by name and in fact produced "expected a node pattern but found an
+identifier". The parser now names it.
 
 ### 9.1 The browser suite
 

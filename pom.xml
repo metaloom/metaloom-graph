@@ -19,6 +19,20 @@
     <inceptionYear>2024</inceptionYear>
 
     <!--
+        Restated rather than inherited from io.metaloom:maven-parent, which declares the same licence. The parent
+        resolves from a repository a reader of this checkout may not have, and a project whose licence can only be
+        discovered by resolving a parent is one whose licence is not discoverable. The wording matches the parent's
+        exactly so the two can never be read as different licences. See LICENSE and NOTICE at the root.
+    -->
+    <licenses>
+        <license>
+            <name>Apache License, Version 2.0</name>
+            <url>https://spdx.org/licenses/Apache-2.0.html</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <!--
         The storage engine and the query language are separate modules on purpose. spec/ARCHITECTURE.md states that
         a query language is not a goal *of the storage layer*, and this is what keeps that literally true: graph-cypher
         depends on graph-core's public api package and on nothing inside it. It also means the query language is a real
