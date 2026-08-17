@@ -12,6 +12,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -444,10 +446,20 @@ public class CompactionTest {
 			// Compaction takes the writer lock one batch at a time, so a writer on another thread makes progress
 			// while it runs rather than blocking for the whole pass.
 			List<Throwable> failures = new ArrayList<>();
+			AtomicBoolean stop = new AtomicBoolean();
+			AtomicInteger made = new AtomicInteger();
 			Thread writer = new Thread(() -> {
 				try {
-					for (int i = 0; i < 200; i++) {
-						store.createNode("Concurrent", Properties.of().set("j", i));
+					// Writes for the *whole* compaction, reclaim phase included, rather than a fixed 200.
+					//
+					// This is the difference between the test passing for the right reason and passing by accident.
+					// Two hundred nodes finish in a few milliseconds, long before compaction reaches the reclaim
+					// phase at the end of the pass — so the original loop left the very interleaving this test is
+					// named for untested. With the writer held open across the whole call, the pre-fix engine fails
+					// this 8 times in 10 with a checksum that disagrees with its page; with the writer stopping
+					// early it fails none.
+					while (!stop.get()) {
+						store.createNode("Concurrent", Properties.of().set("j", made.getAndIncrement()));
 					}
 				} catch (Throwable e) {
 					failures.add(e);
@@ -458,10 +470,12 @@ public class CompactionTest {
 				.livenessThreshold(1.0)
 				.maxRelocationsPerTransaction(64)
 				.build());
+			stop.set(true);
 			writer.join();
 
 			assertTrue(failures.isEmpty(), "a foreground writer must not fail during a compaction: " + failures);
-			assertEquals(200, store.nodesByLabel("Concurrent").size());
+			assertEquals(made.get(), store.nodesByLabel("Concurrent").size(),
+				"every node the concurrent writer acknowledged must have survived the compaction");
 			assertEquals(1000, store.nodesByLabel("Keep").size());
 			store.verify(VerifyLevel.FULL);
 		}

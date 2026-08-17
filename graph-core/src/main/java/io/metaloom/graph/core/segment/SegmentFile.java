@@ -377,13 +377,20 @@ public final class SegmentFile implements AutoCloseable {
 				punched++;
 			}
 		}
-		// Deliberately no force() here, and the reason is worth recording because the obvious change is wrong. A punch
-		// takes effect immediately and the metadata describing it does not, so crashing in between loses both the
-		// checksum fix-up and the floor. But force() calls flushChecksums(), which walks `dirtyPages` and then clears
-		// it — and Compactor calls reclaim() outside runWrite(), so a foreground writer's dirty marks get discarded
-		// by another thread and its pages never receive a correct checksum. Adding a second force() here made that
-		// race measurably more likely (CompactionTest, intermittently). The durability gap is real, pre-existing, and
-		// belongs with the locking fix rather than in front of it.
+		// The locking fix has landed, so this force() is now safe and is here for durability: a punch takes effect
+		// immediately and the metadata describing it does not, so crashing in between would lose both the checksum
+		// fix-up above and the generation floor.
+		//
+		// It could not be here before. force() calls flushChecksums(), which walks `dirtyPages` and then clears it,
+		// and Compactor used to call reclaim() outside runWrite() — so this ran on the compaction thread while a
+		// foreground writer was setting dirty marks, discarded them, and left that writer's pages with checksums that
+		// no longer matched their bytes. Compactor now wraps reclaim() and retireEmptySegments() in runWrite(), so
+		// every caller that reaches flushChecksums() holds the writer lock and there is no second thread to race.
+		//
+		// Measured, because this is exactly the kind of claim that should not be taken on faith: with the writer held
+		// open across the whole compaction, CompactionTest#testCompactionInterleavesWithForegroundWrites fails 8 runs
+		// in 10 against the pre-fix engine with this force() present, and 0 in 12 with the locking fix.
+		force();
 		return punched;
 	}
 

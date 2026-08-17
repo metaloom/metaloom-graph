@@ -722,7 +722,7 @@ trusting anything that depends on it, and skips when it does not. On ext4 or xfs
 
 ### 4.8 Phase 8 — Compaction
 
-- [ ] **Open defect: a compaction interleaved with a foreground writer can leave a `NODE` page whose
+- [x] **Fixed: a compaction interleaved with a foreground writer could leave a `NODE` page whose
       checksum does not match its contents.** `CompactionTest.testCompactionInterleavesWithForegroundWrites`
       fails on its closing `verify(FULL)` with `PageCorrupt: Checksum mismatch in .../node-000000.seg
       page N`, N varying per run, at a **measured 6 failures in 12 runs on a clean checkout of
@@ -733,6 +733,34 @@ trusting anything that depends on it, and skips when it does not. On ext4 or xfs
       shown otherwise rather than as a flaky test. **Diagnose it with a worktree and interleaved runs**:
       a sequential A-then-B comparison of this test measures the machine's state as much as the code,
       and gave 8/8 against 3/8 where interleaving gave 6/12 against 9/12.
+      <br>**The cause.** `SegmentSet.reclaim()` reaches `SegmentFile.force()`, which calls
+      `flushChecksums()` — and that walks the segment's dirty-page `BitSet` and then *clears* it.
+      `Compactor` called `reclaim()` outside `runWrite()`, so it ran on the compaction thread while a
+      foreground writer was still setting dirty marks under the writer lock. The clear discarded marks
+      whose checksums had not been recomputed, and those pages kept a checksum that no longer described
+      their bytes. The failing assertion was the closing `verify(FULL)`, which is the checksum doing
+      exactly its job — one page behind.
+      <br>**Why it looked dormant.** It first appeared not to reproduce at all: 0 of 8 at `0970e6b`,
+      0 of 7 interleaved at `95860b1`, 0 of 12 at `4007617`. The reason was in the test rather than the
+      machine. Its writer thread created a fixed 200 nodes, which finish in a few milliseconds — long
+      before compaction reaches the reclaim phase at the *end* of the pass, which is the only phase that
+      calls `reclaim()`. **The test named for an interleaving was not interleaving with the code that
+      had the bug.** Holding the writer open for the whole `compact()` call reproduces it at once.
+      <br>**Measured**, with the writer held open throughout: **8 failures in 10** against the pre-fix
+      engine, and **0 in 12** with the locking fix — then 0 in 12 again over the whole of
+      `CompactionTest`.
+      <br>**The fix** is the one this file already called for: `Compactor` wraps `set.reclaim()` and
+      `set.retireEmptySegments()` in `runner.runWrite(...)`, so every path that reaches
+      `flushChecksums()` holds the writer lock and no second thread can be setting marks. The related
+      `verify()` defect above is the same mechanism reached through the public API, and was fixed with it.
+      <br>**And the durability gap it was blocking is now closed too.** `reclaimEmptyPages()` deliberately
+      omitted a trailing `force()`, because adding one made the race measurably worse — a punch takes
+      effect immediately while the metadata describing it does not, so a crash in between lost both the
+      checksum fix-up and the generation floor. With the locking fixed that `force()` is safe and is
+      back. It costs nothing measurable: `graph-core` runs in ~50 s with and without it, against a
+      run-to-run variance of 50–84 s on the same host.
+      <br>`CompactionTest`'s writer now runs for the whole compaction rather than 200 nodes, so the test
+      exercises what its name claims.
 - [ ] Foreground p99 latency budget during compaction. Compaction takes the writer lock one batch at a
       time and `CompactionTest` shows a concurrent writer making progress throughout, but a p99 claim
       needs a real latency harness — and the defect above has to be settled first, since it is the same
