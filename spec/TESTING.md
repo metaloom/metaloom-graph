@@ -565,9 +565,10 @@ diagnostic artefact and deleting it on failure is the most frustrating thing a t
       The engine's own server continues to avoid virtual threads deliberately — a page fault on a mapped
       segment blocks the carrier — but the API is public and applications will not
 - [ ] A jcstress harness for the optimistic read path; jcstress is not in the offline repository
-- [x] Soak harness with leak and growth detection, at a configurable duration. **Its growth assertion is
-      currently red** and has been for at least three commits — `mvn test -Pslow` does not pass. Measured
-      and attributed in [PROGRESS.md](PROGRESS.md); it is not a regression from the concurrency work
+- [x] Soak harness with leak and growth detection, at a configurable duration. Its growth assertion was
+      red for several commits and **was right**: the index high water mark ratcheted up on every
+      compaction, which is a real disk leak wherever hole punching is unavailable. Fixed, with
+      `IndexSpaceReuseTest` pinning it; the whole story is in [PROGRESS.md](PROGRESS.md)
 - [x] `kill -9` loop harness (`tools/kill9-loop.sh`, `CrashWorkload`) with acknowledgement checking
 - [x] Performance gates in `-Pbench`, throughput floors and exact structural ceilings
 - [x] Dual-run CI (native on/off), plus slow, crash, gates and a Rust build

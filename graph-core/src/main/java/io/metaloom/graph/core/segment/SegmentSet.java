@@ -362,6 +362,34 @@ public final class SegmentSet implements AutoCloseable {
 		}
 	}
 
+	/**
+	 * Reorders the free ring so the lowest slots are handed out first, packing the next run of allocations against the
+	 * bottom of the segment instead of scattering it over the whole freed range.
+	 *
+	 * <p>
+	 * The ring is FIFO everywhere else, and deliberately so: rotating through the segment before reusing any one slot
+	 * is what keeps the 12 bit generation counter a useful dangling-id detector. That argument does not apply to a kind
+	 * whose ids never leave the engine, and FIFO costs real space when a caller frees a whole structure and immediately
+	 * rebuilds it. The rebuild scatters itself across the freed range; one live record near the top is then enough to
+	 * stop {@link #shrinkHighWater()} trimming anything; and the high water mark ratchets up for the life of the store.
+	 * Measured on the index: 57 live pages sitting under a mark of 252.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>Only safe for a kind whose ids are internal.</b> Never call it for NODE, REL or anything else an application
+	 * can hold across the reuse — that is what the generation counter is protecting.
+	 * </p>
+	 */
+	public void packFreeRing() {
+		if (freeRing.size() < 2) {
+			return;
+		}
+		List<Long> sorted = new ArrayList<>(freeRing);
+		java.util.Collections.sort(sorted);
+		freeRing.clear();
+		freeRing.addAll(sorted);
+	}
+
 	// ---------------------------------------------------------------- compaction
 
 	/**

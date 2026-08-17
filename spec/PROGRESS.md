@@ -302,19 +302,32 @@ that a steal policy cannot be made correct over a `MAP_SHARED` mapping.
       only ever looks at the newest segment. So holes below the high water mark, and every hole in a
       sealed segment, are unreachable after a reopen until `compact()` runs. Measured: delete slot 3,
       reopen, next insert gets slot 10
-- [ ] **`SoakTest` is red, and has been for at least three commits.** `testSteadyStateDoesNotGrowWithoutBound`
-      fails at the default twenty seconds: committed bytes per live element grow from 346 B at the settled
-      sample to 566–610 B at the end, against a bound of 1.5x. Attributed with a worktree at `95860b1`,
-      which is before the concurrency-test work: it fails there too, and marginally worse (609.9 B/element
-      against 565.8 B/element after), so it is not a regression from that work.
-      <br>It is **not** a measurement artefact of the shrinking edge count either, which was the obvious
-      first suspicion: the workload settles at roughly 5,800 live elements and stays there, while storage
-      goes from 2.0 MB to 3.6 MB over the run. That is real growth against a flat live set, with
-      `reclaim()`, `compact(always())` and `checkpoint()` all being called every hundred rounds. The
-      neighbouring free-ring defect above is the obvious place to look first, though `SoakTest` never
-      reopens the store, so it cannot be the whole story.
-      <br>Note that this file previously recorded the soak harness as passing. It asserts the right things;
-      the engine does not satisfy them
+- [x] **Fixed: the index high water mark ratcheted up on every compaction, and `SoakTest` was right about
+      it.** `testSteadyStateDoesNotGrowWithoutBound` failed at the default twenty seconds with committed
+      bytes per live element climbing from 346 B at the settled sample to 566–610 B at the end.
+      <br>**Where it was.** Broken down per record kind, every kind was flat except `INDEX`, which went
+      from 450 KB to 1.65 MB while its live page count sat at 57 — a high water mark of 252 over 57 live
+      pages. Compaction rebuilds the B+trees wholesale: `resetTrees()` frees every page and the caller
+      refills from the live records. The free ring is FIFO, so the refill scattered itself across the
+      freed range in tree-walk order; a single live page landing near the top was enough to stop
+      `shrinkHighWater()` trimming anything; and the mark rose by one or two slots on every rebuild,
+      for the life of the store. Instrumenting the allocator showed it exactly: zero ring rejections,
+      the ring drained to empty every time, and the shortfall taken from the bump cursor.
+      <br>**Why it was worse than a metric bug.** With hole punching available the stranded pages are
+      all-free, `reclaim()` returns their blocks, and real disk usage stays flat at ~1.7 MB while
+      `storageBytes()` climbs to 3.3 MB — so on this host the damage looked cosmetic. But
+      `reclaimEmptyPages()` returns immediately when the native library is absent, **and CI runs the whole
+      suite with `-Dmetaloom.graph.native.enabled=false`**. Measured in that configuration the ratchet is
+      a genuine unbounded disk leak: the index segment grew 762 KB → 2.2 MB and was still climbing.
+      <br>**The fix** is `SegmentSet.packFreeRing()`, called by `resetTrees()` once the trees have been
+      freed: it sorts the free ring so the refill packs against the bottom of the segment and the tail
+      becomes trimmable. FIFO reuse stays the rule everywhere else, because rotating through the segment
+      is what keeps the 12 bit generation a useful dangling-id detector — that argument simply does not
+      apply to a kind whose ids never leave the engine, which is the same property that makes
+      `resetTrees()` affordable at all.
+      <br>**Measured after**: mark tracks live exactly (57/57, 59/59), bytes per element flat at 318 → 312
+      instead of 346 → 606, real disk flat in both native configurations, and `SoakTest` green.
+      `IndexSpaceReuseTest` pins it, and fails at `mark=53 live=27` with the one-line fix removed
 
 ### Phase 15 — Cypher writes
 

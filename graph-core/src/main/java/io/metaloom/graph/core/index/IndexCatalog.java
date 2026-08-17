@@ -887,6 +887,13 @@ public final class IndexCatalog {
 		for (long pageId : pages) {
 			segments.free(pageId);
 		}
+		// Everything the trees held is now free, so hand the refill the bottom of the segment rather than the order the
+		// pages happened to be freed in. A scattered refill leaves a live page near the top, shrinkHighWater() can then
+		// trim nothing, and the mark ratchets up on every rebuild for the life of the store — measured at 57 live index
+		// pages under a high water mark of 252, and a real disk leak rather than a cosmetic one anywhere hole punching
+		// is unavailable. Safe here precisely because index ids are internal and never handed out, which is the same
+		// property that makes resetTrees() affordable at all.
+		segments.packFreeRing();
 		labelRoot(tree.create());
 		propRoot(tree.create());
 		compositeRoot(hadComposite ? tree.create() : ElementId.NULL);
