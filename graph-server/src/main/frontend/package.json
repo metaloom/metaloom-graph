@@ -8,8 +8,9 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "test": "vitest run",
-    "e2e": "playwright test",
-    "e2e:headed": "playwright test --headed"
+    "e2e": "playwright test --grep-invert @screenshots",
+    "e2e:headed": "playwright test --headed",
+    "screenshots": "playwright test --grep @screenshots"
   },
   "dependencies": {
     "d3-drag": "^3.0.0",

@@ -1,0 +1,37 @@
+{{ include "graph.fullname" . }} is installed.
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "graph.fullname" . }} 8080:{{ .Values.service.httpPort }}
+  open http://localhost:8080
+
+  curl -XPOST localhost:8080/api/query -H 'content-type: application/json' \
+    -d '{"query":"MATCH (n) RETURN n LIMIT 10"}'
+
+THERE IS NO AUTHENTICATION ON ANY PORT.
+
+  There is no password to set and no secret in this chart, because the server has no concept of a
+  user. Anything that can reach the Service can read every database under the root. Access control
+  has to come from somewhere else: a NetworkPolicy, an authenticating proxy, or not exposing it.
+
+{{ if .Values.graph.allowWrite -}}
+  graph.allowWrite is ON. Anything that can reach this Service can also change and delete data.
+{{- else -}}
+  Writes are off. CREATE, SET, REMOVE and DELETE are refused with 403. Set graph.allowWrite=true to
+  enable them, having read the paragraph above.
+{{- end }}
+
+{{ if not .Values.persistence.enabled -}}
+  PERSISTENCE IS OFF. The store lives in the pod and dies with it.
+{{ end -}}
+{{ if eq .Values.wire.host "127.0.0.1" -}}
+  The binary streaming port is bound to loopback, so nothing outside the pod can reach it. Set
+  wire.host=0.0.0.0 to use it from elsewhere in the cluster.
+{{ end -}}
+{{ if .Values.metrics.enabled -}}
+  Metrics: port {{ .Values.service.metricsPort }}, /metrics, /health and /ready. Do not expose it
+  outside the cluster — a scrape carries database names, node counts and store sizes.
+{{ end -}}
+{{ if .Values.mcp.enabled -}}
+  MCP is ON at port {{ .Values.service.mcpPort }}{{ if eq .Values.mcp.host "127.0.0.1" }}, bound to loopback{{ end }}. It is a remote code path an LLM drives.
+{{ end -}}
+
+There is no backup mechanism in the engine. See spec/OPERATIONS.md section 5 before you rely on this.

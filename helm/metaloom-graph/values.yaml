@@ -1,0 +1,194 @@
+# Default values for the MetaLoom // Graph chart.
+# Every key is documented; override what you need.
+
+# -- Number of pods. MUST be 1. The store holds a LOCK file and allows exactly one writer process, so
+# a second replica over the same volume crash-loops on the lock while the first keeps serving. The
+# chart refuses anything else rather than letting you find that out in a cluster.
+replicaCount: 1
+
+image:
+  # -- Image repository.
+  repository: metaloom/graph-server
+  # -- Image tag. Empty means the chart's appVersion.
+  tag: ""
+  # -- Use "-native" alongside a tag for the GraalVM build: ~38 MB and ~110 ms to first response.
+  pullPolicy: IfNotPresent
+
+# -- Secrets for pulling from a private registry.
+imagePullSecrets: []
+
+# -- Override the generated name.
+nameOverride: ""
+# -- Override the generated fullname.
+fullnameOverride: ""
+
+graph:
+  # -- The database a request that does not name one gets. Created at start-up if absent.
+  database: default
+
+  # -- Accept CREATE, SET, REMOVE and DELETE queries.
+  # NO PORT ON THIS SERVER HAS AUTHENTICATION. Turning this on hands anything that can reach the
+  # Service the ability to change and delete data — which, for a ClusterIP Service, is everything in
+  # the cluster that can resolve it. Leave it off unless something in front is doing access control.
+  allowWrite: false
+
+  # -- Enable DELETE /api/databases/<name>, which destroys a whole database and its directory in one
+  # request. Separate from allowWrite on purpose: enabling writes is not asking for that.
+  allowDrop: false
+
+  # -- Seed the default database with a demo air-route graph, but only if it is empty. Useful for a
+  # first look; leave it off for anything real.
+  demo: false
+  # -- How much demo data: tiny | small | medium | large, or a number of airports.
+  demoSize: small
+
+  # -- Abandon a query that runs longer than this, in milliseconds. 0 disables the limit, which lets
+  # one query hold a worker thread and a read view indefinitely.
+  queryTimeoutMillis: 30000
+
+  # -- Log a query taking at least this long, in milliseconds. 0 logs none. Must be BELOW
+  # queryTimeoutMillis to ever fire — above it, the query is abandoned before it can be logged.
+  slowQueryMillis: 1000
+
+  # -- Queries the binary port runs at once. Multiplied by the per-stream write queue, this is the
+  # memory the server may hold for clients that stop reading.
+  maxStreams: 8
+
+wire:
+  # -- Open the binary streaming port.
+  enabled: true
+  # -- What the binary port binds. 127.0.0.1 means the Service port exists but NOTHING outside the pod
+  # can reach it — the correct default for an unauthenticated port. Set 0.0.0.0 to actually use it.
+  host: "127.0.0.1"
+
+metrics:
+  # -- Open the monitoring port: /metrics, /health and /ready.
+  # Turning this off also removes the probes' target, so the chart falls back to a TCP check.
+  enabled: true
+  serviceMonitor:
+    # -- Create a Prometheus Operator ServiceMonitor. Needs the CRD to exist.
+    enabled: false
+    # -- Scrape interval.
+    interval: 30s
+    # -- Extra labels, usually what your Prometheus release selects on.
+    labels: {}
+
+mcp:
+  # -- Open the Model Context Protocol port. Off by default, unlike every other port here: it is a
+  # remote code path an LLM drives, against a server with no authentication.
+  enabled: false
+  # -- What the MCP port binds. Loopback until deliberately widened, same reasoning as wire.host.
+  host: "127.0.0.1"
+
+service:
+  # -- Service type.
+  type: ClusterIP
+  # -- HTTP port: the browser UI and /api/query.
+  httpPort: 8080
+  # -- Binary streaming port. Unreachable unless wire.host is widened.
+  wirePort: 8081
+  # -- Monitoring port. Do not expose this outside the cluster; a scrape carries database names,
+  # node counts and store sizes.
+  metricsPort: 8082
+  # -- MCP port.
+  mcpPort: 8083
+  # -- Extra annotations on the Service.
+  annotations: {}
+
+persistence:
+  # -- Use a PersistentVolumeClaim. With this off the store lives in the pod and dies with it, which
+  # is only ever right for a demo.
+  enabled: true
+  # -- StorageClass. Empty uses the cluster default.
+  storageClass: ""
+  # -- ReadWriteOnce, and it must stay that way: one writer process, enforced by a LOCK file.
+  accessModes:
+    - ReadWriteOnce
+  # -- Volume size. 10Gi holds roughly 10M nodes and 20M relationships (6.1 GiB measured) plus the
+  # log and room to compact. NOTE: this cannot be changed by `helm upgrade` — a StatefulSet's
+  # volumeClaimTemplate is immutable. Size it now or plan to migrate.
+  size: 10Gi
+  # -- Use an existing PVC instead of the volumeClaimTemplate.
+  existingClaim: ""
+
+probes:
+  # -- Use /health and /ready on the monitoring port. Turn off for an image older than those routes;
+  # the chart then falls back to a TCP check on the HTTP port, which cannot tell draining from ready.
+  useHealthEndpoint: true
+  liveness:
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 6
+  readiness:
+    initialDelaySeconds: 3
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+  # -- Gives a slow recovery time to finish before the liveness probe starts killing the pod. Recovery
+  # is a single redo pass, so it is normally milliseconds — but a crash during a large bulk load can
+  # take minutes, and a liveness probe that fires during it produces a crash loop that never recovers.
+  startup:
+    enabled: true
+    periodSeconds: 10
+    failureThreshold: 30
+
+# -- How long the pod gets to drain. Must exceed the server's own shutdown budget: 5s to drain running
+# queries, 2s to unwind abandoned ones, plus a checkpoint. Nothing committed is at risk if this is too
+# short — the log is fsynced before any data page is touched — but the close is less clean.
+terminationGracePeriodSeconds: 30
+
+resources:
+  requests:
+    cpu: 250m
+    # -- A transaction is bounded by heap: the engine is no-steal, so a writer holds a private copy of
+    # every page it touches until commit. A bulk load touching a gigabyte of pages needs a gigabyte.
+    memory: 512Mi
+  limits:
+    memory: 2Gi
+
+# -- Extra environment variables, as a plain list of name/value.
+extraEnv: []
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 0
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  # -- Read-only root filesystem. This REQUIRES the /tmp emptyDir the chart mounts alongside it: the
+  # native library is unpacked to java.io.tmpdir and dlopen()ed, so a read-only /tmp silently drops the
+  # whole native layer — no error, just a slower server. Leave both together or neither.
+  readOnlyRootFilesystem: true
+
+serviceAccount:
+  # -- Create a ServiceAccount.
+  create: true
+  # -- Name. Generated when empty.
+  name: ""
+  annotations: {}
+
+ingress:
+  # -- Create an Ingress for the HTTP port. Remember there is no authentication behind it.
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: graph.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# -- Extra labels on the pod.
+podLabels: {}
+# -- Extra annotations on the pod.
+podAnnotations: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

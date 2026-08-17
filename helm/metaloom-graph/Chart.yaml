@@ -1,0 +1,27 @@
+apiVersion: v2
+name: metaloom-graph
+description: MetaLoom // Graph — a native-code backed graph database with an openCypher subset
+type: application
+home: https://metaloom.io/graph
+sources:
+  - https://github.com/metaloom/metaloom-graph
+keywords:
+  - graph
+  - database
+  - cypher
+maintainers:
+  - name: MetaLoom
+
+#
+# Changelog, newest first. Kept here rather than in a separate file so that whoever bumps the version
+# has to look at what changed, and so `helm show chart` carries it.
+#
+#   0.1.0  First release. StatefulSet with one replica, four ports, /health and /ready probes.
+#          NOT upgradeable from anything, and note that persistence.size cannot be changed by a
+#          `helm upgrade` — a volumeClaimTemplate is immutable once the StatefulSet exists.
+#
+version: 0.1.0
+
+# "latest" until the project cuts a release. The image helper falls back to this when image.tag is
+# empty, so a chart user gets whatever the tag points at rather than a version that does not exist.
+appVersion: "latest"

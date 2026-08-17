@@ -3,10 +3,12 @@ package io.metaloom.graph.server.mcp;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.net.Socket;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -163,23 +165,29 @@ public class McpServerTest {
 		// A client that drops its TCP connection sends neither an end nor a close frame. A session map that only
 		// shrank on a clean goodbye would grow for the lifetime of the process, which is a leak no assertion in the
 		// rest of the suite could see.
-		CompletableFuture<HttpResponse<Stream<String>>> abandoned = client.sendAsync(
-			HttpRequest.newBuilder(URI.create(base + McpConstants.SSE_PATH)).GET().build(),
-			HttpResponse.BodyHandlers.ofLines());
-
-		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-		while (mcp.sessionCount() == 0 && System.nanoTime() - deadline < 0) {
-			Thread.sleep(20);
+		//
+		// A raw socket, because java.net.http pools connections: cancelling its CompletableFuture does not reliably
+		// close the underlying socket, so the server sees nothing and this test fails about half the time. Closing a
+		// socket we own is the only way to state "the client disappeared" and mean it.
+		int port = mcp.port();
+		try (Socket socket = new Socket("127.0.0.1", port)) {
+			socket.getOutputStream().write(("GET " + McpConstants.SSE_PATH + " HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+				.getBytes(StandardCharsets.US_ASCII));
+			socket.getOutputStream().flush();
+			awaitSessions(1);
 		}
-		assertEquals(1, mcp.sessionCount(), "the stream should have registered a session");
-
-		abandoned.cancel(true);
-
-		deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-		while (mcp.sessionCount() > 0 && System.nanoTime() - deadline < 0) {
-			Thread.sleep(20);
-		}
+		// Out of the try-with-resources: the socket is closed, so the server should notice.
+		awaitSessions(0);
 		assertEquals(0, mcp.sessionCount(), "the session has to be dropped when the socket goes");
+	}
+
+	/** Waits for the server's session count to reach a value, rather than assuming the close is synchronous. */
+	private void awaitSessions(int expected) throws InterruptedException {
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+		while (mcp.sessionCount() != expected && System.nanoTime() - deadline < 0) {
+			Thread.sleep(20);
+		}
+		assertEquals(expected, mcp.sessionCount(), "sessions did not reach " + expected);
 	}
 
 	private static String awaitLine(LinkedBlockingQueue<String> lines, String prefix) throws InterruptedException {

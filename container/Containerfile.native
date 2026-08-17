@@ -1,0 +1,55 @@
+#
+# MetaLoom // Graph — the GraalVM native image.
+#
+#   mvn -o -Pgraalvm clean package -DskipTests
+#   docker build -f container/Containerfile.native -t metaloom/graph-server:latest-native .
+#
+# Roughly 38 MB, ~110 ms to first response and ~78 MB RSS against the JVM image's several seconds and
+# several hundred. spec/GRAALVM.md has the measurements, and records that the binary serves the React
+# UI over a real store with the Rust crate loaded and io_uring available.
+#
+# debian:stable-slim and NOT alpine: the binary is linked against glibc. Native-plus-alpine is the one
+# combination here that cannot work at all.
+#
+FROM debian:stable-slim
+
+LABEL org.opencontainers.image.title="MetaLoom // Graph (native)"
+LABEL org.opencontainers.image.description="A native-code backed graph database with an openCypher subset"
+LABEL org.opencontainers.image.source="https://github.com/metaloom/metaloom-graph"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates libstdc++6 zlib1g \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV GRAPH_ROOT=/data
+ENV GRAPH_HTTP_PORT=8080
+ENV GRAPH_WIRE_PORT=8081
+ENV GRAPH_METRICS_PORT=8082
+ENV GRAPH_MCP_PORT=8083
+ENV GRAPH_WIRE_HOST=127.0.0.1
+ENV GRAPH_MCP_HOST=127.0.0.1
+ENV GRAPH_MCP_ENABLED=false
+ENV GRAPH_ALLOW_WRITE=false
+ENV GRAPH_ALLOW_DROP=false
+
+EXPOSE 8080
+EXPOSE 8081
+EXPOSE 8082
+EXPOSE 8083
+
+# uid 1000, gid 0 and group-writable: the OpenShift convention, where the uid is replaced at runtime by
+# an arbitrary one that is still in group 0 — which is exactly why no user is created here. A numeric
+# USER needs no passwd entry, and `useradd -u 1000` fails outright on this base image, which already
+# ships a uid 1000. Owning the directories by number is the thing that actually matters.
+RUN mkdir -p /graph /data \
+ && chown 1000:0 /graph /data -R \
+ && chmod 770 /graph /data
+
+ADD --chown=1000:0 ./graph-server/target/native/graph-server /graph/graph-server
+
+USER 1000
+WORKDIR /graph
+VOLUME /data
+
+CMD ["/graph/graph-server"]

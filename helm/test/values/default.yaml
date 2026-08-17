@@ -1,0 +1,13 @@
+# The shape the phases below assume: demo data so there is something to query, and a small volume
+# because k3d's local-path provisioner has no reason to hand out ten gigabytes.
+graph:
+  demo: true
+  demoSize: tiny
+persistence:
+  size: 1Gi
+resources:
+  requests:
+    cpu: 100m
+    memory: 384Mi
+  limits:
+    memory: 1Gi

@@ -37,13 +37,23 @@ not**, in one place.
 | 12 — GraalVM native image | **Done** — the server builds to a 38 MB standalone binary, FFM and all, behind `-Pgraalvm` | [GRAALVM.md](GRAALVM.md); `ForeignDowncallMetadataTest`, `tools/native-image.sh` |
 | 13 — Binary streaming port | **Done** for stage 1: a framed TCP protocol and a Java client that stream rows as the engine produces them. The *executor* still materialises — see below | [WIRE.md](WIRE.md), [TRANSPORT_DECISION.md](TRANSPORT_DECISION.md); `WireVersusEmbeddedTest`, `WireServerTest`, `WireDecoderHostileInputTest` |
 | 14 — Several databases | **Done** — one directory per database under a root, selectable from the client, the HTTP routes and the browser UI | [DATABASES.md](DATABASES.md); `GraphDatabasesTest`, `DatabaseRoutesTest` |
+| 18 — Operability | **Done** — environment-variable configuration, Prometheus metrics on their own port with `/health` and `/ready`, and a slow query log on every front end | [METRICS.md](METRICS.md), [OPERATIONS.md §3.1, §4](OPERATIONS.md); `MetricsCatalogScrapeTest`, `MetricsServerTest`, `SlowQueryLogTest`, `GraphServerOptionsTest` |
+| 19 — MCP | **Done** — eight tools over HTTP+SSE and WebSocket, off by default and loopback when on, write-gated at two points | [MCP.md](MCP.md); `McpProtocolTest`, `McpServerTest`, `CypherGuideToolTest` |
+| 20 — Deployment | **Done** — JVM and GraalVM container images, a Helm chart, and a k3d harness that runs a real pipeline against them | [DEPLOYMENT.md](DEPLOYMENT.md); `helm/test/run.sh` — 35 assertions across nine phases |
 
 **The engine is usable today** for a single-writer embedded workload: durable, crash-safe,
 transactional, indexed, compacting, with snapshot isolation for readers, a Cypher query
 language that reads **and writes**, a browser UI, a streaming binary port and several databases under one root — and it
-holds its answers against a reference model, against real SQL, against its own Java API, and now over its own wire. It
-is **not** usable where concurrent writers, `OPTIONAL MATCH`, an online backup or an authenticated network are requirements.
-None of those exists and none is faked.
+holds its answers against a reference model, against real SQL, against its own Java API, and now over its own wire.
+
+**It is also deployable and observable**: it configures itself from the environment, exports Prometheus metrics with
+`/health` and `/ready` on a port of their own, writes a slow query log that never logs a parameter value, ships as a
+container image in two flavours, installs from a Helm chart that refuses a second replica by name, and speaks the
+Model Context Protocol so an agent can query it.
+
+It is **not** usable where concurrent writers, `OPTIONAL MATCH`, an online backup or an **authenticated** network are
+requirements. None of those exists and none is faked — and the last one is worth repeating, because everything in the
+paragraph above makes it easier to expose.
 
 ---
 

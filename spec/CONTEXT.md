@@ -90,7 +90,9 @@ CONTEXT.md (this file)
         ├─ API.md .................... the public Java API
         ├─ TESTING.md ................ test setup, benchmarks, crash testing
         ├─ OPERATIONS.md ............. configuration, sizing, tuning, monitoring, backup, recovery
-        └─ METRICS.md ................ the Prometheus meter catalogue, and the alert rules it implies
+        ├─ METRICS.md ................ the Prometheus meter catalogue, and the alert rules it implies
+        ├─ MCP.md .................... the Model Context Protocol port and its tools
+        └─ DEPLOYMENT.md ............. the container images, the Helm chart and the k3d harness
 ```
 
 ---
@@ -122,6 +124,8 @@ CONTEXT.md (this file)
 | [API.md](API.md) | The public Java API surface: `GraphStore`, transactions, cursors, traversal, element builders | Internals |
 | [TESTING.md](TESTING.md) | Test layout, fixtures, benchmark harness, crash and fault injection, invariant checkers | Implementation steps |
 | [OPERATIONS.md](OPERATIONS.md) | Running it: sizing, tuning, **how the server is configured from flags and the environment**, what to monitor, **the slow query log**, backup and restore, disaster recovery, what every exception means for an operator, the security posture of every port | Design rationale; how the binary protocol works (WIRE.md); the meter catalogue (METRICS.md) |
+| [DEPLOYMENT.md](DEPLOYMENT.md) | The container images and the Helm chart: why the base image is not Alpine, why `/tmp` is load-bearing, StatefulSet versus Deployment, probes on the monitoring port, and the k3d harness | How the server is configured (OPERATIONS.md §3.1); the native binary itself (GRAALVM.md) |
+| [MCP.md](MCP.md) | The Model Context Protocol port: why it is the one port that is off by default, the two transports and the h2c trap that breaks SSE, the eight tools, the row cap, and the write gate's two enforcement points | The query language (CYPHER.md); the meter catalogue (METRICS.md) |
 | [METRICS.md](METRICS.md) | The Prometheus catalogue: every `graph_` meter with its type, labels and call site, the cached-versus-live tiers and why size gauges are refreshed on a timer, and the map from OPERATIONS.md §4's thresholds to alert rules. **Parsed by `MetricsCatalogScrapeTest`** — editing it can break the build | Which signals to watch and when to worry (OPERATIONS.md §4) |
 | [PLAN.md](PLAN.md) | The phased implementation plan with per-phase deliverables, exit criteria and checkboxes | Design rationale |
 | [PROGRESS.md](PROGRESS.md) | The consolidated done/pending checklist across every phase, and the backlog in priority order | Deliverable definitions, rationale for a gap |
@@ -291,8 +295,13 @@ Full description in [ARCHITECTURE.md](ARCHITECTURE.md).
   costs more than the write.
 - **`unix:blocks` is not available from the JDK here**, so true sparse-file accounting needs the
   native `statx` binding (Phase 6). `StoreStats.storageBytes()` is engine-side accounting instead.
-- **The Rust library is not built by Maven yet** and `cargo` is not installed in this environment.
-  Wiring it in, with a graceful skip, is a Phase 6 item.
+- **The Rust library *is* built by Maven**, by the `build-native` and `package-native` executions in
+  `graph-core/pom.xml`, and `cargo` is present here. A `mvn package` with no skip flags puts
+  `native/linux-x86_64/libmetaloom_graph_native.so` inside the jar, and `/api/stats` then reports
+  `nativeLayer: "ABI 2"` rather than `"not built"`. The graceful skip is there too: every native
+  capability has a pure-Java fallback, so `-Dnative.skip=true` — or a machine without cargo — produces
+  a working server that is quietly slower. `container/build-containers.sh` warns when it is about to
+  package such a jar into an image, because that is where "quietly slower" stops being noticed.
 
 ---
 

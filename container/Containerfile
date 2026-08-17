@@ -1,0 +1,77 @@
+#
+# MetaLoom // Graph — the JVM image.
+#
+# Built from the repository root as the context, so the ADD paths below are repo-relative:
+#
+#   mvn -o clean package -DskipTests
+#   docker build -f container/Containerfile -t metaloom/graph-server:latest .
+#
+# See container/build-containers.sh, which does both and also the native variant.
+#
+FROM eclipse-temurin:25-jre
+
+#
+# NOT alpine, and this is a correctness decision rather than a preference.
+#
+# graph-core/native-rust-lib/rust-toolchain.toml pins x86_64-unknown-linux-gnu, and NativeCapabilities
+# unpacks that .so to java.io.tmpdir and dlopen()s it. On musl the dlopen fails, the capability status
+# becomes "failed to load", and the server carries on happily on the pure-Java fallback — silently
+# giving up the one thing the JVM cannot approach, which is 12.4x on scattered reads via io_uring.
+#
+# Alpine becomes correct only once the crate is also built for x86_64-unknown-linux-musl and packaged
+# under a second classifier. fromClasspath() already keys on a classifier, so the resource layout
+# supports it; that is a bigger change than an image, and until it happens this base is the honest one.
+#
+LABEL org.opencontainers.image.title="MetaLoom // Graph"
+LABEL org.opencontainers.image.description="A native-code backed graph database with an openCypher subset"
+LABEL org.opencontainers.image.source="https://github.com/metaloom/metaloom-graph"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+
+# Every setting the server reads. Listed rather than left to defaults so that `docker inspect` is a
+# complete answer to "what can I configure", and so a chart has something to override.
+ENV GRAPH_ROOT=/data
+ENV GRAPH_HTTP_PORT=8080
+ENV GRAPH_WIRE_PORT=8081
+ENV GRAPH_METRICS_PORT=8082
+ENV GRAPH_MCP_PORT=8083
+#
+# Loopback, deliberately. In a pod this makes the binary port unreachable from outside the pod, which
+# is the correct starting position for a port with no authentication: the chart widens it on purpose.
+# Defaulting it to 0.0.0.0 here would undo that decision for everyone who ever runs this image.
+#
+ENV GRAPH_WIRE_HOST=127.0.0.1
+ENV GRAPH_MCP_HOST=127.0.0.1
+ENV GRAPH_MCP_ENABLED=false
+ENV GRAPH_ALLOW_WRITE=false
+ENV GRAPH_ALLOW_DROP=false
+
+#
+# /tmp has to be writable AND executable: the native library is unpacked there and then dlopen()ed.
+# A read-only root filesystem needs an emptyDir mounted here or the native layer disappears without
+# an error — see spec/OPERATIONS.md and the chart's securityContext comment.
+#
+ENV JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=/tmp"
+
+EXPOSE 8080
+EXPOSE 8081
+EXPOSE 8082
+EXPOSE 8083
+
+# uid 1000, gid 0 and group-writable: the OpenShift convention, where the uid is replaced at runtime by
+# an arbitrary one that is still in group 0 — which is exactly why no user is created here. A numeric
+# USER needs no passwd entry, and `useradd -u 1000` fails outright on this base image, which already
+# ships a uid 1000. Owning the directories by number is the thing that actually matters.
+RUN mkdir -p /graph /data \
+ && chown 1000:0 /graph /data -R \
+ && chmod 770 /graph /data
+
+ADD --chown=1000:0 ./graph-server/target/graph-server-0.0.1-SNAPSHOT.jar /graph/graph-server.jar
+
+USER 1000
+WORKDIR /graph
+VOLUME /data
+
+# --enable-native-access even though the jar manifest already carries Enable-Native-Access: a future
+# JDK turns that warning into an error, and the manifest entry is one shade-config edit away from
+# being lost. CMD rather than ENTRYPOINT so `docker run <image> --help` works.
+CMD ["java", "--enable-native-access=ALL-UNNAMED", "-jar", "/graph/graph-server.jar"]

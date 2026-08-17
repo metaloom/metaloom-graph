@@ -1,0 +1,43 @@
+{{- if .Values.ingress.enabled -}}
+{{/*
+  There is no authentication behind this. An Ingress makes the browser UI and /api/query reachable
+  from outside the cluster, and with graph.allowWrite on it makes the delete path reachable too. Put
+  something in front of it.
+
+  Only the HTTP port is ever exposed here. The monitoring port carries database names and store sizes,
+  and the MCP port is a remote code path an LLM drives; neither belongs behind a public hostname.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "graph.fullname" . }}
+  labels:
+    {{- include "graph.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: {{ include "graph.fullname" $ }}
+                port:
+                  number: {{ $.Values.service.httpPort }}
+          {{- end }}
+    {{- end }}
+{{- end }}

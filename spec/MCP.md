@@ -1,0 +1,185 @@
+# MCP
+
+The Model Context Protocol port: what an AI client can do to this graph, and what it deliberately cannot.
+
+Design rationale for the query language is in [CYPHER.md](CYPHER.md); the security posture of every port is
+[OPERATIONS.md §9.1](OPERATIONS.md#91-the-network-which-has-the-same-posture-and-a-wider-blast-radius).
+
+---
+
+## 1. TL;DR
+
+```bash
+java -jar graph-server.jar --mcp --demo /tmp/demo      # loopback:8083, read-only
+npx @modelcontextprotocol/inspector                     # → http://127.0.0.1:8083/mcp/sse
+```
+
+| | |
+|---|---|
+| Port | **8083**, `--mcp-port=` / `GRAPH_MCP_PORT` |
+| Host | **127.0.0.1**, `--mcp-host=` / `GRAPH_MCP_HOST` |
+| On? | **No.** `--mcp` / `GRAPH_MCP_ENABLED=true` |
+| Transports | HTTP+SSE (`GET /mcp/sse`, `POST /mcp/message`) and WebSocket (`GET /mcp/ws`) |
+| Protocol revision | `2025-03-26` |
+| Writes | Only with the server's own `--allow-write` |
+
+---
+
+## 2. Why it is off by default when nothing else is
+
+Every other port here defaults to on, and this one does not. That is the single place this implementation
+deliberately diverges from MetaLoom's `loom-service-mcp`, which sits behind a token.
+
+There is no authentication anywhere in this process. For the HTTP and binary ports that means "anyone who can reach
+it can read everything", which is stated plainly and bounded by where you put it. MCP is different in kind: it is a
+remote code path an **LLM** drives, against a database, over a protocol whose whole purpose is to let a model decide
+what to run. The blast radius of leaving it open is not the same as for a port a person has to point a client at on
+purpose.
+
+So it is opt-in, and when it is on it binds loopback, and widening it is a second deliberate act.
+
+---
+
+## 3. Architecture
+
+```mermaid
+graph LR
+    CLIENT["MCP client<br/>(Claude, Inspector, …)"]
+    subgraph server["graph-server"]
+        SSE["McpServer<br/>:8083 — SSE + WebSocket"]
+        RPC["McpJsonRpcHandler<br/>initialize · tools/list · tools/call"]
+        REG["GraphMcpTools<br/>plain List registry"]
+        TOOLS["8 tools"]
+    end
+    ENGINE["Cypher → GraphStore"]
+
+    CLIENT <--> SSE --> RPC --> REG --> TOOLS --> ENGINE
+```
+
+**No MCP SDK.** JSON-RPC 2.0 is about two hundred lines and a dependency on a fast-moving SDK for that is a poor
+trade; MetaLoom's MCP service made the same call and this mirrors its shapes deliberately, so somebody who knows one
+knows the other.
+
+**No Dagger.** MetaLoom uses multibinding because tools are contributed from several Maven modules. Here they are all
+in one, so the registry is a `List`.
+
+**The transports share one handler.** A rule enforced in `McpJsonRpcHandler` cannot be missing from one transport,
+which is exactly the class of bug two parallel implementations produce.
+
+### 3.1 The h2c trap
+
+`McpServer` disables HTTP/2 clear text, and that line is load-bearing rather than tidy-minded.
+
+Vert.x enables h2c by default. **Server-Sent Events do not survive it**: measured against this server, `curl -sN`
+over HTTP/1.1 returns the endpoint event immediately, and the identical request with `--http2` returns **zero
+bytes** and hangs. `java.net.http` — what a JVM-based MCP client uses — attempts an h2c upgrade by default, so the
+symptom is a client that connects successfully, is told nothing, and waits forever, with no error anywhere to
+explain it. It cost most of an afternoon to find, because every layer reports success.
+
+`McpServerTest.testAnHttp2ClientStillGetsTheStream` is the guard: it drives an HTTP/2 client and asserts both that
+the event arrives and that the negotiated version came back as 1.1.
+
+---
+
+## 4. The tools
+
+| Tool | Writes | What it is for |
+|------|--------|----------------|
+| `graph_cypher_guide` | | The grammar this build implements, and what it does not |
+| `graph_schema` | | Labels, relationship types, property keys, with counts |
+| `graph_stats` | | Size and health: is a full scan affordable? |
+| `graph_list_databases` | | The databases under the root |
+| `graph_list_indexes` | | Which `(label, key)` pairs are a lookup rather than a scan |
+| `graph_query` | per query | Run Cypher, return rows |
+| `graph_create_index` | **yes** | Declare an index, optionally unique |
+| `graph_drop_index` | **yes** | Drop one. The data is untouched |
+
+### 4.1 `graph_cypher_guide` is the one that earns its place
+
+It looks like documentation and it is the highest-value tool here. A model that has seen Neo4j writes
+`OPTIONAL MATCH` within two turns. This engine refuses it at parse time — correctly — and the model is left with an
+error it cannot reason its way out of, so it tries a synonym, and then another. One call replaces that whole loop.
+
+The text is a packaged resource, `mcp/cypher-guide.md`, and `CypherGuideToolTest` checks it against
+[CYPHER.md](CYPHER.md) so that the guide and the parser cannot drift into disagreeing about what is supported. That
+failure would be worse than having no guide: the server would have told the model that something works.
+
+### 4.2 The row cap
+
+**An LLM context is not a result set.** `graph_query` stops at 200 rows by default, 1000 at most, enforced by
+returning `false` from the engine's own `RowSink` — so the scan actually stops rather than being truncated after it
+has already been paid for.
+
+The response carries `truncated` and, when true, a note saying what to do about it. A model told it saw everything
+when it did not will draw a conclusion from half an answer, which is a worse outcome than a refusal.
+
+### 4.3 What is not exposed, and why
+
+- **Creating or dropping a database.** Dropping already has its own flag, `--allow-drop`, separate from
+  `--allow-write` because it destroys a whole directory in one request and "enabling writes is not asking for that".
+  Handing that to a model is further still.
+- **`EXPLAIN`.** The grammar has none. Inventing one for MCP would be a query-language change made in the wrong
+  place; `graph_list_indexes` plus `graph_stats` answers the question it would be used for. Filed in
+  [TASKS.md](TASKS.md) if it is ever wanted properly.
+
+---
+
+## 5. The write gate, and why it is checked twice
+
+One rule — the server's own `--allow-write` — and two enforcement points:
+
+1. **`tools/list` omits write tools** on a read-only server. An agent should not be shown a capability it cannot
+   use, because it will spend turns trying.
+2. **`tools/call` re-checks before dispatch.** A call naming a tool remembered from an earlier session, against a
+   different server, must not work.
+
+Either alone is a hole: listing without dispatch checking trusts the client's memory; dispatch checking without
+listing wastes the model's time. `McpProtocolTest` asserts both.
+
+A refusal comes back as a **tool result with `isError`**, not as a JSON-RPC error, and its text names the flag and
+says *do not retry*. The distinction matters: a JSON-RPC error is a transport failure the model may reasonably retry,
+where this is a decision it should report to the user.
+
+`McpToolDescriptor.write` is **not serialised**. It is a server-side dispatch detail, and sending it would invite the
+model to argue about it.
+
+---
+
+## 6. Metrics
+
+`graph_mcp_tool_calls{tool,outcome}` — `ok`, `refused` or `error` — and `graph_mcp_sessions` as a gauge. Queries run
+through `graph_query` are recorded as `graph_queries{frontend="mcp"}`, so one dashboard covers all three front ends.
+See [METRICS.md](METRICS.md).
+
+---
+
+## 7. Client configuration
+
+```json
+{
+  "mcpServers": {
+    "metaloom-graph": {
+      "url": "http://127.0.0.1:8083/mcp/sse"
+    }
+  }
+}
+```
+
+There is no token to configure, because there is no authentication. If the port is reachable, so is everything in
+every database under the root.
+
+---
+
+## 8. What is not here
+
+- **No authentication.** Consistent with every other port, and the reason this one is off by default.
+- **No resources and no prompts.** Only `tools`. A `resources/list` over a graph would have to invent a URI scheme
+  for nodes, and nothing has asked for it.
+- **No streaming of a long result.** A tool result is one message. The row cap is what makes that acceptable; the
+  binary port ([WIRE.md](WIRE.md)) is the answer for a real result set.
+- **No `notifications/tools/list_changed`.** The tool set is fixed at start-up, since it depends only on
+  `--allow-write`.
+
+---
+
+_Last updated: 2026-08-16_

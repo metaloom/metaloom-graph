@@ -1,0 +1,17 @@
+# The build context is the repository root, and docker does NOT read .gitignore — so without this the
+# context includes /data, which is a real store and can be gigabytes, plus every node_modules tree.
+#
+# .containerignore is a byte-identical copy, because podman reads that name and docker reads this one.
+# Keep them in step.
+.git
+.github
+**/node_modules
+/data
+test-data
+spec
+website
+graph-core/native-rust-lib/target
+graph-server/src/main/frontend/test-results
+graph-server/src/main/frontend/playwright-report
+
+# NOT **/target: the jar and the native binary live there and are exactly what gets ADDed.
