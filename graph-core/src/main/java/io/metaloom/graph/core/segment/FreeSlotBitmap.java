@@ -1,5 +1,6 @@
 package io.metaloom.graph.core.segment;
 
+import io.metaloom.graph.core.txn.MetaJournal;
 import io.metaloom.graph.core.util.Layouts;
 
 /**
@@ -7,9 +8,32 @@ import io.metaloom.graph.core.util.Layouts;
  * are only a cache in front of it.
  * <p>
  * Access goes through {@link SegmentFile#readSlice}/{@link SegmentFile#writeSlice}, so bitmap changes made inside a
- * transaction land in the page overlay and are committed or discarded with everything else.
+ * transaction are committed or discarded with everything else.
+ *
+ * <h2>Three ways to read a word</h2>
+ *
+ * <p>
+ * A bitmap word is asked three different questions and they do not have the same answer:
+ * </p>
+ *
+ * <ul>
+ * <li><b>What does this transaction see?</b> — its snapshot's image of the word, with its own allocations and frees
+ * laid over it from the {@link MetaJournal}. This is what {@link #isAllocated} answers, and it is what makes a slot a
+ * concurrent transaction allocated correctly invisible.</li>
+ * <li><b>What is actually taken?</b> — the live mapping, ignoring both the snapshot and the journal. Only the allocator
+ * asks this, and it must: handing out a slot somebody else committed since this transaction began would put two records
+ * at one id, which is the worst corruption this engine can produce. See the {@code Live} methods below.</li>
+ * <li><b>What is durable?</b> — the mapping again, at commit time, which is where the journal is replayed.</li>
+ * </ul>
+ *
+ * <p>
+ * Writes never go straight to a word while a transaction is open. Sixty-four slots share one word, so two writers
+ * allocating adjacent slots write the same eight bytes from different starting images, and no byte-level merge of those
+ * is right. They go to the journal as set/clear masks and are folded into the live word at commit.
+ * </p>
  *
  * @see <a href="../../../../../../../../spec/FILE_FORMAT.md">spec/FILE_FORMAT.md</a> section 3.2
+ * @see <a href="../../../../../../../../spec/TRANSACTIONS.md">spec/TRANSACTIONS.md</a> section 6
  */
 public final class FreeSlotBitmap {
 
@@ -23,31 +47,57 @@ public final class FreeSlotBitmap {
 		this.slotCapacity = slotCapacity;
 	}
 
-	private long wordOffset(int slot) {
-		return base + (((long) slot >>> 6) << 3);
+	private long wordOffsetOf(int wordIndex) {
+		return base + ((long) wordIndex << 3);
 	}
 
-	private long readWord(int slot) {
-		return file.readSlice(wordOffset(slot), 8).get(Layouts.LONG, 0);
+	/** The word as the calling transaction sees it: its view, plus whatever it has allocated or freed itself. */
+	private long word(int wordIndex) {
+		long stored = file.readSlice(wordOffsetOf(wordIndex), 8).get(Layouts.LONG, 0);
+		MetaJournal journal = file.journal();
+		return journal == null ? stored : journal.bitmapWord(file.segmentKey(), wordIndex, stored);
 	}
 
-	private void writeWord(int slot, long value) {
-		file.writeSlice(wordOffset(slot), 8).set(Layouts.LONG, 0, value);
+	/** The word as it stands in the mapping, ignoring every transaction. The allocator's question. */
+	private long liveWord(int wordIndex) {
+		return file.mappedSlice(wordOffsetOf(wordIndex), 8).get(Layouts.LONG, 0);
+	}
+
+	private void writeWord(int wordIndex, long value) {
+		file.writeSlice(wordOffsetOf(wordIndex), 8).set(Layouts.LONG, 0, value);
 	}
 
 	public boolean isAllocated(int slot) {
 		checkSlot(slot);
-		return (readWord(slot) & (1L << (slot & 63))) != 0;
+		return (word(slot >>> 6) & (1L << (slot & 63))) != 0;
+	}
+
+	/** Whether the slot is taken according to the mapping, which is the only authority the allocator may use. */
+	public boolean isAllocatedLive(int slot) {
+		checkSlot(slot);
+		return (liveWord(slot >>> 6) & (1L << (slot & 63))) != 0;
 	}
 
 	public void allocate(int slot) {
 		checkSlot(slot);
-		writeWord(slot, readWord(slot) | (1L << (slot & 63)));
+		MetaJournal journal = file.journal();
+		if (journal != null) {
+			journal.bitmapSet(file.segmentKey(), slot);
+			return;
+		}
+		int wordIndex = slot >>> 6;
+		writeWord(wordIndex, word(wordIndex) | (1L << (slot & 63)));
 	}
 
 	public void free(int slot) {
 		checkSlot(slot);
-		writeWord(slot, readWord(slot) & ~(1L << (slot & 63)));
+		MetaJournal journal = file.journal();
+		if (journal != null) {
+			journal.bitmapClear(file.segmentKey(), slot);
+			return;
+		}
+		int wordIndex = slot >>> 6;
+		writeWord(wordIndex, word(wordIndex) & ~(1L << (slot & 63)));
 	}
 
 	/** Returns the first free slot at or after {@code from}, or -1. Scans 64 slots per step. */
@@ -63,11 +113,20 @@ public final class FreeSlotBitmap {
 	 * relocating a record.
 	 */
 	public int nextFree(int from, int limit) {
+		return nextFree(from, limit, false);
+	}
+
+	/** As {@link #nextFree(int, int)}, but over the live mapping. Only the allocator may use it. */
+	public int nextFreeLive(int from, int limit) {
+		return nextFree(from, limit, true);
+	}
+
+	private int nextFree(int from, int limit, boolean live) {
 		int end = Math.min(limit, slotCapacity);
 		for (int slot = Math.max(0, from); slot < end;) {
 			int wordIndex = slot >>> 6;
-			long word = readWord(slot);
-			long masked = ~word & (-1L << (slot & 63));
+			long value = live ? liveWord(wordIndex) : word(wordIndex);
+			long masked = ~value & (-1L << (slot & 63));
 			if (masked != 0) {
 				int candidate = (wordIndex << 6) + Long.numberOfTrailingZeros(masked);
 				return candidate < end ? candidate : -1;
@@ -87,10 +146,19 @@ public final class FreeSlotBitmap {
 
 	/** As {@link #nextFreeRun(int, int, int)} but bounded above by {@code limit}. */
 	public int nextFreeRun(int from, int limit, int length, int slotsPerPage) {
+		return nextFreeRun(from, limit, length, slotsPerPage, false);
+	}
+
+	/** As {@link #nextFreeRun(int, int, int, int)}, but over the live mapping. Only the allocator may use it. */
+	public int nextFreeRunLive(int from, int limit, int length, int slotsPerPage) {
+		return nextFreeRun(from, limit, length, slotsPerPage, true);
+	}
+
+	private int nextFreeRun(int from, int limit, int length, int slotsPerPage, boolean live) {
 		int end = Math.min(limit, slotCapacity);
 		int slot = Math.max(0, from);
 		while (slot + length <= end) {
-			int candidate = nextFree(slot, end);
+			int candidate = nextFree(slot, end, live);
 			if (candidate < 0) {
 				return -1;
 			}
@@ -102,7 +170,7 @@ public final class FreeSlotBitmap {
 			}
 			boolean ok = true;
 			for (int i = 1; i < length; i++) {
-				if (isAllocated(candidate + i)) {
+				if (live ? isAllocatedLive(candidate + i) : isAllocated(candidate + i)) {
 					ok = false;
 					slot = candidate + i + 1;
 					break;
@@ -125,12 +193,11 @@ public final class FreeSlotBitmap {
 		long count = 0;
 		int fullWords = end >>> 6;
 		for (int w = 0; w < fullWords; w++) {
-			count += Long.bitCount(file.readSlice(base + ((long) w << 3), 8).get(Layouts.LONG, 0));
+			count += Long.bitCount(word(w));
 		}
 		int tail = end & 63;
 		if (tail != 0) {
-			long word = file.readSlice(base + ((long) fullWords << 3), 8).get(Layouts.LONG, 0);
-			count += Long.bitCount(word & ((1L << tail) - 1));
+			count += Long.bitCount(word(fullWords) & ((1L << tail) - 1));
 		}
 		return count;
 	}
@@ -140,6 +207,15 @@ public final class FreeSlotBitmap {
 	 * pull the high water mark down once the live records have been relocated.
 	 */
 	public int highestAllocatedBelow(int limit) {
+		return highestAllocatedBelow(limit, false);
+	}
+
+	/** As {@link #highestAllocatedBelow(int)}, over the live mapping. Only the allocator may use it. */
+	public int highestAllocatedBelowLive(int limit) {
+		return highestAllocatedBelow(limit, true);
+	}
+
+	private int highestAllocatedBelow(int limit, boolean live) {
 		int end = Math.min(limit, slotCapacity);
 		if (end <= 0) {
 			return -1;
@@ -148,12 +224,12 @@ public final class FreeSlotBitmap {
 		int tail = end & 63;
 		long mask = tail == 0 ? -1L : (1L << tail) - 1;
 		for (int w = wordIndex; w >= 0; w--) {
-			long word = file.readSlice(base + ((long) w << 3), 8).get(Layouts.LONG, 0);
+			long value = live ? liveWord(w) : word(w);
 			if (w == wordIndex) {
-				word &= mask;
+				value &= mask;
 			}
-			if (word != 0) {
-				return (w << 6) + (63 - Long.numberOfLeadingZeros(word));
+			if (value != 0) {
+				return (w << 6) + (63 - Long.numberOfLeadingZeros(value));
 			}
 		}
 		return -1;

@@ -13,6 +13,7 @@ import io.metaloom.graph.core.api.VectorIndexDefinition;
 import io.metaloom.graph.core.api.VectorIndexState;
 import io.metaloom.graph.core.api.VectorMetric;
 import io.metaloom.graph.core.catalog.Catalog;
+import io.metaloom.graph.core.api.TransactionConflictException;
 import io.metaloom.graph.core.id.ElementId;
 import io.metaloom.graph.core.segment.SegmentSet;
 import io.metaloom.graph.core.util.Layouts;
@@ -104,15 +105,36 @@ public final class IndexCatalog {
 	private final Catalog catalog;
 	private final BTree tree;
 
-	private long catalogPageId = ElementId.NULL;
-
 	public IndexCatalog(SegmentSet segments, Catalog catalog) {
 		this.segments = segments;
 		this.catalog = catalog;
 		this.tree = new BTree(segments);
-		if (segments.segmentCount() > 0 && segments.isLive(firstSlotId())) {
-			catalogPageId = firstSlotId();
-		}
+	}
+
+	/**
+	 * The catalog page: remembered once it is committed, derived until then.
+	 *
+	 * <p>
+	 * It used to be a plain field, cleared and refreshed by {@link #initialised()} whenever it stopped resolving, so
+	 * that a rolled-back creation turned back into "there is no index yet" instead of a stale id. That is safe for one
+	 * writer and a hazard for several. The answer is <em>per transaction</em> — a page one writer has created but not
+	 * committed is live for it and absent for everybody else — so a field written from inside an uncommitted
+	 * transaction hands another thread an id it cannot resolve, and a field cleared by one thread leaves another
+	 * holding {@link ElementId#NULL} in the middle of a lookup.
+	 * </p>
+	 *
+	 * <p>
+	 * The rule that makes it safe is that only a <b>committed</b> id is ever published here — see
+	 * {@link SegmentSet#isLiveInMapping} — so the cache can never name something a concurrent reader cannot see. Until
+	 * then it stays null and the id is derived, which costs a generation read; caching matters because every indexed
+	 * lookup goes through the catalog and the read budgets count what a lookup touches.
+	 * </p>
+	 */
+	private volatile long catalogPageId = ElementId.NULL;
+
+	private long catalogPage() {
+		long cached = catalogPageId;
+		return ElementId.isNull(cached) ? firstSlotId() : cached;
 	}
 
 	private long firstSlotId() {
@@ -124,33 +146,46 @@ public final class IndexCatalog {
 	/**
 	 * Whether the catalog page exists and is readable.
 	 * <p>
-	 * {@code catalogPageId} is in-memory state, and {@link #ensureInitialised()} sets it inside a transaction that may
+	 * {@code catalogPage()} is in-memory state, and {@link #ensureInitialised()} sets it inside a transaction that may
 	 * then roll back — which frees the page underneath it and leaves the field naming a slot that is no longer
 	 * allocated. So the field is a hint, not an authority: it is re-derived from the segment whenever it does not
 	 * resolve, which turns "the index was created by a transaction that was discarded" back into "there is no index
 	 * yet" instead of a {@code StaleIdException} on the next lookup.
 	 */
 	private boolean initialised() {
-		if (!segments.isLive(catalogPageId)) {
-			catalogPageId = firstSlotId();
-			if (!segments.isLive(catalogPageId)) {
-				catalogPageId = ElementId.NULL;
+		if (segments.segmentCount() == 0) {
+			return false;
+		}
+		long id = catalogPage();
+		if (ElementId.isNull(id) || !segments.isLive(id)) {
+			// The cached id does not resolve for this transaction: either it was never committed, or this transaction
+			// is older than the commit that made it. Re-derive before giving up.
+			id = firstSlotId();
+			if (ElementId.isNull(id) || !segments.isLive(id)) {
 				return false;
 			}
 		}
-		return segments.resolve(catalogPageId).get(Layouts.LONG, OFF_MAGIC) == CATALOG_MAGIC;
+		if (segments.resolve(id).get(Layouts.LONG, OFF_MAGIC) != CATALOG_MAGIC) {
+			return false;
+		}
+		if (catalogPageId != id && segments.isLiveInMapping(id)) {
+			catalogPageId = id;
+		}
+		return true;
 	}
 
 	private void ensureInitialised() throws IOException {
 		if (initialised()) {
 			return;
 		}
-		long id = segments.allocate();
-		if (ElementId.slot(id) != 0 || ElementId.segment(id) != 0) {
-			throw new IllegalStateException("The index catalog page must be the first INDEX allocation, got "
-				+ ElementId.toString(id));
+		// Asked for by position rather than allocated and checked. The catalog has to be at INDEX (0, 0) because that
+		// is where a reopen looks for it, and a null answer means another transaction is building it right now or has
+		// already built it since this one's snapshot — a race this transaction has lost, not a broken invariant.
+		long id = segments.allocateAt(0, 0);
+		if (ElementId.isNull(id)) {
+			throw new TransactionConflictException(0,
+				"the index catalog page at INDEX (0, 0) is being created by another transaction");
 		}
-		catalogPageId = id;
 		MemorySegment page = segments.mutable(id);
 		page.set(Layouts.LONG, OFF_MAGIC, CATALOG_MAGIC);
 		page.set(Layouts.LONG, OFF_LABEL_ROOT, tree.create());
@@ -159,21 +194,21 @@ public final class IndexCatalog {
 	}
 
 	private long labelRoot() {
-		return segments.resolve(catalogPageId).get(Layouts.LONG, OFF_LABEL_ROOT);
+		return segments.resolve(catalogPage()).get(Layouts.LONG, OFF_LABEL_ROOT);
 	}
 
 	private void labelRoot(long rootId) {
-		segments.mutable(catalogPageId).set(Layouts.LONG, OFF_LABEL_ROOT, rootId);
-		segments.touched(catalogPageId);
+		segments.mutable(catalogPage()).set(Layouts.LONG, OFF_LABEL_ROOT, rootId);
+		segments.touched(catalogPage());
 	}
 
 	private long propRoot() {
-		return segments.resolve(catalogPageId).get(Layouts.LONG, OFF_PROP_ROOT);
+		return segments.resolve(catalogPage()).get(Layouts.LONG, OFF_PROP_ROOT);
 	}
 
 	private void propRoot(long rootId) {
-		segments.mutable(catalogPageId).set(Layouts.LONG, OFF_PROP_ROOT, rootId);
-		segments.touched(catalogPageId);
+		segments.mutable(catalogPage()).set(Layouts.LONG, OFF_PROP_ROOT, rootId);
+		segments.touched(catalogPage());
 	}
 
 	// ---------------------------------------------------------------- unique constraints
@@ -197,17 +232,17 @@ public final class IndexCatalog {
 			throw new IllegalStateException("At most " + MAX_UNIQUE_KEYS + " unique constraints are supported");
 		}
 		int count = existing.length;
-		MemorySegment page = segments.mutable(catalogPageId);
+		MemorySegment page = segments.mutable(catalogPage());
 		page.set(Layouts.INT, OFF_UNIQUE_KEYS + 4L * count, keyId);
 		page.set(Layouts.INT, OFF_UNIQUE_COUNT, count + 1);
-		segments.touched(catalogPageId);
+		segments.touched(catalogPage());
 	}
 
 	public int[] uniqueKeys() {
 		if (!initialised()) {
 			return new int[0];
 		}
-		MemorySegment page = segments.resolve(catalogPageId);
+		MemorySegment page = segments.resolve(catalogPage());
 		int count = page.get(Layouts.INT, OFF_UNIQUE_COUNT);
 		if (count < 0 || count > MAX_UNIQUE_KEYS) {
 			throw new io.metaloom.graph.core.api.PageCorruptException(
@@ -260,12 +295,12 @@ public final class IndexCatalog {
 	}
 
 	private long compositeRoot() {
-		return segments.resolve(catalogPageId).get(Layouts.LONG, OFF_COMPOSITE_ROOT);
+		return segments.resolve(catalogPage()).get(Layouts.LONG, OFF_COMPOSITE_ROOT);
 	}
 
 	private void compositeRoot(long rootId) {
-		segments.mutable(catalogPageId).set(Layouts.LONG, OFF_COMPOSITE_ROOT, rootId);
-		segments.touched(catalogPageId);
+		segments.mutable(catalogPage()).set(Layouts.LONG, OFF_COMPOSITE_ROOT, rootId);
+		segments.touched(catalogPage());
 	}
 
 	/**
@@ -292,10 +327,10 @@ public final class IndexCatalog {
 			Composite declared = existing.get(i);
 			if (declared.labelId() == labelId && declared.keyId() == keyId) {
 				if (unique && !declared.unique()) {
-					MemorySegment page = segments.mutable(catalogPageId);
+					MemorySegment page = segments.mutable(catalogPage());
 					page.set(Layouts.BYTE, OFF_COMPOSITE_ENTRIES + (long) i * COMPOSITE_ENTRY_BYTES + CI_FLAGS,
 						(byte) CI_FLAG_UNIQUE);
-					segments.touched(catalogPageId);
+					segments.touched(catalogPage());
 				}
 				return false;
 			}
@@ -308,13 +343,13 @@ public final class IndexCatalog {
 		if (ElementId.isNull(compositeRoot())) {
 			compositeRoot(tree.create());
 		}
-		MemorySegment page = segments.mutable(catalogPageId);
+		MemorySegment page = segments.mutable(catalogPage());
 		long base = OFF_COMPOSITE_ENTRIES + (long) existing.size() * COMPOSITE_ENTRY_BYTES;
 		page.set(Layouts.INT, base + CI_LABEL_ID, labelId);
 		page.set(Layouts.INT, base + CI_KEY_ID, keyId);
 		page.set(Layouts.BYTE, base + CI_FLAGS, (byte) (unique ? CI_FLAG_UNIQUE : 0));
 		page.set(Layouts.INT, OFF_COMPOSITE_COUNT, existing.size() + 1);
-		segments.touched(catalogPageId);
+		segments.touched(catalogPage());
 		return true;
 	}
 
@@ -350,7 +385,7 @@ public final class IndexCatalog {
 		if (at < 0) {
 			return false;
 		}
-		MemorySegment page = segments.mutable(catalogPageId);
+		MemorySegment page = segments.mutable(catalogPage());
 		int last = existing.size() - 1;
 		for (int i = at; i < last; i++) {
 			Composite moved = existing.get(i + 1);
@@ -362,7 +397,7 @@ public final class IndexCatalog {
 		page.asSlice(OFF_COMPOSITE_ENTRIES + (long) last * COMPOSITE_ENTRY_BYTES, COMPOSITE_ENTRY_BYTES)
 			.fill((byte) 0);
 		page.set(Layouts.INT, OFF_COMPOSITE_COUNT, last);
-		segments.touched(catalogPageId);
+		segments.touched(catalogPage());
 		if (last == 0 && !ElementId.isNull(compositeRoot())) {
 			for (long pageId : tree.pages(compositeRoot())) {
 				segments.free(pageId);
@@ -388,7 +423,7 @@ public final class IndexCatalog {
 		if (!initialised()) {
 			return List.of();
 		}
-		MemorySegment page = segments.resolve(catalogPageId);
+		MemorySegment page = segments.resolve(catalogPage());
 		int count = page.get(Layouts.INT, OFF_COMPOSITE_COUNT);
 		if (count == 0) {
 			return List.of();
@@ -530,7 +565,7 @@ public final class IndexCatalog {
 			}
 			ord = existing.size();
 		}
-		MemorySegment page = segments.mutable(catalogPageId);
+		MemorySegment page = segments.mutable(catalogPage());
 		long base = OFF_VECTOR_ENTRIES + (long) ord * VECTOR_ENTRY_BYTES;
 		page.set(Layouts.INT, base + VI_LABEL_ID, labelId);
 		page.set(Layouts.INT, base + VI_KEY_ID, keyId);
@@ -546,7 +581,7 @@ public final class IndexCatalog {
 		if (ord >= existing.size()) {
 			page.set(Layouts.INT, OFF_VECTOR_COUNT, ord + 1);
 		}
-		segments.touched(catalogPageId);
+		segments.touched(catalogPage());
 		return ord;
 	}
 
@@ -560,7 +595,7 @@ public final class IndexCatalog {
 		if (!initialised()) {
 			return List.of();
 		}
-		MemorySegment page = segments.resolve(catalogPageId);
+		MemorySegment page = segments.resolve(catalogPage());
 		int count = page.get(Layouts.INT, OFF_VECTOR_COUNT);
 		if (count < 0 || count > MAX_VECTOR_INDEXES) {
 			throw new io.metaloom.graph.core.api.PageCorruptException("The index catalog declares " + count
@@ -613,55 +648,55 @@ public final class IndexCatalog {
 	/** Moves a declaration into a new state, which is how a finished build becomes queryable. */
 	public void vectorIndexState(int ord, VectorIndexState state) {
 		requireDeclared(ord);
-		MemorySegment page = segments.mutable(catalogPageId);
+		MemorySegment page = segments.mutable(catalogPage());
 		page.set(Layouts.BYTE, OFF_VECTOR_ENTRIES + (long) ord * VECTOR_ENTRY_BYTES + VI_STATE,
 			(byte) (state.ordinal() + 1));
-		segments.touched(catalogPageId);
+		segments.touched(catalogPage());
 	}
 
 	/** The ANN graph's entry point, and the highest layer it appears in. Null until the first member is linked. */
 	public long vectorEntryPoint(int ord) {
 		requireDeclared(ord);
-		return segments.resolve(catalogPageId)
+		return segments.resolve(catalogPage())
 			.get(Layouts.LONG, OFF_VECTOR_ENTRIES + (long) ord * VECTOR_ENTRY_BYTES + VI_ENTRY_POINT);
 	}
 
 	public int vectorMaxLevel(int ord) {
 		requireDeclared(ord);
-		return segments.resolve(catalogPageId)
+		return segments.resolve(catalogPage())
 			.get(Layouts.INT, OFF_VECTOR_ENTRIES + (long) ord * VECTOR_ENTRY_BYTES + VI_MAX_LEVEL);
 	}
 
 	public void vectorEntryPoint(int ord, long vectorId, int maxLevel) {
 		requireDeclared(ord);
 		long base = OFF_VECTOR_ENTRIES + (long) ord * VECTOR_ENTRY_BYTES;
-		MemorySegment page = segments.mutable(catalogPageId);
+		MemorySegment page = segments.mutable(catalogPage());
 		page.set(Layouts.LONG, base + VI_ENTRY_POINT, vectorId);
 		page.set(Layouts.INT, base + VI_MAX_LEVEL, maxLevel);
-		segments.touched(catalogPageId);
+		segments.touched(catalogPage());
 	}
 
 	/** How many members the build has linked so far, so a BUILDING index can report progress rather than a shrug. */
 	public long vectorBuiltCount(int ord) {
 		requireDeclared(ord);
-		return segments.resolve(catalogPageId)
+		return segments.resolve(catalogPage())
 			.get(Layouts.LONG, OFF_VECTOR_ENTRIES + (long) ord * VECTOR_ENTRY_BYTES + VI_BUILT_COUNT);
 	}
 
 	public void vectorBuiltCount(int ord, long built) {
 		requireDeclared(ord);
-		segments.mutable(catalogPageId)
+		segments.mutable(catalogPage())
 			.set(Layouts.LONG, OFF_VECTOR_ENTRIES + (long) ord * VECTOR_ENTRY_BYTES + VI_BUILT_COUNT, built);
-		segments.touched(catalogPageId);
+		segments.touched(catalogPage());
 	}
 
 	/** Clears a declaration. The slot is left in place so no other index's ordinal changes. */
 	public void removeVectorIndex(int ord) {
 		requireDeclared(ord);
-		MemorySegment page = segments.mutable(catalogPageId);
+		MemorySegment page = segments.mutable(catalogPage());
 		long base = OFF_VECTOR_ENTRIES + (long) ord * VECTOR_ENTRY_BYTES;
 		page.asSlice(base, VECTOR_ENTRY_BYTES).fill((byte) 0);
-		segments.touched(catalogPageId);
+		segments.touched(catalogPage());
 	}
 
 	private void requireDeclared(int ord) {

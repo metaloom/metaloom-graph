@@ -167,7 +167,7 @@ public final class Compactor {
 				// way through calls flushChecksums(), which clears the dirty-page marks that writer has set,
 				// leaving its pages with stale checksums. Both were reproduced as an intermittent failure.
 				int[] punched = new int[1];
-				runner.runWrite(() -> punched[0] = set.reclaim());
+				runner.runExclusive(() -> punched[0] = set.reclaim());
 				result.pagesPunched += punched[0];
 			}
 		}
@@ -177,7 +177,7 @@ public final class Compactor {
 				continue;
 			}
 			long[] reclaimed = new long[1];
-			runner.runWrite(() -> reclaimed[0] = set.shrinkHighWater());
+			runner.runExclusive(() -> reclaimed[0] = set.shrinkHighWater());
 			result.slotsReclaimed += reclaimed[0];
 			result.batches++;
 		}
@@ -190,7 +190,7 @@ public final class Compactor {
 				if (set != null) {
 					// Unlinking a file takes its mapping with it, so no foreground writer may be inside one.
 					int[] retired = new int[1];
-					runner.runWrite(() -> retired[0] = set.retireEmptySegments());
+					runner.runExclusive(() -> retired[0] = set.retireEmptySegments());
 					result.segmentsRetired += retired[0];
 				}
 			}
@@ -220,7 +220,7 @@ public final class Compactor {
 				break;
 			}
 			long[] moved = new long[1];
-			runner.runWrite(() -> moved[0] = relocateBatch(kind, slice, exhausted));
+			runner.runExclusive(() -> moved[0] = relocateBatch(kind, slice, exhausted));
 			result.batches++;
 			result.relocated(kind, moved[0]);
 			pause(options);
@@ -589,7 +589,7 @@ public final class Compactor {
 		for (int index = 0; index < pending.size(); index += batch) {
 			List<Long> slice = pending.subList(index, Math.min(index + batch, pending.size()));
 			long[] freedHere = new long[1];
-			runner.runWrite(() -> {
+			runner.runExclusive(() -> {
 				for (long nodeId : slice) {
 					if (sets.get(Kind.NODE).isLive(nodeId)) {
 						freedHere[0] += adjacency.defragment(nodeId);
@@ -635,7 +635,7 @@ public final class Compactor {
 	 */
 	private void rebuildIndexes(Result result) throws IOException {
 		long[] freed = new long[1];
-		runner.runWrite(() -> {
+		runner.runExclusive(() -> {
 			freed[0] = indexes.resetTrees();
 			for (long nodeId : sets.get(Kind.NODE).liveIds()) {
 				indexes.onNodeCreated(nodeId, nodes.labels(nodeId), properties.read(nodes.propBlockId(nodeId)));

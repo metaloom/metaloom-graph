@@ -1,5 +1,6 @@
 package io.metaloom.graph.core.segment;
 
+import io.metaloom.graph.core.txn.MetaJournal;
 import io.metaloom.graph.core.util.Layouts;
 
 /**
@@ -61,38 +62,83 @@ public final class PageMetadataArray {
 		return base + (long) page * ENTRY_BYTES + field;
 	}
 
+	/**
+	 * The journal this page metadata is currently being written through, or null when writes go straight to the page.
+	 *
+	 * <p>
+	 * Null outside a transaction — recovery, checkpointing, verification — and null again during the commit's replay,
+	 * which is what makes the same methods perform the operations they queued.
+	 * </p>
+	 */
+	private MetaJournal journal() {
+		return file.journal();
+	}
+
 	public long lsn(int page) {
-		return file.readSlice(offset(page, OFF_LSN), 8).get(Layouts.LONG, 0);
+		long stored = file.readSlice(offset(page, OFF_LSN), 8).get(Layouts.LONG, 0);
+		MetaJournal journal = journal();
+		return journal == null ? stored : journal.pageLsnOver(file.segmentKey(), page, stored);
 	}
 
 	public void lsn(int page, long lsn) {
+		MetaJournal journal = journal();
+		if (journal != null) {
+			journal.pageLsn(file.segmentKey(), page, lsn);
+			return;
+		}
 		file.writeSlice(offset(page, OFF_LSN), 8).set(Layouts.LONG, 0, lsn);
 	}
 
 	public long epoch(int page) {
-		return file.readSlice(offset(page, OFF_EPOCH), 8).get(Layouts.LONG, 0);
+		long stored = file.readSlice(offset(page, OFF_EPOCH), 8).get(Layouts.LONG, 0);
+		MetaJournal journal = journal();
+		return journal == null ? stored : journal.pageEpochOver(file.segmentKey(), page, stored);
 	}
 
 	/** Bumped by every writer before and after it mutates the page; readers use it for optimistic reads. */
 	public void bumpEpoch(int page) {
+		MetaJournal journal = journal();
+		if (journal != null) {
+			journal.pageEpochBump(file.segmentKey(), page);
+			return;
+		}
+		bumpEpoch(page, 1);
+	}
+
+	/** Adds several bumps at once. The commit replay uses it to fold a transaction's worth into one write. */
+	public void bumpEpoch(int page, long times) {
 		long off = offset(page, OFF_EPOCH);
 		long value = file.readSlice(off, 8).get(Layouts.LONG, 0);
-		file.writeSlice(off, 8).set(Layouts.LONG, 0, value + 1);
+		file.writeSlice(off, 8).set(Layouts.LONG, 0, value + times);
 	}
 
 	public int checksum(int page) {
-		return file.readSlice(offset(page, OFF_CHECKSUM), 4).get(Layouts.INT, 0);
+		int stored = file.readSlice(offset(page, OFF_CHECKSUM), 4).get(Layouts.INT, 0);
+		MetaJournal journal = journal();
+		return journal == null ? stored : journal.pageChecksumOver(file.segmentKey(), page, stored);
 	}
 
 	public void checksum(int page, int value) {
+		MetaJournal journal = journal();
+		if (journal != null) {
+			journal.pageChecksum(file.segmentKey(), page, value);
+			return;
+		}
 		file.writeSlice(offset(page, OFF_CHECKSUM), 4).set(Layouts.INT, 0, value);
 	}
 
 	public int liveCount(int page) {
-		return Short.toUnsignedInt(file.readSlice(offset(page, OFF_LIVE_COUNT), 2).get(Layouts.SHORT, 0));
+		int stored = Short.toUnsignedInt(file.readSlice(offset(page, OFF_LIVE_COUNT), 2).get(Layouts.SHORT, 0));
+		MetaJournal journal = journal();
+		return journal == null ? stored : journal.pageLiveCountOver(file.segmentKey(), page, stored);
 	}
 
 	public void liveCountDelta(int page, int delta) {
+		MetaJournal journal = journal();
+		if (journal != null) {
+			journal.pageLiveCountDelta(file.segmentKey(), page, delta);
+			return;
+		}
 		long off = offset(page, OFF_LIVE_COUNT);
 		int value = Short.toUnsignedInt(file.readSlice(off, 2).get(Layouts.SHORT, 0)) + delta;
 		if (value < 0) {
@@ -102,18 +148,32 @@ public final class PageMetadataArray {
 	}
 
 	public int flags(int page) {
-		return Short.toUnsignedInt(file.readSlice(offset(page, OFF_FLAGS), 2).get(Layouts.SHORT, 0));
+		int stored = Short.toUnsignedInt(file.readSlice(offset(page, OFF_FLAGS), 2).get(Layouts.SHORT, 0));
+		MetaJournal journal = journal();
+		return journal == null ? stored : journal.pageFlagsOver(file.segmentKey(), page, stored);
 	}
 
 	public void flags(int page, int value) {
+		MetaJournal journal = journal();
+		if (journal != null) {
+			journal.pageFlags(file.segmentKey(), page, value);
+			return;
+		}
 		file.writeSlice(offset(page, OFF_FLAGS), 2).set(Layouts.SHORT, 0, (short) value);
 	}
 
 	public int freeHint(int page) {
-		return file.readSlice(offset(page, OFF_FREE_HINT), 4).get(Layouts.INT, 0);
+		int stored = file.readSlice(offset(page, OFF_FREE_HINT), 4).get(Layouts.INT, 0);
+		MetaJournal journal = journal();
+		return journal == null ? stored : journal.pageFreeHintOver(file.segmentKey(), page, stored);
 	}
 
 	public void freeHint(int page, int value) {
+		MetaJournal journal = journal();
+		if (journal != null) {
+			journal.pageFreeHint(file.segmentKey(), page, value);
+			return;
+		}
 		file.writeSlice(offset(page, OFF_FREE_HINT), 4).set(Layouts.INT, 0, value);
 	}
 
@@ -126,23 +186,21 @@ public final class PageMetadataArray {
 	 * </p>
 	 */
 	public int genFloor(int page) {
-		return Short.toUnsignedInt(file.readSlice(offset(page, OFF_GEN_FLOOR), 2).get(Layouts.SHORT, 0));
+		int stored = Short.toUnsignedInt(file.readSlice(offset(page, OFF_GEN_FLOOR), 2).get(Layouts.SHORT, 0));
+		MetaJournal journal = journal();
+		return journal == null ? stored : journal.pageGenFloorOver(file.segmentKey(), page, stored);
 	}
 
-	/**
-	 * Raises the floor, never lowers it.
-	 *
-	 * <p>
-	 * Monotonic because a page can be punched more than once, and because a page punched twice may hold slots that
-	 * were reused in between and slots that were not. Taking the maximum of the old floor and what the records say is
-	 * the only rule that covers both: the reused slots carry their real counters, and the untouched ones carry the
-	 * zeros the first punch left, whose history lives only here.
-	 * </p>
-	 */
 	public void raiseGenFloor(int page, int value) {
 		int capped = Math.min(value, 0xFFFF);
-		if (capped > genFloor(page)) {
-			file.writeSlice(offset(page, OFF_GEN_FLOOR), 2).set(Layouts.SHORT, 0, (short) capped);
+		if (capped <= genFloor(page)) {
+			return;
 		}
+		MetaJournal journal = journal();
+		if (journal != null) {
+			journal.pageGenFloor(file.segmentKey(), page, capped);
+			return;
+		}
+		file.writeSlice(offset(page, OFF_GEN_FLOOR), 2).set(Layouts.SHORT, 0, (short) capped);
 	}
 }

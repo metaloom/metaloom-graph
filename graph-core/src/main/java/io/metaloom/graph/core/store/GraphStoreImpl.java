@@ -11,12 +11,15 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.EnumMap;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.concurrent.locks.StampedLock;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
@@ -42,6 +45,7 @@ import io.metaloom.graph.core.api.ScanOptions;
 import io.metaloom.graph.core.api.ReadTransaction;
 import io.metaloom.graph.core.api.SnapshotStats;
 import io.metaloom.graph.core.api.SnapshotTooOldException;
+import io.metaloom.graph.core.api.TransactionConflictException;
 import io.metaloom.graph.core.api.StoreClosedException;
 import io.metaloom.graph.core.api.StoreMetrics;
 import io.metaloom.graph.core.api.StoreStats;
@@ -61,11 +65,14 @@ import io.metaloom.graph.core.maintenance.Compactor;
 import io.metaloom.graph.core.maintenance.MaintenanceRunner;
 import io.metaloom.graph.core.metrics.IoCounters;
 import io.metaloom.graph.core.nativelib.NativeLib;
-import io.metaloom.graph.core.page.OverlayHolder;
+import io.metaloom.graph.core.txn.MetaJournal;
+import io.metaloom.graph.core.txn.WriteContext;
+import io.metaloom.graph.core.txn.WriteContextHolder;
 import io.metaloom.graph.core.page.PageOverlay;
 import io.metaloom.graph.core.segment.Geometry;
 import io.metaloom.graph.core.segment.SegmentFile;
 import io.metaloom.graph.core.segment.SegmentSet;
+import io.metaloom.graph.core.segment.Superblock;
 import io.metaloom.graph.core.store.adj.AdjacencyStore;
 import io.metaloom.graph.core.store.adj.PackedEdge;
 import io.metaloom.graph.core.store.blob.BlobStore;
@@ -85,7 +92,8 @@ import io.metaloom.graph.core.wal.WalManager;
  *
  * @see <a href="../../../../../../../../spec/ARCHITECTURE.md">spec/ARCHITECTURE.md</a>
  */
-public final class GraphStoreImpl implements GraphStore, TransactionImpl.Completion, MaintenanceRunner {
+public final class GraphStoreImpl implements GraphStore, TransactionImpl.Completion, MaintenanceRunner,
+	MetaJournal.Target {
 
 	private static final Logger logger = LoggerFactory.getLogger(GraphStoreImpl.class);
 
@@ -107,15 +115,48 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	/** Null unless the store has vector storage. The ANN structure over the vector records. */
 	private final HnswIndex hnsw;
 	private final WalManager wal;
-	private final OverlayHolder overlays = new OverlayHolder();
+	private final WriteContextHolder contexts = new WriteContextHolder();
 	private final TransactionManager transactions;
 	private final IoCounters counters;
 
 	private final FileChannel lockChannel;
 	private final FileLock lock;
 
-	/** One writer at a time. Readers never take it. */
-	private final ReentrantLock writerLock = new ReentrantLock();
+	/**
+	 * Writers hold this shared for the length of a transaction; maintenance takes it exclusively.
+	 *
+	 * <p>
+	 * It is what replaced the single writer lock, and the change of shape is the change of design. The old lock made a
+	 * transaction the unit of mutual exclusion between writers, which is what {@code TRANSACTIONS.md §6} could
+	 * correctly say left nothing for conflict detection to detect. This one excludes nobody from anybody except the
+	 * operations that genuinely cannot run beside a writer — {@code verify}, {@code checkpoint}, {@code reclaim},
+	 * compaction, {@code close} — each of which reaches past the transaction mechanism rather than through it.
+	 * </p>
+	 *
+	 * <p>
+	 * Not fair, but a queued exclusive acquisition does block new shared ones, which is what stops a stream of short
+	 * writers starving a checkpoint forever. Reentrant in the direction maintenance needs: a compaction batch holds it
+	 * exclusively and then opens a transaction, which takes it shared, and {@link ReentrantReadWriteLock} permits that
+	 * downgrade.
+	 * </p>
+	 */
+	private final ReentrantReadWriteLock writeGate = new ReentrantReadWriteLock();
+
+	/**
+	 * The commit point, and the only thing about a write transaction that is still serialised.
+	 *
+	 * <p>
+	 * Held across four steps that have to be one instant: folding the transaction's metadata journal onto the live
+	 * state, validating its write set against what has committed since it began, appending its redo records, and
+	 * copying them into the mapping. Validation and the append in particular cannot be separated — a conflict decided
+	 * against one LSN and logged against another is a conflict check that proves nothing.
+	 * </p>
+	 */
+	private final ReentrantLock commitLock = new ReentrantLock();
+
+	/** How many times an auto-commit mutation re-runs itself after losing a conflict. See {@link #write}. */
+	private static final int AUTO_COMMIT_ATTEMPTS = 64;
+
 	/**
 	 * Held for writing only while a commit copies its pages into the mapping, so a reader never observes half of a
 	 * commit.
@@ -128,7 +169,16 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	 */
 	private final StampedLock applyLock = new StampedLock();
 
-	private TransactionImpl currentTransaction;
+	/**
+	 * The write transaction running on each thread, if any.
+	 *
+	 * <p>
+	 * One field sufficed while one writer at a time held a lock; with several in flight the question "is there a write
+	 * transaction" only has an answer per thread. Removed rather than nulled when a transaction ends, so a pooled
+	 * thread does not carry a dead handle into its next task.
+	 * </p>
+	 */
+	private final ThreadLocal<TransactionImpl> currentTransaction = new ThreadLocal<>();
 
 	/**
 	 * The LSN of the newest commit whose pages are in the mapping, which is what a new read view is fixed at.
@@ -138,8 +188,8 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	 */
 	private volatile long appliedLsn;
 
-	private long nextTxnId;
-	private long lastCheckpointLsn;
+	private final AtomicLong nextTxnId = new AtomicLong();
+	private volatile long lastCheckpointLsn;
 	/**
 	 * Volatile because {@code checkOpen()} reads it on every operation from every thread, while {@code close()} writes
 	 * it under the writer lock — which readers never take. In practice the surrounding lock traffic publishes it, and
@@ -162,7 +212,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		this.wal = wal;
 		this.lockChannel = lockChannel;
 		this.lock = lock;
-		this.nextTxnId = manifest.nextTxnId();
+		this.nextTxnId.set(manifest.nextTxnId());
 		// Everything the log had is already in the mapping by the time the store is constructed — recovery ran first.
 		// A view opened before the first commit of this session must therefore be fixed here, not at zero, or it would
 		// consider every page it reads to predate it.
@@ -180,7 +230,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		this.hnsw = vectors == null ? null : new HnswIndex(vectors, indexes);
 
 		for (SegmentSet set : segmentSets.values()) {
-			set.overlays(overlays);
+			set.writeContexts(contexts);
 			set.snapshots(transactions.holder());
 			set.counters(counters);
 		}
@@ -284,27 +334,70 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 	@Override
 	public Transaction begin() {
+		return begin(IsolationLevel.SNAPSHOT);
+	}
+
+	@Override
+	public Transaction begin(IsolationLevel level) {
 		checkOpen();
-		// Refused rather than allowed to nest. The writer lock is reentrant, so nesting used to succeed and then lose
-		// data silently: the inner transaction publishes its own overlay, and committing it clears that overlay while
-		// the outer transaction is still live, after which every remaining write in the outer transaction goes straight
-		// to the mapping — unlogged, and past the point where a rollback could take it back. A caller that wants to join
-		// an existing transaction asks with hasWriteTransaction() and simply does not call begin().
-		if (writerLock.isHeldByCurrentThread() && currentTransaction != null) {
-			throw new GraphStoreException("A write transaction (id " + currentTransaction.id()
+		if (level == IsolationLevel.READ_COMMITTED) {
+			// A write transaction cannot read the live mapping and still be a transaction. Its own writes are in its
+			// overlay, but everything else would move underneath it between one statement and the next, and it would
+			// then decide what to write from a state that no longer holds — which is the lost update the whole design
+			// is built to make impossible. Refused rather than silently upgraded, so a caller asking for it finds out.
+			throw new IllegalArgumentException("A write transaction cannot run at READ_COMMITTED; use SNAPSHOT, or"
+				+ " SERIALIZABLE if what it reads must be validated too. READ_COMMITTED is a read-view level.");
+		}
+		// Refused rather than allowed to nest. Nesting used to succeed and then lose data silently: the inner
+		// transaction publishes its own overlay, and committing it clears that overlay while the outer transaction is
+		// still live, after which every remaining write in the outer transaction goes straight to the mapping —
+		// unlogged, and past the point where a rollback could take it back. A caller that wants to join an existing
+		// transaction asks with hasWriteTransaction() and simply does not call begin().
+		TransactionImpl open = currentTransaction.get();
+		if (open != null) {
+			throw new GraphStoreException("A write transaction (id " + open.id()
 				+ ") is already open on thread '" + Thread.currentThread().getName()
 				+ "'. Nested write transactions are not supported: commit or roll back the open one first, or test"
 				+ " hasWriteTransaction() and join it instead of beginning another.");
 		}
-		writerLock.lock();
+		// Shared, for the length of the transaction. It excludes maintenance, not other writers.
+		writeGate.readLock().lock();
 		try {
-			TransactionImpl txn = new TransactionImpl(nextTxnId++, geometry.pageSize(), this);
-			overlays.set(txn.overlay());
-			currentTransaction = txn;
+			checkOpen();
+			// Under the apply read latch so that the LSN and the registration land together, exactly as beginRead()
+			// must: a commit slipping between them would fix the writer at an LSN whose before-images — the input to
+			// its own conflict detection — nobody was asked to keep.
+			Snapshot snapshot;
+			long stamp = applyLock.readLock();
+			try {
+				snapshot = transactions.beginWrite(level, appliedLsn, System.nanoTime());
+			} finally {
+				applyLock.unlockRead(stamp);
+			}
+			snapshot.guard(this::underApplyReadLock);
+			TransactionImpl txn = new TransactionImpl(nextTxnId.getAndIncrement(), geometry.pageSize(), snapshot, level,
+				this);
+			contexts.set(txn.context());
+			currentTransaction.set(txn);
 			return txn;
 		} catch (RuntimeException e) {
-			writerLock.unlock();
+			writeGate.readLock().unlock();
 			throw e;
+		}
+	}
+
+	/**
+	 * Runs a page reconstruction with the apply step excluded, for a writer that has no outer frame to retry in.
+	 *
+	 * @see Snapshot.ExclusionGuard
+	 */
+	private java.lang.foreign.MemorySegment underApplyReadLock(
+		java.util.function.Supplier<java.lang.foreign.MemorySegment> work) {
+		long stamp = applyLock.readLock();
+		try {
+			return work.get();
+		} finally {
+			applyLock.unlockRead(stamp);
 		}
 	}
 
@@ -349,10 +442,138 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		T run() throws IOException;
 	}
 
+	/**
+	 * The commit point.
+	 *
+	 * <p>
+	 * Five steps under one lock, in an order that is not negotiable. The journal is folded first, because until it is
+	 * the transaction's allocations and counter moves are not expressed as bytes at all and there is nothing to log.
+	 * Validation comes next, against the version chains as they stand at that instant. Then the dictionary, because
+	 * ids interned by this transaction are embedded in the records it is about to make durable. Then the log and the
+	 * fsync, which is the barrier. Only then the mapping.
+	 * </p>
+	 *
+	 * <p>
+	 * Validating before logging rather than after is what makes a conflict cost nothing: a refused transaction has
+	 * written no log record and touched no data file, so it is over the instant it is refused.
+	 * </p>
+	 */
 	private long commitInternal(TransactionImpl txn) throws IOException {
+		WriteContext context = txn.context();
+		boolean committed = false;
 		try {
-			// Counters live in the segment headers; flushing them inside the transaction makes them part of the
-			// atomic unit rather than a separate, unlogged write.
+			commitLock.lock();
+			try {
+				// The data pages first, and validation before anything else is touched. Folding first and validating
+				// afterwards was wrong in a way that took a while to see: the fold moves the shared superblock
+				// counters, so a conflict raised after it left the live count advanced over a bitmap whose bits were
+				// then discarded with the overlay — verify() reporting an accounting mismatch on a store where nothing
+				// had gone wrong except a transaction losing a race.
+				List<WalManager.PageDiff> diffs = diffPages(context, false);
+				validate(txn, context, diffs);
+
+				Map<Long, long[]> headers = captureHeaders(context);
+				boolean folded = false;
+				try {
+					fold(context);
+					folded = true;
+					diffs.addAll(diffPages(context, true));
+					// Dictionary ids are embedded in the records being committed, so they must be durable first.
+					catalog.force();
+					WalManager.CommitBatch batch = wal.logCommit(txn.id(), diffs);
+					long stamp = applyLock.writeLock();
+					try {
+						retainVersions(batch, context);
+						wal.apply(batch);
+						if (batch.commitLsn() > appliedLsn) {
+							appliedLsn = batch.commitLsn();
+						}
+					} finally {
+						applyLock.unlockWrite(stamp);
+					}
+					committed = true;
+					return batch.commitLsn();
+				} finally {
+					if (folded && !committed) {
+						// The log or the dictionary failed after the fold. The overlay goes with the rollback, but the
+						// header counters are Java fields that the fold has already moved, and nothing else would put
+						// them back.
+						restoreHeaders(headers);
+					}
+				}
+			} finally {
+				commitLock.unlock();
+			}
+		} finally {
+			long lsn = endTransaction(txn, committed);
+			if (committed) {
+				// Outside both locks: reclamation only reads the active set and unlinks dead chain entries, and it can
+				// walk every versioned page, which is far too long to hold either the commit lock or readers out for.
+				// After endTransaction, so that this transaction's own view no longer pins the horizon.
+				transactions.vacuum(lsn);
+			}
+		}
+	}
+
+	/**
+	 * The runs this transaction changed, on either the metadata pages or everything else.
+	 *
+	 * <p>
+	 * Split by region because the two halves are settled at different points in the commit: the data pages are final
+	 * when the transaction stops writing, and the metadata pages do not exist until {@link #fold} builds them.
+	 * </p>
+	 */
+	private List<WalManager.PageDiff> diffPages(WriteContext context, boolean metadata) {
+		List<WalManager.PageDiff> diffs = new ArrayList<>();
+		for (Map.Entry<Long, PageOverlay.Page> entry : context.overlay().pages().entrySet()) {
+			if (isMetadataPage(entry.getKey()) != metadata) {
+				continue;
+			}
+			PageOverlay.Page page = entry.getValue();
+			List<int[]> runs = WalManager.changedRuns(page.base(), page.copy());
+			if (!runs.isEmpty()) {
+				diffs.add(new WalManager.PageDiff(entry.getKey(), page, runs));
+			}
+		}
+		return diffs;
+	}
+
+	/**
+	 * Whether a page holds the segment header, the free-slot bitmap or the page metadata array rather than records.
+	 *
+	 * <p>
+	 * Decided from the geometry rather than from whether the overlay happened to rebase it, so that a metadata page
+	 * that reached the overlay by some other route — {@code force()} inside a maintenance transaction writes the
+	 * superblock directly — is still recognised. The regions are whole pages, which
+	 * {@link Geometry} guarantees by aligning each of them up, so a page is never half one and half the other.
+	 * </p>
+	 */
+	private boolean isMetadataPage(long pageKey) {
+		Kind kind = PageOverlay.kindOf(pageKey);
+		return PageOverlay.pageOf(pageKey) < geometry.dataStart(kind) / geometry.pageSize();
+	}
+
+	/**
+	 * Folds the transaction's metadata journal onto the live state.
+	 *
+	 * <p>
+	 * Under the commit lock, which is the only place "the live state" is a fixed instant. The replay rebases each
+	 * metadata page onto the mapping as it stands and applies the transaction's operations — set this bit, add this
+	 * delta — on top, so they carry every writer that committed since this one began instead of the image it happened
+	 * to read.
+	 * </p>
+	 */
+	private void fold(WriteContext context) {
+		MetaJournal journal = context.journal();
+		if (journal.isEmpty()) {
+			return;
+		}
+		context.replaying(true);
+		try {
+			journal.replay(this);
+			// The headers last, because the fold above is what gives them their final counters. Every segment, not
+			// only the journalled ones: a counter moved outside a transaction — by recovery, or by a segment created
+			// mid-transaction — is still owed a durable header.
 			for (SegmentSet set : segmentSets.values()) {
 				for (SegmentFile segment : set.segments()) {
 					if (segment.superblock().counterDirty()) {
@@ -360,24 +581,224 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 					}
 				}
 			}
-			// Dictionary ids are embedded in the records being committed, so they must be durable first.
-			catalog.force();
-			WalManager.CommitBatch batch = wal.logCommit(txn.id(), txn.overlay());
-			long stamp = applyLock.writeLock();
-			try {
-				retainVersions(batch);
-				wal.apply(batch);
-				appliedLsn = batch.commitLsn();
-			} finally {
-				applyLock.unlockWrite(stamp);
-			}
-			// Outside the apply lock: reclamation only reads the active set and unlinks dead chain entries, and it can
-			// walk every versioned page, which is far too long to hold readers out for.
-			transactions.vacuum(batch.commitLsn());
-			return batch.commitLsn();
 		} finally {
-			endTransaction();
+			context.replaying(false);
 		}
+	}
+
+	private Map<Long, long[]> captureHeaders(WriteContext context) {
+		Map<Long, long[]> captured = new HashMap<>();
+		for (long segmentKey : context.journal().segments().keySet()) {
+			SegmentFile segment = journalSegment(segmentKey);
+			if (segment != null) {
+				captured.put(segmentKey, segment.superblock().captureCounters());
+			}
+		}
+		return captured;
+	}
+
+	private void restoreHeaders(Map<Long, long[]> captured) {
+		for (Map.Entry<Long, long[]> entry : captured.entrySet()) {
+			SegmentFile segment = journalSegment(entry.getKey());
+			if (segment != null) {
+				segment.superblock().restoreCounters(entry.getValue());
+			}
+		}
+	}
+
+	/**
+	 * Refuses the commit if anything it depends on has changed since it began.
+	 *
+	 * <p>
+	 * <b>Write set, byte by byte.</b> Every run the transaction is about to write is checked against the page's version
+	 * chain for an overlapping run committed after its snapshot. Byte ranges rather than pages, because a page holds a
+	 * hundred and twenty-eight nodes and two writers touching different ones have not met.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>Except the slots it allocated itself.</b> Those bytes were dead — the allocator handed the slot to this
+	 * transaction and to nobody else — so whatever a previous occupant left there cannot be something another
+	 * transaction is depending on. Without this exemption, reusing a slot freed since the snapshot would conflict every
+	 * time, and a store that deletes anything would stop being able to insert concurrently.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>Read set, page by page, at SERIALIZABLE only.</b> See {@link IsolationLevel#SERIALIZABLE}.
+	 * </p>
+	 */
+	private void validate(TransactionImpl txn, WriteContext context, List<WalManager.PageDiff> diffs) {
+		long since = context.snapshot().snapshotLsn();
+		PageVersions versions = transactions.versions();
+		Map<Long, List<int[]>> owned = ownedRanges(context);
+		for (WalManager.PageDiff diff : diffs) {
+			if (isMetadataPage(diff.key())) {
+				// Already merged as operations rather than as bytes. See PageOverlay.Page#isRebased.
+				continue;
+			}
+			List<int[]> exempt = owned.get(diff.key());
+			for (int[] run : diff.runs()) {
+				for (int[] part : outside(run, exempt)) {
+					long conflict = versions.conflictingLsn(diff.key(), part[0], part[1], since);
+					if (conflict > 0) {
+						throw new TransactionConflictException(txn.id(), diff.key(), since, conflict, false,
+							describe(diff.key(), part[0], part[1]));
+					}
+				}
+			}
+		}
+		if (!context.tracksReads()) {
+			return;
+		}
+		for (long key : context.readSet()) {
+			long conflict = versions.changedSince(key, since);
+			if (conflict > 0) {
+				throw new TransactionConflictException(txn.id(), key, since, conflict, true,
+					describe(key, -1, -1));
+			}
+		}
+	}
+
+	/** Which bytes of which pages hold slots this transaction allocated, and therefore exclusively owns. */
+	private Map<Long, List<int[]>> ownedRanges(WriteContext context) {
+		if (context.reservedSlots().isEmpty()) {
+			return Map.of();
+		}
+		Map<Long, List<int[]>> owned = new HashMap<>();
+		int pageSize = geometry.pageSize();
+		for (WriteContext.SlotRun run : context.reservedSlots()) {
+			Kind kind = Kind.byCode(MetaJournal.kindCodeOf(run.segmentKey()));
+			int segmentNumber = MetaJournal.segmentNumberOf(run.segmentKey());
+			long offset = geometry.byteOffset(kind, run.slot());
+			int length = geometry.stride(kind) * run.count();
+			int pageIndex = (int) (offset / pageSize);
+			int inPage = (int) (offset % pageSize);
+			// A run never straddles a page — invariant I1 — so one entry always covers it.
+			owned.computeIfAbsent(PageOverlay.key(kind, segmentNumber, pageIndex), k -> new ArrayList<>())
+				.add(new int[] { inPage, inPage + length });
+		}
+		return owned;
+	}
+
+	/** The parts of {@code run} not covered by any exempt range. */
+	private List<int[]> outside(int[] run, List<int[]> exempt) {
+		if (exempt == null || exempt.isEmpty()) {
+			return List.of(run);
+		}
+		List<int[]> parts = new ArrayList<>();
+		int cursor = run[0];
+		int end = run[0] + run[1];
+		List<int[]> sorted = new ArrayList<>(exempt);
+		sorted.sort((a, b) -> Integer.compare(a[0], b[0]));
+		for (int[] range : sorted) {
+			if (range[1] <= cursor || range[0] >= end) {
+				continue;
+			}
+			if (range[0] > cursor) {
+				parts.add(new int[] { cursor, range[0] - cursor });
+			}
+			cursor = Math.max(cursor, range[1]);
+			if (cursor >= end) {
+				return parts;
+			}
+		}
+		parts.add(new int[] { cursor, end - cursor });
+		return parts;
+	}
+
+	private String describe(long pageKey, int offset, int length) {
+		Kind kind = PageOverlay.kindOf(pageKey);
+		String where = kind + " segment " + PageOverlay.segmentOf(pageKey) + " page " + PageOverlay.pageOf(pageKey);
+		return offset < 0 ? where : where + " bytes " + offset + ".." + (offset + length - 1);
+	}
+
+	// ------------------------------------------------ MetaJournal.Target: the commit's fold of the metadata journal
+
+	/**
+	 * The segment a journal entry names, or null when it has been retired since.
+	 *
+	 * <p>
+	 * Only empty trailing segments are retired, and only under the exclusive gate, so a null here means the entry has
+	 * nothing left to place rather than that something has gone wrong.
+	 * </p>
+	 */
+	private SegmentFile journalSegment(long segmentKey) {
+		SegmentSet set = segmentSets.get(Kind.byCode(MetaJournal.kindCodeOf(segmentKey)));
+		if (set == null) {
+			return null;
+		}
+		int number = MetaJournal.segmentNumberOf(segmentKey);
+		return number < set.segmentCount() ? set.segment(number) : null;
+	}
+
+	@Override
+	public boolean has(long segmentKey) {
+		return journalSegment(segmentKey) != null;
+	}
+
+	@Override
+	public void allocate(long segmentKey, int slot) {
+		journalSegment(segmentKey).freeSlots().allocate(slot);
+	}
+
+	@Override
+	public void free(long segmentKey, int slot) {
+		journalSegment(segmentKey).freeSlots().free(slot);
+	}
+
+	@Override
+	public void pageLiveCountDelta(long segmentKey, int page, int delta) {
+		journalSegment(segmentKey).pageMeta().liveCountDelta(page, delta);
+	}
+
+	@Override
+	public void pageEpochBump(long segmentKey, int page, long times) {
+		journalSegment(segmentKey).pageMeta().bumpEpoch(page, times);
+	}
+
+	@Override
+	public void pageGenFloor(long segmentKey, int page, int value) {
+		journalSegment(segmentKey).pageMeta().raiseGenFloor(page, value);
+	}
+
+	@Override
+	public void pageFreeHint(long segmentKey, int page, int value) {
+		journalSegment(segmentKey).pageMeta().freeHint(page, value);
+	}
+
+	@Override
+	public void pageChecksum(long segmentKey, int page, int value) {
+		journalSegment(segmentKey).pageMeta().checksum(page, value);
+	}
+
+	@Override
+	public void pageFlags(long segmentKey, int page, int value) {
+		journalSegment(segmentKey).pageMeta().flags(page, value);
+	}
+
+	@Override
+	public void pageLsn(long segmentKey, int page, long value) {
+		journalSegment(segmentKey).pageMeta().lsn(page, value);
+	}
+
+	@Override
+	public void header(long segmentKey, MetaJournal.SegmentEntry entry) {
+		Superblock superblock = journalSegment(segmentKey).superblock();
+		if (entry.liveDelta() != 0) {
+			superblock.liveCountDelta(entry.liveDelta());
+		}
+		if (entry.freeAbsolute() != Long.MIN_VALUE) {
+			superblock.freeCount(entry.freeAbsolute());
+		} else if (entry.freeDelta() != 0) {
+			superblock.freeCountDelta(entry.freeDelta());
+		}
+		if (entry.sealedTo() != null) {
+			superblock.sealed(entry.sealedTo());
+		}
+		if (entry.lastLsn() >= 0) {
+			superblock.lastLsn(entry.lastLsn());
+		}
+		// The header itself is rewritten by the caller's flush pass, once, after every entry has been folded.
+		superblock.markCounterDirty();
 	}
 
 	/**
@@ -391,11 +812,13 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	 *
 	 * <p>
 	 * The guard is the whole performance story. With no snapshot open there is nothing to retain, so a store that never
-	 * opens one never allocates a byte here and commit is exactly as fast as it was before MVCC existed.
+	 * opens one never allocates a byte here and commit is exactly as fast as it was before MVCC existed. A write
+	 * transaction registers a view of its own, so the guard has to ignore the committer's — otherwise the single-writer
+	 * store, which is the one that used to pay nothing, would start retaining on its own behalf.
 	 * </p>
 	 */
-	private void retainVersions(WalManager.CommitBatch batch) {
-		if (!transactions.needsVersions()) {
+	private void retainVersions(WalManager.CommitBatch batch, WriteContext context) {
+		if (!transactions.needsVersionsBesides(context.snapshot().id())) {
 			return;
 		}
 		PageVersions versions = transactions.versions();
@@ -434,7 +857,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	public boolean hasWriteTransaction() {
 		// Deliberately the same test {@link #write} uses to decide whether to join or to open one, so a caller asking
 		// the question and a mutation answering it for itself can never disagree.
-		return writerLock.isHeldByCurrentThread() && currentTransaction != null;
+		return currentTransaction.get() != null;
 	}
 
 	@Override
@@ -452,9 +875,18 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		if (attempts < 1) {
 			throw new IllegalArgumentException("attempts must be at least 1");
 		}
+		return inTransaction(work, attempts, IsolationLevel.SNAPSHOT);
+	}
+
+	@Override
+	public <T> T inTransaction(TransactionalWork<T> work, int attempts, IsolationLevel level) throws IOException {
+		checkOpen();
+		if (attempts < 1) {
+			throw new IllegalArgumentException("attempts must be at least 1");
+		}
 		GraphStoreException last = null;
 		for (int attempt = 1; attempt <= attempts; attempt++) {
-			try (Transaction txn = begin()) {
+			try (Transaction txn = begin(level)) {
 				T result = work.run();
 				txn.commit();
 				return result;
@@ -472,35 +904,99 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 	@Override
 	public void rollback(TransactionImpl txn) {
-		try {
-			txn.overlay().clear();
-			for (SegmentSet set : segmentSets.values()) {
-				set.rollbackState();
-			}
-		} finally {
-			endTransaction();
-		}
+		endTransaction(txn, false);
 	}
 
-	private void endTransaction() {
-		overlays.clear();
-		currentTransaction = null;
-		if (writerLock.isHeldByCurrentThread()) {
-			writerLock.unlock();
+	/**
+	 * Ends a transaction, one way or the other, and gives back everything it was holding.
+	 *
+	 * <p>
+	 * A rollback is now entirely local: discard the overlay, discard the journal, hand the reserved slots back. It used
+	 * to also reload every superblock from the mapping and empty the allocator's free rings, which was right when a
+	 * rollback could only be undoing the one transaction there was — and is destructive now, because those are shared
+	 * and hold other writers' work.
+	 * </p>
+	 *
+	 * @return the commit LSN when it committed, otherwise the store's current applied LSN
+	 */
+	private long endTransaction(TransactionImpl txn, boolean committed) {
+		WriteContext context = txn.context();
+		try {
+			// "Alone" means no read view is open and this is the only writer, which is what lets a rollback put the
+			// high water marks back — see SegmentSet#rollbackState. Asked before the view is closed, so the writer
+			// counted here is this one.
+			boolean alone = !committed && transactions.activeCount() == 0 && transactions.activeWriterCount() == 1;
+			for (SegmentSet set : segmentSets.values()) {
+				if (committed) {
+					set.commitState(context);
+				} else {
+					set.rollbackState(context, alone);
+				}
+			}
+			context.overlay().clear();
+			context.journal().clear();
+		} finally {
+			contexts.clear();
+			currentTransaction.remove();
+			// Closing the view releases the horizon this transaction was pinning, so it must happen before the vacuum
+			// that follows a commit.
+			context.snapshot().close();
+			writeGate.readLock().unlock();
 		}
+		return appliedLsn;
 	}
 
 	/** Runs the operation inside the caller's transaction if there is one, otherwise in an auto-commit transaction. */
 	private <T> T write(WriteOp<T> op) throws IOException {
 		checkOpen();
-		if (writerLock.isHeldByCurrentThread() && currentTransaction != null) {
-			return op.run();
+		TransactionImpl open = currentTransaction.get();
+		if (open != null) {
+			return underApply(open, op);
 		}
-		try (Transaction txn = begin()) {
-			T result = op.run();
-			txn.commit();
-			return result;
+		// An auto-commit mutation retries its own conflicts rather than raising them.
+		//
+		// This is the difference between an explicit transaction and a single statement, and it matters more than it
+		// looks. A caller who opened a transaction has a unit of work to reconsider, so a conflict is news; a caller
+		// who called setNodeProperties has nothing to reconsider, and re-running the one statement against a newer
+		// state is exactly what they meant. Raising it would make every mutation on a store with two writers a checked
+		// failure — and the commonest conflict is not even between the callers' data, it is two inserts landing in one
+		// B+tree leaf, which no caller can restructure their way out of.
+		//
+		// Progress is guaranteed: a conflict has a winner, so each attempt runs with one fewer competitor. The bound is
+		// generous rather than infinite, because a store under more contention than this has a problem a retry loop
+		// should surface rather than absorb.
+		TransactionConflictException conflict = null;
+		for (int attempt = 0; attempt < AUTO_COMMIT_ATTEMPTS; attempt++) {
+			try (Transaction txn = begin()) {
+				T result = underApply((TransactionImpl) txn, op);
+				txn.commit();
+				return result;
+			} catch (TransactionConflictException e) {
+				conflict = e;
+				backOff(attempt);
+			}
 		}
+		throw conflict;
+	}
+
+	/**
+	 * Waits a little longer after each lost conflict.
+	 *
+	 * <p>
+	 * Yielding was not enough, and the reason is worth keeping. A conflict against a transaction that is still running
+	 * — the loser found the resource reserved rather than overwritten — is resolved by that transaction finishing, and
+	 * a durable commit takes milliseconds where a failed attempt takes microseconds. Four writers racing to create the
+	 * one index catalog page burned all sixty-four of their attempts inside the winner's first commit and then raised a
+	 * conflict on a store where the only thing wrong was that somebody else was ahead of them.
+	 * </p>
+	 */
+	private void backOff(int attempt) {
+		if (attempt < 4) {
+			Thread.yield();
+			return;
+		}
+		long nanos = Math.min(5_000_000L, 50_000L << Math.min(attempt - 4, 7));
+		java.util.concurrent.locks.LockSupport.parkNanos(nanos);
 	}
 
 	/**
@@ -516,15 +1012,27 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	 */
 	private <T> T read(Supplier<T> op) {
 		checkOpen();
+		TransactionImpl open = currentTransaction.get();
+		if (open != null) {
+			// Inside a write transaction the overlay and the transaction's own view give the consistent answer, and the
+			// read must not be routed through a read view the same thread happens to also have open. Checked first, so
+			// a thread holding both is not made to answer for the reader's liveness while it is writing. The latch is
+			// taken for the same reason a mutation takes it — see underApply.
+			Snapshot writerView = open.snapshot();
+			long writerStamp = applyLock.readLock();
+			writerView.exclusionHeld(true);
+			try {
+				return op.get();
+			} finally {
+				writerView.exclusionHeld(false);
+				applyLock.unlockRead(writerStamp);
+			}
+		}
 		Snapshot snapshot = transactions.holder().current();
 		if (snapshot != null) {
 			// Once per operation rather than once per page: a view the horizon has passed is wrong everywhere, not
 			// only on the pages it has yet to touch.
 			snapshot.checkAlive();
-		}
-		if (writerLock.isHeldByCurrentThread() && currentTransaction != null) {
-			// Inside a write transaction the overlay already gives a consistent view.
-			return op.get();
 		}
 		long stamp = applyLock.tryOptimisticRead();
 		if (stamp != 0) {
@@ -563,12 +1071,58 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		T run() throws IOException;
 	}
 
+	/**
+	 * Runs one operation of a write transaction with the commit apply step excluded.
+	 *
+	 * <p>
+	 * <b>The writer lock used to do this by accident, and it was load-bearing.</b> One writer at a time meant no commit
+	 * could be applying while another transaction was reading, so a writer could read the mapping freely. Concurrent
+	 * writers removed that, and the hole it left is narrow and silent: a writer checks the version chain for a page,
+	 * finds nothing newer than its snapshot, and reads the mapping — and in between, a commit publishes its
+	 * before-image and copies its bytes in. The writer then sees the new bytes with no chain entry telling it to undo
+	 * them. It surfaced as a reader being told the generation of a property block it had just resolved was stale.
+	 * </p>
+	 *
+	 * <p>
+	 * Ordinary reads solve this optimistically — run without a lock, ask afterwards whether an apply happened, repeat
+	 * if it did — which a mutation cannot do, because repeating it is not free of side effects. So a mutation takes the
+	 * latch for its own short duration instead. It is held per operation, never for the transaction: a commit waits for
+	 * one statement, not for a unit of work.
+	 * </p>
+	 */
+	private <T> T underApply(TransactionImpl txn, WriteOp<T> op) throws IOException {
+		Snapshot snapshot = txn.snapshot();
+		long stamp = applyLock.readLock();
+		// Tells the snapshot the apply step is excluded, so a page it has to rebuild is rebuilt here rather than
+		// through the guard, which would take the same non-reentrant latch a second time.
+		snapshot.exclusionHeld(true);
+		try {
+			return op.run();
+		} finally {
+			snapshot.exclusionHeld(false);
+			applyLock.unlockRead(stamp);
+		}
+	}
+
 	@Override
 	public void runWrite(MaintenanceRunner.Unit unit) throws IOException {
 		write(() -> {
 			unit.run();
 			return null;
 		});
+	}
+
+	@Override
+	public void runExclusive(MaintenanceRunner.Unit unit) throws IOException {
+		writeGate.writeLock().lock();
+		try {
+			write(() -> {
+				unit.run();
+				return null;
+			});
+		} finally {
+			writeGate.writeLock().unlock();
+		}
 	}
 
 	@Override
@@ -606,15 +1160,19 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 		ReadLease() {
 			checkOpen();
+			TransactionImpl open = currentTransaction.get();
+			if (open != null) {
+				// The writer's own view, and the latch with it: a scan inside a write transaction is exposed to a
+				// concurrent commit's apply exactly as a single read is.
+				this.snapshot = open.snapshot();
+				this.stamp = applyLock.readLock();
+				this.held = true;
+				this.snapshot.exclusionHeld(true);
+				return;
+			}
 			Snapshot current = transactions.holder().current();
 			if (current != null) {
 				current.checkAlive();
-			}
-			if (writerLock.isHeldByCurrentThread() && currentTransaction != null) {
-				this.snapshot = null;
-				this.stamp = 0;
-				this.held = false;
-				return;
 			}
 			this.snapshot = current;
 			this.stamp = applyLock.readLock();
@@ -2123,14 +2681,16 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	@Override
 	public void checkpoint() throws IOException {
 		checkOpen();
-		writerLock.lock();
+		// Exclusive: a checkpoint forces every data file and trims the log, and a commit landing in the middle of that
+		// would be durable in the mapping and gone from the log at once.
+		writeGate.writeLock().lock();
 		long started = System.nanoTime();
 		try {
 			// Same reason as commit(): an interrupt reaching the channel closes it for everybody.
 			uninterruptible(() -> {
 				catalog.force();
 				long lsn = wal.checkpoint();
-				manifest.checkpoint(lsn, lsn, nextTxnId);
+				manifest.checkpoint(lsn, lsn, nextTxnId.get());
 				manifest.force();
 				wal.trim(lsn);
 				lastCheckpointLsn = lsn;
@@ -2138,7 +2698,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			});
 		} finally {
 			counters.checkpointed(System.nanoTime() - started);
-			writerLock.unlock();
+			writeGate.writeLock().unlock();
 		}
 	}
 
@@ -2177,16 +2737,18 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	@Override
 	public int reclaim() throws IOException {
 		checkOpen();
-		refuseWhileViewsAreOpen("reclaim()");
-		writerLock.lock();
+		writeGate.writeLock().lock();
 		try {
+			// Under the gate rather than before it: with concurrent writers, checking first and taking the lock second
+			// leaves a window in which a view opens in between, which is exactly the case the refusal exists for.
+			refuseWhileViewsAreOpen("reclaim()");
 			int punched = 0;
 			for (SegmentSet set : segmentSets.values()) {
 				punched += set.reclaim();
 			}
 			return punched;
 		} finally {
-			writerLock.unlock();
+			writeGate.writeLock().unlock();
 		}
 	}
 
@@ -2273,11 +2835,11 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	@Override
 	public void verify(VerifyLevel level, VerifyOptions options) {
 		checkOpen();
-		writerLock.lock();
+		writeGate.writeLock().lock();
 		try {
-			// Reentrant: a caller verifying from inside its own open transaction still holds it, and must not have it
+			// Reentrant: a caller verifying from inside its own maintenance scope still holds it, and must not have it
 			// released underneath by the throttling pacer.
-			boolean ownsWriterLock = writerLock.getHoldCount() == 1;
+			boolean ownsWriterLock = writeGate.getWriteHoldCount() == 1;
 			long[] stamp = { applyLock.readLock() };
 			try {
 				for (SegmentSet set : segmentSets.values()) {
@@ -2295,7 +2857,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				applyLock.unlockRead(stamp[0]);
 			}
 		} finally {
-			writerLock.unlock();
+			writeGate.writeLock().unlock();
 		}
 	}
 
@@ -2313,7 +2875,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		return () -> {
 			applyLock.unlockRead(stamp[0]);
 			if (ownsWriterLock) {
-				writerLock.unlock();
+				writeGate.writeLock().unlock();
 			}
 			boolean interrupted = false;
 			try {
@@ -2328,7 +2890,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			}
 			// Retaken unconditionally, including on interrupt: the caller's finally blocks will release both.
 			if (ownsWriterLock) {
-				writerLock.lock();
+				writeGate.writeLock().lock();
 			}
 			stamp[0] = applyLock.readLock();
 			return !interrupted;
@@ -2476,7 +3038,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		// recoverable state, it is a segfault. Taking the lock waits for the in-flight write instead — and because the
 		// lock is reentrant, a caller closing from inside its own transaction is not deadlocked by this, it simply
 		// closes a store whose transaction is about to be rolled back by the overlay being discarded.
-		writerLock.lock();
+		writeGate.writeLock().lock();
 		try {
 			// A store being closed on an interrupted thread — the shutdownNow() case — must still be able to write its
 			// final checkpoint.
@@ -2485,7 +3047,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				return null;
 			});
 		} finally {
-			writerLock.unlock();
+			writeGate.writeLock().unlock();
 		}
 	}
 
@@ -2501,7 +3063,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		try {
 			catalog.force();
 			long lsn = wal.checkpoint();
-			manifest.checkpoint(lsn, lsn, nextTxnId);
+			manifest.checkpoint(lsn, lsn, nextTxnId.get());
 			wal.trim(lsn);
 		} catch (IOException e) {
 			first = e;

@@ -64,6 +64,7 @@ public final class Snapshot implements ReadTransaction {
 	private final TransactionManager manager;
 	private final Thread owner;
 	private final long openedAtNanos;
+	private final boolean writer;
 
 	/** Pages already rebuilt for this view. Valid for the life of the snapshot — see {@link #pageAsOf}. */
 	private final Map<Long, MemorySegment> reconstructed = new HashMap<>();
@@ -82,7 +83,7 @@ public final class Snapshot implements ReadTransaction {
 	private int exclusionDepth;
 
 	Snapshot(long id, long snapshotLsn, IsolationLevel level, PageVersions versions, TransactionManager manager,
-		long openedAtNanos) {
+		long openedAtNanos, boolean writer) {
 		this.id = id;
 		this.snapshotLsn = snapshotLsn;
 		this.level = level;
@@ -90,6 +91,21 @@ public final class Snapshot implements ReadTransaction {
 		this.manager = manager;
 		this.owner = Thread.currentThread();
 		this.openedAtNanos = openedAtNanos;
+		this.writer = writer;
+	}
+
+	/**
+	 * True when this view belongs to a write transaction rather than to a reader.
+	 *
+	 * <p>
+	 * It holds the reclamation horizon exactly as a reader's does — that is what its conflict detection validates
+	 * against — but it is not what {@code snapshotStats().openViews()} is counting, and the retention budget does not
+	 * abandon it. Abandoning a writer would not release the memory that is actually growing, which is its overlay, and
+	 * it would turn a bounded cost into a failed transaction for no gain.
+	 * </p>
+	 */
+	public boolean isWriter() {
+		return writer;
 	}
 
 	public long id() {
@@ -122,7 +138,30 @@ public final class Snapshot implements ReadTransaction {
 
 	/** True when this view fixes what it reads. {@link IsolationLevel#READ_COMMITTED} views do not and cost nothing. */
 	public boolean isVersioned() {
-		return level == IsolationLevel.SNAPSHOT;
+		return level != IsolationLevel.READ_COMMITTED;
+	}
+
+	/**
+	 * How this view gets the apply step excluded when it has to rebuild a page and the caller is not already holding it
+	 * out.
+	 *
+	 * <p>
+	 * A reader never needs this: {@code GraphStoreImpl.read} runs optimistically, catches
+	 * {@link NeedsExclusionException} and repeats the whole operation under the latch, which is both cheaper and the
+	 * only way to keep a lock off the fast path. <b>A writer has no such outer frame.</b> Its reads are made by the
+	 * stores directly, in the middle of a mutation that cannot simply be run twice, so it carries the ability to take
+	 * the latch for the length of one rebuild instead.
+	 * </p>
+	 */
+	public interface ExclusionGuard {
+
+		MemorySegment guarded(java.util.function.Supplier<MemorySegment> work);
+	}
+
+	private ExclusionGuard guard;
+
+	public void guard(ExclusionGuard guard) {
+		this.guard = guard;
 	}
 
 	/**
@@ -168,8 +207,15 @@ public final class Snapshot implements ReadTransaction {
 			throw new SnapshotTooOldException(snapshotLsn, versions.horizonLsn());
 		}
 		if (exclusionDepth == 0) {
-			throw new NeedsExclusionException();
+			if (guard == null) {
+				throw new NeedsExclusionException();
+			}
+			return guard.guarded(() -> rebuild(pageKey, mappedPage, pageSize));
 		}
+		return rebuild(pageKey, mappedPage, pageSize);
+	}
+
+	private MemorySegment rebuild(long pageKey, java.util.function.Supplier<MemorySegment> mappedPage, int pageSize) {
 		MemorySegment rebuilt = versions.reconstruct(pageKey, snapshotLsn, mappedPage.get(), pageSize);
 		if (rebuilt == null) {
 			return null;

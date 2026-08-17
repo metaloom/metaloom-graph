@@ -17,10 +17,12 @@ import io.metaloom.graph.core.api.PageCorruptException;
 import io.metaloom.graph.core.id.Kind;
 import io.metaloom.graph.core.metrics.IoCounters;
 import io.metaloom.graph.core.nativelib.NativeLib;
-import io.metaloom.graph.core.page.OverlayHolder;
 import io.metaloom.graph.core.page.PageOverlay;
+import io.metaloom.graph.core.txn.MetaJournal;
 import io.metaloom.graph.core.txn.Snapshot;
 import io.metaloom.graph.core.txn.SnapshotHolder;
+import io.metaloom.graph.core.txn.WriteContext;
+import io.metaloom.graph.core.txn.WriteContextHolder;
 import io.metaloom.graph.core.util.Crc;
 import io.metaloom.graph.core.util.Layouts;
 
@@ -65,8 +67,8 @@ public final class SegmentFile implements AutoCloseable {
 	private final long dataStart;
 	private final BitSet dirtyPages;
 
-	/** Publishes the active transaction's overlay, but only to the thread that owns it. */
-	private OverlayHolder overlays;
+	/** Publishes the write transaction running on the calling thread, if it has one. */
+	private WriteContextHolder contexts;
 
 	/** Publishes the calling thread's open read view, if it has one. Null until a store wires one in. */
 	private SnapshotHolder snapshots;
@@ -130,12 +132,27 @@ public final class SegmentFile implements AutoCloseable {
 
 	// ---------------------------------------------------------------- overlay routing
 
-	public void overlays(OverlayHolder overlays) {
-		this.overlays = overlays;
+	public void writeContexts(WriteContextHolder contexts) {
+		this.contexts = contexts;
 	}
 
 	public void snapshots(SnapshotHolder snapshots) {
 		this.snapshots = snapshots;
+	}
+
+	/** The identity this segment goes by in a {@link MetaJournal}. */
+	public long segmentKey() {
+		return MetaJournal.segmentKey(kindCode, segmentNumber);
+	}
+
+	/**
+	 * The metadata operations of the transaction running on this thread, or null when there is none — and also null
+	 * while that transaction is replaying, which is what makes the replay perform the operations instead of queuing
+	 * them again.
+	 */
+	public MetaJournal journal() {
+		WriteContext context = contexts == null ? null : contexts.current();
+		return context == null || context.isReplaying() ? null : context.journal();
 	}
 
 	public void counters(IoCounters counters) {
@@ -146,17 +163,31 @@ public final class SegmentFile implements AutoCloseable {
 		return counters;
 	}
 
-	private PageOverlay overlay() {
-		return overlays == null ? null : overlays.current();
+	private WriteContext context() {
+		return contexts == null ? null : contexts.current();
 	}
 
 	private int pageIndexOf(long fileOffset) {
 		return (int) (fileOffset / pageSize);
 	}
 
-	/** The mapped page at a whole-file page index. Bypasses the overlay by design: commit diffs against it. */
+	/** The mapped page at a whole-file page index. Bypasses every transaction: the commit rebases metadata onto it. */
 	public MemorySegment mappedPage(int pageIndex) {
 		return mapped.asSlice((long) pageIndex * pageSize, pageSize);
+	}
+
+	/**
+	 * A slice of the mapping as it stands, past the overlay and past any view.
+	 *
+	 * <p>
+	 * Exactly one caller is entitled to this: the slot allocator. Everything else in the engine must read what its
+	 * transaction is entitled to see, or snapshot isolation is not isolation. The allocator is the exception because it
+	 * is not answering a question about data — it is answering "is this slot taken", and a slot another transaction
+	 * committed since is taken however invisible its contents are.
+	 * </p>
+	 */
+	public MemorySegment mappedSlice(long fileOffset, long length) {
+		return mapped.asSlice(fileOffset, length);
 	}
 
 	/**
@@ -178,19 +209,29 @@ public final class SegmentFile implements AutoCloseable {
 	 * already written to it, so a writer always sees its own uncommitted changes.
 	 */
 	public MemorySegment readSlice(long fileOffset, long length) {
-		PageOverlay overlay = overlay();
-		if (overlay != null) {
-			// This thread is the writer. It reads its own uncommitted pages, and otherwise the mapping as it stands
-			// now — never through a read view, even if the same thread has one open.
-			//
-			// That is not a convenience, it is the only safe answer. A writer decides what to write from what it
-			// reads: allocating a slot, appending to an adjacency block, splitting an index page. Reading any of that
-			// through a view fixed in the past would compute the new state from stale input and overwrite everything
-			// committed since, which is a lost update the engine has no way to detect afterwards.
+		WriteContext context = context();
+		if (context != null) {
 			int pageIndex = pageIndexOf(fileOffset);
-			MemorySegment page = overlay.peek(PageOverlay.key(kind, segmentNumber, pageIndex));
+			long key = PageOverlay.key(kind, segmentNumber, pageIndex);
+			// Read-your-writes outranks everything: the transaction's own copy of the page, if it has one.
+			MemorySegment page = context.overlay().peek(key);
 			if (page != null) {
 				return page.asSlice(fileOffset - (long) pageIndex * pageSize, length);
+			}
+			if (context.isReplaying()) {
+				// The commit is folding metadata into the live state. Reading through the transaction's view here would
+				// resurrect the world as it was when the transaction began and undo every writer that committed since.
+				return mapped.asSlice(fileOffset, length);
+			}
+			context.read(key);
+			// Otherwise the writer's own view, exactly as a reader's. It used to be the live mapping, and that was
+			// right while writers were serialised: a writer decides what to write from what it reads, and reading
+			// through a stale view would compute the new state from stale input. With concurrent writers the live
+			// mapping is the stale input — it moves underneath the transaction — so the view is what makes a writer's
+			// reads repeatable, and commit-time validation is what stops it deciding from something that has changed.
+			MemorySegment viewed = viewOf(context.snapshot(), key, pageIndex);
+			if (viewed != null) {
+				return viewed.asSlice(fileOffset - (long) pageIndex * pageSize, length);
 			}
 			return mapped.asSlice(fileOffset, length);
 		}
@@ -207,16 +248,38 @@ public final class SegmentFile implements AutoCloseable {
 		return mapped.asSlice(fileOffset, length);
 	}
 
+	/** The page as a write transaction's view shows it, or null when that is the mapped page itself. */
+	private MemorySegment viewOf(Snapshot snapshot, long key, int pageIndex) {
+		return snapshot == null || !snapshot.isVersioned()
+			? null
+			: snapshot.pageAsOf(key, () -> mappedPage(pageIndex), pageSize);
+	}
+
 	/**
 	 * A slice for writing. Inside a transaction this copies the page into the overlay on first touch and returns a
 	 * slice of the copy, so the mapped file is never modified before the commit is durable.
 	 */
 	public MemorySegment writeSlice(long fileOffset, long length) {
 		int pageIndex = pageIndexOf(fileOffset);
-		PageOverlay overlay = overlay();
-		if (overlay != null) {
-			MemorySegment page = overlay.forWrite(PageOverlay.key(kind, segmentNumber, pageIndex),
-				mappedPage(pageIndex));
+		WriteContext context = context();
+		if (context != null) {
+			long key = PageOverlay.key(kind, segmentNumber, pageIndex);
+			PageOverlay overlay = context.overlay();
+			MemorySegment page;
+			if (context.isReplaying()) {
+				page = overlay.forWriteRebased(key, mappedPage(pageIndex));
+			} else {
+				MemorySegment existing = overlay.peek(key);
+				if (existing != null) {
+					page = existing;
+				} else {
+					// The copy — and with it the base the commit diffs against — is taken from what this transaction
+					// is entitled to see, not from the mapping. See PageOverlay: diffing against the mapping is how a
+					// second writer on the same page silently reverts the first.
+					MemorySegment viewed = viewOf(context.snapshot(), key, pageIndex);
+					page = overlay.forWrite(key, viewed != null ? viewed : mappedPage(pageIndex));
+				}
+			}
 			return page.asSlice(fileOffset - (long) pageIndex * pageSize, length);
 		}
 		markDirtyPage(pageIndex);
@@ -308,6 +371,13 @@ public final class SegmentFile implements AutoCloseable {
 	 * than per record write: a 64 byte write must not cost a CRC over 8 KiB.
 	 */
 	public void markDirty(int slot) {
+		if (context() != null) {
+			// Inside a transaction nothing has reached the mapping yet, so there is nothing to checksum. The mark is
+			// set by applyPage when the commit lands, which is both the correct instant and the only one at which a
+			// single thread owns this BitSet — several writers setting bits in a plain BitSet is a data race, and it
+			// used to be one that verify() could clear out from under a writer.
+			return;
+		}
 		dirtyPages.set(geometry.pageOfSlot(kind, slot));
 	}
 

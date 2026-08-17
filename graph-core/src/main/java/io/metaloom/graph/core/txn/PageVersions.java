@@ -210,6 +210,55 @@ public final class PageVersions {
 	}
 
 	/**
+	 * The LSN of the first commit after {@code sinceLsn} that overwrote any of {@code [offset, offset + length)} on
+	 * this page, or -1 when nothing did.
+	 *
+	 * <p>
+	 * This is write-write conflict detection, and it costs one chain walk that stops as soon as it reaches an entry the
+	 * transaction is entitled to see. The chains already hold exactly the right information: an entry says "this byte
+	 * range was overwritten at this LSN", which is the question a committing transaction is asking about every run it
+	 * is about to write.
+	 * </p>
+	 *
+	 * <p>
+	 * Byte ranges rather than whole pages, because whole pages would make two writers touching unrelated records in one
+	 * page a conflict — and a page holds a hundred and twenty-eight nodes.
+	 * </p>
+	 */
+	public long conflictingLsn(long pageKey, int offset, int length, long sinceLsn) {
+		Chain chain = chains.get(pageKey);
+		if (chain == null) {
+			return -1;
+		}
+		int end = offset + length;
+		for (Version version = chain.head; version != null && version.supersededAt > sinceLsn;
+			version = version.older) {
+			if (version.offset < end && offset < version.offset + version.before.length) {
+				return version.supersededAt;
+			}
+		}
+		return -1;
+	}
+
+	/**
+	 * The LSN of the newest commit after {@code sinceLsn} that changed anything on this page, or -1.
+	 *
+	 * <p>
+	 * The read-set half of {@link io.metaloom.graph.core.api.IsolationLevel#SERIALIZABLE} validation. Page granularity
+	 * here rather than byte, and deliberately: a read is not recorded as a range — recording one per read would cost
+	 * more than the isolation is worth — so the page is what the transaction can be said to have depended on.
+	 * </p>
+	 */
+	public long changedSince(long pageKey, long sinceLsn) {
+		Chain chain = chains.get(pageKey);
+		if (chain == null) {
+			return -1;
+		}
+		Version head = chain.head;
+		return head != null && head.supersededAt > sinceLsn ? head.supersededAt : -1;
+	}
+
+	/**
 	 * Drops every entry no snapshot at or after {@code oldestActiveLsn} can need, and returns the bytes reclaimed.
 	 *
 	 * <p>

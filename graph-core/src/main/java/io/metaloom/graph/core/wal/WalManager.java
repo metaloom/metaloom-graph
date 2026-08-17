@@ -114,26 +114,35 @@ public final class WalManager implements AutoCloseable {
 	}
 
 	/**
+	 * One overlay page and the runs within it this transaction changed, worked out once by the commit.
+	 *
+	 * <p>
+	 * The runs come from {@link PageOverlay.Page#base()} rather than from the mapping, which is what makes two writers
+	 * on one page compose instead of overwriting each other, and they are computed <em>before</em> the log is written
+	 * because conflict detection needs the same list. Passing it in rather than recomputing it here saves diffing every
+	 * touched page twice.
+	 * </p>
+	 */
+	public record PageDiff(long key, PageOverlay.Page page, List<int[]> runs) {
+	}
+
+	/**
 	 * Writes the transaction's redo records and makes them durable. Nothing has touched a data file when this returns,
 	 * so the caller can take the reader-excluding lock for the short apply step only.
 	 */
-	public CommitBatch logCommit(long txnId, PageOverlay overlay) throws IOException {
-		if (overlay.isEmpty()) {
-			return new CommitBatch(lastCommitLsn, List.of());
-		}
+	public CommitBatch logCommit(long txnId, List<PageDiff> diffs) throws IOException {
 		long prevLsn = 0;
 		List<PageWrite> writes = new ArrayList<>();
 
-		for (Map.Entry<Long, MemorySegment> entry : overlay.pages().entrySet()) {
-			long key = entry.getKey();
-			MemorySegment copy = entry.getValue();
+		for (PageDiff diff : diffs) {
+			long key = diff.key();
+			MemorySegment copy = diff.page().copy();
 			Kind kind = PageOverlay.kindOf(key);
 			int segmentNumber = PageOverlay.segmentOf(key);
 			int pageIndex = PageOverlay.pageOf(key);
 			SegmentFile file = segmentSets.get(kind).segment(segmentNumber);
-			MemorySegment mapped = file.mappedPage(pageIndex);
 
-			for (int[] run : changedRuns(mapped, copy)) {
+			for (int[] run : diff.runs()) {
 				int offset = run[0];
 				int length = run[1];
 				byte[] image = new byte[length];
@@ -143,6 +152,11 @@ public final class WalManager implements AutoCloseable {
 				prevLsn = writer.append(prevLsn, txnId, WalRecord.TYPE_PAGE_IMAGE, payload);
 				writes.add(new PageWrite(file, kind, segmentNumber, pageIndex, copy, offset, length));
 			}
+		}
+		if (writes.isEmpty()) {
+			// The transaction left every page it touched exactly as it found it. Logging a commit record for that
+			// would burn an LSN and an fsync to say nothing.
+			return new CommitBatch(lastCommitLsn, List.of());
 		}
 		long commitLsn = writer.append(prevLsn, txnId, WalRecord.TYPE_TXN_COMMIT, new byte[0]);
 		// The barrier: nothing below this line can be lost, and nothing above it has touched a data file.
@@ -159,10 +173,10 @@ public final class WalManager implements AutoCloseable {
 	}
 
 	/**
-	 * The changed byte runs between the mapped page and the transaction's copy. Runs separated by a small gap are
-	 * merged, because a record header costs more than a few unchanged bytes.
+	 * The changed byte runs between the image a transaction started from and its copy. Runs separated by a small gap
+	 * are merged, because a record header costs more than a few unchanged bytes.
 	 */
-	static List<int[]> changedRuns(MemorySegment original, MemorySegment modified) {
+	public static List<int[]> changedRuns(MemorySegment original, MemorySegment modified) {
 		List<int[]> runs = new ArrayList<>();
 		int size = (int) modified.byteSize();
 		int start = -1;

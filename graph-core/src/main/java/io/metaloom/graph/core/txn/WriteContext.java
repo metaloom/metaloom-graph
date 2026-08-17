@@ -1,0 +1,221 @@
+package io.metaloom.graph.core.txn;
+
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import io.metaloom.graph.core.api.IsolationLevel;
+import io.metaloom.graph.core.page.PageOverlay;
+
+/**
+ * Everything one in-flight write transaction owns, published to the segment layer for the thread that is running it.
+ *
+ * <p>
+ * With a single writer this was one field — the overlay — and a thread-owner check. Concurrent writers need the rest of
+ * it alongside, and need it to be strictly per-transaction: the view the writer reads through, the metadata operations
+ * it has queued, and the slots it has reserved out of the shared allocator but not yet committed. Anything left in
+ * shared state for the duration would be another writer's problem.
+ * </p>
+ *
+ * @see <a href="../../../../../../../../spec/TRANSACTIONS.md">spec/TRANSACTIONS.md</a> section 6
+ */
+public final class WriteContext {
+
+	/** One allocation or free that has not been committed yet: which segment, which slot, how many. */
+	public record SlotRun(long segmentKey, int slot, int count) {
+	}
+
+	private final long txnId;
+	private final PageOverlay overlay;
+	private final MetaJournal journal = new MetaJournal();
+	private final Snapshot snapshot;
+	private final IsolationLevel level;
+
+	private final List<SlotRun> reserved = new ArrayList<>();
+	private final List<SlotRun> freed = new ArrayList<>();
+
+	/**
+	 * Slots this transaction freed and may hand straight back to itself, keyed by kind and run length.
+	 *
+	 * <p>
+	 * A free does not reach the shared allocator until the transaction commits — a slot on the shared ring is one the
+	 * allocator will give out, and giving out one whose delete has not committed would let a rollback restore a record
+	 * somebody else now owns. But a transaction that frees a structure and immediately rebuilds it is the normal case,
+	 * not an exotic one: it is what {@code IndexCatalog.resetTrees} does, and what every property block that changes
+	 * size does. Without this the rebuild takes fresh slots off the bump cursor and the high water mark ratchets up
+	 * once per rebuild, for the life of the store.
+	 * </p>
+	 *
+	 * <p>
+	 * Safe because these slots are the transaction's own: it held them, it freed them, and it takes them back before
+	 * anybody else can see either event.
+	 * </p>
+	 */
+	private final Map<Long, Deque<SlotRun>> reusable = new HashMap<>();
+
+	/** Slots freed and then taken back within this transaction, so the allocator can tell them from live ones. */
+	private final Set<Long> freedHere = new HashSet<>();
+
+	/**
+	 * Where each segment's high water mark stood before this transaction first pushed it up.
+	 *
+	 * <p>
+	 * The mark is shared and moves the moment a slot is reserved, because two writers each bumping a private copy would
+	 * both claim the same slot. That makes it the one piece of allocator state a rollback cannot simply discard — and
+	 * leaving it raised broke a property this engine holds to: a rolled-back transaction and a crash in the middle of
+	 * the same transaction must reach byte-identical stores, and a mark left high is a difference in
+	 * {@code storageBytes}. So the value is remembered and put back, but only when nothing has been committed or
+	 * reserved above it in the meantime.
+	 * </p>
+	 */
+	private final Map<Long, Long> highWaterBefore = new HashMap<>();
+
+	/**
+	 * True while the commit is folding the journal back into the live metadata.
+	 *
+	 * <p>
+	 * It flips two things at once, and they belong together. The metadata classes stop routing through the journal, so
+	 * the same {@code allocate}/{@code liveCountDelta} calls that queued an operation now perform it; and the overlay
+	 * rebases the pages they touch onto the mapping as it stands under the commit lock, so the operation lands on top
+	 * of every writer that committed since this one began. Outside the commit lock it is always false.
+	 * </p>
+	 */
+	private boolean replaying;
+
+	/**
+	 * Pages this transaction has read, tracked only for {@link IsolationLevel#SERIALIZABLE}.
+	 *
+	 * <p>
+	 * Null at every other level, and deliberately so: recording a page key on every read costs a hash insert on the
+	 * engine's hottest path, and snapshot isolation has no use for it. Validating it at commit is what turns
+	 * first-committer-wins into serializability, because a transaction that decided anything from a page somebody else
+	 * has since changed did not run at any single instant.
+	 * </p>
+	 */
+	private final Set<Long> readSet;
+
+	public WriteContext(long txnId, int pageSize, Snapshot snapshot, IsolationLevel level) {
+		this.txnId = txnId;
+		this.overlay = new PageOverlay(pageSize);
+		this.snapshot = snapshot;
+		this.level = level;
+		this.readSet = level == IsolationLevel.SERIALIZABLE ? new HashSet<>() : null;
+	}
+
+	public long txnId() {
+		return txnId;
+	}
+
+	public PageOverlay overlay() {
+		return overlay;
+	}
+
+	public MetaJournal journal() {
+		return journal;
+	}
+
+	/** The view this writer reads through. Never null: a writer that read the live mapping could not be isolated. */
+	public Snapshot snapshot() {
+		return snapshot;
+	}
+
+	public IsolationLevel level() {
+		return level;
+	}
+
+	public boolean tracksReads() {
+		return readSet != null;
+	}
+
+	public boolean isReplaying() {
+		return replaying;
+	}
+
+	public void replaying(boolean value) {
+		this.replaying = value;
+	}
+
+	public void read(long pageKey) {
+		if (readSet != null) {
+			readSet.add(pageKey);
+		}
+	}
+
+	public Set<Long> readSet() {
+		return readSet == null ? Set.of() : readSet;
+	}
+
+	/** Records where the mark stood, the first time this transaction raises it for a segment. */
+	public void noteHighWater(long segmentKey, long before) {
+		highWaterBefore.putIfAbsent(segmentKey, before);
+	}
+
+	public Map<Long, Long> highWaterBefore() {
+		return highWaterBefore;
+	}
+
+	public void reserved(long segmentKey, int slot, int count) {
+		reserved.add(new SlotRun(segmentKey, slot, count));
+	}
+
+	public void freed(long segmentKey, int slot, int count) {
+		SlotRun run = new SlotRun(segmentKey, slot, count);
+		freed.add(run);
+		reusable.computeIfAbsent(reuseKey(segmentKey, count), k -> new ArrayDeque<>()).addLast(run);
+		for (int i = 0; i < count; i++) {
+			freedHere.add(slotKey(segmentKey, slot + i));
+		}
+	}
+
+	/** A run of {@code count} slots of this kind that the transaction freed and has not taken back, or null. */
+	public SlotRun takeReusable(int kindCode, int count) {
+		Deque<SlotRun> queue = reusable.get(((long) kindCode << 32) | (count & 0xFFFFFFFFL));
+		return queue == null ? null : queue.pollFirst();
+	}
+
+	/** True when this transaction is the one that freed the slot, so it may claim it back before the commit. */
+	public boolean freedHere(long segmentKey, int slot) {
+		return freedHere.contains(slotKey(segmentKey, slot));
+	}
+
+	/**
+	 * Orders the reusable runs by position so a rebuild packs against the bottom of the segment.
+	 *
+	 * @see io.metaloom.graph.core.segment.SegmentSet#packFreeRing()
+	 */
+	public void packReusable() {
+		for (Deque<SlotRun> queue : reusable.values()) {
+			if (queue.size() < 2) {
+				continue;
+			}
+			List<SlotRun> sorted = new ArrayList<>(queue);
+			sorted.sort(Comparator.comparingLong(SlotRun::segmentKey).thenComparingInt(SlotRun::slot));
+			queue.clear();
+			queue.addAll(sorted);
+		}
+	}
+
+	private static long reuseKey(long segmentKey, int count) {
+		return (segmentKey & 0xFFFFFFFF00000000L) | (count & 0xFFFFFFFFL);
+	}
+
+	private static long slotKey(long segmentKey, int slot) {
+		return (segmentKey << 24) ^ slot;
+	}
+
+	/** Slots taken out of the shared allocator by this transaction and not yet visible to anybody else. */
+	public List<SlotRun> reservedSlots() {
+		return reserved;
+	}
+
+	/** Slots this transaction released. They only reach the free rings if it commits. */
+	public List<SlotRun> freedSlots() {
+		return freed;
+	}
+}

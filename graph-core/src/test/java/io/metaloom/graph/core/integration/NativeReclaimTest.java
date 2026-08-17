@@ -187,24 +187,33 @@ public class NativeReclaimTest {
 			// is 4094. One node, so the page stays punchable; one transaction, so this is cheap cycles and not
 			// thousands of commits.
 			boolean reachedTheTop = false;
-			try (Transaction txn = store.begin()) {
-				for (int i = 0; i < 4 * ElementId.MAX_GEN && !reachedTheTop; i++) {
+			// One transaction per cycle, not one transaction for all of them. A slot only becomes reusable when the
+			// delete that freed it commits: while it is uncommitted the advanced generation lives in the transaction's
+			// overlay and the mapping still holds the old one, and handing the slot back before those agree is exactly
+			// the reuse that broke the conserved-total invariant under concurrent writers. So the turnover this test
+			// needs is a cross-transaction property now, and it is written as one.
+			for (int i = 0; i < 4 * ElementId.MAX_GEN && !reachedTheTop; i++) {
+				try (Transaction txn = store.begin()) {
 					long id = store.createNode("N", Properties.of().set("i", i));
 					reachedTheTop = ElementId.gen(id) == ElementId.MAX_GEN - 1;
 					store.deleteNode(id);
+					txn.commit();
 				}
-				txn.commit();
 			}
 			assertTrue(reachedTheTop, "the slot's counter never reached the top of its range");
 			assertTrue(store.reclaim() > 0, "the emptied page should have been punched");
 
 			// Two cycles after the punch must produce two different ids. With a maximum they would be identical
-			// whenever the floor had reached the top of the range.
+			// whenever the floor had reached the top of the range. A transaction per cycle, for the reason above: the
+			// slot only comes back once the delete that freed it is committed.
 			long first;
 			long second;
 			try (Transaction txn = store.begin()) {
 				first = store.createNode("M", Properties.of().set("i", 1));
 				store.deleteNode(first);
+				txn.commit();
+			}
+			try (Transaction txn = store.begin()) {
 				second = store.createNode("M", Properties.of().set("i", 2));
 				txn.commit();
 			}

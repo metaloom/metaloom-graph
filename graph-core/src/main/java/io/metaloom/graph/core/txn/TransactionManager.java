@@ -5,6 +5,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 import io.metaloom.graph.core.api.GraphStoreException;
 import io.metaloom.graph.core.api.IsolationLevel;
@@ -49,6 +50,7 @@ public final class TransactionManager {
 	private final AtomicLong nextSnapshotId = new AtomicLong(1);
 	private final AtomicLong abandoned = new AtomicLong();
 	private final long retainedBytesBudget;
+	private final ReentrantLock vacuumLock = new ReentrantLock();
 
 	public TransactionManager(long retainedBytesBudget) {
 		this.retainedBytesBudget = retainedBytesBudget;
@@ -75,14 +77,37 @@ public final class TransactionManager {
 			throw new GraphStoreException("A read transaction is already open on thread "
 				+ Thread.currentThread().getName() + "; close it before opening another");
 		}
-		Snapshot snapshot =
-			new Snapshot(nextSnapshotId.getAndIncrement(), currentLsn, level, versions, this, nowNanos);
+		Snapshot snapshot = new Snapshot(nextSnapshotId.getAndIncrement(), currentLsn, level, versions, this, nowNanos,
+			false);
 		if (snapshot.isVersioned()) {
 			// Registered before it is published, so a commit that sees it in the active set is a commit whose
 			// before-images this view can already reach.
 			active.put(snapshot.id(), snapshot);
 		}
 		holder.set(snapshot);
+		return snapshot;
+	}
+
+	/**
+	 * Opens a write transaction's view: registered like any other, but not published to the thread.
+	 *
+	 * <p>
+	 * Not published, because a writer reaches its view through its {@link WriteContext} and a thread is allowed to hold
+	 * both. Publishing it would collide with a read view the caller already had open — and would refuse the write
+	 * outright, since {@link #begin} declines to nest — which is a restriction the writer does not need: it reads
+	 * through its own view either way.
+	 * </p>
+	 *
+	 * <p>
+	 * The caller must exclude the commit apply step across this call, for the same reason {@link #begin} must.
+	 * </p>
+	 */
+	public Snapshot beginWrite(IsolationLevel level, long currentLsn, long nowNanos) {
+		Snapshot snapshot = new Snapshot(nextSnapshotId.getAndIncrement(), currentLsn, level, versions, this, nowNanos,
+			true);
+		if (snapshot.isVersioned()) {
+			active.put(snapshot.id(), snapshot);
+		}
 		return snapshot;
 	}
 
@@ -98,8 +123,46 @@ public final class TransactionManager {
 		return !active.isEmpty();
 	}
 
+	/**
+	 * As {@link #needsVersions()}, but ignoring one view — the committing transaction's own.
+	 *
+	 * <p>
+	 * A writer registers a view like anybody else, so without this every commit would retain what it overwrote on
+	 * behalf of itself and a store with one writer and no readers would start paying for MVCC it does not use. It is
+	 * safe to ignore: nothing else can begin during the apply, which holds the same latch a new view has to take, so
+	 * "nobody else is registered" really does mean nobody else can want these bytes.
+	 * </p>
+	 */
+	public boolean needsVersionsBesides(long snapshotId) {
+		if (active.isEmpty()) {
+			return false;
+		}
+		if (active.size() > 1) {
+			return true;
+		}
+		return !active.containsKey(snapshotId);
+	}
+
+	/** Open read views. Write transactions hold the horizon too, but they are not what a caller is counting here. */
 	public int activeCount() {
-		return active.size();
+		int count = 0;
+		for (Snapshot snapshot : active.values()) {
+			if (!snapshot.isWriter()) {
+				count++;
+			}
+		}
+		return count;
+	}
+
+	/** Write transactions currently registered, which is how many writers are in flight. */
+	public int activeWriterCount() {
+		int count = 0;
+		for (Snapshot snapshot : active.values()) {
+			if (snapshot.isWriter()) {
+				count++;
+			}
+		}
+		return count;
 	}
 
 	public long abandonedCount() {
@@ -121,6 +184,9 @@ public final class TransactionManager {
 	public long oldestActiveAgeNanos(long nowNanos) {
 		long oldest = 0;
 		for (Snapshot snapshot : active.values()) {
+			if (snapshot.isWriter()) {
+				continue;
+			}
 			long age = nowNanos - snapshot.openedAtNanos();
 			if (age > oldest) {
 				oldest = age;
@@ -135,12 +201,34 @@ public final class TransactionManager {
 	 * @return the bytes reclaimed
 	 */
 	public long vacuum(long currentLsn) {
+		// One vacuum at a time. It runs outside every other lock — it walks whole chains, which is far too long to hold
+		// readers out for — and that was safe while one writer meant one commit meant one vacuum. With concurrent
+		// writers two of them arrive at once, and they cut the same chains at different horizons: one truncates a tail
+		// the other is still walking, {@code chain.oldest} ends up describing neither, and the byte accounting is
+		// decremented twice for the same entry. What it looks like from outside is a page whose newest before-image is
+		// older than it should be — so a view that is entitled to reconstruct the page decides it does not need to, and
+		// reads bytes from the future.
+		//
+		// Skipped rather than queued: a vacuum in flight is already cutting everything this one could, at a horizon it
+		// computed no earlier than this one would have.
+		if (!vacuumLock.tryLock()) {
+			return 0;
+		}
+		try {
+			return vacuumUnderLock(currentLsn);
+		} finally {
+			vacuumLock.unlock();
+		}
+	}
+
+	private long vacuumUnderLock(long currentLsn) {
 		long reclaimed = versions.vacuum(oldestActiveLsn(currentLsn));
 		if (versions.retainedBytes() <= retainedBytesBudget) {
 			return reclaimed;
 		}
 		// Over budget. Abandon views oldest first: each one released lets the horizon move up to the next.
 		List<Snapshot> oldestFirst = new ArrayList<>(active.values());
+		oldestFirst.removeIf(Snapshot::isWriter);
 		oldestFirst.sort(Comparator.comparingLong(Snapshot::snapshotLsn));
 		for (Snapshot snapshot : oldestFirst) {
 			if (versions.retainedBytes() <= retainedBytesBudget) {

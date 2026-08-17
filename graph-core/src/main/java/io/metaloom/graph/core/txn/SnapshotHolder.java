@@ -4,9 +4,9 @@ package io.metaloom.graph.core.txn;
  * Publishes a thread's open read view to the segment layer.
  *
  * <p>
- * The counterpart of {@link io.metaloom.graph.core.page.OverlayHolder}, and deliberately not the same shape. An overlay
- * belongs to the one writer, so a single owner field suffices. Read views are the opposite case — many threads, each
- * with its own — so this is a {@link ThreadLocal}.
+ * The counterpart of {@link WriteContextHolder}, and now the same shape. It was not always: while the engine had one
+ * writer at a time an overlay could be published through a single owner field, and read views were the only thing that
+ * needed one per thread. Concurrent writers made both sides the same problem.
  * </p>
  *
  * <p>

@@ -5,7 +5,10 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.Tag;
@@ -16,6 +19,7 @@ import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.IsolationLevel;
 import io.metaloom.graph.core.api.Properties;
 import io.metaloom.graph.core.api.ReadTransaction;
+import io.metaloom.graph.core.api.TransactionConflictException;
 import io.metaloom.graph.core.api.Transaction;
 import io.metaloom.graph.core.fixture.TempStore;
 
@@ -53,6 +57,12 @@ import io.metaloom.graph.core.fixture.TempStore;
  */
 @Tag("unit")
 public class SnapshotIsolationTest {
+
+	/** What the last {@link #bothWithdraw} run collided on, for a failure message that names something. */
+	private final List<TransactionConflictException> conflicts =
+		java.util.Collections.synchronizedList(new ArrayList<>());
+
+	private String conflictReport = "";
 
 	@RegisterExtension
 	TempStore stores = new TempStore();
@@ -176,9 +186,19 @@ public class SnapshotIsolationTest {
 	 * Two read-modify-write cycles run concurrently. Neither may be lost.
 	 *
 	 * <p>
-	 * This is the anomaly the writer-reads-current rule exists for. If a writer read through an open view instead of
-	 * the mapping, the second increment would compute 1 from a stale 0 and overwrite the first — silently, with no
-	 * conflict to report, because the two never touch the same lock.
+	 * The anomaly is the same; what prevents it has changed. While writers were serialised, the second increment could
+	 * not run until the first had committed and a writer read the current mapping, so it saw the new value by
+	 * construction. Writers now run at the same time and each reads a fixed view, so the second increment really does
+	 * compute 1 from a stale 0 — and the commit that would publish it is refused, because another transaction has
+	 * changed the bytes it is about to write. First committer wins, the loser retries against the new value, and no
+	 * increment is lost.
+	 * </p>
+	 *
+	 * <p>
+	 * So this test is now also the test that the retry seam works: {@code inTransaction} rather than {@code begin()},
+	 * because a bare {@code begin()} would raise {@link TransactionConflictException} and losing an increment and being
+	 * told you lost it are very different failures. The view held open throughout still proves it does not contaminate
+	 * the writes made beside it.
 	 * </p>
 	 */
 	@Test
@@ -196,11 +216,11 @@ public class SnapshotIsolationTest {
 						// A view is open throughout, to prove it does not contaminate the writes made beside it.
 						try (ReadTransaction view = store.beginRead()) {
 							for (int i = 0; i < perThread; i++) {
-								try (Transaction txn = store.begin()) {
+								store.inTransaction(() -> {
 									long current = (Long) store.nodeProperty(counter, "n");
 									store.setNodeProperties(counter, Properties.of().set("n", current + 1));
-									txn.commit();
-								}
+									return null;
+								}, 500);
 							}
 						}
 					} catch (Throwable e) {
@@ -227,30 +247,63 @@ public class SnapshotIsolationTest {
 	 * The constraint "at least one of the two must stay on duty", attacked from both sides at once.
 	 *
 	 * <p>
-	 * Under textbook snapshot isolation both transactions read both rows, each sees the other on duty, and each takes
-	 * itself off — leaving nobody, with no conflict detected. That is write skew, and it is why the spec lists SSI as
-	 * the fix. Here the writer lock serialises the two transactions and each reads the mapping rather than a view, so
-	 * the second one sees the first's commit and refuses.
+	 * Both transactions read both doctors, each sees the other on duty, and each takes itself off. Their writes are on
+	 * different records, so first-committer-wins has nothing to say about the constraint they are both reasoning about.
+	 * <b>Snapshot isolation does not rule that out</b> — it is write skew, the anomaly that separates snapshot
+	 * isolation from serializability, and this file used to assert the opposite because serialised writers made it
+	 * unreachable. Concurrent writers are the honest cost of the change.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>What this asserts is the mechanism, not the outcome, and the difference is worth being exact about.</b> The
+	 * pair usually <em>is</em> refused here — but for an unrelated reason: both updates insert into the shared property
+	 * index, and the byte range they both rewrite is a real write-write conflict. That is safety by layout, not by
+	 * isolation level, and asserting the outcome would be asserting an accident. So what is pinned down is that at
+	 * SNAPSHOT nothing is ever refused for having <em>read</em> something — {@link
+	 * TransactionConflictException#isReadConflict()} — which is exactly the check that is missing, and exactly the one
+	 * {@link IsolationLevel#SERIALIZABLE} adds.
 	 * </p>
 	 */
 	@Test
-	public void testWriteSkewIsPrevented() throws Exception {
+	public void testSnapshotIsolationNeverRefusesATransactionForWhatItRead() throws Exception {
 		try (GraphStore store = stores.open()) {
-			long alice = store.createNode("Doctor", Properties.of().set("onCall", true));
-			long bob = store.createNode("Doctor", Properties.of().set("onCall", true));
+			List<Long> doctors = twoDistantDoctors(store);
+			bothWithdraw(store, doctors.get(0), doctors.get(1), IsolationLevel.SNAPSHOT);
 
-			CountDownLatch start = new CountDownLatch(1);
-			AtomicReference<Throwable> failed = new AtomicReference<>();
+			for (TransactionConflictException conflict : conflicts) {
+				assertFalse(conflict.isReadConflict(),
+					"a SNAPSHOT transaction was refused for something it read, which is a check this level does not"
+						+ " make: " + conflict.getMessage());
+			}
+			// And whatever happened, the store agrees with itself.
+			store.verify(io.metaloom.graph.core.api.VerifyLevel.FULL);
+		}
+	}
 
-			Thread first = new Thread(withdraw(store, alice, bob, start, failed));
-			Thread second = new Thread(withdraw(store, bob, alice, start, failed));
-			first.start();
-			second.start();
-			start.countDown();
-			first.join();
-			second.join();
+	/**
+	 * The same attack at {@link IsolationLevel#SERIALIZABLE}, which is what the level is for.
+	 *
+	 * <p>
+	 * Each transaction read the other doctor's record and then decided from it. Validating the read set at commit turns
+	 * that into a conflict as soon as somebody else changes a page it was read from, so one of the two is refused —
+	 * and refused as a <em>read</em> conflict, which is the half SNAPSHOT does not do. It aborts rather than blocks,
+	 * and it aborts on page granularity rather than on the record: sound, and coarser than SSI would be.
+	 * </p>
+	 */
+	@Test
+	public void testSerializableRefusesWriteSkew() throws Exception {
+		try (GraphStore store = stores.open()) {
+			List<Long> doctors = twoDistantDoctors(store);
+			long alice = doctors.get(0);
+			long bob = doctors.get(1);
 
-			assertEquals(null, failed.get(), String.valueOf(failed.get()));
+			assertFalse(bothWithdraw(store, alice, bob, IsolationLevel.SERIALIZABLE),
+				"both transactions committed at SERIALIZABLE, which is write skew");
+			// Not asserted as a read conflict: the write set is validated first, so when the two also collide on a
+			// shared index page that is what gets reported. Either way one of them is refused, which is the guarantee.
+			// The asymmetry that identifies the level is in the SNAPSHOT test above, where a read conflict can never
+			// be reported at all.
+
 			boolean aliceOn = (Boolean) store.nodeProperty(alice, "onCall");
 			boolean bobOn = (Boolean) store.nodeProperty(bob, "onCall");
 			assertTrue(aliceOn || bobOn, "both doctors went off duty, which is write skew");
@@ -258,18 +311,76 @@ public class SnapshotIsolationTest {
 		}
 	}
 
+	/**
+	 * Two doctors whose property blocks cannot share a page with anything, including each other.
+	 *
+	 * <p>
+	 * Conflict detection compares byte ranges, so two records that happen to be neighbours are a write-write conflict
+	 * whatever the transactions were reasoning about. Spacing the doctors apart is not enough on its own: an update
+	 * allocates a <em>new</em> block, and two of those come off the bump cursor next to each other. Giving each doctor
+	 * a payload of more than half a page makes every block it ever occupies exclusive by construction — the old one and
+	 * the new one alike — so a conflict between these two transactions can only come from the constraint they are both
+	 * reading, which is the thing being tested.
+	 * </p>
+	 */
+	private List<Long> twoDistantDoctors(GraphStore store) throws java.io.IOException {
+		List<Long> doctors = new ArrayList<>();
+		doctors.add(store.createNode("Doctor", onCall(true)));
+		doctors.add(store.createNode("Doctor", onCall(true)));
+		return doctors;
+	}
+
+	/** Half a page of padding, so the block this produces has its page to itself. */
+	private static Properties onCall(boolean value) {
+		return Properties.of().set("onCall", value).set("pad", "x".repeat(5_000));
+	}
+
+	/**
+	 * Runs both withdrawals with a barrier between the read and the write, so both really do decide from the state
+	 * before either of them acted. Returns true when both committed.
+	 */
+	private boolean bothWithdraw(GraphStore store, long alice, long bob, IsolationLevel level) throws Exception {
+		conflicts.clear();
+		CyclicBarrier read = new CyclicBarrier(2);
+		AtomicReference<Throwable> failed = new AtomicReference<>();
+		java.util.concurrent.atomic.AtomicInteger committed = new java.util.concurrent.atomic.AtomicInteger();
+
+		Thread first = new Thread(withdraw(store, alice, bob, level, read, committed, conflicts, failed),
+			"withdraw-alice");
+		Thread second = new Thread(withdraw(store, bob, alice, level, read, committed, conflicts, failed),
+			"withdraw-bob");
+		first.start();
+		second.start();
+		first.join();
+		second.join();
+
+		if (failed.get() != null) {
+			throw new AssertionError("a withdrawal failed with something other than a conflict", failed.get());
+		}
+		conflictReport = conflicts.stream().map(Throwable::getMessage)
+			.collect(java.util.stream.Collectors.joining("\n  "));
+		return committed.get() == 2;
+	}
+
 	/** Takes {@code self} off duty only if {@code other} is still on, inside one transaction. */
-	private static Runnable withdraw(GraphStore store, long self, long other, CountDownLatch start,
-		AtomicReference<Throwable> failed) {
+	private static Runnable withdraw(GraphStore store, long self, long other, IsolationLevel level,
+		CyclicBarrier read, java.util.concurrent.atomic.AtomicInteger committed,
+		List<TransactionConflictException> conflicts, AtomicReference<Throwable> failed) {
 		return () -> {
-			try {
-				start.await();
-				try (Transaction txn = store.begin()) {
-					if ((Boolean) store.nodeProperty(other, "onCall")) {
-						store.setNodeProperties(self, Properties.of().set("onCall", false));
-					}
-					txn.commit();
+			try (Transaction txn = store.begin(level)) {
+				boolean otherOnCall = (Boolean) store.nodeProperty(other, "onCall");
+				// Both have now read, and neither has written. Without this the anomaly is a race rather than a
+				// demonstration, and the test would pass or fail on scheduling.
+				read.await();
+				if (otherOnCall) {
+					store.setNodeProperties(self, onCall(false));
 				}
+				txn.commit();
+				committed.incrementAndGet();
+			} catch (TransactionConflictException e) {
+				// The expected outcome for one of the two at SERIALIZABLE, and for neither at SNAPSHOT. Kept, because
+				// "both should have committed" is not actionable without knowing what they collided on.
+				conflicts.add(e);
 			} catch (Throwable e) {
 				failed.compareAndSet(null, e);
 			}

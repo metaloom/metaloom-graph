@@ -38,8 +38,14 @@ public interface GraphStore extends AutoCloseable {
 	// ---------------------------------------------------------------- transactions
 
 	/**
-	 * Starts a write transaction. Only one may be active at a time; other writers block. Every mutating method below
+	 * Starts a write transaction at {@link IsolationLevel#SNAPSHOT}.
+	 *
+	 * <p>
+	 * <b>Writers run concurrently.</b> The transaction reads the store as it stands at this instant and keeps its
+	 * changes private until it commits; if another transaction commits a change to something this one wrote, the commit
+	 * raises {@link TransactionConflictException} and the first committer keeps its version. Every mutating method below
 	 * joins the caller's transaction if there is one, and otherwise runs in its own auto-commit transaction.
+	 * </p>
 	 *
 	 * <p>
 	 * Nesting is <b>refused</b>: calling this on a thread that already holds an open write transaction raises a
@@ -48,6 +54,16 @@ public interface GraphStore extends AutoCloseable {
 	 * </p>
 	 */
 	Transaction begin();
+
+	/**
+	 * Starts a write transaction at the given level.
+	 *
+	 * @param level
+	 *            {@link IsolationLevel#SNAPSHOT} or {@link IsolationLevel#SERIALIZABLE}. A writer cannot run at
+	 *            {@link IsolationLevel#READ_COMMITTED} — it would decide what to write from a state that has already
+	 *            moved — and asking for it raises {@link IllegalArgumentException} rather than being upgraded silently.
+	 */
+	Transaction begin(IsolationLevel level);
 
 	/**
 	 * Opens a {@link IsolationLevel#SNAPSHOT} read view: every read on this thread sees the store as it was at this
@@ -74,11 +90,11 @@ public interface GraphStore extends AutoCloseable {
 	 * Whether this thread already holds a write transaction.
 	 *
 	 * <p>
-	 * {@link #begin()} refuses to nest, as {@link #beginRead()} does. It has to: the writer lock is reentrant, so a
-	 * nested transaction used to succeed and then lose data silently — the inner transaction publishes its own page
-	 * overlay, and committing it clears the overlay while the outer transaction is still live, after which the outer
-	 * transaction's writes went straight to the mapping, unlogged and past the point where a rollback could take them
-	 * back. A refusal is a caught mistake; that was an uncaught one.
+	 * {@link #begin()} refuses to nest, as {@link #beginRead()} does. It has to: a nested transaction used to succeed
+	 * and then lose data silently — the inner transaction publishes its own page overlay, and committing it clears the
+	 * overlay while the outer transaction is still live, after which the outer transaction's writes went straight to
+	 * the mapping, unlogged and past the point where a rollback could take them back. A refusal is a caught mistake;
+	 * that was an uncaught one.
 	 * </p>
 	 *
 	 * <p>
@@ -94,11 +110,16 @@ public interface GraphStore extends AutoCloseable {
 	 * reports contention.
 	 *
 	 * <p>
-	 * Failures that repeating cannot fix — a constraint violation, an abandoned snapshot — are raised immediately
-	 * rather than retried into the same answer.
+	 * {@link TransactionConflictException} is the case this exists for, and retrying it always makes progress: a
+	 * conflict has a winner, so the next attempt runs against a newer state with one fewer competitor. Failures that
+	 * repeating cannot fix — a constraint violation, an abandoned snapshot — are raised immediately rather than retried
+	 * into the same answer.
 	 * </p>
 	 */
 	<T> T inTransaction(TransactionalWork<T> work, int attempts) throws IOException;
+
+	/** As {@link #inTransaction(TransactionalWork, int)}, at the given isolation level. */
+	<T> T inTransaction(TransactionalWork<T> work, int attempts, IsolationLevel level) throws IOException;
 
 	default <T> T inTransaction(TransactionalWork<T> work) throws IOException {
 		return inTransaction(work, 3);

@@ -78,19 +78,21 @@ public class HammerTest {
 						.set("w", Witness.longForm(id, generation.incrementAndGet()))
 						.set("bucket", (long) rnd.nextInt(8)));
 				})
-				.op("multiOpTransaction", 2, rnd -> {
-					try (Transaction txn = store.begin()) {
-						long a = nodes.get(rnd.nextInt(nodes.size()));
-						long b = nodes.get(rnd.nextInt(nodes.size()));
-						store.setNodeProperties(a, Properties.of()
-							.set("w", Witness.shortForm(a, generation.incrementAndGet()))
-							.set("bucket", (long) rnd.nextInt(8)));
-						if (a != b) {
-							store.createEdge(a, "LINKS", b);
-						}
-						txn.commit();
+				// inTransaction, not begin(): six writers hammering one store conflict constantly, and every conflict
+				// here is real — two of them writing the same node, or inserting into one index leaf. Retrying is the
+				// contract. The single-statement ops above need no such wrapper, because an auto-commit mutation
+				// retries its own conflicts inside the engine.
+				.op("multiOpTransaction", 2, rnd -> store.inTransaction(() -> {
+					long a = nodes.get(rnd.nextInt(nodes.size()));
+					long b = nodes.get(rnd.nextInt(nodes.size()));
+					store.setNodeProperties(a, Properties.of()
+						.set("w", Witness.shortForm(a, generation.incrementAndGet()))
+						.set("bucket", (long) rnd.nextInt(8)));
+					if (a != b) {
+						store.createEdge(a, "LINKS", b);
 					}
-				})
+					return null;
+				}, 200))
 				.op("rollback", 1, rnd -> {
 					try (Transaction txn = store.begin()) {
 						long id = nodes.get(rnd.nextInt(nodes.size()));
@@ -131,7 +133,9 @@ public class HammerTest {
 						.set("w", Witness.shortForm(id, generation.incrementAndGet()))
 						.set("bucket", (long) rnd.nextInt(8)));
 					return null;
-				}))
+					// The default three attempts is not enough with six writers on one index: this op exists to
+					// exercise the retry seam, so it is given room to actually retry.
+				}, 200))
 				.op("checkpoint", 1, rnd -> store.checkpoint())
 				.op("maintenanceWhileViewsOpen", 1, rnd -> {
 					// reclaim() is refused while any view is open. Whether one is open right now is a race, so both

@@ -3,12 +3,13 @@ package io.metaloom.graph.core.txn;
 import java.io.IOException;
 
 import io.metaloom.graph.core.api.GraphStoreException;
+import io.metaloom.graph.core.api.IsolationLevel;
 import io.metaloom.graph.core.api.Transaction;
 import io.metaloom.graph.core.page.PageOverlay;
 
 /**
- * The write side of a transaction: an overlay of private page copies plus the callbacks the store uses to commit or
- * discard them.
+ * The write side of a transaction: the {@link WriteContext} it runs in, plus the callbacks the store uses to commit or
+ * discard it.
  *
  * @see <a href="../../../../../../../../spec/TRANSACTIONS.md">spec/TRANSACTIONS.md</a> section 4
  */
@@ -23,15 +24,15 @@ public final class TransactionImpl implements Transaction {
 	}
 
 	private final long id;
-	private final PageOverlay overlay;
+	private final WriteContext context;
 	private final Completion completion;
 
 	private boolean active = true;
 	private long commitLsn = -1;
 
-	public TransactionImpl(long id, int pageSize, Completion completion) {
+	public TransactionImpl(long id, int pageSize, Snapshot snapshot, IsolationLevel level, Completion completion) {
 		this.id = id;
-		this.overlay = new PageOverlay(pageSize);
+		this.context = new WriteContext(id, pageSize, snapshot, level);
 		this.completion = completion;
 	}
 
@@ -40,8 +41,22 @@ public final class TransactionImpl implements Transaction {
 		return id;
 	}
 
+	public WriteContext context() {
+		return context;
+	}
+
 	public PageOverlay overlay() {
-		return overlay;
+		return context.overlay();
+	}
+
+	/** The view this transaction reads through, which is also the point its conflict detection validates against. */
+	public Snapshot snapshot() {
+		return context.snapshot();
+	}
+
+	@Override
+	public IsolationLevel level() {
+		return context.level();
 	}
 
 	@Override
@@ -49,8 +64,14 @@ public final class TransactionImpl implements Transaction {
 		if (!active) {
 			throw new GraphStoreException("Transaction " + id + " is no longer active");
 		}
-		commitLsn = completion.commit(this);
-		active = false;
+		try {
+			commitLsn = completion.commit(this);
+		} finally {
+			// Cleared whichever way the commit went. A conflict ends the transaction just as firmly as success does:
+			// its overlay has been discarded, so letting a caller retry commit() on the same handle would commit
+			// nothing and report an LSN as though it had.
+			active = false;
+		}
 		return commitLsn;
 	}
 
@@ -70,7 +91,7 @@ public final class TransactionImpl implements Transaction {
 
 	@Override
 	public int touchedPages() {
-		return overlay.size();
+		return context.overlay().size();
 	}
 
 	public long commitLsn() {

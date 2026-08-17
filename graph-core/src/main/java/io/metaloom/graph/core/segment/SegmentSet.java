@@ -8,8 +8,12 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Stream;
 
 import io.metaloom.graph.core.api.OutOfSegmentsException;
@@ -17,8 +21,10 @@ import io.metaloom.graph.core.id.ElementId;
 import io.metaloom.graph.core.id.Kind;
 import io.metaloom.graph.core.id.StaleIdException;
 import io.metaloom.graph.core.metrics.IoCounters;
-import io.metaloom.graph.core.page.OverlayHolder;
+import io.metaloom.graph.core.txn.MetaJournal;
 import io.metaloom.graph.core.txn.SnapshotHolder;
+import io.metaloom.graph.core.txn.WriteContext;
+import io.metaloom.graph.core.txn.WriteContextHolder;
 import io.metaloom.graph.core.util.Layouts;
 
 /**
@@ -42,10 +48,34 @@ public final class SegmentSet implements AutoCloseable {
 	private final Geometry geometry;
 	private final Path dir;
 
-	private final List<SegmentFile> segments = new ArrayList<>();
+	private final List<SegmentFile> segments = new CopyOnWriteArrayList<>();
 	private final Deque<Long> freeRing = new ArrayDeque<>();
 	/** Segregated free lists for multi-slot runs, keyed by run length. */
 	private final Map<Integer, Deque<Long>> freeRuns = new HashMap<>();
+
+	/**
+	 * Everything the allocator touches, and the only lock it takes.
+	 *
+	 * <p>
+	 * Allocation is the one operation concurrent writers genuinely cannot do optimistically. Every other collision
+	 * between two writers is detectable afterwards — they wrote the same bytes, so one of them aborts — but two writers
+	 * handed the same slot have already put two records at one id, and there is no bitmap, checksum or invariant that
+	 * can tell them apart later. So the handout is serialised, and it is the <em>only</em> thing that is: the lock is
+	 * held for a bitmap scan and a record fill, not for the transaction.
+	 * </p>
+	 */
+	private final ReentrantLock allocLock = new ReentrantLock();
+
+	/**
+	 * Slots reserved by transactions that have not committed, packed as {@code (segment << 32) | slot}.
+	 *
+	 * <p>
+	 * The bitmap in the mapping only knows about slots that <em>have</em> committed, so on its own it would hand the
+	 * same slot to two writers in flight at once. This is the difference. It is memory-only and its loss is harmless:
+	 * after a crash there are no transactions in flight.
+	 * </p>
+	 */
+	private final Map<Long, Long> reserved = new HashMap<>();
 
 	private final int slotsPerSegment;
 	private final int slotsPerPage;
@@ -54,7 +84,7 @@ public final class SegmentSet implements AutoCloseable {
 	/** Per segment scan cursor for {@link #allocateLowest}, valid only while nothing is freed. */
 	private int[] lowestFreeHint = new int[8];
 
-	private OverlayHolder overlays;
+	private WriteContextHolder contexts;
 	private SnapshotHolder snapshots;
 	private IoCounters counters;
 
@@ -109,11 +139,11 @@ public final class SegmentSet implements AutoCloseable {
 
 	// ---------------------------------------------------------------- transaction plumbing
 
-	/** Routes access through the store's overlay holder, which is thread-scoped. */
-	public void overlays(OverlayHolder overlays) {
-		this.overlays = overlays;
+	/** Routes access through the store's write-context holder, which is thread-scoped. */
+	public void writeContexts(WriteContextHolder contexts) {
+		this.contexts = contexts;
 		for (SegmentFile segment : segments) {
-			segment.overlays(overlays);
+			segment.writeContexts(contexts);
 		}
 	}
 
@@ -138,14 +168,222 @@ public final class SegmentSet implements AutoCloseable {
 		}
 	}
 
-	/** Discards in-memory allocator state after a rollback; the bitmap on disk is authoritative. */
-	public void rollbackState() {
-		for (SegmentFile segment : segments) {
-			segment.superblock().reload();
+	/**
+	 * Releases what a transaction reserved and never committed.
+	 *
+	 * <p>
+	 * It used to reload every superblock from the mapping and empty the free rings, which was correct with one writer
+	 * and is destructive with several: the counters it would restore are shared, and another writer's uncommitted
+	 * changes are not in them to be restored. Under concurrency a rollback is purely local — the overlay and the
+	 * journal are discarded, which is the whole of it — and the only shared state to give back is the slots this
+	 * transaction took out of the allocator. They go on the free ring rather than being forgotten, because the bump
+	 * cursor has already moved past them.
+	 * </p>
+	 */
+	public void rollbackState(WriteContext context, boolean alone) {
+		if (context == null) {
+			return;
 		}
-		freeRing.clear();
-		freeRuns.clear();
+		allocLock.lock();
+		try {
+			for (WriteContext.SlotRun run : context.reservedSlots()) {
+				if (MetaJournal.kindCodeOf(run.segmentKey()) != kind.code()) {
+					continue;
+				}
+				int number = MetaJournal.segmentNumberOf(run.segmentKey());
+				for (int i = 0; i < run.count(); i++) {
+					reserved.remove(pack(number, run.slot() + i));
+				}
+			}
+			// Before the slots go back on the ring, not after. Lowering the mark and then offering the slots above it
+			// hands the same slot out twice: once off the ring and once off the bump cursor on its way back up.
+			if (alone) {
+				lowerHighWater(context);
+			}
+			// Deduplicated: a transaction that turns one slot over repeatedly reserves it once per cycle, and two ring
+			// entries naming one slot is two allocations of it after the next rollback.
+			Set<Long> returned = new HashSet<>();
+			for (WriteContext.SlotRun run : context.reservedSlots()) {
+				if (MetaJournal.kindCodeOf(run.segmentKey()) != kind.code() || run.count() != 1) {
+					continue;
+				}
+				int number = MetaJournal.segmentNumberOf(run.segmentKey());
+				if (number < segments.size() && run.slot() < segments.get(number).superblock().highWaterSlot()
+					&& returned.add(pack(number, run.slot()))) {
+					pushFree(number, run.slot());
+				}
+			}
+			clearHints();
+		} finally {
+			allocLock.unlock();
+		}
+	}
+
+	/**
+	 * Publishes what a committed transaction did to the allocator: its reservations are now real, and the slots it
+	 * freed become reusable.
+	 *
+	 * <p>
+	 * The frees are deferred to here rather than pushed when {@link #free} runs, and that is not tidiness. A slot on
+	 * the ring is a slot the allocator will hand out; handing out one whose delete has not committed would let a
+	 * rollback restore a record that somebody else is already using.
+	 * </p>
+	 */
+	public void commitState(WriteContext context) {
+		if (context == null) {
+			return;
+		}
+		allocLock.lock();
+		try {
+			for (WriteContext.SlotRun run : context.reservedSlots()) {
+				if (MetaJournal.kindCodeOf(run.segmentKey()) != kind.code()) {
+					continue;
+				}
+				int number = MetaJournal.segmentNumberOf(run.segmentKey());
+				for (int i = 0; i < run.count(); i++) {
+					reserved.remove(pack(number, run.slot() + i));
+				}
+			}
+			for (WriteContext.SlotRun run : context.freedSlots()) {
+				if (MetaJournal.kindCodeOf(run.segmentKey()) != kind.code()) {
+					continue;
+				}
+				int number = MetaJournal.segmentNumberOf(run.segmentKey());
+				if (number >= segments.size() || segments.get(number).freeSlots().isAllocatedLive(run.slot())) {
+					// Freed and then taken back by this same transaction. The mapping is the authority and it says the
+					// slot is live, so offering it to the allocator would hand out a record that exists.
+					continue;
+				}
+				if (run.count() == 1) {
+					pushFree(number, run.slot());
+				} else {
+					Deque<Long> ring = freeRuns.computeIfAbsent(run.count(), k -> new ArrayDeque<>());
+					if (ring.size() < FREE_RING_CAPACITY) {
+						ring.addLast(pack(number, run.slot()));
+					}
+				}
+			}
+			clearHints();
+		} finally {
+			allocLock.unlock();
+		}
+	}
+
+	/**
+	 * Puts a rolled-back transaction's high water marks back, where that is still true.
+	 *
+	 * <p>
+	 * <b>Only when this transaction is the only one in the store</b> — no read view open, no other writer. The mark
+	 * bounds every scan, so lowering it hides whatever is above it, and above it is exactly where a record that another
+	 * view is still entitled to see can be sitting. It also feeds the bump cursor, so lowering it under a free-ring
+	 * entry naming the same slot hands that slot out twice. Alone, neither can happen, and alone is the case the
+	 * property is about: a rolled-back transaction and a crash in the middle of the same transaction must reach
+	 * byte-identical stores. Under contention the mark stays up, which is harmless — a mark above a free slot is the
+	 * state an ordinary delete produces, and what {@code shrinkHighWater} exists to tidy.
+	 * </p>
+	 */
+	private void lowerHighWater(WriteContext context) {
+		for (Map.Entry<Long, Long> entry : context.highWaterBefore().entrySet()) {
+			long segmentKey = entry.getKey();
+			if (MetaJournal.kindCodeOf(segmentKey) != kind.code()) {
+				continue;
+			}
+			int number = MetaJournal.segmentNumberOf(segmentKey);
+			if (number >= segments.size()) {
+				continue;
+			}
+			SegmentFile segment = segments.get(number);
+			int before = (int) (long) entry.getValue();
+			int current = (int) Math.min(segment.superblock().highWaterSlot(), slotsPerSegment);
+			if (current <= before) {
+				continue;
+			}
+			if (segment.freeSlots().highestAllocatedBelowLive(current) >= before) {
+				continue;
+			}
+			boolean reservedAbove = false;
+			for (int slot = before; slot < current && !reservedAbove; slot++) {
+				reservedAbove = reserved.containsKey(pack(number, slot));
+			}
+			if (!reservedAbove) {
+				segment.superblock().highWaterSlot(before);
+				// Every ring entry above the new mark has to go with it. A slot named by the ring and also reachable
+				// from the bump cursor is handed out twice — which is what shrinkHighWater() has always avoided by
+				// emptying the caches outright, and what this had to learn the same way.
+				purgeCachesAbove(number, before);
+			}
+		}
+	}
+
+	/**
+	 * Claims one named slot, or {@link ElementId#NULL} when somebody already has it.
+	 *
+	 * <p>
+	 * One caller: the index catalog page, which has to live at INDEX (0, 0) because that is where a reopen looks for
+	 * it. It used to allocate ordinarily and assert that it had been given slot 0, which held only because a rollback
+	 * emptied the free rings and reloaded the bump cursor from disk — so the very first allocation of a store really
+	 * was the first slot. Concurrent writers recycle rolled-back slots instead of forgetting them, and the assertion
+	 * started firing on stores where nothing was wrong. Asking for the slot is what the caller meant in the first
+	 * place.
+	 * </p>
+	 */
+	public long allocateAt(int segmentNumber, int slot) throws IOException {
+		allocLock.lock();
+		try {
+			while (segments.size() <= segmentNumber) {
+				addSegment();
+			}
+			SegmentFile segment = segments.get(segmentNumber);
+			if (segment.freeSlots().isAllocated(slot) || segment.freeSlots().isAllocatedLive(slot)
+				|| reserved.containsKey(pack(segmentNumber, slot))) {
+				return ElementId.NULL;
+			}
+			freeRing.remove(pack(segmentNumber, slot));
+			long high = segment.superblock().highWaterSlot();
+			if (high <= slot) {
+				noteHighWater(segment, high);
+				segment.superblock().highWaterSlot(slot + 1L);
+			}
+			return claim(segment, slot, 1);
+		} finally {
+			allocLock.unlock();
+		}
+	}
+
+	/** Forgets every cached free slot of one segment at or above {@code mark}. */
+	private void purgeCachesAbove(int segmentNumber, int mark) {
+		freeRing.removeIf(packed -> (int) (packed >>> 32) == segmentNumber && slotOf(packed) >= mark);
+		for (Deque<Long> ring : freeRuns.values()) {
+			ring.removeIf(packed -> (int) (packed >>> 32) == segmentNumber && slotOf(packed) >= mark);
+		}
 		clearHints();
+	}
+
+	/** Whether a slot is spoken for in the mapping or by a transaction that has not committed yet. */
+	public boolean isTaken(int segmentNumber, int slot) {
+		allocLock.lock();
+		try {
+			if (segmentNumber >= segments.size()) {
+				return false;
+			}
+			return segments.get(segmentNumber).freeSlots().isAllocatedLive(slot)
+				|| reserved.containsKey(pack(segmentNumber, slot));
+		} finally {
+			allocLock.unlock();
+		}
+	}
+
+	/** Drops every in-memory allocator cache. The bitmap on disk is authoritative; this only forgets a shortcut. */
+	public void resetAllocatorCaches() {
+		allocLock.lock();
+		try {
+			freeRing.clear();
+			freeRuns.clear();
+			reserved.clear();
+			clearHints();
+		} finally {
+			allocLock.unlock();
+		}
 	}
 
 	/** Re-reads every header after a log replay, which may have written a newer copy into the other A/B slot. */
@@ -153,9 +391,7 @@ public final class SegmentSet implements AutoCloseable {
 		for (SegmentFile segment : segments) {
 			segment.superblock().selectActive();
 		}
-		freeRing.clear();
-		freeRuns.clear();
-		clearHints();
+		resetAllocatorCaches();
 	}
 
 	// ---------------------------------------------------------------- segments
@@ -179,7 +415,7 @@ public final class SegmentSet implements AutoCloseable {
 		// The fresh superblock is written outside any overlay and made durable immediately: a segment file whose
 		// header never reached disk would fail to open after a crash.
 		segment.force();
-		segment.overlays(overlays);
+		segment.writeContexts(contexts);
 		segment.snapshots(snapshots);
 		segments.add(segment);
 		return segment;
@@ -189,29 +425,49 @@ public final class SegmentSet implements AutoCloseable {
 
 	/** Allocates one slot and returns its id, with a generation that never reads as zero. */
 	public long allocate() throws IOException {
-		Long reused;
-		while ((reused = freeRing.pollFirst()) != null) {
-			if (isReusable(reused, 1)) {
-				return claim(segmentOf(reused), slotOf(reused), 1);
+		allocLock.lock();
+		try {
+			long own = reuseOwnFreed(1);
+			if (own != ElementId.NULL) {
+				return own;
 			}
-			// The ring is a cache in front of the bitmap and the bitmap is the authority. Compaction allocates
-			// straight out of the bitmap, so it can take a slot the ring still remembers; handing that slot out
-			// again would give two records the same id.
-		}
-		SegmentFile segment = activeSegment();
-		long high = segment.superblock().highWaterSlot();
-		if (high >= slotsPerSegment) {
-			// The bump cursor is exhausted: try to recycle before adding a segment.
-			int scanned = segment.freeSlots().nextFree(0);
-			if (scanned >= 0) {
-				return claim(segment, scanned, 1);
+			List<Long> deferred = null;
+			try {
+				Long reused;
+				while ((reused = freeRing.pollFirst()) != null) {
+					if (!isReusable(reused, 1)) {
+						// The ring is a cache in front of the bitmap and the bitmap is the authority. Compaction
+						// allocates straight out of the bitmap, so it can take a slot the ring still remembers;
+						// handing that slot out again would give two records the same id.
+						continue;
+					}
+					if (!isFreeInView(reused, 1)) {
+						deferred = defer(deferred, reused);
+						continue;
+					}
+					return claim(segmentOf(reused), slotOf(reused), 1);
+				}
+			} finally {
+				returnDeferred(deferred);
 			}
-			segment.superblock().sealed(true);
-			segment = addSegment();
-			high = 0;
+			SegmentFile segment = activeSegment();
+			long high = segment.superblock().highWaterSlot();
+			if (high >= slotsPerSegment) {
+				// The bump cursor is exhausted: try to recycle before adding a segment.
+				int scanned = nextFreeUnreserved(segment, 0, slotsPerSegment);
+				if (scanned >= 0) {
+					return claim(segment, scanned, 1);
+				}
+				segment.superblock().sealed(true);
+				segment = addSegment();
+				high = 0;
+			}
+			noteHighWater(segment, high);
+			segment.superblock().highWaterSlot(high + 1);
+			return claim(segment, (int) high, 1);
+		} finally {
+			allocLock.unlock();
 		}
-		segment.superblock().highWaterSlot(high + 1);
-		return claim(segment, (int) high, 1);
 	}
 
 	/** Allocates {@code count} consecutive slots that do not straddle a page boundary. */
@@ -226,40 +482,123 @@ public final class SegmentSet implements AutoCloseable {
 		if (count == 1) {
 			return allocate();
 		}
-		Deque<Long> ring = freeRuns.get(count);
-		if (ring != null) {
-			Long reused;
-			while ((reused = ring.pollFirst()) != null) {
-				if (isReusable(reused, count)) {
-					return claim(segmentOf(reused), slotOf(reused), count);
+		allocLock.lock();
+		try {
+			long own = reuseOwnFreed(count);
+			if (own != ElementId.NULL) {
+				return own;
+			}
+			Deque<Long> ring = freeRuns.get(count);
+			if (ring != null) {
+				List<Long> deferred = null;
+				try {
+					Long reused;
+					while ((reused = ring.pollFirst()) != null) {
+						if (!isReusable(reused, count)) {
+							continue;
+						}
+						if (!isFreeInView(reused, count)) {
+							deferred = defer(deferred, reused);
+							continue;
+						}
+						return claim(segmentOf(reused), slotOf(reused), count);
+					}
+				} finally {
+					if (deferred != null) {
+						for (Long entry : deferred) {
+							ring.addLast(entry);
+						}
+					}
 				}
 			}
-		}
-		SegmentFile segment = activeSegment();
-		long high = segment.superblock().highWaterSlot();
-		long inPage = high % slotsPerPage;
-		if (inPage + count > slotsPerPage) {
-			// Skip the page tail rather than straddle. The skipped slots go on the free ring.
-			long skip = slotsPerPage - inPage;
-			for (long i = 0; i < skip; i++) {
-				pushFree(segment.segmentNumber(), (int) (high + i));
+			SegmentFile segment = activeSegment();
+			long high = segment.superblock().highWaterSlot();
+			long inPage = high % slotsPerPage;
+			if (inPage + count > slotsPerPage) {
+				// Skip the page tail rather than straddle. The skipped slots go on the free ring.
+				long skip = slotsPerPage - inPage;
+				for (long i = 0; i < skip; i++) {
+					pushFree(segment.segmentNumber(), (int) (high + i));
+				}
+				high += skip;
 			}
-			high += skip;
-		}
-		if (high + count > slotsPerSegment) {
-			int scanned = segment.freeSlots().nextFreeRun(0, count, slotsPerPage);
-			if (scanned >= 0) {
-				return claim(segment, scanned, count);
+			if (high + count > slotsPerSegment) {
+				int scanned = nextFreeRunUnreserved(segment, 0, slotsPerSegment, count);
+				if (scanned >= 0) {
+					return claim(segment, scanned, count);
+				}
+				segment.superblock().sealed(true);
+				segment = addSegment();
+				high = 0;
 			}
-			segment.superblock().sealed(true);
-			segment = addSegment();
-			high = 0;
+			noteHighWater(segment, high);
+			segment.superblock().highWaterSlot(high + count);
+			return claim(segment, (int) high, count);
+		} finally {
+			allocLock.unlock();
 		}
-		segment.superblock().highWaterSlot(high + count);
-		return claim(segment, (int) high, count);
 	}
 
-	/** True when every slot of a ring entry is still free according to the bitmap, which is the authority. */
+	/**
+	 * Hands the calling transaction back a run it freed itself, or {@link ElementId#NULL} if it has none.
+	 *
+	 * <p>
+	 * Tried before the shared ring, because a transaction that frees a structure and rebuilds it should reuse its own
+	 * space rather than extend the segment. The freed run only reaches the shared ring at commit — see
+	 * {@link WriteContext#takeReusable} for why — so without this the rebuild allocates off the bump cursor and the
+	 * high water mark ratchets up once per rebuild, which is the defect {@code IndexSpaceReuseTest} pins down.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>{@link Kind#INDEX} only, and the restriction is not caution.</b> Reusing a slot before the delete that freed
+	 * it has committed means the record's generation counter is advanced in the transaction's overlay and not in the
+	 * mapping, so the two disagree for as long as the transaction runs — and every other kind is reachable through an
+	 * id held somewhere else while that is true. Enabling it for {@code PROP} was measured breaking the conserved-total
+	 * invariant of {@code ParallelConsistencyTest} under four writers, as a reader resolving a property block it was
+	 * entitled to see and being told its generation was stale. The index is the case that needs it and the case where
+	 * it holds: {@code resetTrees()} frees and rebuilds the whole structure inside one transaction, and no id survives
+	 * that rebuild to be confused by it — the same argument {@link #packFreeRing()} is limited by.
+	 * </p>
+	 */
+	private long reuseOwnFreed(int count) {
+		if (kind != Kind.INDEX) {
+			return ElementId.NULL;
+		}
+		WriteContext context = contexts == null ? null : contexts.current();
+		if (context == null) {
+			return ElementId.NULL;
+		}
+		WriteContext.SlotRun run;
+		while ((run = context.takeReusable(kind.code(), count)) != null) {
+			int number = MetaJournal.segmentNumberOf(run.segmentKey());
+			if (number >= segments.size()) {
+				continue;
+			}
+			SegmentFile segment = segments.get(number);
+			boolean free = true;
+			for (int i = 0; i < count && free; i++) {
+				// The transaction's own view, which already has its free in it. The shared reservation set is
+				// deliberately not consulted: these slots are in it precisely when this transaction allocated them
+				// itself earlier, and refusing them for that reason is what made a create-delete-create loop walk up
+				// the segment instead of turning one slot over.
+				free = !segment.freeSlots().isAllocated(run.slot() + i);
+			}
+			if (free) {
+				return claim(segment, run.slot(), count);
+			}
+		}
+		return ElementId.NULL;
+	}
+
+	/**
+	 * True when every slot of a ring entry is free in the mapping and reserved by nobody.
+	 *
+	 * <p>
+	 * The mapping rather than the caller's view, and this is the whole of why {@code isAllocatedLive} exists. A slot
+	 * another transaction committed since this one began is invisible through the view — which is right for reading it
+	 * and catastrophic for allocating it.
+	 * </p>
+	 */
 	private boolean isReusable(long packed, int count) {
 		int number = (int) (packed >>> 32);
 		if (number >= segments.size()) {
@@ -271,6 +610,31 @@ public final class SegmentSet implements AutoCloseable {
 			return false;
 		}
 		for (int i = 0; i < count; i++) {
+			if (bitmap.isAllocatedLive(slot + i) || reserved.containsKey(pack(number, slot + i))) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * True when the slots are also free in the calling transaction's own view.
+	 *
+	 * <p>
+	 * A slot can be free in the mapping and still hold a record this transaction is entitled to see: another writer
+	 * deleted it after this one's snapshot. Allocating it would be safe for everybody else and wrong for the caller —
+	 * it would overwrite a record its own reads are still supposed to return. So it is passed over and put back, not
+	 * dropped: it becomes reusable again as soon as a transaction begins that cannot see the old record.
+	 * </p>
+	 */
+	private boolean isFreeInView(long packed, int count) {
+		int number = (int) (packed >>> 32);
+		if (number >= segments.size()) {
+			return false;
+		}
+		FreeSlotBitmap bitmap = segments.get(number).freeSlots();
+		int slot = slotOf(packed);
+		for (int i = 0; i < count; i++) {
 			if (bitmap.isAllocated(slot + i)) {
 				return false;
 			}
@@ -278,21 +642,112 @@ public final class SegmentSet implements AutoCloseable {
 		return true;
 	}
 
+	private void noteHighWater(SegmentFile segment, long before) {
+		WriteContext context = contexts == null ? null : contexts.current();
+		if (context != null) {
+			context.noteHighWater(segment.segmentKey(), before);
+		}
+	}
+
+	private List<Long> defer(List<Long> deferred, long packed) {
+		List<Long> list = deferred == null ? new ArrayList<>(4) : deferred;
+		list.add(packed);
+		return list;
+	}
+
+	private void returnDeferred(List<Long> deferred) {
+		if (deferred == null) {
+			return;
+		}
+		for (Long entry : deferred) {
+			if (freeRing.size() < FREE_RING_CAPACITY) {
+				freeRing.addLast(entry);
+			}
+		}
+	}
+
+	/** The first slot in {@code [from, limit)} that is neither allocated in the mapping nor reserved in flight. */
+	private int nextFreeUnreserved(SegmentFile segment, int from, int limit) {
+		int number = segment.segmentNumber();
+		for (int slot = from; slot >= 0 && slot < limit;) {
+			int candidate = segment.freeSlots().nextFreeLive(slot, limit);
+			if (candidate < 0) {
+				return -1;
+			}
+			if (!reserved.containsKey(pack(number, candidate)) && !segment.freeSlots().isAllocated(candidate)) {
+				return candidate;
+			}
+			slot = candidate + 1;
+		}
+		return -1;
+	}
+
+	private int nextFreeRunUnreserved(SegmentFile segment, int from, int limit, int count) {
+		int number = segment.segmentNumber();
+		for (int slot = from; slot >= 0 && slot + count <= limit;) {
+			int candidate = segment.freeSlots().nextFreeRunLive(slot, limit, count, slotsPerPage);
+			if (candidate < 0) {
+				return -1;
+			}
+			boolean taken = false;
+			for (int i = 0; i < count; i++) {
+				if (reserved.containsKey(pack(number, candidate + i))
+					|| segment.freeSlots().isAllocated(candidate + i)) {
+					taken = true;
+					break;
+				}
+			}
+			if (!taken) {
+				return candidate;
+			}
+			slot = candidate + 1;
+		}
+		return -1;
+	}
+
 	private long claim(SegmentFile segment, int slot, int count) {
 		FreeSlotBitmap bitmap = segment.freeSlots();
+		WriteContext context = contexts == null ? null : contexts.current();
+		long segmentKey = segment.segmentKey();
 		for (int i = 0; i < count; i++) {
-			if (bitmap.isAllocated(slot + i)) {
+			// Live rather than the caller's view, except for a slot this very transaction freed — which is still
+			// allocated in the mapping, because its delete has not committed, and is nevertheless the transaction's to
+			// take back. Nobody else can be racing for it: it was live until this transaction freed it, and it goes
+			// into the reservation set below before the lock is released.
+			boolean mine = context != null && context.freedHere(segmentKey, slot + i);
+			if (bitmap.isAllocated(slot + i)
+				|| (!mine && (reserved.containsKey(pack(segment.segmentNumber(), slot + i))
+					|| bitmap.isAllocatedLive(slot + i)))) {
 				// Two records at one id is the worst corruption this engine can produce, so it fails loudly rather
 				// than quietly overwriting.
 				throw new IllegalStateException("Double allocation of " + kind + " segment " + segment.segmentNumber()
-					+ " slot " + (slot + i));
+					+ " slot " + (slot + i) + " (view=" + bitmap.isAllocated(slot + i)
+					+ " live=" + bitmap.isAllocatedLive(slot + i)
+					+ " reserved=" + reserved.containsKey(pack(segment.segmentNumber(), slot + i))
+					+ " reservedBy=" + reserved.get(pack(segment.segmentNumber(), slot + i))
+					+ " me=" + (context == null ? null : context.txnId())
+					+ " freedHere=" + mine + " highWater=" + segment.superblock().highWaterSlot() + ")");
 			}
 			bitmap.allocate(slot + i);
 		}
+		if (context != null) {
+			for (int i = 0; i < count; i++) {
+				reserved.put(pack(segment.segmentNumber(), slot + i), context.txnId());
+			}
+			context.reserved(segmentKey, slot, count);
+		}
 		// Read the generation before clearing: free() left the advanced value in the record, and zeroing first would
 		// wipe it and make every reused slot look like generation 1.
+		//
+		// From the mapping, not from this transaction's view, and that distinction is the whole correctness of a
+		// reused slot. The counter is allocator state — like the bitmap — and the transaction that freed this slot may
+		// have committed after this one's snapshot, so the view still shows the value from before the delete. Claiming
+		// with that value hands out an id byte-for-byte identical to one already given away, and worse: the copy would
+		// then match its base at those bytes, the commit's diff would not carry them, and the record would land under a
+		// generation on disk that its own id does not match. That is the StaleIdException a reader gets one read later.
 		int page = geometry.pageOfSlot(kind, slot);
-		int gen = readGen(segment, slot);
+		boolean freedByMe = context != null && context.freedHere(segmentKey, slot);
+		int gen = freedByMe ? readGen(segment, slot) : readGenLive(segment, slot);
 		if (gen == 0) {
 			// Zero means the counter is gone, not that it was never set. Hole punching returns an all-free page's
 			// blocks to the filesystem and the generation lives inside the record, so a punched page reads as zeros
@@ -313,6 +768,11 @@ public final class SegmentSet implements AutoCloseable {
 		MemorySegment run = segment.recordsForWrite(slot, count);
 		run.fill((byte) 0);
 		writeGen(segment, slot, gen);
+		if (readGen(segment, slot) != gen) {
+			// Unreachable: writeGen wrote it through the same overlay readGen reads. Asserted because getting it wrong
+			// is invisible until a reader resolves the id and is told its generation is stale.
+			throw new IllegalStateException("Generation " + gen + " did not take on " + kind + " slot " + slot);
+		}
 
 		segment.superblock().liveCountDelta(count);
 		segment.pageMeta().liveCountDelta(page, count);
@@ -338,7 +798,6 @@ public final class SegmentSet implements AutoCloseable {
 		int gen = readGen(segment, slot);
 		writeGen(segment, slot, (gen % ElementId.MAX_GEN) + 1);
 
-		clearHints();
 		segment.superblock().liveCountDelta(-count);
 		segment.superblock().freeCountDelta(count);
 		int page = geometry.pageOfSlot(kind, slot);
@@ -346,13 +805,26 @@ public final class SegmentSet implements AutoCloseable {
 		segment.pageMeta().bumpEpoch(page);
 		segment.markDirty(slot);
 
-		if (count == 1) {
-			pushFree(segment.segmentNumber(), slot);
-		} else {
-			Deque<Long> ring = freeRuns.computeIfAbsent(count, k -> new ArrayDeque<>());
-			if (ring.size() < FREE_RING_CAPACITY) {
-				ring.addLast(pack(segment.segmentNumber(), slot));
+		WriteContext context = contexts == null ? null : contexts.current();
+		if (context != null) {
+			// Held back until the commit. A slot on the free ring is a slot the allocator will hand out, and handing
+			// out one whose delete has not committed would let a rollback restore a record somebody else now owns.
+			context.freed(segment.segmentKey(), slot, count);
+			return;
+		}
+		allocLock.lock();
+		try {
+			clearHints();
+			if (count == 1) {
+				pushFree(segment.segmentNumber(), slot);
+			} else {
+				Deque<Long> ring = freeRuns.computeIfAbsent(count, k -> new ArrayDeque<>());
+				if (ring.size() < FREE_RING_CAPACITY) {
+					ring.addLast(pack(segment.segmentNumber(), slot));
+				}
 			}
+		} finally {
+			allocLock.unlock();
 		}
 	}
 
@@ -381,13 +853,24 @@ public final class SegmentSet implements AutoCloseable {
 	 * </p>
 	 */
 	public void packFreeRing() {
-		if (freeRing.size() < 2) {
-			return;
+		allocLock.lock();
+		try {
+			WriteContext context = contexts == null ? null : contexts.current();
+			if (context != null) {
+				// Inside a transaction its own freed runs are what the rebuild will actually draw on; the shared ring
+				// is not reached until they run out.
+				context.packReusable();
+			}
+			if (freeRing.size() < 2) {
+				return;
+			}
+			List<Long> sorted = new ArrayList<>(freeRing);
+			java.util.Collections.sort(sorted);
+			freeRing.clear();
+			freeRing.addAll(sorted);
+		} finally {
+			allocLock.unlock();
 		}
-		List<Long> sorted = new ArrayList<>(freeRing);
-		java.util.Collections.sort(sorted);
-		freeRing.clear();
-		freeRing.addAll(sorted);
 	}
 
 	// ---------------------------------------------------------------- compaction
@@ -405,26 +888,31 @@ public final class SegmentSet implements AutoCloseable {
 		if (count <= 0 || count > slotsPerPage) {
 			throw new IllegalArgumentException("count " + count + " outside 1.." + slotsPerPage);
 		}
-		for (int number = 0; number < segments.size() && number <= limitSegment; number++) {
-			SegmentFile segment = segments.get(number);
-			int high = (int) Math.min(segment.superblock().highWaterSlot(), slotsPerSegment);
-			int limit = number == limitSegment ? Math.min(high, limitSlot) : high;
-			if (limit < count) {
-				continue;
+		allocLock.lock();
+		try {
+			for (int number = 0; number < segments.size() && number <= limitSegment; number++) {
+				SegmentFile segment = segments.get(number);
+				int high = (int) Math.min(segment.superblock().highWaterSlot(), slotsPerSegment);
+				int limit = number == limitSegment ? Math.min(high, limitSlot) : high;
+				if (limit < count) {
+					continue;
+				}
+				int from = hintFor(number);
+				int slot = count == 1
+					? nextFreeUnreserved(segment, from, limit)
+					: nextFreeRunUnreserved(segment, from, limit, count);
+				if (slot >= 0) {
+					// Everything below the claimed slot is now allocated, so the next scan can start here. Without the
+					// hint a relocation pass rescans the whole bitmap from zero for every single record it moves.
+					lowestFreeHint[number] = slot;
+					return claim(segment, slot, count);
+				}
+				lowestFreeHint[number] = limit;
 			}
-			int from = hintFor(number);
-			int slot = count == 1
-				? segment.freeSlots().nextFree(from, limit)
-				: segment.freeSlots().nextFreeRun(from, limit, count, slotsPerPage);
-			if (slot >= 0) {
-				// Everything below the claimed slot is now allocated, so the next scan can start here. Without the
-				// hint a relocation pass rescans the whole bitmap from zero for every single record it moves.
-				lowestFreeHint[number] = slot;
-				return claim(segment, slot, count);
-			}
-			lowestFreeHint[number] = limit;
+			return ElementId.NULL;
+		} finally {
+			allocLock.unlock();
 		}
-		return ElementId.NULL;
 	}
 
 	private int hintFor(int segmentNumber) {
@@ -481,9 +969,7 @@ public final class SegmentSet implements AutoCloseable {
 			segment.superblock().freeCount(top - segment.freeSlots().countAllocated(top));
 		}
 		// Ring entries may name slots above the new mark, which allocate() would happily hand out again.
-		freeRing.clear();
-		freeRuns.clear();
-		clearHints();
+		resetAllocatorCaches();
 		return reclaimed;
 	}
 
@@ -507,9 +993,7 @@ public final class SegmentSet implements AutoCloseable {
 			retired++;
 		}
 		if (retired > 0) {
-			freeRing.clear();
-			freeRuns.clear();
-			clearHints();
+			resetAllocatorCaches();
 		}
 		return retired;
 	}
@@ -655,6 +1139,34 @@ public final class SegmentSet implements AutoCloseable {
 		return segment.recordsForWrite(ElementId.slot(id), count);
 	}
 
+	/**
+	 * True if the id names a live record <em>in the mapping</em> — committed, and therefore visible to everybody.
+	 *
+	 * <p>
+	 * {@link #isLive} answers for the caller's own view, which is the right question almost everywhere and the wrong
+	 * one for anything a thread intends to publish to other threads. Deliberately uncounted: it reads the mapping
+	 * directly rather than through {@code record()}, because it is a question about existence rather than a record the
+	 * caller's query had to touch, and the read budgets are about the latter.
+	 * </p>
+	 */
+	public boolean isLiveInMapping(long id) {
+		if (ElementId.isNull(id) || ElementId.kindCode(id) != kind.code()) {
+			return false;
+		}
+		int segmentNumber = ElementId.segment(id);
+		if (segmentNumber >= segments.size()) {
+			return false;
+		}
+		SegmentFile segment = segments.get(segmentNumber);
+		int slot = ElementId.slot(id);
+		if (slot >= slotsPerSegment || !segment.freeSlots().isAllocatedLive(slot)) {
+			return false;
+		}
+		int gen = Short.toUnsignedInt(segment.mappedSlice(geometry.byteOffset(kind, slot), stride())
+			.get(Layouts.SHORT, genOffset)) & ElementId.MAX_GEN;
+		return gen == ElementId.gen(id);
+	}
+
 	/** True if the id still names a live record. Never throws for a stale id. */
 	public boolean isLive(long id) {
 		if (ElementId.isNull(id) || ElementId.kindCode(id) != kind.code()) {
@@ -742,6 +1254,12 @@ public final class SegmentSet implements AutoCloseable {
 		if (stored != ElementId.gen(id)) {
 			throw new StaleIdException(id, "generation is " + stored + " on disk");
 		}
+	}
+
+	/** The generation stored in the mapping, past every transaction. The allocator's read; see {@link #claim}. */
+	private int readGenLive(SegmentFile segment, int slot) {
+		return Short.toUnsignedInt(segment.mappedSlice(geometry.byteOffset(kind, slot), stride())
+			.get(Layouts.SHORT, genOffset));
 	}
 
 	private int readGen(SegmentFile segment, int slot) {

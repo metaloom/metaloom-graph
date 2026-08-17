@@ -59,6 +59,17 @@ public class ParallelConsistencyTest {
 	private static final long OPENING_BALANCE = 1_000L;
 	private static final long TOTAL = ACCOUNTS * OPENING_BALANCE;
 
+	/**
+	 * How many times a transfer may lose a conflict before the test calls it a failure.
+	 *
+	 * <p>
+	 * Four writers over sixteen accounts collide often, and every collision is real: both transactions read the same
+	 * balance. Generous rather than unlimited, so a transfer that can never commit still fails the test instead of
+	 * hanging it.
+	 * </p>
+	 */
+	private static final int ATTEMPTS = 200;
+
 	@Test
 	public void testTheConservedTotalHoldsUnderSnapshotReads() throws Exception {
 		try (GraphStore store = stores.open()) {
@@ -297,19 +308,24 @@ public class ParallelConsistencyTest {
 				}
 				long from = accounts.get(fromIndex);
 				long to = accounts.get(toIndex);
-				try (Transaction txn = store.begin()) {
+				// inTransaction rather than begin(), because writers run concurrently and two transfers touching one
+				// account are a genuine conflict: each read a balance the other has since replaced. Retrying is the
+				// answer and is what the engine asks for — the point of the test is that the total is conserved
+				// however many attempts it takes, not that every attempt succeeds first time.
+				boolean moved = store.inTransaction(() -> {
 					long fromBalance = (Long) store.nodeProperty(from, "balance");
 					long amount = fromBalance <= 1 ? 0 : 1 + rnd.nextInt((int) Math.min(50, fromBalance - 1));
 					if (amount == 0) {
-						txn.rollback();
-						return;
+						return false;
 					}
 					long toBalance = (Long) store.nodeProperty(to, "balance");
 					store.setNodeProperties(from, Properties.of().set("balance", fromBalance - amount));
 					store.setNodeProperties(to, Properties.of().set("balance", toBalance + amount));
 					store.createEdge(from, "PAID", to);
-					txn.commit();
-					// After the commit: a transfer that threw or rolled back left no edge either.
+					return true;
+				}, ATTEMPTS);
+				if (moved) {
+					// After the commit: a transfer that threw or was refused left no edge either.
 					committed.incrementAndGet();
 				}
 			});

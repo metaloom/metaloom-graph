@@ -5,6 +5,7 @@ import java.lang.foreign.MemorySegment;
 import io.metaloom.graph.core.api.FormatVersionException;
 import io.metaloom.graph.core.api.PageCorruptException;
 import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.txn.MetaJournal;
 import io.metaloom.graph.core.util.Crc;
 import io.metaloom.graph.core.util.Layouts;
 
@@ -189,6 +190,21 @@ public final class Superblock {
 		counterDirty = false;
 	}
 
+	private MetaJournal journal() {
+		return file.journal();
+	}
+
+	/**
+	 * The bump cursor, shared by every writer and advanced the moment a slot is reserved.
+	 *
+	 * <p>
+	 * <b>Deliberately not journalled.</b> Two writers that each bumped a private copy of this would both claim the
+	 * same slot, and two records at one id is the worst thing this engine can produce. So it moves in shared state
+	 * under the allocator's lock, and the journal records only that the header must be rewritten. The cost is that a
+	 * rolled-back allocation leaves the mark raised over a slot that is free — which is the state compaction's
+	 * {@code shrinkHighWater} exists to tidy, and which is already reachable by an ordinary delete.
+	 * </p>
+	 */
 	public long highWaterSlot() {
 		return highWaterSlot;
 	}
@@ -196,37 +212,69 @@ public final class Superblock {
 	public void highWaterSlot(long value) {
 		this.highWaterSlot = value;
 		this.counterDirty = true;
+		MetaJournal journal = journal();
+		if (journal != null) {
+			journal.headerTouched(file.segmentKey());
+		}
 	}
 
 	public long liveCount() {
+		MetaJournal journal = journal();
+		return journal == null ? liveCount : journal.liveCountOver(file.segmentKey(), liveCount);
+	}
+
+	/** The committed live count, ignoring any transaction in flight. Used by the commit's own accounting. */
+	public long liveCountShared() {
 		return liveCount;
 	}
 
 	public void liveCountDelta(long delta) {
+		MetaJournal journal = journal();
+		if (journal != null) {
+			journal.liveCountDelta(file.segmentKey(), delta);
+			return;
+		}
 		this.liveCount += delta;
 		this.counterDirty = true;
 	}
 
 	public long freeCount() {
-		return freeCount;
+		MetaJournal journal = journal();
+		return journal == null ? freeCount : journal.freeCountOver(file.segmentKey(), freeCount);
 	}
 
 	public void freeCountDelta(long delta) {
+		MetaJournal journal = journal();
+		if (journal != null) {
+			journal.freeCountDelta(file.segmentKey(), delta);
+			return;
+		}
 		this.freeCount += delta;
 		this.counterDirty = true;
 	}
 
 	/** Sets the free count outright. Compaction recomputes it from the bitmap rather than tracking a delta. */
 	public void freeCount(long value) {
+		MetaJournal journal = journal();
+		if (journal != null) {
+			journal.freeCountAbsolute(file.segmentKey(), value);
+			return;
+		}
 		this.freeCount = value;
 		this.counterDirty = true;
 	}
 
 	public long lastLsn() {
-		return lastLsn;
+		MetaJournal journal = journal();
+		return journal == null ? lastLsn : journal.lastLsnOver(file.segmentKey(), lastLsn);
 	}
 
 	public void lastLsn(long lsn) {
+		MetaJournal journal = journal();
+		if (journal != null) {
+			journal.lastLsn(file.segmentKey(), lsn);
+			return;
+		}
 		this.lastLsn = lsn;
 		this.counterDirty = true;
 	}
@@ -235,15 +283,47 @@ public final class Superblock {
 		return counterDirty;
 	}
 
+	/**
+	 * The mutable counters, as one array, so a commit that fails after folding a journal can put them back.
+	 *
+	 * <p>
+	 * They are Java fields rather than bytes in the mapping until a flush, so nothing else would undo the fold: the
+	 * overlay goes with the rollback, and these would stay moved. Order is live, free, flags, lastLsn, highWater.
+	 * </p>
+	 */
+	public long[] captureCounters() {
+		return new long[] { liveCount, freeCount, flags, lastLsn, highWaterSlot };
+	}
+
+	public void restoreCounters(long[] captured) {
+		this.liveCount = captured[0];
+		this.freeCount = captured[1];
+		this.flags = captured[2];
+		this.lastLsn = captured[3];
+		this.highWaterSlot = captured[4];
+	}
+
+	/** Marks the header as owing a rewrite. The commit's journal fold uses it after folding a transaction's deltas. */
+	public void markCounterDirty() {
+		this.counterDirty = true;
+	}
+
 	public long sequence() {
 		return sequence;
 	}
 
 	public boolean sealed() {
-		return (flags & FLAG_SEALED) != 0;
+		MetaJournal journal = journal();
+		boolean shared = (flags & FLAG_SEALED) != 0;
+		return journal == null ? shared : journal.sealedOver(file.segmentKey(), shared);
 	}
 
 	public void sealed(boolean value) {
+		MetaJournal journal = journal();
+		if (journal != null) {
+			journal.sealed(file.segmentKey(), value);
+			return;
+		}
 		flags = value ? flags | FLAG_SEALED : flags & ~FLAG_SEALED;
 		this.counterDirty = true;
 	}

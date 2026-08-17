@@ -159,18 +159,37 @@ public class CompactionCrashTest {
 
 		@Override
 		public void runWrite(Unit unit) throws IOException {
+			fallible(unit, delegate::runWrite);
+		}
+
+		/**
+		 * Compaction's write units are exclusive ones, so this is the method the batches actually arrive through.
+		 * Counted alongside {@link #runWrite} rather than separately: the test is choosing a batch to fail at, and the
+		 * batch is a unit of work whichever way the compactor asks for it.
+		 */
+		@Override
+		public void runExclusive(Unit unit) throws IOException {
+			fallible(unit, delegate::runExclusive);
+		}
+
+		private void fallible(Unit unit, Fallible run) throws IOException {
 			if (++writes < failAt) {
-				delegate.runWrite(unit);
+				run.accept(unit);
 				return;
 			}
 			if (!insideBatch) {
 				throw new SimulatedCrash();
 			}
 			// Throwing from inside the unit leaves the transaction to be rolled back by its own close().
-			delegate.runWrite(() -> {
+			run.accept(() -> {
 				unit.run();
 				throw new SimulatedCrash();
 			});
+		}
+
+		@FunctionalInterface
+		private interface Fallible {
+			void accept(Unit unit) throws IOException;
 		}
 
 		@Override
