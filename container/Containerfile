@@ -44,6 +44,13 @@ ENV GRAPH_MCP_HOST=127.0.0.1
 ENV GRAPH_MCP_ENABLED=false
 ENV GRAPH_ALLOW_WRITE=false
 ENV GRAPH_ALLOW_DROP=false
+# LOAD CSV reads local files, so it is off and has no directory. Setting GRAPH_IMPORT_DIR without this
+# does not enable it, and this without GRAPH_IMPORT_DIR is a start-up error rather than a silent no-op.
+ENV GRAPH_ALLOW_LOAD_CSV=false
+# Its own flag, not part of --allow-write: a backup is a read, but it reads every byte of a database in
+# one request from a port with no authentication, which is a different decision from "answer queries".
+# Off, so the CLI below works offline out of the box and online only once someone says so.
+ENV GRAPH_ALLOW_BACKUP=false
 
 #
 # /tmp has to be writable AND executable: the native library is unpacked there and then dlopen()ed.
@@ -66,6 +73,31 @@ RUN mkdir -p /graph /data \
  && chmod 770 /graph /data
 
 ADD --chown=1000:0 ./graph-server/target/graph-server-0.0.1-SNAPSHOT.jar /graph/graph-server.jar
+
+#
+# The backup tool, in the image rather than alongside it.
+#
+# A backup that needs a second artifact downloaded, version-matched and mounted is a backup that gets
+# taken once. The dump format is versioned but the encoder is not negotiated, so the CLI that ships
+# with a server is by construction the one that reads what that server writes.
+#
+#   docker exec g metaloom-graph-cli database backup default --server=http://localhost:8080 --out=- > g.dump
+#
+# Note the --server. GRAPH_ROOT=/data below is read by BOTH programs, so a bare `database backup` in a
+# running container tries to open /data directly and is refused: the server holds the store's exclusive
+# LOCK, which is the engine's guarantee that one process writes. The error says so and names --server.
+#
+# --path is for the container that is NOT running a server, which is how a dump goes back:
+#
+#   docker run --rm -i -v graphdata:/data metaloom/graph-server:latest \
+#       metaloom-graph-cli database restore default --in=- --force < g.dump
+#
+# That works because there is no ENTRYPOINT here and GRAPH_ROOT is already /data. Restore is offline
+# only — it creates the target from the dump's own geometry, which a running server cannot do.
+#
+ADD --chown=1000:0 ./graph-cli/target/graph-cli-0.0.1-SNAPSHOT-cli.jar /graph/graph-cli.jar
+ADD ./container/metaloom-graph-cli.sh /usr/local/bin/metaloom-graph-cli
+RUN chmod 755 /usr/local/bin/metaloom-graph-cli
 
 USER 1000
 WORKDIR /graph

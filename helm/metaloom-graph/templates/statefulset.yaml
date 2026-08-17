@@ -83,6 +83,14 @@ spec:
               value: {{ .Values.graph.allowWrite | quote }}
             - name: GRAPH_ALLOW_DROP
               value: {{ .Values.graph.allowDrop | quote }}
+            {{- if .Values.graph.allowLoadCsv }}
+            - name: GRAPH_ALLOW_LOAD_CSV
+              value: "true"
+            - name: GRAPH_IMPORT_DIR
+              value: {{ required "graph.importDir is required when graph.allowLoadCsv is on: LOAD CSV reads one directory and there is no default" .Values.graph.importDir | quote }}
+            {{- end }}
+            - name: GRAPH_ALLOW_BACKUP
+              value: {{ .Values.graph.allowBackup | quote }}
             - name: GRAPH_DEMO
               value: {{ .Values.graph.demo | quote }}
             {{- if .Values.graph.demo }}

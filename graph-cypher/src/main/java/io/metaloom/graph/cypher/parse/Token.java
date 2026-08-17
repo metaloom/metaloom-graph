@@ -6,13 +6,25 @@ package io.metaloom.graph.cypher.parse;
  * @param type
  *            what kind of token this is
  * @param text
- *            the source text, or the decoded value for a string literal
+ *            the source text, or the decoded value for a string literal. For a {@link Type#KEYWORD} this is the
+ *            <b>upper-cased</b> form, which is what every {@code isKeyword} comparison and every {@code switch} in the
+ *            parser is written against
+ * @param raw
+ *            what was actually written. Identical to {@code text} for everything except a keyword, where it is the
+ *            spelling before case folding — see {@link #raw()}
  * @param line
  *            1-based
  * @param column
  *            1-based
  */
-public record Token(Token.Type type, String text, int line, int column) {
+public record Token(Token.Type type, String text, String raw, int line, int column) {
+
+	/**
+	 * Everything but a keyword: what was written is what the parser sees, so the two spellings coincide.
+	 */
+	public Token(Type type, String text, int line, int column) {
+		this(type, text, text, line, column);
+	}
 
 	public enum Type {
 		/** A bare or backtick-quoted name: a variable, a label, a relationship type, a property key, a function. */
@@ -31,6 +43,21 @@ public record Token(Token.Type type, String text, int line, int column) {
 
 	public boolean is(Type expected, String expectedText) {
 		return type == expected && text.equalsIgnoreCase(expectedText);
+	}
+
+	/**
+	 * The name as the author spelled it.
+	 *
+	 * <p>
+	 * A label and a property key are ordinary names that happen to be allowed to collide with a keyword — {@code :Order}
+	 * and {@code .end} are the examples the grammar calls out. They reach the parser as {@link Type#KEYWORD} tokens, so
+	 * reading {@link #text()} for them yields {@code ORDER} and {@code END}: not a parse error, but a node stored under a
+	 * label nobody wrote. This is the accessor those two positions must use, and the only reason the component exists.
+	 * </p>
+	 */
+	@Override
+	public String raw() {
+		return raw;
 	}
 
 	public boolean isKeyword(String word) {

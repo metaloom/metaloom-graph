@@ -6,10 +6,13 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -22,12 +25,14 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.api.io.TempDir;
 
 import io.metaloom.graph.core.api.GraphDatabases;
 import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.Properties;
 import io.metaloom.graph.core.api.Transaction;
 import io.metaloom.graph.core.fixture.TempStore;
+import io.metaloom.graph.server.io.SandboxedFileCsvSource;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 
@@ -44,6 +49,10 @@ public class GraphServerTest {
 
 	@RegisterExtension
 	TempStore stores = new TempStore();
+
+	/** For the LOAD CSV cases, which need real files in a real directory — that is what they are about. */
+	@TempDir
+	Path tmp;
 
 	private GraphDatabases databases;
 	private GraphStore store;
@@ -393,6 +402,103 @@ public class GraphServerTest {
 		server = new GraphServer(databases, GraphDatabases.DEFAULT_NAME,
 			GraphServerOptions.DEFAULT_QUERY_TIMEOUT_MILLIS, true, true);
 		base = "http://localhost:" + server.listen(0).toCompletionStage().toCompletableFuture().join();
+	}
+
+	/**
+	 * A null cell is a result, not a failure.
+	 *
+	 * <p>
+	 * {@code ResultJson.collect} switches over the value to decide what to draw, and a pattern switch throws on null
+	 * unless null is a case. So every query returning a missing property came back 500 with an NPE and no message —
+	 * including {@code RETURN null}, which is the shortest query that can produce one. Found by loading a CSV with an
+	 * empty field, which is the same thing arriving by a route that makes it common rather than occasional.
+	 * </p>
+	 */
+	@Test
+	public void testAQueryMayReturnNull() throws Exception {
+		HttpResponse<String> literal = post("RETURN null AS nothing");
+		assertEquals(200, literal.statusCode(), literal.body());
+		assertNull(new JsonObject(literal.body()).getJsonArray("rows").getJsonArray(0).getValue(0));
+
+		HttpResponse<String> missing = post("MATCH (n:Person) RETURN n.name AS name, n.absent AS absent ORDER BY name");
+		assertEquals(200, missing.statusCode(), missing.body());
+		JsonArray first = new JsonObject(missing.body()).getJsonArray("rows").getJsonArray(0);
+		assertEquals("Alice", first.getString(0));
+		assertNull(first.getValue(1));
+
+		// And a null beside something the graph pane does draw, so the node still arrives.
+		HttpResponse<String> mixed = post("MATCH (n:Person {name: 'Alice'}) RETURN n, n.absent");
+		assertEquals(200, mixed.statusCode(), mixed.body());
+		assertEquals(1, new JsonObject(mixed.body()).getJsonObject("graph").getJsonArray("nodes").size());
+	}
+
+	// ---------------------------------------------------------------- LOAD CSV
+
+	/**
+	 * The refusal that {@code --allow-write} does not give.
+	 *
+	 * <p>
+	 * {@code LOAD CSV … RETURN row} creates nothing, so {@code isWrite()} is false and the write gate lets it straight
+	 * through. Without a check of its own, a server deliberately left read-only would read files off its own disk for
+	 * anything that can reach the port — and this port has no authentication and binds every interface.
+	 * </p>
+	 */
+	@Test
+	public void testLoadCsvIsRefusedWithoutItsOwnFlag() throws Exception {
+		HttpResponse<String> response = post("LOAD CSV FROM 'file:///etc/passwd' AS row RETURN row");
+		assertEquals(403, response.statusCode(), response.body());
+		JsonObject json = new JsonObject(response.body());
+		assertEquals("loadcsv", json.getString("error"));
+		assertTrue(json.getString("message").contains("--allow-load-csv"), json.getString("message"));
+
+		// Enabling writes is not enabling this, which is the whole point of the flag being separate.
+		restartAllowingWrites();
+		assertEquals(403, post("LOAD CSV FROM 'file:///etc/passwd' AS row RETURN row").statusCode());
+	}
+
+	@Test
+	public void testLoadCsvReadsOnlyInsideTheImportDirectory() throws Exception {
+		Path importDir = Files.createDirectories(tmp.resolve("import"));
+		Files.writeString(importDir.resolve("people.csv"), "name,age\nAlice,30\nBob,41\n");
+		Files.writeString(tmp.resolve("secret.txt"), "the crown jewels");
+
+		server.close();
+		server = new GraphServer(databases, GraphDatabases.DEFAULT_NAME,
+			GraphServerOptions.DEFAULT_QUERY_TIMEOUT_MILLIS, true, true);
+		server.csvSource(new SandboxedFileCsvSource(importDir));
+		base = "http://localhost:" + server.listen(0).toCompletionStage().toCompletableFuture().join();
+
+		HttpResponse<String> ok = post("LOAD CSV WITH HEADERS FROM 'file:///people.csv' AS row "
+			+ "RETURN row.name AS name ORDER BY name");
+		assertEquals(200, ok.statusCode(), ok.body());
+		JsonArray rows = new JsonObject(ok.body()).getJsonArray("rows");
+		assertEquals(2, rows.size());
+		assertEquals("Alice", rows.getJsonArray(0).getString(0));
+
+		// The escape, over HTTP rather than only at the unit level, because this is the request a real attempt makes.
+		HttpResponse<String> escape = post("LOAD CSV FROM 'file:///../secret.txt' AS row RETURN row");
+		assertEquals(403, escape.statusCode(), escape.body());
+		assertEquals("loadcsv", new JsonObject(escape.body()).getString("error"));
+		assertFalse(escape.body().contains("crown jewels"), "and nothing was read");
+	}
+
+	/** A malformed file is the caller's input, so it is a 400 and it names the line. */
+	@Test
+	public void testAMalformedCsvIsA400WithALineNumber() throws Exception {
+		Path importDir = Files.createDirectories(tmp.resolve("import2"));
+		Files.writeString(importDir.resolve("bad.csv"), "name,age\nAlice,30,extra\n");
+
+		server.close();
+		server = new GraphServer(databases, GraphDatabases.DEFAULT_NAME,
+			GraphServerOptions.DEFAULT_QUERY_TIMEOUT_MILLIS, true, true);
+		server.csvSource(new SandboxedFileCsvSource(importDir));
+		base = "http://localhost:" + server.listen(0).toCompletionStage().toCompletableFuture().join();
+
+		HttpResponse<String> response = post("LOAD CSV WITH HEADERS FROM 'file:///bad.csv' AS r RETURN r.name");
+		assertEquals(400, response.statusCode(), response.body());
+		JsonObject json = new JsonObject(response.body());
+		assertEquals("csv", json.getString("error"));
+		assertTrue(json.getString("message").contains("Line 2"), json.getString("message"));
 	}
 
 	@Test

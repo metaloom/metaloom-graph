@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
+import java.util.Set;
 
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -39,6 +40,8 @@ public class CypherParserTest {
 		assertEquals("MATCH", tokens.get(0).text(), "a keyword normalises to upper case");
 		assertEquals("Person", tokens.get(2).text(), "an identifier keeps its case");
 		assertEquals("person", tokens.get(5).text());
+		assertEquals("match", tokens.get(0).raw(), "but the keyword also keeps what was written");
+		assertEquals("Person", tokens.get(2).raw(), "and raw() is the same text for a non-keyword");
 	}
 
 	@Test
@@ -223,9 +226,10 @@ public class CypherParserTest {
 			() -> CypherParser.parse("MATCH (n) FOREACH (x IN [1] | SET n.x = x)"));
 		assertTrue(foreach.getMessage().contains("FOREACH is not supported"), foreach.getMessage());
 		assertEquals(11, foreach.column(), "and points at the clause");
-		assertTrue(assertThrows(CypherSyntaxException.class,
-			() -> CypherParser.parse("LOAD CSV FROM 'f.csv' AS row RETURN row")).getMessage()
-				.contains("LOAD CSV is not supported"));
+		// LOAD CSV is no longer among them either: the clause is built, and whether a *file* may be read is a decision
+		// for the CsvSource the caller supplies rather than for the grammar. See LoadCsvTest.
+		assertInstanceOf(Ast.LoadCsv.class,
+			CypherParser.parse("LOAD CSV FROM 'f.csv' AS row RETURN row").parts().get(0).clauses().get(0));
 		// CALL is no longer among them: the build has a procedure mechanism now, with one procedure in it. A call is
 		// parsed, and an unknown *procedure* is refused by the executor rather than by the grammar — which is the
 		// right layer for it, since "no such procedure" is not a syntax error.
@@ -336,12 +340,43 @@ public class CypherParserTest {
 			() -> CypherParser.parse("MATCH (a)-[*5..2]->(b) RETURN a")).getMessage().contains("min <= max"));
 	}
 
+	/**
+	 * {@code :Order}, {@code :End} and {@code .order} are ordinary names in a graph, and refusing them would be
+	 * gratuitous — <b>and they keep the spelling they were written with</b>.
+	 *
+	 * <p>
+	 * The second half of that used to be false, and this test asserted it was: a keyword token carries its folded text,
+	 * both {@code labelName} and {@code propertyKeyName} read it, and so {@code (n:Order {end: 1})} produced a node
+	 * labelled {@code ORDER} with a key called {@code END}. Nothing threw — the data was simply not what was written,
+	 * and every read of it through the Java API or a second query missed. The grammar had claimed the correct behaviour
+	 * all along ({@code spec/CYPHER.md} section 1, and {@code labelName}'s own javadoc); it was the assertions here that
+	 * had pinned the defect in place.
+	 * </p>
+	 */
 	@Test
 	public void testKeywordsAreUsableAsLabelsAndPropertyNames() {
-		// `:Order`, `:End` and `.order` are ordinary names in a graph, and refusing them would be gratuitous.
 		Ast.Match match = (Ast.Match) CypherParser.parse("MATCH (n:Order {end: 1}) RETURN n.order")
 			.parts().get(0).clauses().get(0);
-		assertEquals(List.of("ORDER"), match.pattern().get(0).nodes().get(0).labels());
-		assertTrue(match.pattern().get(0).nodes().get(0).properties().containsKey("END"));
+		assertEquals(List.of("Order"), match.pattern().get(0).nodes().get(0).labels());
+		assertTrue(match.pattern().get(0).nodes().get(0).properties().containsKey("end"));
+
+		// Several at once, on the write side, including a mixed-case one that is neither spelling by accident.
+		Ast.Create create = assertInstanceOf(Ast.Create.class,
+			CypherParser.parse("CREATE (n:Order:Person {end: 1, Contains: 2, name: 'x'})").parts().get(0).clauses()
+				.get(0));
+		Ast.NodePattern node = create.pattern().get(0).nodes().get(0);
+		assertEquals(List.of("Order", "Person"), node.labels());
+		assertEquals(Set.of("end", "Contains", "name"), node.properties().keySet());
+
+		// The column an unaliased projection is named after is reconstructed from the tokens, so it had the same bug.
+		Ast.Return returning = assertInstanceOf(Ast.Return.class,
+			CypherParser.parse("MATCH (n:Order) WHERE n.end > 1 RETURN n.end").parts().get(0).clauses().get(1));
+		assertEquals("end",
+			assertInstanceOf(Ast.Property.class, returning.projection().items().get(0).expression()).key());
+		assertEquals("n.end", returning.projection().items().get(0).alias(),
+			"the column is named after what the caller wrote");
+
+		// A keyword used as a keyword is unaffected, in whatever case it was written.
+		assertInstanceOf(Ast.Match.class, CypherParser.parse("match (n) return n").parts().get(0).clauses().get(0));
 	}
 }

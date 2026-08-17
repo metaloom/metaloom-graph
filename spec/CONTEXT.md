@@ -36,7 +36,9 @@ Reads take no lock and scale to **10x at 32 threads**; writes do not scale at al
 
 It is **not concurrent for writers** — writers serialise on one lock — but readers get **MVCC snapshot
 isolation**: `store.beginRead()` fixes a view across many reads while the writer commits underneath.
-There is **no backup mechanism**. The Rust crate is written but has never been compiled here.
+There is now an **online logical backup** — a portable dump taken under an MVCC snapshot without stopping
+writers, with a CLI to take and restore it ([BACKUP.md](BACKUP.md)). There is still no *physical* snapshot,
+no incremental backup and no point-in-time recovery.
 
 **Adjacency sizing, if you touch that layer**: a block is a run of 512 byte cells that doubles as the
 node fills, not a page. It was a page until [reports/SCALE.md](reports/SCALE.md) measured what that
@@ -86,11 +88,12 @@ CONTEXT.md (this file)
         ├─ NATIVE_FFM.md ............. the Java <-> native boundary
         ├─ IO_URING.md ............... the ring: what it buys, and why nothing calls it yet
         ├─ TASKS.md .................. deferred work items, area-prefixed — currently URING-1..7
-        ├─ GRAALVM.md ................ the native binary: FFM under native-image
+        ├─ GRAALVM.md ................ the two native binaries: FFM under native-image
         ├─ API.md .................... the public Java API
         ├─ TESTING.md ................ test setup, benchmarks, crash testing
         ├─ OPERATIONS.md ............. configuration, sizing, tuning, monitoring, backup, recovery
         ├─ METRICS.md ................ the Prometheus meter catalogue, and the alert rules it implies
+        ├─ BACKUP.md ................. the logical dump, the paced scan it needs, and the CLI
         ├─ MCP.md .................... the Model Context Protocol port and its tools
         └─ DEPLOYMENT.md ............. the container images, the Helm chart and the k3d harness
 ```
@@ -120,11 +123,12 @@ CONTEXT.md (this file)
 | [NATIVE_FFM.md](NATIVE_FFM.md) | Which functions live in native code and why, the FFM binding rules, arena lifetimes, the pure-Java fallback contract | Storage semantics, and the two capabilities that have a file of their own |
 | [IO_URING.md](IO_URING.md) | Capability N1 on its own: the Rust ring, `UringIoEngine`, the 15x measurement and what it is not, why no caller exists, and the group-commit design that would be the first | The other native capabilities; the work items behind its gaps (TASKS.md) |
 | [TASKS.md](TASKS.md) | Deferred work items with an area prefix: for each gap a spec identified and did not close, whether it is worth building, what it costs, what would change the verdict, and what "done" means. Currently the io_uring items, URING-1..7, including why the WAL is further from being the ring's first caller than [IO_URING.md §6.1](IO_URING.md) reads | The design of anything on the list; the index backlog (INDEX_TASKS.md); the cross-project backlog order (PROGRESS.md §5) |
-| [GRAALVM.md](GRAALVM.md) | Compiling the server to a native binary: what native-image does and does not support of the FFM API, downcall registration, the netty substitution, and what the binary costs against the jar | How the FFM layer works (NATIVE_FFM.md) |
+| [GRAALVM.md](GRAALVM.md) | Compiling the server **and the CLI** to native binaries: what native-image does and does not support of the FFM API, downcall registration, the netty substitution, and what each binary costs against its jar — one-sided for the CLI, a real trade for the server | How the FFM layer works (NATIVE_FFM.md) |
 | [API.md](API.md) | The public Java API surface: `GraphStore`, transactions, cursors, traversal, element builders | Internals |
 | [TESTING.md](TESTING.md) | Test layout, fixtures, benchmark harness, crash and fault injection, invariant checkers | Implementation steps |
 | [OPERATIONS.md](OPERATIONS.md) | Running it: sizing, tuning, **how the server is configured from flags and the environment**, what to monitor, **the slow query log**, backup and restore, disaster recovery, what every exception means for an operator, the security posture of every port | Design rationale; how the binary protocol works (WIRE.md); the meter catalogue (METRICS.md) |
-| [DEPLOYMENT.md](DEPLOYMENT.md) | The container images and the Helm chart: why the base image is not Alpine, why `/tmp` is load-bearing, StatefulSet versus Deployment, probes on the monitoring port, and the k3d harness | How the server is configured (OPERATIONS.md §3.1); the native binary itself (GRAALVM.md) |
+| [BACKUP.md](BACKUP.md) | The logical dump: why not a file copy, how one snapshot makes the walk online without stopping writers, the paced scan that keeps it that way, the format and its hostile-input rules, why ids are not preserved, the restore order, and `metaloom-graph-cli` | The storage format (FILE_FORMAT.md); the operational procedure (OPERATIONS.md §5) |
+| [DEPLOYMENT.md](DEPLOYMENT.md) | The container images and the Helm chart: why the base image is not Alpine, why `/tmp` is load-bearing, why both images also carry `metaloom-graph-cli`, StatefulSet versus Deployment, probes on the monitoring port, and the k3d harness | How the server is configured (OPERATIONS.md §3.1); the native binary itself (GRAALVM.md) |
 | [MCP.md](MCP.md) | The Model Context Protocol port: why it is the one port that is off by default, the two transports and the h2c trap that breaks SSE, the eight tools, the row cap, and the write gate's two enforcement points | The query language (CYPHER.md); the meter catalogue (METRICS.md) |
 | [METRICS.md](METRICS.md) | The Prometheus catalogue: every `graph_` meter with its type, labels and call site, the cached-versus-live tiers and why size gauges are refreshed on a timer, and the map from OPERATIONS.md §4's thresholds to alert rules. **Parsed by `MetricsCatalogScrapeTest`** — editing it can break the build | Which signals to watch and when to worry (OPERATIONS.md §4) |
 | [PLAN.md](PLAN.md) | The phased implementation plan with per-phase deliverables, exit criteria and checkboxes | Design rationale |
@@ -321,6 +325,7 @@ Full description in [ARCHITECTURE.md](ARCHITECTURE.md).
 | Know what runs in native code | [NATIVE_FFM.md §2](NATIVE_FFM.md#2-the-native-surface) |
 | Write a crash test | [TESTING.md §6](TESTING.md#6-crash-and-fault-injection) |
 | Work out what to monitor, or why it will not open | [OPERATIONS.md](OPERATIONS.md) |
+| Back a database up, or restore one | [BACKUP.md](BACKUP.md), and [OPERATIONS.md §5](OPERATIONS.md#5-backup-and-restore) for the procedure |
 | Add something to the read path | [TESTING.md §7](TESTING.md#7-benchmarks) first — the budgets are build failures |
 | Pick up the next work item | [PROGRESS.md §5](PROGRESS.md#5-the-backlog-in-the-order-that-buys-the-most), then [PLAN.md](PLAN.md) for its definition |
 | Know whether something is already built | [PROGRESS.md](PROGRESS.md) |
@@ -388,5 +393,5 @@ deliverables and exit criteria are in [PLAN.md](PLAN.md).
 
 ---
 
-_Git HEAD revision: `0970e6b`_
-_Last updated: 2026-08-16 (IDX-7: the declared composite index)_
+_Git HEAD revision: `3edb034`_
+_Last updated: 2026-08-17 (LOAD CSV; the logical backup with its CLI, natively compiled and in both container images)_

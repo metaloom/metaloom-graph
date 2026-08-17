@@ -1,0 +1,161 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <artifactId>graph-cli</artifactId>
+
+    <parent>
+        <groupId>io.metaloom.graph</groupId>
+        <artifactId>metaloom-graph</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <name>MetaLoom // Graph :: CLI</name>
+    <description>metaloom-graph-cli: back up and restore a database, offline or against a running server</description>
+
+    <!--
+        graph-core and the JDK, and that is the whole list.
+
+        Offline mode opens the store directly, so graph-core is unavoidable — and it is enough, because only
+        `io.metaloom.graph.core.api` is exported and the dump is written against that surface alone. Online mode is
+        java.net.http, not graph-client: the client deliberately carries no engine (ClientDependencyTest fails by
+        loading if it ever does), and the wire protocol has no admin frames anyway. One HTTP request needs no Vert.x.
+
+        No parser-generator and no picocli. The argument handling follows GraphServerOptions' shape — a record, a
+        parse(), a declared variable list that generates the help text — because two spellings of "read the command line" in
+        one repository is one too many.
+    -->
+    <dependencies>
+        <dependency>
+            <groupId>io.metaloom.graph</groupId>
+            <artifactId>graph-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.metaloom.graph</groupId>
+            <artifactId>graph-core</artifactId>
+            <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <!--
+                                Attached under a classifier rather than replacing the artifact, because graph-server
+                                depends on this module for the dump format: one encoder, so a dump taken over HTTP is
+                                byte-for-byte the one taken offline. Replacing the main artifact would hand the server
+                                an uber jar with a second copy of graph-core inside it.
+
+                                So: graph-cli-<version>.jar is the library, graph-cli-<version>-cli.jar is the runnable
+                                one.
+                            -->
+                            <shadedArtifactAttached>true</shadedArtifactAttached>
+                            <shadedClassifierName>cli</shadedClassifierName>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>io.metaloom.graph.cli.GraphCli</mainClass>
+                                    <manifestEntries>
+                                        <!--
+                                            An uber jar cannot carry several module descriptors, so module-info is
+                                            dropped below and the narrow per-module native-access grant is not
+                                            available here. The same trade graph-server documents: run the reactor
+                                            jars to keep it.
+                                        -->
+                                        <Enable-Native-Access>ALL-UNNAMED</Enable-Native-Access>
+                                    </manifestEntries>
+                                </transformer>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer" />
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheLicenseResourceTransformer" />
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheNoticeResourceTransformer">
+                                    <addHeader>false</addHeader>
+                                </transformer>
+                            </transformers>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>module-info.class</exclude>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <!--
+            The GraalVM native build: `mvn -Pgraalvm package -pl graph-cli -am`, producing
+            target/native/metaloom-graph-cli.
+
+            This is the artifact the native image was always the right shape for. spec/GRAALVM.md section 9 measures
+            the trade and states it plainly: the binary wins on startup and footprint and loses 3x on a warm query, so
+            it is wrong for a server that stays up and right for "a CLI, a container that scales to zero, a short-lived
+            job". A backup command runs once, does one pass over a store and exits — it never has a warm query to lose.
+
+            Two differences from graph-server's profile, both because this module is smaller rather than because
+            anything was skipped:
+
+            * No `svm` dependency and no extra source root. The one substitution the server needs is netty's, and
+              there is no netty here — the online mode is java.net.http, which native-image compiles as it stands.
+            * No extra native-image.properties. Everything this binary needs travels inside graph-core's jar, under
+              META-INF/native-image/io.metaloom.graph/graph-core: the downcall registrations and -H:+SharedArenaSupport,
+              without which every segment file this CLI maps would fail on close. That file being in graph-core rather
+              than in the server is what makes a second executable free, and this profile is the first thing to prove it.
+
+            It reads the SHADED jar, hence the -cli classifier below: native-image is given one artifact and follows
+            no dependency graph.
+        -->
+        <profile>
+            <id>graalvm</id>
+            <build>
+                <plugins>
+                    <!--
+                        verify, not package, for the same reason the server's is: the shade plugin has to have
+                        finished writing the jar this reads, and two plugins bound to one phase order by declaration
+                        in a way that is easy to get wrong and hard to notice.
+                    -->
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <version>3.1.0</version>
+                        <executions>
+                            <execution>
+                                <id>native-image</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+                                <configuration>
+                                    <executable>bash</executable>
+                                    <arguments>
+                                        <argument>${project.basedir}/../tools/native-image.sh</argument>
+                                        <argument>${project.build.directory}/${project.build.finalName}-cli.jar</argument>
+                                        <argument>${project.build.directory}/native</argument>
+                                        <argument>metaloom-graph-cli</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+</project>

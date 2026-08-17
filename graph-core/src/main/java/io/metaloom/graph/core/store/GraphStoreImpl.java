@@ -38,6 +38,7 @@ import io.metaloom.graph.core.api.IsolationLevel;
 import io.metaloom.graph.core.api.Neighbour;
 import io.metaloom.graph.core.api.NeighbourCursor;
 import io.metaloom.graph.core.api.Properties;
+import io.metaloom.graph.core.api.ScanOptions;
 import io.metaloom.graph.core.api.ReadTransaction;
 import io.metaloom.graph.core.api.SnapshotStats;
 import io.metaloom.graph.core.api.SnapshotTooOldException;
@@ -89,6 +90,8 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	private static final Logger logger = LoggerFactory.getLogger(GraphStoreImpl.class);
 
 	private final Path path;
+	/** What this open was asked for. Only the per-open settings are read back; the manifest owns the rest. */
+	private final GraphStoreOptions openedWith;
 	private final Geometry geometry;
 	private final Manifest manifest;
 	private final Catalog catalog;
@@ -147,7 +150,8 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 	private GraphStoreImpl(Path path, Geometry geometry, Manifest manifest, Catalog catalog,
 		Map<Kind, SegmentSet> segmentSets, WalManager wal, FileChannel lockChannel, FileLock lock,
-		IoCounters counters, long retainedVersionBytes) {
+		IoCounters counters, long retainedVersionBytes, GraphStoreOptions openedWith) {
+		this.openedWith = openedWith;
 		this.path = path;
 		this.counters = counters;
 		this.transactions = new TransactionManager(retainedVersionBytes);
@@ -241,7 +245,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 			logger.debug("Opened graph store {} with {} at LSN {}", path, geometry, resumeLsn);
 			GraphStoreImpl store = new GraphStoreImpl(path, geometry, manifest, catalog, sets, wal, lockChannel, lock,
-				counters, options.retainedVersionBytes());
+				counters, options.retainedVersionBytes(), options);
 			if (resumeLsn != manifest.checkpointLsn()) {
 				// A recovery happened: checkpoint immediately so the next open replays nothing.
 				store.checkpoint();
@@ -972,6 +976,23 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			indexes.removeCompositeIndex(labelId, keyId);
 			return null;
 		});
+	}
+
+	@Override
+	public GraphStoreOptions options() {
+		// Rebuilt from the manifest rather than from the options this store was opened with: the manifest is the
+		// authority on the three settings that were fixed at creation, and an open may well have passed different ones
+		// (the geometry check refuses a mismatch, but a reopen with defaults is normal and must not be reported).
+		return GraphStoreOptions.builder()
+			.pageSize(geometry.pageSize())
+			.segmentCapacity(geometry.segmentCapacity())
+			.vectorDimensions(manifest.vectorDimensions())
+			.walSegmentBytes(openedWith.walSegmentBytes())
+			.walSyncMode(openedWith.walSyncMode())
+			.walSyncIntervalMillis(openedWith.walSyncIntervalMillis())
+			.retainedVersionBytes(openedWith.retainedVersionBytes())
+			.ioEngine(openedWith.ioEngine())
+			.build();
 	}
 
 	@Override
@@ -1878,14 +1899,73 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 	@Override
 	public boolean forEachNodeWhile(java.util.function.LongPredicate consumer) {
-		// runRead rather than read: a scan is long, so it takes the latch outright instead of gambling on an
-		// optimistic pass it would usually lose, and it must not be run twice — the consumer has side effects.
+		return forEachNodeWhile(consumer, ScanOptions.uninterrupted());
+	}
+
+	/**
+	 * {@inheritDoc}
+	 *
+	 * <p>
+	 * The throttled form wraps the caller's predicate rather than changing the walk: every {@code batchSize} ids it
+	 * closes the {@link ReadLease} and opens a new one, which is the whole of the pacing. {@code SegmentSet} needs no
+	 * knowledge of it, and the id sequence is identical either way — the only difference is who may commit while it
+	 * runs.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>Reopening the lease is what makes this safe rather than merely faster.</b> A lease taken inside a read view
+	 * re-registers the exclusion the version machinery needs, so the reconstruction path is available in every batch;
+	 * and because the bitmap is read through the same snapshot as everything else, the batches agree about which nodes
+	 * exist. See {@link ScanOptions}.
+	 * </p>
+	 */
+	@Override
+	public boolean forEachNodeWhile(java.util.function.LongPredicate consumer, ScanOptions options) {
+		ScanOptions scan = options == null ? ScanOptions.uninterrupted() : options;
 		try {
 			boolean[] complete = { true };
-			runRead(() -> complete[0] = segmentSets.get(Kind.NODE).forEachLiveIdWhile(consumer));
+			if (!scan.isThrottled()) {
+				// runRead rather than read: a scan is long, so it takes the latch outright instead of gambling on an
+				// optimistic pass it would usually lose, and it must not be run twice — the consumer has side effects.
+				runRead(() -> complete[0] = segmentSets.get(Kind.NODE).forEachLiveIdWhile(consumer));
+				return complete[0];
+			}
+			checkOpen();
+			ReadLease[] lease = { new ReadLease() };
+			int[] sinceYield = { 0 };
+			try {
+				complete[0] = segmentSets.get(Kind.NODE).forEachLiveIdWhile(id -> {
+					if (!consumer.test(id)) {
+						return false;
+					}
+					if (++sinceYield[0] >= scan.batchSize()) {
+						sinceYield[0] = 0;
+						lease[0].close();
+						// The window in which a writer can apply. Everything the scan is entitled to see is fixed by
+						// the caller's snapshot, so nothing that commits here can change the answer.
+						pause(scan.pauseMicrosPerBatch());
+						lease[0] = new ReadLease();
+					}
+					return true;
+				});
+			} finally {
+				lease[0].close();
+			}
 			return complete[0];
 		} catch (IOException e) {
 			throw new GraphStoreException("Node scan failed", e);
+		}
+	}
+
+	/** Sleeps between batches, if asked. Interruption ends the pause rather than the scan. */
+	private static void pause(long micros) {
+		if (micros <= 0) {
+			return;
+		}
+		try {
+			Thread.sleep(java.time.Duration.ofNanos(micros * 1_000));
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
 		}
 	}
 

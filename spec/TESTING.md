@@ -3,9 +3,10 @@
 A storage engine is only as good as its evidence. This file defines how the project proves that it
 does not lose data.
 
-The suite today is 795 tests across the five modules — 393 in `graph-core`, 259 in `graph-cypher`, 22
-in `graph-protocol`, 2 in `graph-client`, 119 in `graph-server` — running in a few minutes, plus benchmarks, a soak, a scaling
-harness and a `kill -9` loop behind profiles and scripts. The PoC suite it replaced had one red test,
+The suite today is 1,010 tests across the six modules — 467 in `graph-core`, 304 in `graph-cypher`,
+22 in `graph-protocol`, 2 in `graph-client`, 35 in `graph-cli`, 180 in `graph-server` — running in a
+few minutes, plus benchmarks, a soak, a scaling harness and a `kill -9` loop behind profiles and
+scripts. The PoC suite it replaced had one red test,
 three unbounded benchmarks living in the unit suite, and two tests that passed for reasons unrelated
 to what they asserted ([CURRENT_STATE.md §5](CURRENT_STATE.md#5-test-reality-check)).
 
@@ -149,6 +150,13 @@ graph-protocol/src/test/java/io/metaloom/graph/protocol/
 graph-client/src/test/java/io/metaloom/graph/client/
                  ClientDependencyTest — fails by *loading* if graph-core or graph-cypher ever reaches
                  the client's classpath
+graph-cli/src/test/java/io/metaloom/graph/cli/
+                 the backup tool: GraphCliTest drives the commands through run() and its exit status,
+                 CliOptionsTest the command line both ways
+  dump/          BackupRoundTripTest — an isomorphism, not an id-by-id equality, because a restore
+                 deliberately does not preserve ids; BackupUnderLoadTest — a dump taken while a writer
+                 commits is one instant AND the writer made progress; DumpHostileInputTest — a dump is
+                 untrusted input on the same terms a store file is
 graph-server/src/test/java/io/metaloom/graph/server/
                  the HTTP contract, the two result shapes the UI needs, the command line, and
                  demo/DemoDataTest — the generated air route graph the browser suite drives
@@ -588,6 +596,5 @@ diagnostic artefact and deleting it on failure is the most frustrating thing a t
 
 ---
 
-_Git HEAD revision: `0970e6b`_
-_Last updated: 2026-08-16 (IDX-7: CompositeIndexTest, CompositeIndexPlanTest, and the composite
-indexes declared mid-workload in ReferenceModelTest)_
+_Git HEAD revision: `3edb034`_
+_Last updated: 2026-08-17 (graph-cli's tests, and the counts re-derived from the surefire reports)_

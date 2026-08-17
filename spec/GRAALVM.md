@@ -3,10 +3,18 @@
 Whether this project — which is built on the Foreign Function and Memory API and on memory-mapped
 files — can be compiled to a standalone native binary, and what it takes.
 
-**It can, and it is built.** `mvn -Pgraalvm verify` produces
-`graph-server/target/native/graph-server`: a 38 MB executable with no JVM, serving the Cypher API and
-the React UI over a real store, with the Rust crate loaded and `io_uring` reported available inside
-the image.
+**It can, and it is built.** `mvn -Pgraalvm verify` produces **two** binaries:
+
+| Binary | From | Size | What it is |
+|---|---|---|---|
+| `graph-server/target/native/graph-server` | `graph-server`, profile `graalvm` | 55 MB | The server: Cypher API and the React UI over a real store, with the Rust crate loaded and `io_uring` reported available inside the image |
+| `graph-cli/target/native/metaloom-graph-cli` | `graph-cli`, profile `graalvm` | 38 MB | The backup tool of [BACKUP.md](BACKUP.md): opens a store, walks it under a snapshot, writes and reads a dump |
+
+The second one is the artifact this whole page argues for. [§9](#9-what-it-costs-and-what-it-buys)
+measures the trade and it is genuinely two-sided for a server — but a CLI runs once, does one pass
+and exits, so it never reaches the warm-query row that is the case against. It also **costs nothing
+to add**: everything the engine needs from native-image lives in `graph-core`'s jar, so a second
+executable built on that jar inherits it. See [§10.1](#101-the-cli).
 
 **FFM was not the obstacle.** That was the open question going in, and the answer is that GraalVM 25
 supports every part of the API this engine uses: downcalls against libc, downcalls into a
@@ -294,9 +302,77 @@ So the honest reading is:
 - **The jar wins for a server that stays up and answers queries**, which is what this one is for.
 
 Profile-guided optimisation is the standard answer to the third row and has not been tried here. Nor
-has `-march=native`, which the build output suggests. Both are listed in [§11](#11-not-done).
+has `-march=native`, which the build output suggests. Both are listed in [§12](#12-not-done).
 
-## 10. Gotchas
+### 9.1 The same measurement for the CLI, where it comes out one-sided
+
+Three runs each, same machine, against a three-node store — deliberately tiny, because what is being
+measured is the cost of *starting*, not of walking.
+
+| `metaloom-graph-cli` | shaded jar on JDK 25 | native binary |
+|---|---|---|
+| `--help` | 18–20 ms | **1–2 ms** |
+| `database inspect` (reads a header, opens no store) | 25–27 ms | **1–2 ms** |
+| `database backup` (opens a store, maps it, walks it, closes it) | 96–97 ms | **32–35 ms** |
+| Peak RSS for that backup | 64 MB | **22 MB** |
+| Artifact | 608 KB jar **plus a JDK** | **38 MB, nothing else** |
+
+There is no row where the jar wins, because the row where the jar wins is the twentieth query and
+this program does not run twenty queries. Note the third line in particular: even the command that
+does real work — map every segment file, scan under a snapshot, `fsync`, close — is **3x faster**,
+because at that size it is still almost entirely start-up.
+
+The last row is the one that matters for the container image rather than for a person's terminal:
+the native server image has **no JVM in it**, so `java -jar graph-cli.jar` is not a fallback there.
+Before this binary existed, that image could not be backed up from the inside at all.
+
+## 10. The Second Binary
+
+### 10.1 The CLI
+
+`graph-cli`'s `graalvm` profile is **fifteen lines and no metadata**, which is the interesting part.
+It has no `svm` dependency, no substitution source root, and no `native-image.properties` of its own.
+Everything it needs — every downcall shape, and `-H:+SharedArenaSupport`, without which every segment
+file it maps fails on close — travels inside `graph-core`'s jar under
+`META-INF/native-image/io.metaloom.graph/graph-core`.
+
+That was the point of putting those registrations in `graph-core` rather than in the server
+([§3](#3-downcall-registration)), and this is the first thing to test the claim: a second, unrelated
+executable built on the engine compiled first time, with no metadata written for it.
+
+The two differences from the server's profile are both absences:
+
+- **No netty substitution**, because there is no netty. The online mode is `java.net.http`, which
+  native-image compiles as it stands. So the CLI, unlike the server, does **not** need a jar built by
+  `-Pgraalvm` — its shaded jar is native-image ready either way.
+- **No logback**, so nothing has to be initialised at build time and
+  [§6](#6-logging-is-baked-in)'s consequence does not apply.
+
+It reads the **shaded** jar, `graph-cli-<version>-cli.jar`. The unclassified artifact is the library
+`graph-server` depends on for the dump format and contains no engine; handing that one to
+native-image would produce a binary that failed on the first class it loaded.
+
+### 10.2 Its smoke test
+
+The CLI cannot create data — it backs a database up and puts one back, and both halves need one that
+already exists — so `tools/GraphSeed.java` writes it a store first, on the JVM, over the same shaded
+jar that has just been compiled into the binary. A single-file source-launcher program with a
+classpath, the same trade `WireSmoke.java` makes for the server.
+
+The binary then does the whole round: `list`, `backup`, `inspect`, `restore`, `backup` again, and the
+two dumps must agree on every count. It also points `--server` at a port nothing listens on (which
+constructs the HTTP client, resolves a name and opens a socket — 1.2 MB of `java.net.http` that
+nothing else here would exercise) and feeds `inspect` a truncated dump, which has to be **diagnosed
+rather than crash**.
+
+Two details are load-bearing and were both got wrong first:
+
+- `-H:+SharedArenaSupport` **fails on close, not on use** ([§4](#4-shared-arenas)), so a check that
+  opened a store and stopped would pass on a broken binary. The round trip closes several.
+- The truncation has to cut **inside** the header. A dump's header is about 50 bytes, so a 64-byte
+  prefix still parses and `inspect` correctly succeeds on a file that is nine tenths missing.
+
+## 11. Gotchas
 
 - **`ADDRESS` is `void*` in the metadata**, and `pointer` is rejected. The valid names are exactly the
   keys of `Linker.canonicalLayouts()`, which is worth printing once rather than guessing.
@@ -313,20 +389,22 @@ has `-march=native`, which the build output suggests. Both are listed in [§11](
 - **`--no-fallback` is deliberate.** Without it, a build that cannot close the world silently emits a
   "fallback image" that requires a JVM anyway — a 38 MB file that is not what anyone asked for.
 
-## 11. Not Done
+## 12. Not Done
 
 - **No PGO, and no `-march=native`.** Either might close part of the 3x query gap. Neither has been
   measured, so neither is claimed.
 - **Linux x86-64 only.** Nothing here is platform specific except the Rust crate's classifier, but no
   other target has been built.
-- **The binary is not in CI**, and the Playwright suite still runs against the jar. The smoke test in
-  `tools/native-image.sh` is what stands in for both.
+- **The binaries are not in CI**, and the Playwright suite still runs against the jar. The smoke tests
+  in `tools/native-image.sh` are what stand in for both.
+- **No native `graph-client`.** It would compile — no netty, no engine — but nothing has asked for it,
+  and unlike the CLI there is no image whose only option it is.
 - **No `--enable-monitoring`.** The binary has no JFR and does not dump thread stacks on `SIGQUIT`,
   which was noticed while debugging §5.1 and worked around rather than fixed.
 - **`io_uring` is reported available inside the image but never exercised there**, because nothing in
   the engine issues a batch yet on any runtime. See [IO_URING.md](IO_URING.md).
 
-## 12. Key Files
+## 13. Key Files
 
 | File | Purpose |
 |---|---|
@@ -336,11 +414,14 @@ has `-march=native`, which the build output suggests. Both are listed in [§11](
 | `.../graph-server/native-image.properties` | logback and slf4j at build time |
 | `graph-server/src/nativeimage/java/…/NettyDirectBufferSubstitution.java` | The one substitution, and why |
 | `graph-core/src/test/java/…/nativelib/ForeignDowncallMetadataTest.java` | The drift guard, run by every `mvn test` |
-| `tools/native-image.sh` | Build and smoke test |
-| `tools/WireSmoke.java` | The smoke test's binary-port half: handshake, query, rows. Single-file source launcher, no classpath |
+| `tools/native-image.sh` | Builds either binary and smoke tests it. `server` and `cli` are the two shorthands |
+| `tools/WireSmoke.java` | The server smoke test's binary-port half: handshake, query, rows. Single-file source launcher, no classpath |
+| `tools/GraphSeed.java` | The CLI smoke test's fixture: writes a store for the binary to back up. Single-file source launcher over the shaded CLI jar |
 | `graph-server/pom.xml`, profile `graalvm` | Source root, `svm` dependency, the `verify` binding |
+| `graph-cli/pom.xml`, profile `graalvm` | The `verify` binding, and nothing else — see [§10.1](#101-the-cli) |
+| `container/Containerfile.native` | Both binaries into one image, because that image has no JVM to fall back to |
 
 ---
 
-_Git HEAD revision: `78db6d5`_
-_Last updated: 2026-08-15 (written against GraalVM 25.0.3, netty 4.2.12, Vert.x 5.0.11)_
+_Git HEAD revision: `3edb034`_
+_Last updated: 2026-08-17 (the CLI's native build; written against GraalVM 25.0.3, netty 4.2.12, Vert.x 5.0.11)_

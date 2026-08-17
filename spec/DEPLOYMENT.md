@@ -10,9 +10,11 @@ The security posture every decision here follows from is [OPERATIONS.md §9](OPE
 ## 1. TL;DR
 
 ```bash
-mvn -o clean package -DskipTests
+mvn -o clean package -DskipTests             # native: mvn -o -Pgraalvm clean verify -DskipTests
 container/build-containers.sh jvm            # or: native, or: both
-docker run --rm -e GRAPH_DEMO=true -p 8080:8080 -p 8082:8082 metaloom/graph-server:latest
+docker run --rm -d --name g -e GRAPH_DEMO=true -e GRAPH_ALLOW_BACKUP=true -p 8080:8080 -p 8082:8082 \
+    metaloom/graph-server:latest
+docker exec g metaloom-graph-cli database backup default --server=http://localhost:8080 --out=- > g.dump
 
 helm install g helm/metaloom-graph --set graph.demo=true
 helm/test/run.sh --build                     # the whole thing on a throwaway k3d cluster
@@ -22,7 +24,7 @@ helm/test/run.sh --build                     # the whole thing on a throwaway k3
 
 ## 2. The image
 
-Two of them, from one jar and one binary:
+Two of them, each carrying **two** programs — the server and the backup tool:
 
 | | Base | Size | Start | Why |
 |---|------|------|-------|-----|
@@ -30,9 +32,12 @@ Two of them, from one jar and one binary:
 | `Containerfile.native` | `debian:stable-slim` | ~90 MB | ~110 ms | GraalVM; see [GRAALVM.md](GRAALVM.md) |
 
 Build context is the **repository root**, because the Containerfiles `ADD` build outputs out of
-`graph-server/target`. `.dockerignore` and `.containerignore` are byte-identical copies — podman reads the second name
-— and they exist because docker does **not** read `.gitignore`, so without them the context would include `/data`,
-which is a real store and can be gigabytes.
+`graph-server/target` and `graph-cli/target`. `.dockerignore` and `.containerignore` are byte-identical copies —
+podman reads the second name — and they exist because docker does **not** read `.gitignore`, so without them the
+context would include `/data`, which is a real store and can be gigabytes.
+
+**`verify`, not `package`, for the native images.** native-image is bound to the verify phase in both poms, so
+`mvn -Pgraalvm package` finishes happily and produces no binary at all, which reads as a broken profile.
 
 ### 2.1 Not Alpine, and this is a correctness decision
 
@@ -56,7 +61,36 @@ It has to be **writable and not `noexec`**, because that is where the native lib
 The image sets `-Djava.io.tmpdir=/tmp` explicitly, and the chart mounts an `emptyDir` there precisely so that
 `readOnlyRootFilesystem: true` does not quietly cost the native layer.
 
-### 2.3 The build script checks what the build left out
+### 2.3 The backup tool is inside the image
+
+Both images carry `metaloom-graph-cli` on the `PATH` — the JVM image as a launcher over
+`/graph/graph-cli.jar`, the native image as its own compiled binary. A backup that needs a second artifact
+downloaded, version-matched and mounted is a backup that gets taken once; and in the native image there is no JVM,
+so without the compiled CLI that container could not be backed up from the inside **at all**.
+
+```bash
+# Out of a running server. Only the dump goes to stdout, so this pipe is clean.
+docker exec g metaloom-graph-cli database backup default --server=http://localhost:8080 --out=- > g.dump
+
+# Back into a volume, with nothing serving it. No --path (GRAPH_ROOT is /data) and no --force (it is empty).
+docker run --rm -i -v graphdata:/data metaloom/graph-server:latest \
+    metaloom-graph-cli database restore default --in=- < g.dump
+```
+
+That second one works because there is no `ENTRYPOINT` in either image — a deliberate property, and the same one
+that makes `docker run <image> --help` work for the server.
+
+**`--server` while a server is running, `--path` only when none is.** `GRAPH_ROOT=/data` is read by *both*
+programs, so a bare `database backup` in a serving container tries to open `/data` directly and is refused: the
+server holds the store's exclusive `LOCK`, which is the engine's guarantee that one process writes. The error says
+so and names `--server`. Restore is offline-only regardless ([BACKUP.md §6](BACKUP.md)), which is why it is spelled
+as a second container rather than as an `exec`.
+
+`GRAPH_ALLOW_BACKUP` gates the online half and is **off** in both images. It is separate from `GRAPH_ALLOW_WRITE`
+because a backup is a read that hands over every byte of a database in one request, from a port with no
+authentication — a different decision from "answer queries".
+
+### 2.4 The build script checks what the build left out
 
 Both the UI and the native layer are optional at build time — the Maven build routes around a missing `npm` or
 `cargo` — and neither absence is visible at run time: the server starts and answers every API route, and is simply
@@ -141,12 +175,15 @@ Nine phases; **35 assertions, all passing** as of this writing. Three of them ar
 
 - **No authentication, in the image or the chart.** Consistent with the engine; see
   [OPERATIONS.md §9.1](OPERATIONS.md#91-the-network-which-has-the-same-posture-and-a-wider-blast-radius).
-- **No backup.** The engine has none ([OPERATIONS.md §5](OPERATIONS.md#5-backup-and-restore)), so neither does the
-  chart. A volume snapshot of a stopped pod is the only correct procedure today.
+- **No backup in the chart.** The tool is in the image (§2.3) and `kubectl exec <pod> -- metaloom-graph-cli
+  database backup default --server=http://localhost:8080 --out=- > g.dump` works today, given
+  `graph.allowBackup`. What is not here is a `CronJob`, a retention policy or anywhere to put the dump —
+  scheduling is not something this chart should decide, and a chart that half-decided it would be worse than
+  one that says so.
 - **No NetworkPolicy.** It would be the right place to bound an unauthenticated Service, and what it should allow
   depends entirely on the cluster.
 - **No horizontal scaling, and there will not be.** One writer process is a property of the storage engine.
 
 ---
 
-_Last updated: 2026-08-16_
+_Last updated: 2026-08-17 (metaloom-graph-cli in both images)_

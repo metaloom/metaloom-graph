@@ -49,10 +49,46 @@ public final class Ast {
 			}
 			return false;
 		}
+
+		/**
+		 * Whether running this query would read a file.
+		 *
+		 * <p>
+		 * The companion to {@link #isWrite()}, and it exists because that method does <b>not</b> cover this.
+		 * {@code LOAD CSV … RETURN row} creates nothing, sets nothing and deletes nothing, so it is not a write by any
+		 * reading of the word — and a server that gated file access on {@code --allow-write} alone would therefore
+		 * serve it on a read-only port. Since no port here has authentication, that is an arbitrary local file read for
+		 * anything that can reach it.
+		 * </p>
+		 *
+		 * <p>
+		 * Answered from the tree for the same reason {@code isWrite} is: the refusal costs no worker thread, no
+		 * transaction and no open file.
+		 * </p>
+		 */
+		public boolean readsFiles() {
+			for (SingleQuery part : parts) {
+				if (part.readsFiles()) {
+					return true;
+				}
+			}
+			return false;
+		}
 	}
 
-	/** A sequence of clauses, optionally ending in RETURN. */
-	public record SingleQuery(List<Clause> clauses) {
+	/**
+	 * A sequence of clauses, optionally ending in RETURN.
+	 *
+	 * @param periodicCommit
+	 *            rows per transaction under {@code USING PERIODIC COMMIT}, or 0 when the whole part is one transaction.
+	 *            It sits here rather than in the clause list because it is not a step in the pipeline: it precedes
+	 *            {@code LOAD CSV}, governs every clause after it, and there can be at most one per part
+	 */
+	public record SingleQuery(List<Clause> clauses, int periodicCommit) {
+
+		public SingleQuery(List<Clause> clauses) {
+			this(clauses, 0);
+		}
 
 		public boolean isWrite() {
 			for (Clause clause : clauses) {
@@ -63,10 +99,20 @@ public final class Ast {
 			}
 			return false;
 		}
+
+		/** See {@link Query#readsFiles()}. */
+		public boolean readsFiles() {
+			for (Clause clause : clauses) {
+				if (clause instanceof LoadCsv) {
+					return true;
+				}
+			}
+			return false;
+		}
 	}
 
 	public sealed interface Clause permits Match, Unwind, With, Return, Create, Merge, SetClause, Remove, Delete,
-		Call {
+		Call, LoadCsv {
 	}
 
 	/**
@@ -100,6 +146,28 @@ public final class Ast {
 	}
 
 	public record Unwind(Expr expression, String variable) implements Clause {
+	}
+
+	/**
+	 * {@code LOAD CSV [WITH HEADERS] FROM <expr> AS <var> [FIELDTERMINATOR '<char>']}.
+	 *
+	 * <p>
+	 * Structurally an {@link Unwind} whose list comes from outside the process: it binds one variable per row and
+	 * multiplies the rows flowing through it, which is why it streams and why it needed no new machinery in the
+	 * executor beyond the reader itself.
+	 * </p>
+	 *
+	 * <p>
+	 * The URL is an {@link Expr} rather than a string so that {@code $file} works. It is evaluated per execution and
+	 * handed to the {@code CsvSource} unresolved — this tree deliberately does not know what a path is.
+	 * </p>
+	 *
+	 * @param withHeaders
+	 *            true to consume the first row as column names and bind each row as a map, false to bind a list
+	 * @param fieldTerminator
+	 *            the field separator, {@code ,} unless {@code FIELDTERMINATOR} said otherwise
+	 */
+	public record LoadCsv(Expr url, String variable, boolean withHeaders, char fieldTerminator) implements Clause {
 	}
 
 	public record With(Projection projection, Expr where) implements Clause {

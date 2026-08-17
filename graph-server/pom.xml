@@ -27,6 +27,15 @@
             <groupId>io.metaloom.graph</groupId>
             <artifactId>graph-cypher</artifactId>
         </dependency>
+        <!--
+            The dump format, so that a backup taken over HTTP is byte-for-byte the one the CLI writes offline. The
+            alternative — a second encoder on the server side — is two implementations of one format, which is the
+            shape that drifts.
+        -->
+        <dependency>
+            <groupId>io.metaloom.graph</groupId>
+            <artifactId>graph-cli</artifactId>
+        </dependency>
         <dependency>
             <groupId>io.metaloom.graph</groupId>
             <artifactId>graph-core</artifactId>

@@ -1,6 +1,7 @@
 package io.metaloom.graph.server;
 
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -18,6 +19,7 @@ import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.GraphStoreException;
 import io.metaloom.graph.core.api.StoreStats;
 import io.metaloom.graph.core.nativelib.NativeCapabilities;
+import io.metaloom.graph.cli.dump.GraphBackup;
 import io.metaloom.graph.cypher.Cypher;
 import io.metaloom.graph.cypher.CypherResult;
 import io.metaloom.graph.cypher.CypherStats;
@@ -26,8 +28,12 @@ import io.metaloom.graph.cypher.QueryAbortedException;
 import io.metaloom.graph.cypher.RowSink;
 import io.metaloom.graph.cypher.ast.Ast;
 import io.metaloom.graph.cypher.exec.CypherTypeException;
+import io.metaloom.graph.cypher.io.CsvAccessException;
+import io.metaloom.graph.cypher.io.CsvFormatException;
+import io.metaloom.graph.cypher.io.CsvSource;
 import io.metaloom.graph.cypher.parse.CypherSyntaxException;
 import io.metaloom.graph.server.demo.DemoData;
+import io.metaloom.graph.server.io.SandboxedFileCsvSource;
 import io.metaloom.graph.server.mcp.McpConstants;
 import io.metaloom.graph.server.mcp.McpJsonRpcHandler;
 import io.metaloom.graph.server.mcp.McpServer;
@@ -50,7 +56,9 @@ import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
 import io.vertx.core.VertxOptions;
+import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpServer;
+import io.vertx.core.http.HttpServerResponse;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.Router;
@@ -123,6 +131,15 @@ public final class GraphServer implements AutoCloseable {
 	private final boolean allowDrop;
 	/** Whether a query may change a store. Off unless an operator asked for it. */
 	private final boolean allowWrite;
+
+	/** Where LOAD CSV may read. Refuses everything unless {@link #csvSource} has been called. */
+	private CsvSource csv = CsvSource.DENY;
+
+	/** Cached from {@link #csv}, so the event-loop refusal is a field read rather than a comparison. */
+	private boolean allowLoadCsv;
+
+	/** Whether GET /api/databases/{name}/backup exists. Off unless an operator asked for it. */
+	private boolean allowBackup;
 	/** Past this, a query is abandoned rather than allowed to hold a worker thread and a read view indefinitely. */
 	private final long queryTimeoutMillis;
 	/** How long an abandoned query is given to unwind before the stores are closed regardless. */
@@ -181,6 +198,33 @@ public final class GraphServer implements AutoCloseable {
 		this.queryTimeoutMillis = queryTimeoutMillis;
 		this.allowDrop = allowDrop;
 		this.allowWrite = allowWrite;
+	}
+
+	/**
+	 * Enables {@code LOAD CSV}, against a source that decides which files it may read.
+	 *
+	 * <p>
+	 * A setter rather than a constructor parameter, for the same reason {@code slowQueryMillis} is one: the
+	 * constructors are a public surface several tests and embedders already use, and this is off in all of them. Not
+	 * calling it leaves {@link CsvSource#DENY} in place, which is the only safe default for a port with no
+	 * authentication — see {@code SandboxedFileCsvSource} for what the enabled case then permits.
+	 * </p>
+	 */
+	/**
+	 * Enables the backup route.
+	 *
+	 * <p>
+	 * A setter for the same reason {@link #csvSource} is one, and off in every constructor: handing out a whole
+	 * database in one request from an unauthenticated port is not something an embedder should get by default.
+	 * </p>
+	 */
+	public void allowBackup(boolean allowBackup) {
+		this.allowBackup = allowBackup;
+	}
+
+	public void csvSource(CsvSource csv) {
+		this.csv = csv == null ? CsvSource.DENY : csv;
+		this.allowLoadCsv = this.csv != CsvSource.DENY;
 	}
 
 	public static void main(String[] args) throws Exception {
@@ -249,6 +293,13 @@ public final class GraphServer implements AutoCloseable {
 		GraphServer server = new GraphServer(vertx, databases, options.database(), true,
 			options.queryTimeoutMillis(), options.allowDrop(), options.allowWrite());
 		server.slowQueryMillis = options.slowQueryMillis();
+		server.allowBackup(options.allowBackup());
+		if (options.allowLoadCsv()) {
+			// Constructed here rather than lazily, so an unreadable or missing import directory is a start-up failure
+			// naming the path — not a 500 on the first query somebody tries months later.
+			server.csvSource(new SandboxedFileCsvSource(options.importDir()));
+			logger.info("LOAD CSV enabled, reading only under {}", options.importDir().toRealPath());
+		}
 		if (options.slowQueryMillis() > 0 && options.queryTimeoutMillis() > 0
 			&& options.slowQueryMillis() >= options.queryTimeoutMillis()) {
 			// A warning and not a refusal: --query-timeout=0 is legal and this combination is merely useless, not
@@ -273,6 +324,8 @@ public final class GraphServer implements AutoCloseable {
 				.withPort(options.wirePort())
 				.withMaxConcurrentStreams(options.maxConcurrentStreams())
 				.withQueryTimeoutMillis(options.queryTimeoutMillis()), options.allowWrite());
+			// The same source object, so there is one sandbox for the process rather than one per front end.
+			wire.csvSource(server.csv);
 			int wirePort = wire.listen().toCompletionStage().toCompletableFuture().join();
 			logger.info("Binary streaming port on {}:{} — see graph-client", wire.options().host(), wirePort);
 			wire.instrument(metrics, options.slowQueryMillis());
@@ -350,6 +403,9 @@ public final class GraphServer implements AutoCloseable {
 
 		// The declared composite indexes of one database. A collection, so it takes ?database= like everything else,
 		// and one of them is named by its two path segments — the pair is the identity, not a generated id.
+		// Registered before BodyHandler would matter and streamed by hand: a dump is not a JSON body and the 1 MiB
+		// body limit above has nothing to do with it.
+		router.get("/api/databases/:name/backup").handler(this::backupDatabase);
 		router.get("/api/indexes").handler(this::listIndexes);
 		router.post("/api/indexes").handler(this::createIndex);
 		router.delete("/api/indexes/:label/:key").handler(this::dropIndex);
@@ -417,6 +473,16 @@ public final class GraphServer implements AutoCloseable {
 			return;
 		}
 
+		// The same shape as the write refusal above, and needed because it is NOT the same question: a
+		// `LOAD CSV ... RETURN row` creates nothing, so isWrite() is false for it and the check above lets it through.
+		// Without this, a server deliberately left read-only would read files for anyone who can reach the port.
+		if (parsed.readsFiles() && !allowLoadCsv) {
+			metrics.recordQueryRejected("http", "loadcsv");
+			fail(context, 403, "loadcsv", "This server does not read files. Start it with --allow-load-csv and "
+				+ "--import-dir=<path> to enable LOAD CSV, which may then read only what is under that directory.");
+			return;
+		}
+
 		if (closing.get()) {
 			// 503 with Connection: close, so a client behind a load balancer is taken out of rotation rather than
 			// retried onto a server that is going away.
@@ -448,7 +514,7 @@ public final class GraphServer implements AutoCloseable {
 			String kind = parsed.isWrite() ? "write" : "read";
 			try {
 				Collector collector = new Collector();
-				Cypher.stream(store, parsed, parameters, collector, deadline);
+				Cypher.stream(store, parsed, parameters, collector, deadline, csv);
 				CypherResult result = new CypherResult(collector.columns, collector.rows, collector.stats);
 				if (result.stats().containsUpdates()) {
 					// The schema is a 60-second cache over a full scan, so without this the sidebar would keep
@@ -544,6 +610,12 @@ public final class GraphServer implements AutoCloseable {
 
 	private void respondToFailure(RoutingContext context, Throwable error) {
 		switch (error) {
+			// 403 and not 400: the query is well formed and this server declines to serve it. The message never says
+			// whether the file exists — see SandboxedFileCsvSource on why that distinction is not offered.
+			case CsvAccessException refused -> fail(context, 403, "loadcsv", refused.getMessage());
+			// 400: the file is the caller's input, and a malformed one is their mistake to fix. The message carries a
+			// line number, which is the only thing that makes a million-row file actionable.
+			case CsvFormatException malformed -> fail(context, 400, "csv", malformed.getMessage());
 			case CypherSyntaxException syntax ->
 				fail(context, 400, "syntax", syntax.getMessage(), syntax.line(), syntax.column());
 			case CypherTypeException type -> fail(context, 400, "type", type.getMessage());
@@ -738,6 +810,120 @@ public final class GraphServer implements AutoCloseable {
 			return new JsonObject().put("name", name).put("dropped", true);
 		}, false).onSuccess(dropped -> context.json(dropped))
 			.onFailure(error -> respondToFailure(context, error));
+	}
+
+	/**
+	 * Streams a database out as a dump, while it is being used.
+	 *
+	 * <p>
+	 * <b>Its own flag.</b> {@code --allow-backup} rather than {@code --allow-write}, because a backup is a read that
+	 * hands over <em>every byte</em> of a database in one request, on a port with no authentication. That is a
+	 * different decision from "answer queries", in exactly the way {@code --allow-drop} is a different decision from
+	 * "accept writes", and folding it into either would mean an operator enabling one had silently enabled this.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>The whole walk runs inside one {@code executeBlocking} body, on one thread.</b> It has to: the read view that
+	 * makes the dump a single point in time is thread-confined, so a walk that hopped threads would silently start
+	 * reading current data instead. This is the one route in this server that streams while holding a view — every
+	 * other one materialises first, for the reason this class's javadoc gives — and it is safe here only because the
+	 * view never leaves the worker.
+	 * </p>
+	 *
+	 * <p>
+	 * The query deadline deliberately does <b>not</b> apply. It exists to stop a runaway query from holding a worker
+	 * and a view; a backup holds both on purpose, for as long as the data takes, and thirty seconds is not a bound
+	 * anybody wants on a backup. What it costs is stated in spec/BACKUP.md rather than hidden behind a timeout.
+	 * </p>
+	 */
+	private void backupDatabase(RoutingContext context) {
+		if (!allowBackup) {
+			metrics.recordQueryRejected("http", "backup");
+			fail(context, 403, "backup", "This server does not serve backups. Start it with --allow-backup, which is "
+				+ "separate from --allow-write because a backup hands over every byte of a database in one request "
+				+ "and no port here has authentication.");
+			return;
+		}
+		String name = context.pathParam("name");
+		GraphStore store;
+		try {
+			GraphDatabases.validate(name);
+			store = databases.database(name);
+		} catch (RuntimeException | IOException e) {
+			respondToFailure(context, e instanceof IOException io ? new GraphStoreException(io.getMessage(), io) : e);
+			return;
+		}
+
+		HttpServerResponse response = context.response();
+		response.putHeader("content-type", "application/octet-stream");
+		response.putHeader("content-disposition", "attachment; filename=\"" + name + ".dump\"");
+		// Chunked, because the size is not known until the walk finishes and buffering a database in memory to find
+		// it out would defeat the point of streaming.
+		response.setChunked(true);
+
+		vertx.<GraphBackup.Summary>executeBlocking(() -> {
+			try (OutputStream out = new ResponseStream(response)) {
+				return GraphBackup.write(store, name, out, System.currentTimeMillis());
+			}
+			// Unordered: a backup is long, and making it share an ordered queue with other blocking work would let one
+			// backup delay every schema scan behind it.
+		}, false).onSuccess(summary -> {
+			// Sent as headers rather than appended to the body: the body IS the dump, and a summary inside it would
+			// have to be parsed past by every reader. Headers are written before the first chunk goes out.
+			response.putTrailer("x-graph-nodes", String.valueOf(summary.nodes()));
+			response.putTrailer("x-graph-relationships", String.valueOf(summary.relationships()));
+			response.putTrailer("x-graph-lightweight-edges", String.valueOf(summary.lightweightEdges()));
+			response.putTrailer("x-graph-snapshot-lsn", String.valueOf(summary.snapshotLsn()));
+			response.end();
+			logger.info("Backed up '{}': {} nodes, {} relationships, {} lightweight edges, {} bytes",
+				name, summary.nodes(), summary.relationships(), summary.lightweightEdges(), summary.bytes());
+		}).onFailure(error -> {
+			logger.error("Backup of '{}' failed", name, error);
+			if (response.headWritten()) {
+				// Bytes are already on the wire, so there is no status left to change. Killing the connection is the
+				// only way to tell the client the dump is incomplete — and it must be told, because a truncated dump
+				// that arrived with a 200 would look like a valid short one until its checksum was checked.
+				response.reset();
+			} else {
+				respondToFailure(context, error);
+			}
+		});
+	}
+
+	/** Vert.x's response as an OutputStream, with backpressure honoured on the worker thread that is filling it. */
+	private static final class ResponseStream extends OutputStream {
+
+		private final HttpServerResponse response;
+
+		ResponseStream(HttpServerResponse response) {
+			this.response = response;
+		}
+
+		@Override
+		public void write(int b) {
+			write(new byte[] { (byte) b }, 0, 1);
+		}
+
+		@Override
+		public void write(byte[] bytes, int off, int len) {
+			response.write(Buffer.buffer(java.util.Arrays.copyOfRange(bytes, off, off + len)));
+			// The whole point of doing this on a worker: when the socket cannot keep up, this thread waits instead of
+			// queueing the rest of a database in memory. An event loop could not block here, which is the other reason
+			// the walk is not on one.
+			while (response.writeQueueFull()) {
+				try {
+					Thread.sleep(java.time.Duration.ofMillis(5));
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+					throw new java.io.UncheckedIOException(new IOException("Interrupted writing the backup"));
+				}
+			}
+		}
+
+		@Override
+		public void close() {
+			// The response is ended by the success handler, which is also where the trailers go.
+		}
 	}
 
 	// ---------------------------------------------------------------- composite indexes

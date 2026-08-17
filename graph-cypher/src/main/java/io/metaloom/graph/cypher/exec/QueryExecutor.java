@@ -1,5 +1,7 @@
 package io.metaloom.graph.cypher.exec;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -12,6 +14,9 @@ import io.metaloom.graph.cypher.CypherStats;
 import io.metaloom.graph.cypher.RowSink;
 import io.metaloom.graph.cypher.ast.Ast;
 import io.metaloom.graph.cypher.func.Functions;
+import io.metaloom.graph.cypher.io.CsvFormatException;
+import io.metaloom.graph.cypher.io.CsvRowReader;
+import io.metaloom.graph.cypher.io.CsvSource;
 
 /**
  * Runs a parsed query and produces columns and rows.
@@ -26,18 +31,40 @@ import io.metaloom.graph.cypher.func.Functions;
  */
 public final class QueryExecutor {
 
+	/**
+	 * How many CSV rows pass between two consultations of the abort signal.
+	 *
+	 * <p>
+	 * Matches {@code GraphAccess}'s interval on store touches, and exists for the case that one does not cover: a
+	 * {@code LOAD CSV … RETURN row} touches the store never, so without this the query deadline would not bound it at
+	 * all and a large file would be read to its end whatever the caller had asked for.
+	 * </p>
+	 */
+	private static final int ABORT_CHECK_ROWS = 1024;
+
 	private final GraphAccess graph;
 	private final Evaluator evaluator;
 	private final PatternMatcher matcher;
 	private final Writer writer;
+	private final CsvSource csv;
 
 	public QueryExecutor(GraphAccess graph, Map<String, Object> parameters) {
+		this(graph, parameters, CsvSource.DENY);
+	}
+
+	/**
+	 * @param csv
+	 *            where {@code LOAD CSV} may read from. {@link CsvSource#DENY} unless the caller has decided otherwise —
+	 *            see that interface for why refusal is the default
+	 */
+	public QueryExecutor(GraphAccess graph, Map<String, Object> parameters, CsvSource csv) {
 		this.graph = graph;
 		this.evaluator = new Evaluator(graph, parameters);
 		this.matcher = new PatternMatcher(evaluator);
 		// MERGE has to match before it can decide whether to create, so the writer gets the same matcher rather than
 		// one of its own — a second instance would be a second place for the pattern rules to drift.
 		this.writer = new Writer(graph, evaluator, matcher);
+		this.csv = csv == null ? CsvSource.DENY : csv;
 	}
 
 	/**
@@ -48,6 +75,81 @@ public final class QueryExecutor {
 	 *            an addendum to the result — for {@code CREATE (n:Person)} it is the entire result
 	 */
 	public record Result(List<String> columns, List<List<Object>> rows, CypherStats stats) {
+	}
+
+	/**
+	 * Where {@link #runBatched} puts a transaction boundary.
+	 *
+	 * <p>
+	 * The executor decides <em>where</em> the boundaries fall, because only it knows how many CSV rows have been read;
+	 * the caller decides <em>what</em> a boundary is, because only it knows about transactions. This module has no
+	 * business calling {@code store.begin()} — everything it does to the graph goes through {@link GraphAccess}, and
+	 * keeping it that way is what makes the query layer's use of the storage API checkable.
+	 * </p>
+	 */
+	public interface BatchBoundary {
+
+		/** Called before the first row of a batch is produced. */
+		void begin();
+
+		/**
+		 * Called after the last row of a batch has been written, and not called at all for an empty final batch.
+		 *
+		 * @param rowsCommitted
+		 *            CSV rows durable once this returns, counted from the start of the load
+		 */
+		void commit(long rowsCommitted);
+	}
+
+	/**
+	 * Runs a {@code USING PERIODIC COMMIT} load: the same clauses as {@link #run}, in transactions of {@code batchSize}
+	 * CSV rows.
+	 *
+	 * <p>
+	 * The file is read once, from one reader, and held open across the batches — the alternative would be reopening and
+	 * skipping, which is quadratic and would also read a file that had changed underneath. The rows of one batch are
+	 * materialised, the remaining clauses run over exactly those rows, and the boundary closes the transaction before
+	 * the next row is read. Peak memory is therefore one batch rather than one file, which is the entire point.
+	 * </p>
+	 *
+	 * <p>
+	 * Every batch shares one {@link Writer}, so the returned counters are the load's rather than the last batch's.
+	 * </p>
+	 *
+	 * @return what the whole load changed
+	 */
+	public CypherStats runBatched(Ast.SingleQuery part, int batchSize, BatchBoundary boundary) {
+		if (!(part.clauses().get(0) instanceof Ast.LoadCsv load)) {
+			throw new IllegalArgumentException("A batched run starts with LOAD CSV; the parser enforces this");
+		}
+		List<Ast.Clause> rest = List.copyOf(part.clauses().subList(1, part.clauses().size()));
+		List<Row> batch = new ArrayList<>();
+		long[] read = { 0 };
+		boolean[] open = { false };
+
+		forEachCsvRow(load, new Row(), row -> {
+			if (!open[0]) {
+				boundary.begin();
+				open[0] = true;
+			}
+			batch.add(row);
+			read[0]++;
+			if (batch.size() >= batchSize) {
+				runClauses(rest, batch);
+				batch.clear();
+				boundary.commit(read[0]);
+				open[0] = false;
+			}
+			return true;
+		});
+
+		// The last batch is short unless the row count divides exactly, and a file whose row count does divide exactly
+		// must not open a transaction here for the zero rows that follow.
+		if (open[0]) {
+			runClauses(rest, batch);
+			boundary.commit(read[0]);
+		}
+		return writer.stats();
 	}
 
 	public Result run(Ast.Query query) {
@@ -137,6 +239,9 @@ public final class QueryExecutor {
 			boolean ok = switch (clause) {
 				case Ast.Match ignored -> true;
 				case Ast.Unwind ignored -> true;
+				// The whole point of the clause: a file is the one input that genuinely does not fit in memory, so it
+				// must not be read into a list on its way to being read row by row.
+				case Ast.LoadCsv ignored -> true;
 				case Ast.With with -> streams(with.projection());
 				case Ast.Return returning -> streams(returning.projection());
 				// A write materialises so that it can commit before a row is delivered, and its eager semantics come
@@ -279,6 +384,7 @@ public final class QueryExecutor {
 				}
 				yield true;
 			}
+			case Ast.LoadCsv load -> forEachCsvRow(load, row, next);
 			// The WHERE goes *into* the projection stage rather than after it, because the list path filters before
 			// it slices: WITH n WHERE n.x > 5 LIMIT 3 means three of the rows that passed, not however many of the
 			// first three did. Applying them the other way round is a wrong answer that throws nothing.
@@ -286,6 +392,102 @@ public final class QueryExecutor {
 			case Ast.Return returning -> project(row, returning.projection(), null, stages, index, next);
 			default -> throw new IllegalStateException("Not a streaming clause: " + clauses.get(index));
 		};
+	}
+
+	/**
+	 * Opens the CSV named by the clause and pushes one row per record, binding {@code load.variable()}.
+	 *
+	 * <p>
+	 * The one place this module touches the outside world, and it does so through {@link CsvSource} — which is what
+	 * keeps the sandbox decision with the server rather than in the parser. Both execution paths come through here, so
+	 * the header handling, the abort checks and the close cannot drift between them.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>Closed on every path.</b> The try-with-resources covers a normal end, an exception, and — the case that is
+	 * easy to miss — a downstream {@code LIMIT} returning false, which is a perfectly ordinary early exit and would
+	 * otherwise leak a file handle per query.
+	 * </p>
+	 *
+	 * @return false if anything downstream had enough, which stops the read where it is
+	 */
+	private boolean forEachCsvRow(Ast.LoadCsv load, Row row, RowConsumer out) {
+		Object url = evaluator.evaluate(load.url(), row);
+		if (!(url instanceof String location)) {
+			throw new CypherTypeException("LOAD CSV needs a string URL but got " + Values.typeName(url));
+		}
+		try (CsvRowReader reader = new CsvRowReader(csv.open(location), load.fieldTerminator())) {
+			List<String> headers = null;
+			if (load.withHeaders()) {
+				headers = reader.next();
+				if (headers == null) {
+					// No header line means no columns, so every `row.x` downstream would be null. An empty result is a
+					// plausible answer to a query and a terrible answer to this, so it is refused.
+					throw new CsvFormatException("LOAD CSV WITH HEADERS needs a header line, and " + location
+						+ " is empty");
+				}
+				checkHeaders(headers, location);
+			}
+			List<String> values;
+			long produced = 0;
+			while ((values = reader.next()) != null) {
+				// GraphAccess only consults the abort signal when it touches the store, so a load that reads a file and
+				// returns it would otherwise run past the query deadline unbounded. This is the other half of that
+				// check, on the same interval and against the same signal.
+				if (++produced % ABORT_CHECK_ROWS == 0) {
+					graph.checkAbortNow();
+				}
+				// `values` is a fresh list per record and may contain nulls, so it is handed over as it is — List.copyOf
+				// would reject the nulls that an empty unquoted field deliberately produces.
+				Object bound = headers == null ? values : toMap(headers, values, reader.line(), location);
+				if (!out.accept(row.with(load.variable(), bound))) {
+					return false;
+				}
+			}
+			return true;
+		} catch (IOException e) {
+			throw new UncheckedIOException("LOAD CSV could not read " + location, e);
+		}
+	}
+
+	/**
+	 * Binds a record to its header, refusing a width the header cannot explain.
+	 *
+	 * <p>
+	 * A short row is padded with nulls rather than refused: a trailing empty column is extremely common in exported
+	 * data and Cypher's null semantics already say what {@code row.missing} means. A <em>long</em> row is refused,
+	 * because there is no name to bind the extra cells to and the overwhelmingly likely cause is an unquoted separator
+	 * inside a value — which means the row's other cells are misaligned too, and importing it would write wrong data
+	 * under correct-looking keys.
+	 * </p>
+	 */
+	private static Map<String, Object> toMap(List<String> headers, List<String> values, long line, String location) {
+		if (values.size() > headers.size()) {
+			throw new CsvFormatException("Line " + line + " of " + location + " has " + values.size()
+				+ " fields but the header declares " + headers.size()
+				+ "; the usual cause is an unquoted separator inside a value");
+		}
+		Map<String, Object> bound = new LinkedHashMap<>(headers.size());
+		for (int i = 0; i < headers.size(); i++) {
+			bound.put(headers.get(i), i < values.size() ? values.get(i) : null);
+		}
+		return bound;
+	}
+
+	/** A duplicate or absent column name makes {@code row.x} ambiguous, so it is refused before any row is read. */
+	private static void checkHeaders(List<String> headers, String location) {
+		Set<String> seen = new LinkedHashSet<>();
+		for (int i = 0; i < headers.size(); i++) {
+			String header = headers.get(i);
+			if (header == null || header.isBlank()) {
+				throw new CsvFormatException("Column " + (i + 1) + " of " + location + " has no name in the header, "
+					+ "so nothing downstream could refer to it");
+			}
+			if (!seen.add(header)) {
+				throw new CsvFormatException("The header of " + location + " names '" + header + "' more than once, "
+					+ "so row." + header + " would be ambiguous");
+			}
+		}
 	}
 
 	/**
@@ -340,12 +542,28 @@ public final class QueryExecutor {
 	}
 
 	private Result runSingle(Ast.SingleQuery query) {
-		List<Row> rows = new ArrayList<>();
-		rows.add(new Row());
+		// One empty row, so the first clause runs exactly once. A clause that produces rows replaces it; a clause that
+		// filters has something to filter.
+		List<Row> seed = new ArrayList<>();
+		seed.add(new Row());
+		return runClauses(query.clauses(), seed);
+	}
+
+	/**
+	 * The materialised path, over a given starting set of rows.
+	 *
+	 * <p>
+	 * Split out from {@link #runSingle} so that {@link #runBatched} can run the clauses after {@code LOAD CSV} over one
+	 * batch's rows and get exactly the semantics an unbatched run would have given them. Sharing the loop rather than
+	 * copying it is what keeps periodic commit from being a second, subtly different executor.
+	 * </p>
+	 */
+	private Result runClauses(List<Ast.Clause> clauses, List<Row> seed) {
+		List<Row> rows = seed;
 		List<String> columns = List.of();
 		boolean returned = false;
 
-		for (Ast.Clause clause : query.clauses()) {
+		for (Ast.Clause clause : clauses) {
 			switch (clause) {
 				case Ast.Match match -> {
 					List<Row> next = new ArrayList<>();
@@ -369,6 +587,17 @@ public final class QueryExecutor {
 						for (Object element : list) {
 							next.add(row.with(unwind.variable(), element));
 						}
+					}
+					rows = next;
+				}
+				case Ast.LoadCsv load -> {
+					// The whole file, in memory. That is what this path is, and it is why USING PERIODIC COMMIT exists:
+					// a write query cannot stream — it commits before delivering a row — so a load feeding CREATE
+					// arrives here, and unbatched its peak memory is the file. Cypher.write drives the batched form;
+					// this is the single-transaction one, which is correct and is bounded by the file size.
+					List<Row> next = new ArrayList<>();
+					for (Row row : rows) {
+						forEachCsvRow(load, row, next::add);
 					}
 					rows = next;
 				}

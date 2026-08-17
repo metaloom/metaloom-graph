@@ -2,6 +2,7 @@ package io.metaloom.graph.server;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -238,8 +239,51 @@ public class GraphServerOptionsTest {
 		}
 		// And the reverse direction, spelled out: the count is asserted so that adding a variable to the parser
 		// without adding it to VARIABLES fails here rather than being noticed by an operator.
-		assertEquals(18, GraphServerOptions.VARIABLES.size(),
+		assertEquals(21, GraphServerOptions.VARIABLES.size(),
 			"a variable was added or removed; update this count and check --help still prints all of them");
+	}
+
+	/**
+	 * {@code LOAD CSV} is off by default, and the two settings that enable it only make sense together.
+	 *
+	 * <p>
+	 * Both halves are refused at parse time rather than at the first query. A server that took
+	 * {@code --allow-load-csv} and then refused every load would look like a bug in the queries, and one that took
+	 * {@code --import-dir} without the flag reads as enabled and is not — which is the more dangerous of the two,
+	 * because it is the one an operator would believe.
+	 * </p>
+	 */
+	@Test
+	public void testLoadCsvIsOffByDefaultAndNeedsAnImportDirectory() {
+		GraphServerOptions defaults = parse("/data");
+		assertFalse(defaults.allowLoadCsv(), "off unless asked for");
+		assertNull(defaults.importDir());
+
+		GraphServerOptions enabled = parse("/data", "--allow-load-csv", "--import-dir=/srv/import");
+		assertTrue(enabled.allowLoadCsv());
+		assertEquals(Path.of("/srv/import"), enabled.importDir());
+
+		assertTrue(assertThrows(IllegalArgumentException.class, () -> parse("/data", "--allow-load-csv"))
+			.getMessage().contains("--import-dir"));
+		assertTrue(assertThrows(IllegalArgumentException.class, () -> parse("/data", "--import-dir=/srv/import"))
+			.getMessage().contains("--allow-load-csv"));
+
+		// And through the environment, which is how the chart sets it.
+		GraphServerOptions fromEnv = parseWithEnv(Map.of("GRAPH_ROOT", "/data",
+			"GRAPH_ALLOW_LOAD_CSV", "true", "GRAPH_IMPORT_DIR", "/srv/import"));
+		assertTrue(fromEnv.allowLoadCsv());
+		assertEquals(Path.of("/srv/import"), fromEnv.importDir());
+	}
+
+	/** A backup hands over everything in one request, so it is its own decision rather than part of another. */
+	@Test
+	public void testBackupIsOffByDefaultAndIndependentOfTheOtherFlags() {
+		assertFalse(parse("/data").allowBackup());
+		assertFalse(parse("/data", "--allow-write").allowBackup(), "enabling writes is not enabling this");
+		assertFalse(parse("/data", "--allow-drop").allowBackup());
+		assertTrue(parse("/data", "--allow-backup").allowBackup());
+		assertFalse(parse("/data", "--allow-backup").allowWrite(), "and it does not enable anything else either");
+		assertTrue(parseWithEnv(Map.of("GRAPH_ROOT", "/data", "GRAPH_ALLOW_BACKUP", "true")).allowBackup());
 	}
 
 	@Test

@@ -18,8 +18,8 @@ Design rationale lives in the other files; [CONTEXT.md](CONTEXT.md) routes to th
 | **Databases** | One directory per database under the root, each a complete independent store ([DATABASES.md](DATABASES.md)). Sizing below is **per database**. |
 | **Concurrency** | One writer process, enforced by a `LOCK` file. One writer *thread*, enforced by a lock. Readers are unlimited and scale (measured to 10x at 32 threads). |
 | **Durability** | A commit is on the device when the call returns, under the default sync mode. |
-| **Failure domain** | The store directory. There is no replication, no failover and no backup mechanism inside the engine. |
-| **Biggest operational gap** | **No online backup.** See §5. |
+| **Failure domain** | The store directory. There is no replication and no failover. Backup is `metaloom-graph-cli`, outside the engine — [BACKUP.md](BACKUP.md). |
+| **Biggest operational gap** | **No authentication on any port.** See §9. Online backup exists now — §5 |
 
 ---
 
@@ -100,6 +100,9 @@ what lets the image's `CMD` carry no arguments at all.
 | `GRAPH_DATABASE` | `--database=` | `default` |
 | `GRAPH_ALLOW_WRITE` | `--allow-write` | false |
 | `GRAPH_ALLOW_DROP` | `--allow-drop` | false |
+| `GRAPH_ALLOW_BACKUP` | `--allow-backup` | **false** — see §5 |
+| `GRAPH_ALLOW_LOAD_CSV` | `--allow-load-csv` | **false** — see §9.1 |
+| `GRAPH_IMPORT_DIR` | `--import-dir=` | none; required by the flag above |
 | `GRAPH_DEMO` | `--demo` | false |
 | `GRAPH_DEMO_SIZE` | `--demo-size=` | small |
 | `GRAPH_QUERY_TIMEOUT_MILLIS` | `--query-timeout=` | 30000 |
@@ -130,6 +133,10 @@ Three behaviours that are decisions rather than accidents:
   "address already in use" from whichever bound second, which names the port but not the two settings that chose it.
   Port `0` means "any free one" and is excluded, as is a disabled front end. Note that the monitoring port defaults to
   8082, so serving HTTP on 8082 is now a start-up error rather than a race.
+
+**`--allow-load-csv` and `--import-dir` are refused apart**, in both directions and at parse time. The flag without a
+directory would accept every load and then refuse it, which reads as a bug in the queries; a directory without the flag
+reads as enabled and is not, which is the more dangerous of the two because it is the one an operator believes.
 
 **`GRAPH_WIRE_HOST` deserves its own line.** The binary port binds loopback by default, which inside a pod means it is
 unreachable from outside that pod. That is the correct default and the reason the chart has to widen it deliberately:
@@ -207,36 +214,64 @@ It applies to every front end, tagged `http`, `wire` or `mcp`.
 
 ## 5. Backup and Restore
 
-**The engine has no backup mechanism.** This is the largest operational gap and it is stated plainly rather than
-worked around.
+**There is an online logical backup.** `metaloom-graph-cli` writes a database out as a portable dump while it is being
+used: writers are not stopped, and the dump is a single point in time. The design is [BACKUP.md](BACKUP.md); this is
+the procedure.
 
-What works today:
+```bash
+# Against a running server — needs --allow-backup on it
+metaloom-graph-cli database backup mydb --server=http://localhost:8080 --out=mydb-$(date +%Y%m%dT%H%M%S).dump
 
-**Cold copy.** Close the store, copy the directory, reopen. Correct, complete, and requires downtime.
+# Or directly, with the server stopped
+metaloom-graph-cli database backup mydb --path=/data/graphs --out=mydb.dump
+
+# Restore. Offline only, and it creates the target from the dump's own geometry
+metaloom-graph-cli database restore mydb --path=/data/graphs --in=mydb.dump --force
+
+# What is in a dump, without opening a store
+metaloom-graph-cli database inspect --in=mydb.dump
+```
+
+**In a container it is already there**, as `metaloom-graph-cli` on the `PATH` of both images — including the native
+one, which has no JVM and therefore no other way to do this. `GRAPH_ROOT=/data` is set in the image and read by both
+programs, so use `--server` while the server is running: a bare `--path` opens the store the server has exclusively
+locked and is refused. [DEPLOYMENT.md §2.3](DEPLOYMENT.md) has both directions spelled out.
+
+**`--force` is about data, not existence.** A restore replaces a database whole, so it refuses one that holds
+anything unless told twice — but a target that is merely *there* and empty is replaced without a flag. That matters
+because opening a root that does not exist creates an empty `default` inside it, which is exactly the state a machine
+is in when a dump is being put onto it.
+
+**What it costs while it runs.** Writers wait one batch at a time rather than for the whole walk; `reclaim()` and
+`compact()` are refused for the duration, because the backup holds a read view; and retention grows with write volume ×
+backup duration. Past `retainedVersionBytes` (256 MiB) the engine abandons the oldest view — usually the backup's — and
+the CLI reports that with what to do about it. On a store under heavy write load, back up offline or raise the budget.
+
+**Element ids are not preserved.** A restored node has the same labels, properties and relationships and a different
+id. Anything outside the store that recorded an id is stale after a restore. That is the price of a portable dump; a
+physical copy would have preserved them and is not built.
+
+**Cold copy still works**, and is the only thing that preserves ids and index structures byte for byte:
 
 ```bash
 # with the writing process stopped
 cp -a --sparse=always /data/mygraph /backup/mygraph-$(date +%Y%m%dT%H%M%S)
 ```
 
-`--sparse=always` matters: hole punching leaves large sparse regions and a naive copy materialises them.
+`--sparse=always` matters: hole punching leaves large sparse regions and a naive copy materialises them. Restore is the
+reverse — stop the process, replace the directory, start. Delete the `LOCK` file only if you are certain no process is
+using it.
 
-**Restore** is the reverse: stop the process, replace the directory, start. Delete the `LOCK` file only if you are
-certain no process is using it.
+What still does **not** work:
 
-What does **not** work:
-
-- **Copying a live store is not safe.** There is no snapshot isolation and no way to quiesce writers from outside the
-  process. A copy taken during a write can catch a half-applied commit. The `snapshot()` API in
-  [API.md](API.md) is designed but not implemented.
+- **Copying a live store is not safe.** There is no filesystem-level snapshot and no way to quiesce writers from
+  outside the process. A copy taken during a write can catch a half-applied commit. Use the logical backup above, which
+  gets its atomicity from the engine's MVCC rather than from the filesystem.
 - **Copying only the segment files is not enough.** The `MANIFEST`, the `dict/` directory and the `wal/` directory are
   all part of the store. The dictionary in particular maps the label and key ids embedded in every record; without it
   the records are unreadable.
 - There is **no point-in-time recovery** and **no incremental backup**. The log is trimmed at each checkpoint, so it
-  cannot be replayed against an older copy.
-
-If you need any of this, put the system of record somewhere else and treat this store as a rebuildable index. That is
-the recommendation in [reports/PHASE_STATUS.md](reports/PHASE_STATUS.md) §5 and it has not changed.
+  cannot be replayed against an older copy or an older dump.
 
 ---
 
@@ -407,6 +442,20 @@ Both can read **every byte** of one store — and of **every database under the 
 per-database authentication either. Treat exposing either as equivalent to handing out the root directory, because that
 is what it is.
 
+**A backup hands over everything, and that is off by default too.** `--allow-backup` serves
+`GET /api/databases/{name}/backup`, which streams a whole database in one request. It is a read, so `--allow-write`
+does not cover it — and it is the read that hands over every byte, so it does not come with `--allow-write` either.
+Treat enabling it as equivalent to publishing the store directory, because that is what it is.
+
+**The query language can read files, and that is off by default and is a separate decision.** `--allow-load-csv`
+enables `LOAD CSV`, and `--import-dir=<path>` is the whole of what it may then read. It is **not** covered by
+`--allow-write`, because `LOAD CSV … RETURN row` writes nothing — a server left deliberately read-only would otherwise
+have read files off its own disk for anything that could reach the port, and returned them as query results. Inside the
+import directory, `file:///x.csv` means `<import-dir>/x.csv`; traversal, absolute paths and symlinks pointing out are
+refused, `http://` is refused by name so that the clause cannot be used to make the server fetch an address of the
+caller's choosing, and a refusal never says whether the file exists. It is refused unconditionally on the MCP port.
+[CYPHER.md §5.6](CYPHER.md) has the design; `SandboxedFileCsvSourceTest` is the test.
+
 **The query language can write, and that is off by default.** `--allow-write` enables `CREATE`, `SET`, `REMOVE` and
 `DELETE` on both ports at once; without it a write query is refused before it reaches a worker thread — 403 over HTTP,
 `READ_ONLY` on the wire. Turning it on hands anything that can reach the port the ability to change and delete data,
@@ -442,9 +491,12 @@ Two consequences of enabling writes that are easy to miss:
 
 Stated plainly, because an operations document that implies capabilities the system lacks is a liability:
 
-- No online backup, no incremental backup, no point-in-time recovery (§5).
+- No incremental backup and no point-in-time recovery (§5). Online *logical* backup exists; a physical snapshot does not.
 - No repair tool for a store that fails `verify` (§6.3).
-- No authentication on any port (§9.1). This is the largest gap after backup.
+- No authentication on any port (§9.1). With backup built, this is now the largest gap.
+- **No bound on what one `LOAD CSV` may cost.** The import directory bounds *which* files, not their size: a load runs
+  under the query deadline like anything else, and a batched one holds the writer lock for a batch at a time. Put only
+  files you meant to import in that directory.
 - No metrics exporter **for an embedder**. `graph-server` exports Prometheus metrics ([METRICS.md](METRICS.md)); the
   engine itself still just returns `StoreMetrics` as a Java object, and wiring that up in a process that embeds
   `graph-core` directly remains the embedder's job. That is deliberate — see METRICS.md §2.
@@ -454,5 +506,5 @@ Stated plainly, because an operations document that implies capabilities the sys
 
 ---
 
-_Git HEAD revision: `e4601d1`_
-_Last updated: 2026-08-16 (env-var configuration, Prometheus metrics, the slow query log, MCP)_
+_Git HEAD revision: `3edb034`_
+_Last updated: 2026-08-17 (the LOAD CSV flag; backup and restore, including from inside a container)_

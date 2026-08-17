@@ -283,6 +283,26 @@ public interface GraphStore extends AutoCloseable {
 	 */
 	boolean forEachNodeWhile(java.util.function.LongPredicate consumer);
 
+	/**
+	 * The same scan, releasing the read latch between batches so that writers are not blocked for its whole duration.
+	 *
+	 * <p>
+	 * {@link #forEachNodeWhile(java.util.function.LongPredicate)} holds the latch outright, which is correct for a
+	 * query and wrong for a walk of every node: that latch is the one a committing writer takes exclusively, so a scan
+	 * of a large store stops every writer in the process until it finishes. This is the form a backup, an export or any
+	 * other whole-store read should use.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>Open a read view first.</b> Under a {@code SNAPSHOT} view this sees one consistent node set however many times
+	 * the latch is dropped — {@link ScanOptions} explains why, and it is the property the whole idea rests on. Without
+	 * one, a throttled scan sees a series of instants and a node created halfway through may or may not appear.
+	 * </p>
+	 *
+	 * @return false if the predicate stopped the scan, true if every live node was visited
+	 */
+	boolean forEachNodeWhile(java.util.function.LongPredicate consumer, ScanOptions options);
+
 	/** Every node carrying the label, via the label index. */
 	List<Long> nodesByLabel(String label);
 
@@ -342,6 +362,25 @@ public interface GraphStore extends AutoCloseable {
 
 	/** Whether an index over this label and key has been declared. */
 	boolean hasIndex(String label, String key);
+
+	/**
+	 * The geometry this store was created with, as recorded in its manifest.
+	 *
+	 * <p>
+	 * Page size, segment capacity and vector dimensions are fixed at creation and cannot be changed afterwards — the
+	 * address function derives every per-kind table from them, and recovery has to build the segment set before it can
+	 * replay anything into it. So a caller that wants to make <em>another</em> store able to hold this one's data has
+	 * to be able to ask what they are. A backup is that caller: a dump from a store with 768-dimension vectors cannot
+	 * be replayed into one created without vector storage, and the failure should be a message at restore time rather
+	 * than a store that turns out not to fit its data.
+	 * </p>
+	 *
+	 * <p>
+	 * Only the three creation-time settings are meaningful in what comes back. The WAL and retention settings are
+	 * per-open rather than per-store and are reported as this store's current ones.
+	 * </p>
+	 */
+	GraphStoreOptions options();
 
 	/** Every declared composite index, in declaration order. */
 	List<CompositeIndex> compositeIndexes();

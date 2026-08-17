@@ -113,6 +113,25 @@ A drop closes the store *before* unlinking the directory. Unlinking a mapped fil
 valid and the store convinced it still has somewhere to write, which is a stranger failure than a
 refusal.
 
+### 3.1 `replace`, which is not "drop without the check"
+
+A **restore** has to put a database back over an existing one, and very often over the last one there
+is: opening a root that does not exist creates a `default` inside it, so a machine being restored onto
+holds exactly one database before the dump is read. `drop` then `create` cannot express that, and the
+rule above is not wrong — so the operation itself is the thing that was missing.
+
+```java
+GraphStore replace(String name, GraphStoreOptions storeOptions) throws IOException
+```
+
+Closes, deletes and recreates while holding the lock, so **the root is never observed empty** and the
+rule it appears to bypass is about a state that no longer occurs. It creates when there was nothing
+there, so a restore does not have to know which case it is in. The options are the *dump's*, for the
+reason `create(String, GraphStoreOptions)` exists: geometry is fixed at creation.
+
+It is not on the HTTP surface. Nothing over the network replaces a database — restore is offline only
+([BACKUP.md §6](BACKUP.md)).
+
 ---
 
 ## 4. Selection
@@ -201,12 +220,12 @@ The initial database comes from `GET /api/databases`, never from a hard-coded `"
 
 | | |
 |---|---|
-| `GraphDatabasesTest` | The registry: layout, separation proved by writing to one and reading the other, lazy open, drop, the legacy refusal, and the traversal cases — which are the security test for the whole feature |
+| `GraphDatabasesTest` | The registry: layout, separation proved by writing to one and reading the other, lazy open, drop, `replace` over the last database (§3.1), the legacy refusal, and the traversal cases — which are the security test for the whole feature |
 | `DatabaseRoutesTest` | The HTTP surface: listing, `?database=` genuinely reaching a different store, 400 vs 404, create, drop, and drop refused without the flag |
 | `WireServerTest` | Two connections to two databases from one process seeing different data; an unknown database refused at the handshake; a hostile name refused before it becomes a path |
 | `GraphServerOptionsTest` | `--database=` validated at parse time, `--allow-drop` off by default |
 
 ---
 
-_Git HEAD revision: `e4601d1`_
-_Last updated: 2026-08-15 (protocol version 3)_
+_Git HEAD revision: `3edb034`_
+_Last updated: 2026-08-17 (replace, for restore over the last database)_

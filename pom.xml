@@ -48,6 +48,8 @@
         <module>graph-cypher</module>
         <module>graph-protocol</module>
         <module>graph-client</module>
+        <!-- graph-cli before graph-server: the server uses its dump format for the backup route. -->
+        <module>graph-cli</module>
         <module>graph-server</module>
     </modules>
 
@@ -117,6 +119,11 @@
             <dependency>
                 <groupId>io.metaloom.graph</groupId>
                 <artifactId>graph-protocol</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.metaloom.graph</groupId>
+                <artifactId>graph-cli</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>

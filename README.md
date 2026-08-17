@@ -22,7 +22,7 @@ Durable, transactional, indexed, compacting, hardened, with snapshot isolation f
 | **Space reclamation** | Two halves. `reclaim()` punches all-free pages and breaks no ids. `compact()` relocates records to close holes within pages, rewrites every internal reference, and pulls the high water marks down; it is the one operation that invalidates ids. A store churned to a tenth of its slots comes back to 0.95 liveness. |
 | **Native layer** | Rust via FFM, with `cargo test` and `clippy -D warnings` inside `mvn test`. **io_uring is 12.4x** over a `pread` loop on 64 scattered reads — the one capability the JVM cannot approach. The hot-loop codecs are not: 1.38x on edges, 7.8x *slower* on CRC32C. |
 | **Hardening** | Reads-per-operation and write-amplification budgets enforced as build failures; a differential harness against an in-memory model across crashes and compaction; every format parser tested against corrupt and hostile input; a `kill -9` loop that checks acknowledged commits. |
-| **Not there** | No concurrent writers, no `OPTIONAL MATCH`, no backup mechanism, no repair tool, no authentication on either port. [spec/OPERATIONS.md](spec/OPERATIONS.md) says so plainly. |
+| **Not there** | No concurrent writers, no `OPTIONAL MATCH`, no repair tool, no authentication on either port, and no *physical* snapshot or point-in-time recovery. [spec/OPERATIONS.md](spec/OPERATIONS.md) says so plainly. |
 | **Adjacency sizing** | A block is a run of 512 byte cells that doubles as the node fills, so degree 3 costs 512 bytes rather than a page. Fixing this took a 10M-node random graph from 61 GiB to 6.2 GiB and its load from 43 to 11 minutes. [spec/reports/SCALE.md](spec/reports/SCALE.md) has the before and after. |
 
 What is done and what is left, as one checklist: [spec/PROGRESS.md](spec/PROGRESS.md). The reason for
@@ -259,8 +259,8 @@ One command builds everything — three Java modules, the Rust native layer and 
 mvn clean install
 ```
 
-The reactor is a parent pom over `graph-core`, `graph-cypher`, `graph-protocol`, `graph-client` and
-`graph-server`. `graph-core` drives
+The reactor is a parent pom over `graph-core`, `graph-cypher`, `graph-protocol`, `graph-client`,
+`graph-cli` and `graph-server`. `graph-core` drives
 `cargo` through the exec plugin at four points: **build** before compile, **package** the resulting
 shared object into the jar under its platform classifier, **test** the crate with
 `cargo test` and `clippy -D warnings` during `mvn test`, and **clean** the crate's target directory
@@ -269,7 +269,7 @@ during `mvn clean`. `graph-server` drives `npm` on the same terms — install, b
 jar.
 
 ```bash
-mvn test              # 584 tests across five modules, the UI's own 17, and the Rust crate's 12
+mvn test              # the suite across six modules, the UI's own 17, and the Rust crate's 12
 mvn test -Pslow       # adds the scaling curve, the soak and the long-running reader
 mvn test -Pbench      # adds the benchmarks and the performance gates
 mvn test -Pall-tests  # everything
@@ -306,12 +306,13 @@ mvn -pl graph-server exec:java -Dexec.args="/data/mygraph 8080"
 
 ### A native binary
 
-The server also compiles to a standalone executable with no JVM:
+The server and the backup CLI both compile to standalone executables with no JVM:
 
 ```bash
 export GRAALVM_HOME=/path/to/graalvm-25
-mvn -Pgraalvm verify                               # jar, then binary, then a smoke test against the binary
+mvn -Pgraalvm verify                               # jars, then binaries, then a smoke test against each
 ./graph-server/target/native/graph-server --demo /tmp/demo 8080
+./graph-cli/target/native/metaloom-graph-cli database backup default --path=/data/graphs --out=g.dump
 ```
 
 **The FFM layer survives ahead-of-time compilation intact** — libc downcalls, mapped segment files, and
@@ -331,6 +332,18 @@ That last row is the trade and it is not a footnote: with no JIT, a scan-heavy q
 in the binary. The image wins where startup and footprint decide it; the jar wins for a server that
 stays up. The whole exercise, including the four things that build cleanly and fail at run time, is in
 [spec/GRAALVM.md](spec/GRAALVM.md).
+
+**For the CLI there is no such trade**, because it runs once and exits rather than staying up: `--help`
+in 1–2 ms against 18–20, a real backup in 32 ms against 96, 22 MB resident against 64. Its profile is
+fifteen lines and no metadata of its own — everything native-image needs travels inside `graph-core`'s
+jar, which is what makes a second executable free.
+
+Both binaries go into the container images, which is not a nicety for the native one: it has no JVM, so
+without the compiled CLI that image could not be backed up from the inside at all.
+
+```bash
+docker exec g metaloom-graph-cli database backup default --server=http://localhost:8080 --out=- > g.dump
+```
 
 ## Specification
 

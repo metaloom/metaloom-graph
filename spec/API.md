@@ -284,7 +284,8 @@ store.vacuum(Duration.ofSeconds(5));      // bounded incremental vacuum
 store.verify(VerifyLevel.CHECKSUMS);      // scrub: CHECKSUMS or FULL
 StoreStats s = store.stats();             // per-kind live/dead counts and bytes
 StoreMetrics m = store.metrics();         // counters and gauges; subtract two snapshots to cost an interval
-store.snapshot(Path.of("/backup/x"));     // reflink-based, O(1) where supported
+// A whole-store reflink clone is still designed and unbuilt. What exists instead is a *logical* backup, outside
+// the engine and against this API: see spec/BACKUP.md and metaloom-graph-cli.
 
 int pages = store.reclaim();              // punch all-free pages; breaks no ids
 CompactionReport r = store.compact();     // relocate records; BREAKS IDS, see FILE_FORMAT.md §9
@@ -443,6 +444,10 @@ scopes them for the calling thread rather than duplicating them.
 - [x] `metrics()` returning `StoreMetrics` / `IoStats`, and throttled `verify` via `VerifyOptions`
 - [x] Vacuum — reclamation at the end of every commit rather than a separate call or a worker thread
 - [ ] `snapshot` (Phase 6): a whole-store reflink clone. `FICLONE` is bound and called by nothing
+- [x] `options()` — the geometry a store was created with, which a restore has to be able to ask for
+- [x] `forEachNodeWhile(consumer, ScanOptions)` — a paced scan, so a whole-store walk does not block every writer.
+      The second gap a real consumer found in this API, after `forEachNode` itself ([BACKUP.md §2.1](BACKUP.md))
+- [x] Logical backup and restore, built on those two: [BACKUP.md](BACKUP.md)
 - [x] README rewritten against the new API
 
 ---

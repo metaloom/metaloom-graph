@@ -1,7 +1,8 @@
 # openCypher — the accepted subset
 
 An openCypher subset over the storage engine, plus an HTTP server and a browser UI. Reads and writes;
-**writes are off by default on both ports** and turned on with `--allow-write` (§5.1).
+**writes are off by default on both ports** and turned on with `--allow-write` (§5.1). **`LOAD CSV` is
+off by default too, under a separate flag and confined to one directory** (§5.6).
 Three modules:
 
 | Module | What it is |
@@ -30,8 +31,10 @@ for (CypherRow row : result) {
 
 ```
 Query        := SingleQuery (UNION [ALL] SingleQuery)*
-SingleQuery  := Clause+ [Return]          -- Return is required unless the query writes
-Clause       := Match | Unwind | With | Create | Merge | Set | Remove | Delete | Call
+SingleQuery  := [PeriodicCommit] Clause+ [Return]   -- Return is required unless the query writes
+Clause       := Match | Unwind | With | Create | Merge | Set | Remove | Delete | Call | LoadCsv
+PeriodicCommit := USING PERIODIC COMMIT [Int]       -- only before a leading LoadCsv; see 5.6
+LoadCsv      := LOAD CSV [WITH HEADERS] FROM Expr AS Variable [FIELDTERMINATOR StringLit]
 Call         := CALL Name '(' [Expr (',' Expr)*] ')' YIELD Variable (',' Variable)*
 Match        := MATCH Pattern [WHERE Expr]
 Unwind       := UNWIND Expr AS Variable
@@ -383,7 +386,7 @@ The simple form compares under Cypher equality, so `1` and `1.0` select the same
 | `OPTIONAL MATCH` | Needs null-padding semantics through the rest of the pipeline |
 | List comprehensions, map projections, pattern comprehensions | Not built |
 | `ALL`/`ANY`/`NONE`/`SINGLE` predicates, `EXISTS` subqueries | Not built |
-| User-defined procedures, `LOAD CSV` | No procedure *registry* exists. `CALL` itself is built and there is exactly one procedure: `CALL vector.query(label, key, vector, k) YIELD node, score` — see [VECTOR.md](VECTOR.md). Any other name is refused at execution with that message |
+| User-defined procedures | No procedure *registry* exists. `CALL` itself is built and there is exactly one procedure: `CALL vector.query(label, key, vector, k) YIELD node, score` — see [VECTOR.md](VECTOR.md). Any other name is refused at execution with that message |
 | Temporal and spatial types | The store has `Instant`; Cypher's temporal algebra is not implemented |
 
 **Each of these is refused at parse time, by name, with a caret.** The parser accepts only what the
@@ -405,6 +408,119 @@ FOREACH is not supported: use UNWIND, which this build does implement (1:11)
 graph that could be built: a variable-length range does not say how many relationships to make, an
 undirected arrow does not say which way one points, and a missing or alternated type does not say what
 to create.
+
+---
+
+### 5.6 `LOAD CSV`
+
+```cypher
+LOAD CSV WITH HEADERS FROM 'file:///people.csv' AS row
+MERGE (p:Person {id: row.id}) SET p.name = row.name, p.age = toInteger(row.age)
+
+USING PERIODIC COMMIT 10000
+LOAD CSV WITH HEADERS FROM $file AS row FIELDTERMINATOR ';'
+MERGE (a:City {name: row.from}) MERGE (b:City {name: row.to}) MERGE (a)-[:ROAD]->(b)
+```
+
+Structurally an `UNWIND` whose list comes from outside the process: it binds one variable per record and
+multiplies the rows flowing through it. `WITH HEADERS` binds a map, so `row.name` works — `Evaluator`
+already indexes a `Map` — and without it a list, so `row[0]` does.
+
+**Every value is a string.** `toInteger`, `toFloat` and `toBoolean` are written where they are meant.
+Inferring types is the behaviour that looks helpful and quietly destroys data: a leading-zero identifier
+loses its zeros and a product code like `1E5` becomes `100000.0`. An unquoted empty field is `null`; a
+quoted one is `''`, which is the only distinction the format offers between "no value" and "an empty
+one" and is worth keeping.
+
+**The reader is a character state machine, not a loop over lines**, because a quoted field may contain a
+newline. `Corpus.splitCsv` in the tests is line-based and honest about being "RFC 4180 enough for this
+file"; it is the test corpus for `CsvRowReader`, not its implementation. A BOM is dropped, `\r\n` and a
+lone `\r` both end a record, `""` is one literal quote, a short row pads with `null` and a **long** row
+is refused naming its line — the likely cause is an unquoted separator, which means the row's other
+cells are misaligned too and importing it would write wrong data under correct-looking keys.
+
+#### `FROM` is not a keyword, and must not become one
+
+`FROM`, `HEADERS` and `FIELDTERMINATOR` are matched **contextually**, as ordinary identifiers at the
+positions inside the clause where they can appear. Reserving them in the lexer would be the obvious
+implementation and would silently break the language: a keyword token carries its **folded** spelling,
+and `labelName`/`propertyKeyName` accept keywords as ordinary names, so `r.from` would become `r.FROM`.
+A column called `from` is near-universal in the edge lists this clause exists to load.
+
+> That folding was a live defect until this work, not a hypothetical: `(n:Order {end: 1})` really did
+> store a label `ORDER` and a key `END`, contradicting §1 and `labelName`'s own javadoc, and
+> `CypherParserTest` asserted the wrong behaviour rather than catching it. `Token` now carries the
+> original spelling beside the folded one, and those two positions — plus the projection-column naming,
+> which had the same bug — read it.
+
+#### The file is not this module's business
+
+`graph-cypher` has no third-party dependencies and no `java.nio.file` in `src/main`, and adding a file
+reader would have put the **sandbox policy** in the parser, where the server cannot configure it. So the
+module parses CSV and the caller supplies the bytes:
+
+```java
+public interface CsvSource { Reader open(String url); CsvSource DENY = url -> { throw ... }; }
+```
+
+**The default is `DENY` on every overload that does not name one.** An embedded caller cannot be turned
+into a file-reading primitive by a query string it did not write — and a query string is very often the
+part of an application that came from outside it.
+
+#### On a server, it is off by default and confined to one directory
+
+| | |
+|---|---|
+| Flag | `--allow-load-csv` / `GRAPH_ALLOW_LOAD_CSV`, **off by default** |
+| Directory | `--import-dir=<path>` / `GRAPH_IMPORT_DIR`, required with the flag and refused without it |
+| HTTP | **403** `loadcsv` before a worker thread is spent |
+| Wire | `READ_ONLY`, on the event loop |
+| MCP | **Always refused**, whatever the flag says |
+
+**`--allow-write` does not cover this, and that is the whole reason the flag exists.** `LOAD CSV … RETURN
+row` creates nothing, so `Ast.isWrite()` is false for it: a server deliberately left read-only would
+have read files off its own disk for anything that could reach the port. `Ast.Query.readsFiles()` is the
+companion predicate, answered from the tree so the refusal costs nothing.
+
+`SandboxedFileCsvSource` is the enabled case. `file:///x.csv` means `<import-dir>/x.csv`, **not**
+`/x.csv` — the leading slashes are stripped, so a URL cannot name a file outside the root before any
+check runs, which makes containment structural rather than a filter. Then `normalize()`, then a
+`startsWith` check, then `toRealPath()` and the check again, because an import directory is very often
+somewhere a less-trusted process drops files and a symlink planted in one is a realistic way out.
+`http://` is refused **by name**: an SSRF primitive on an unauthenticated port is worse than the file
+read it would be replacing. A refusal never says whether the file exists, so the clause cannot be used
+to probe a filesystem the caller cannot otherwise see.
+
+**MCP refuses it unconditionally**, which is not a configuration question. That port is the one an LLM
+drives ([MCP.md](MCP.md)); a `LOAD CSV` names a file rather than anything in the graph, and a model that
+can read the import directory and return it as query results is a wider capability than "query this
+database". A bulk import is an operator's action.
+
+#### `USING PERIODIC COMMIT`
+
+The clause exists because of a property of everything above it. **A write query cannot stream** — it
+commits before delivering a row (§4.1) — so `LOAD CSV … CREATE` runs through the materialised path and
+its peak memory is the whole file. Batching bounds both the heap and the transaction: *n* rows are read,
+the remaining clauses run over exactly those rows, that transaction commits, and the reader continues
+from where it stopped. The file is read once, from one reader held open across the batches.
+
+**It gives up atomicity, and the failure mode has to be stated rather than discovered.** If row 70,000
+violates a constraint, every batch before it is committed and durable and there is nothing left to roll
+back. The error names how many rows survived, because "some prefix of your file is loaded" is only
+actionable if the caller is told which prefix — and the advice is to write the load with `MERGE` rather
+than `CREATE`, which makes a re-run idempotent. The batch in flight *is* rolled back, so the store holds
+whole batches or nothing, never half of one.
+
+Refused in two cases, each because the alternative is worse than a refusal:
+
+- **Inside a transaction the caller opened.** Everywhere else a write query joins one and commits
+  nothing; here committing is the entire mechanism, and ending somebody else's unit of work is not this
+  code's decision.
+- **When `LOAD CSV` is not the first clause.** A batch boundary is only meaningful if the CSV is what
+  drives the rows; with anything else first the rows were fixed before the load ran.
+
+A bare `USING PERIODIC COMMIT` takes 4,000 — the same number `DemoData.Batch` settled on, and for the
+same reason. The upper bound is 1,000,000, because a batch is materialised before it is committed.
 
 ---
 
@@ -712,7 +828,9 @@ it still reads everything. Bind to localhost unless something else provides acce
 
 | Class | Cases | |
 |---|---|---|
-| `CypherParserTest` | 20 | Tokens, precedence, ranges, and every refusal naming itself with a caret |
+| `CypherParserTest` | 26 | Tokens, precedence, ranges, every refusal naming itself with a caret, and that a label or property key named after a keyword keeps its spelling |
+| `io/CsvRowReaderTest` | 15 | RFC 4180: quoted newlines, the `""` escape, BOM, `\r\n`, a custom terminator, and a record straddling the buffer |
+| `LoadCsvTest` | 27 | §5.6 end to end: both row shapes, both execution paths, the reader closed on every exit including an early `LIMIT`, `DENY` by default, and periodic commit's partial-failure semantics |
 | `NullSemanticsTest` | 16 | §2, on its own |
 | `CypherExecutionTest` | 31 | Every clause, end to end |
 | `CypherVersusApiTest` | 12 | **The load-bearing one** — see below |
@@ -725,7 +843,8 @@ it still reads everything. Bind to localhost unless something else provides acce
 | `CypherSnapshotTest` | 4 | §4: views closed, joined, and a query atomic against a live writer |
 | `GraphServerTest` | 25 | The HTTP contract, both result shapes, the schema scan and its cache, the id-precision regression, and the write flag with its 403 |
 | `DemoDataTest` | 10 | §8.3: the graph is connected as claimed, its distances match the world, and it is the same every time |
-| `GraphServerOptionsTest` | 15 | The command line, so an ignored flag fails a test rather than starting a server that does the wrong thing |
+| `GraphServerOptionsTest` | 23 | The command line, so an ignored flag fails a test rather than starting a server that does the wrong thing — including that `--allow-load-csv` and `--import-dir` are refused apart |
+| `io/SandboxedFileCsvSourceTest` | 12 | **The security test for §5.6**: traversal, absolute paths, symlinks out, `http://`, and that a refusal never says whether the file exists. Every case asserts nothing was read |
 | `model/graph.test.ts` | 12 | The merge rule: node identity across results, held links, and that every change advances the version |
 | `model/colors.test.ts` | 5 | A colour is a function of a name, and the demo graph's labels do not collide |
 | `e2e/graph-browser.spec.ts` | 30 | The UI in a browser against a real server — see §9.1 |
@@ -813,5 +932,5 @@ previous bundle. Every assertion in the first run failed against markup that no 
 
 ---
 
-_Git HEAD revision: `0970e6b`_
-_Last updated: 2026-08-16 (the /api/indexes routes and the sidebar's index panel)_
+_Git HEAD revision: `3edb034`_
+_Last updated: 2026-08-17 (LOAD CSV, USING PERIODIC COMMIT, and the keyword-spelling fix)_

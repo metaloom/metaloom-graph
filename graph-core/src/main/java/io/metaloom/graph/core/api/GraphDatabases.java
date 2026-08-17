@@ -201,6 +201,29 @@ public final class GraphDatabases implements AutoCloseable {
 	 *             silently hand back somebody else's data, and neither is a thing to guess at
 	 */
 	public GraphStore create(String name) throws IOException {
+		return create(name, options);
+	}
+
+	/**
+	 * Creates a database with options of its own, rather than the root's.
+	 *
+	 * <p>
+	 * Almost every caller wants {@link #create(String)}: one root, one set of options, no surprises. This exists for
+	 * the one case where the options are not the caller's to choose — <b>restoring a backup</b>. Page size, segment
+	 * capacity and vector dimensions are fixed when a store is created and are recorded in its manifest, so a dump
+	 * taken from a store with 768-dimension vectors cannot be replayed faithfully into a root whose default has none.
+	 * Without this the restore would either refuse or, worse, quietly produce a store that could not hold the data it
+	 * was given.
+	 * </p>
+	 *
+	 * <p>
+	 * The options are <b>not</b> remembered for the root: a later {@code database(name)} reopens with the root's, and
+	 * the geometry checks in the segment layer refuse a mismatch loudly. That is the correct failure — the store's own
+	 * manifest is the authority on what it was created with, and this method does not get to change what the root
+	 * means.
+	 * </p>
+	 */
+	public GraphStore create(String name, GraphStoreOptions storeOptions) throws IOException {
 		validate(name);
 		synchronized (this) {
 			checkOpen();
@@ -209,7 +232,53 @@ public final class GraphDatabases implements AutoCloseable {
 				throw new GraphStoreException("A database '" + name + "' already exists");
 			}
 			Files.createDirectories(path);
-			return openStore(name);
+			GraphStore store = GraphStore.open(path, storeOptions == null ? options : storeOptions);
+			open.put(name, store);
+			return store;
+		}
+	}
+
+	/**
+	 * Replaces a database with an empty one, whether or not it existed.
+	 *
+	 * <p>
+	 * For <b>restoring a backup</b>, which is the one operation that legitimately destroys a database in order to put
+	 * one back, and which {@link #drop} followed by {@link #create} cannot express: dropping refuses to remove the last
+	 * database in a root, and a root opened for a restore very often holds exactly one — the {@code default} that
+	 * {@link #open} created when it found the directory empty. The most natural restore there is, into a fresh root,
+	 * would otherwise be the one that could not be done.
+	 * </p>
+	 *
+	 * <p>
+	 * That refusal is still right where it applies. It exists so that a running server cannot be left serving nothing,
+	 * and nothing here weakens it: the replacement is created before the lock is released, so the root is never
+	 * observed empty. This is not "drop without the check", it is one step that has no intermediate state.
+	 * </p>
+	 *
+	 * <p>
+	 * The store options are the dump's, not the root's, for the reason spelled out on {@link #create(String,
+	 * GraphStoreOptions)}: geometry is fixed at creation, so this is the only moment at which a target can be made able
+	 * to hold what it is about to be given.
+	 * </p>
+	 */
+	public GraphStore replace(String name, GraphStoreOptions storeOptions) throws IOException {
+		validate(name);
+		synchronized (this) {
+			checkOpen();
+			GraphStore existing = open.remove(name);
+			if (existing != null) {
+				// Closed before the directory goes, always. Unlinking a mapped file leaves the mapping valid and the
+				// store convinced it still has somewhere to write.
+				existing.close();
+			}
+			Path path = root.resolve(name);
+			if (Files.exists(path)) {
+				deleteRecursively(path);
+			}
+			Files.createDirectories(path);
+			GraphStore store = GraphStore.open(path, storeOptions == null ? options : storeOptions);
+			open.put(name, store);
+			return store;
 		}
 	}
 
@@ -219,7 +288,8 @@ public final class GraphDatabases implements AutoCloseable {
 	 * @return false if there was no such database, so that dropping twice is not an error
 	 * @throws GraphStoreException
 	 *             if it is the last one. A root with no databases cannot be reopened without one being made, and a
-	 *             server holding no database at all is a state with no useful behaviour
+	 *             server holding no database at all is a state with no useful behaviour. {@link #replace} is the way
+	 *             to put a database back over the last one
 	 */
 	public boolean drop(String name) throws IOException {
 		validate(name);

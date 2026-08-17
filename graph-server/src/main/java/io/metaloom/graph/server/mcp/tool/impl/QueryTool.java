@@ -97,6 +97,16 @@ public final class QueryTool extends StoreTool {
 				"This server does not accept write queries. It was started without --allow-write, so CREATE, SET, "
 					+ "REMOVE and DELETE are refused. Do not retry; ask the operator."));
 		}
+		// Refused on this port whatever --allow-load-csv says, and unlike every other refusal here that is not a
+		// configuration question. This is the port an LLM drives (spec/MCP.md), a LOAD CSV names a file rather than
+		// anything in the graph, and a model that can read files under the server's import directory and return them
+		// as query results is a wider capability than "query this database" — which is the only thing this tool is
+		// for. A bulk import is an operator's action, on the HTTP or binary port.
+		if (parsed.readsFiles()) {
+			return Future.succeededFuture(GraphMcpToolResults.error(
+				"LOAD CSV is not available over MCP. This port answers questions about the graph; loading a file into "
+					+ "it is an operator action. Do not retry."));
+		}
 
 		return vertx.executeBlocking(() -> {
 			GraphStore store = store(database);

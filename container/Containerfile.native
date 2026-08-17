@@ -1,12 +1,19 @@
 #
 # MetaLoom // Graph — the GraalVM native image.
 #
-#   mvn -o -Pgraalvm clean package -DskipTests
+#   mvn -o -Pgraalvm clean verify -DskipTests
 #   docker build -f container/Containerfile.native -t metaloom/graph-server:latest-native .
+#
+# `verify`, not `package`: native-image is bound to the verify phase in both poms, so `mvn package`
+# builds the jars and quietly produces no binary at all.
 #
 # Roughly 38 MB, ~110 ms to first response and ~78 MB RSS against the JVM image's several seconds and
 # several hundred. spec/GRAALVM.md has the measurements, and records that the binary serves the React
 # UI over a real store with the Rust crate loaded and io_uring available.
+#
+# Two binaries go in, because this image has no JVM: without the compiled CLI there is no way to take a
+# backup from inside it at all, and `java -jar` is not an available fallback the way it is in the JVM
+# image. That is what makes the CLI's own native build load-bearing rather than a nicety.
 #
 # debian:stable-slim and NOT alpine: the binary is linked against glibc. Native-plus-alpine is the one
 # combination here that cannot work at all.
@@ -32,6 +39,8 @@ ENV GRAPH_MCP_HOST=127.0.0.1
 ENV GRAPH_MCP_ENABLED=false
 ENV GRAPH_ALLOW_WRITE=false
 ENV GRAPH_ALLOW_DROP=false
+ENV GRAPH_ALLOW_LOAD_CSV=false
+ENV GRAPH_ALLOW_BACKUP=false
 
 EXPOSE 8080
 EXPOSE 8081
@@ -47,6 +56,23 @@ RUN mkdir -p /graph /data \
  && chmod 770 /graph /data
 
 ADD --chown=1000:0 ./graph-server/target/native/graph-server /graph/graph-server
+
+#
+# The backup tool, compiled the same way and spelled the same way as in the JVM image:
+#
+#   docker exec g metaloom-graph-cli database backup default --server=http://localhost:8080 --out=- > g.dump
+#
+#   docker run --rm -i -v graphdata:/data metaloom/graph-server:latest-native \
+#       metaloom-graph-cli database restore default --in=- --force < g.dump
+#
+# GRAPH_ROOT=/data above is read by both programs, so the restore needs no --path. In a container that
+# IS serving, use --server: the running store is exclusively locked, and the error says so.
+#
+# This is where the native image wins on its own terms rather than by a margin. A CLI runs once, walks
+# a store and exits — it never has a warm query to lose to the missing JIT, which is the one row of
+# spec/GRAALVM.md section 9 that argues against the binary for the server.
+#
+ADD --chown=1000:0 ./graph-cli/target/native/metaloom-graph-cli /usr/local/bin/metaloom-graph-cli
 
 USER 1000
 WORKDIR /graph

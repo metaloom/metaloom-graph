@@ -82,11 +82,24 @@ import io.metaloom.graph.server.wire.WireServerOptions;
  *            whether a query may change a store at all. Off by default: no port has authentication, and the
  *            difference between handing out a copy of the data and handing out the ability to delete it deserves an
  *            explicit act
+ * @param allowLoadCsv
+ *            whether {@code LOAD CSV} may read anything. <b>Off by default, and a flag of its own rather than part of
+ *            {@code allowWrite}</b>, because {@code LOAD CSV … RETURN row} writes nothing: a server that gated file
+ *            access on the write flag would serve it while believing itself read-only. Requires {@code importDir}
+ * @param importDir
+ *            the one directory {@code LOAD CSV} may read, and the whole of what it may read. There is no default,
+ *            deliberately — the only defensible one would be "nothing", which is what leaving it unset means
+ * @param allowBackup
+ *            whether {@code GET /api/databases/{name}/backup} exists. <b>Off by default and separate from
+ *            {@code allowWrite}</b>: a backup is a read, but it is the read that hands over every byte of a database
+ *            in a single request, which on a port with no authentication is its own decision — the same reasoning
+ *            that gives {@code allowDrop} a flag of its own
  */
 public record GraphServerOptions(Path root, int port, boolean demo, int demoAirports, long queryTimeoutMillis,
 	long slowQueryMillis, boolean wire, int wirePort, String wireHost, int maxConcurrentStreams,
 	boolean metrics, int metricsPort, boolean mcp, int mcpPort, String mcpHost,
-	String database, boolean allowDrop, boolean allowWrite) {
+	String database, boolean allowDrop, boolean allowWrite, boolean allowLoadCsv, Path importDir,
+	boolean allowBackup) {
 
 	static final int DEFAULT_PORT = 8080;
 
@@ -155,7 +168,10 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 		new EnvVar("GRAPH_METRICS_PORT", "The monitoring port: /metrics, /health and /ready."),
 		new EnvVar("GRAPH_MCP_ENABLED", "Open the MCP port. Off by default. true/false."),
 		new EnvVar("GRAPH_MCP_PORT", "The MCP port."),
-		new EnvVar("GRAPH_MCP_HOST", "What the MCP port binds. Loopback by default."));
+		new EnvVar("GRAPH_MCP_HOST", "What the MCP port binds. Loopback by default."),
+		new EnvVar("GRAPH_ALLOW_LOAD_CSV", "Accept LOAD CSV. Off by default, and needs GRAPH_IMPORT_DIR. true/false."),
+		new EnvVar("GRAPH_IMPORT_DIR", "The one directory LOAD CSV may read, and the whole of what it may read."),
+		new EnvVar("GRAPH_ALLOW_BACKUP", "Serve GET /api/databases/<name>/backup. Off by default. true/false."));
 
 	public GraphServerOptions {
 		if (wireHost == null || wireHost.isBlank()) {
@@ -163,6 +179,19 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 		}
 		if (mcpHost == null || mcpHost.isBlank()) {
 			throw new IllegalArgumentException("A bind address is required for the MCP port");
+		}
+		// Refused at parse time rather than at the first query, because a server that accepted the flag and then
+		// refused every LOAD CSV would look like a bug in the queries rather than a gap in its own configuration.
+		// The pair is also refused the other way round: an import directory with the flag off reads as enabled and is
+		// not, which is the more dangerous of the two misunderstandings.
+		if (allowLoadCsv && importDir == null) {
+			throw new IllegalArgumentException("--allow-load-csv needs --import-dir=<path>: LOAD CSV reads files "
+				+ "under one directory and there is no default, because no port here has authentication and the "
+				+ "default would be somebody's whole filesystem");
+		}
+		if (!allowLoadCsv && importDir != null) {
+			throw new IllegalArgumentException("--import-dir was given but --allow-load-csv was not, so LOAD CSV "
+				+ "would still be refused. Pass both, or neither");
 		}
 	}
 
@@ -203,6 +232,9 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 		String database = GraphDatabases.DEFAULT_NAME;
 		boolean allowDrop = false;
 		boolean allowWrite = false;
+		boolean allowLoadCsv = false;
+		Path importDir = null;
+		boolean allowBackup = false;
 		int positional = 0;
 
 		// The environment first, so that every flag below overwrites it rather than the other way round.
@@ -222,6 +254,15 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 		}
 		if ((value = read(env, "GRAPH_ALLOW_DROP")) != null) {
 			allowDrop = parseBoolean(value, "GRAPH_ALLOW_DROP");
+		}
+		if ((value = read(env, "GRAPH_ALLOW_LOAD_CSV")) != null) {
+			allowLoadCsv = parseBoolean(value, "GRAPH_ALLOW_LOAD_CSV");
+		}
+		if ((value = read(env, "GRAPH_IMPORT_DIR")) != null) {
+			importDir = Path.of(value);
+		}
+		if ((value = read(env, "GRAPH_ALLOW_BACKUP")) != null) {
+			allowBackup = parseBoolean(value, "GRAPH_ALLOW_BACKUP");
 		}
 		if ((value = read(env, "GRAPH_DEMO")) != null) {
 			demo = parseBoolean(value, "GRAPH_DEMO");
@@ -303,6 +344,12 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 				allowDrop = true;
 			} else if (argument.equals("--allow-write")) {
 				allowWrite = true;
+			} else if (argument.equals("--allow-backup")) {
+				allowBackup = true;
+			} else if (argument.equals("--allow-load-csv")) {
+				allowLoadCsv = true;
+			} else if (argument.startsWith("--import-dir=")) {
+				importDir = Path.of(argument.substring("--import-dir=".length()));
 			} else if (argument.equals("--help") || argument.equals("-h")) {
 				throw new HelpRequested();
 			} else if (argument.startsWith("-")) {
@@ -324,7 +371,8 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 		checkPortsDiffer(port, wire ? wirePort : -1, metrics ? metricsPort : -1, mcp ? mcpPort : -1);
 
 		return new GraphServerOptions(store, port, demo, airports, queryTimeout, slowQuery, wire, wirePort, wireHost,
-			streams, metrics, metricsPort, mcp, mcpPort, mcpHost, database, allowDrop, allowWrite);
+			streams, metrics, metricsPort, mcp, mcpPort, mcpHost, database, allowDrop, allowWrite, allowLoadCsv,
+			importDir, allowBackup);
 	}
 
 	private static String read(UnaryOperator<String> env, String name) {
@@ -445,6 +493,14 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 			                        everything in it. Off by default, and separate from --allow-write:
 			                        it destroys a whole database in one request, including ones no
 			                        query addressed.
+			  --allow-backup        Serve GET /api/databases/<name>/backup, which streams a whole
+			                        database out. Off by default and separate from --allow-write:
+			                        it is a read, but it is the read that hands over everything.
+			  --allow-load-csv      Accept LOAD CSV. Off by default and NOT implied by --allow-write,
+			                        because LOAD CSV ... RETURN row writes nothing: without its own
+			                        flag a read-only server would serve it. Requires --import-dir.
+			  --import-dir=<path>   The one directory LOAD CSV may read, and the whole of what it can
+			                        read. file:///x.csv means <path>/x.csv; symlinks out are refused.
 			  --demo                Seed the default database with a demo graph, but only if it is
 			                        empty. Independent of --allow-write, which is about queries.
 			  --demo-size=<size>    How much demo data. Implies --demo.

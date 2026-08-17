@@ -36,6 +36,22 @@ graph:
   # request. Separate from allowWrite on purpose: enabling writes is not asking for that.
   allowDrop: false
 
+  # -- Accept LOAD CSV. Off by default and NOT implied by allowWrite, because `LOAD CSV ... RETURN row`
+  # writes nothing: without a flag of its own a read-only server would read files off its own disk for
+  # anything that can reach the Service. Requires importDir.
+  allowLoadCsv: false
+  # -- The one directory LOAD CSV may read, and the whole of what it may read. `file:///x.csv` means
+  # `<importDir>/x.csv`. Mount something here yourself — the chart does not create a volume for it,
+  # because a directory the pod cannot write is exactly what you want for an import source.
+  importDir: ""
+
+  # -- Serve GET /api/databases/<name>/backup, which is what `metaloom-graph-cli database backup
+  # --server=...` drives. Off by default and separate from allowWrite: a backup is a read, but it hands
+  # over every byte of a database in one request, from a Service with no authentication. The CLI is in
+  # the image, so with this on a backup is one `kubectl exec` — see spec/DEPLOYMENT.md section 2.3.
+  # Leaving it off does not prevent backups: `--path` against a stopped pod's volume still works.
+  allowBackup: false
+
   # -- Seed the default database with a demo air-route graph, but only if it is empty. Useful for a
   # first look; leave it off for anything real.
   demo: false

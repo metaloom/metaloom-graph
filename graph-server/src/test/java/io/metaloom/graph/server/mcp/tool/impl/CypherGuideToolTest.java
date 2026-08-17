@@ -33,7 +33,10 @@ public class CypherGuideToolTest {
 		String spec = Files.readString(SPEC);
 		// Taken from CYPHER.md section 5.5's table. Named individually rather than parsed, because the table's prose
 		// column is not machine-readable and a half-working parse would be worse than an explicit list.
-		List<String> unsupported = List.of("OPTIONAL MATCH", "FOREACH", "LOAD CSV");
+		// LOAD CSV left this list when the clause was built. It is still refused over MCP — see QueryTool — but that
+		// is a property of this port rather than of the subset, so it does not belong in the "not implemented" section
+		// the guide and CYPHER.md section 5.5 share.
+		List<String> unsupported = List.of("OPTIONAL MATCH", "FOREACH");
 		for (String construct : unsupported) {
 			assertTrue(spec.contains(construct),
 				construct + " is no longer named in CYPHER.md; if it became supported, update the guide too");

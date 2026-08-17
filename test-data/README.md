@@ -92,7 +92,8 @@ integer, float, boolean and list.
 **Deliberately avoided:** `CREATE INDEX` / `CREATE CONSTRAINT` (schema DDL is outside the
 openCypher grammar), `CALL { … }` and `EXISTS { … }` subqueries, quantified path patterns,
 `CALL db.*`, APOC, `elementId()`, temporal types — dates are plain strings such as
-`'2025-01-08'` — and `LOAD CSV`.
+`'2025-01-08'` — and `LOAD CSV`, which this engine now implements but which would tie a dump to
+a file layout outside itself.
 
 Because of that, importing a dump into another openCypher engine needs no rewriting, but
 also gets no indexes: on a much larger dataset you would add engine-specific index DDL

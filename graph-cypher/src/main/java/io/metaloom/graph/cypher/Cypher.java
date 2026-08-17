@@ -12,6 +12,7 @@ import io.metaloom.graph.core.api.Transaction;
 import io.metaloom.graph.cypher.ast.Ast;
 import io.metaloom.graph.cypher.exec.GraphAccess;
 import io.metaloom.graph.cypher.exec.QueryExecutor;
+import io.metaloom.graph.cypher.io.CsvSource;
 import io.metaloom.graph.cypher.parse.CypherParser;
 
 /**
@@ -129,8 +130,28 @@ public final class Cypher {
 	 */
 	public static void stream(GraphStore store, Ast.Query parsed, Map<String, Object> parameters, RowSink sink,
 		QueryAbort abort) {
+		stream(store, parsed, parameters, sink, abort, CsvSource.DENY);
+	}
+
+	/**
+	 * Runs a query that may read a file, against a source that decides which files it may read.
+	 *
+	 * <p>
+	 * The only entry point through which {@code LOAD CSV} can do anything: every other overload passes
+	 * {@link CsvSource#DENY}, so a caller that has not thought about file access cannot be made to perform it by a query
+	 * string. {@link CsvSource} says why that is the default rather than a convenience.
+	 * </p>
+	 *
+	 * <p>
+	 * The source is consulted per {@code LOAD CSV} clause, per execution, with the URL exactly as the query wrote it.
+	 * Resolving it — and refusing it — is the source's job, because the policy depends on how the caller is exposed and
+	 * this module cannot know that.
+	 * </p>
+	 */
+	public static void stream(GraphStore store, Ast.Query parsed, Map<String, Object> parameters, RowSink sink,
+		QueryAbort abort, CsvSource csv) {
 		if (parsed.isWrite()) {
-			write(store, parsed, parameters, sink, abort);
+			write(store, parsed, parameters, sink, abort, csv);
 			return;
 		}
 		// Joins the caller's view when there is one. Opening a second would be refused, and closing theirs at the end
@@ -139,7 +160,8 @@ public final class Cypher {
 		try {
 			// Inside the try, so the sink sees every row while the view it was read under is still open. A sink that
 			// stops early simply ends the loop; that is an outcome, and the finally still closes the view.
-			new QueryExecutor(new GraphAccess(store, abort), parameters).stream(parsed, abortChecking(sink, abort));
+			new QueryExecutor(new GraphAccess(store, abort), parameters, csv)
+				.stream(parsed, abortChecking(sink, abort));
 		} finally {
 			if (view != null) {
 				view.close();
@@ -207,17 +229,22 @@ public final class Cypher {
 	 * </p>
 	 */
 	private static void write(GraphStore store, Ast.Query parsed, Map<String, Object> parameters, RowSink sink,
-		QueryAbort abort) {
+		QueryAbort abort, CsvSource csv) {
 		if (store.hasReadTransaction()) {
 			throw new CypherWriteException("A write query cannot run inside a read view. The view fixes what reads "
 				+ "see at the instant it opened, and a writer has to read the current state — so this query would "
 				+ "silently not get the isolation the view was opened for. Close the view first.");
 		}
+		if (periodicCommitOf(parsed) > 0) {
+			writeInBatches(store, parsed, parameters, sink, abort, csv);
+			return;
+		}
 		// begin() does not refuse to nest, and a nested transaction is not caught but silently ruinous: committing the
 		// inner one clears the overlay, after which the outer one's writes bypass the log entirely.
 		Transaction txn = store.hasWriteTransaction() ? null : store.begin();
 		try {
-			QueryExecutor.Result result = new QueryExecutor(new GraphAccess(store, abort), parameters).run(parsed);
+			QueryExecutor.Result result = new QueryExecutor(new GraphAccess(store, abort), parameters, csv)
+				.run(parsed);
 			if (txn != null) {
 				txn.commit();
 			}
@@ -231,6 +258,115 @@ public final class Cypher {
 				txn.close();
 			}
 		}
+	}
+
+	/** The batch size of a {@code USING PERIODIC COMMIT} query, or 0. Only a single-part query can carry one. */
+	private static int periodicCommitOf(Ast.Query parsed) {
+		return parsed.parts().size() == 1 ? parsed.parts().get(0).periodicCommit() : 0;
+	}
+
+	/**
+	 * {@code USING PERIODIC COMMIT}: the load, in transactions of {@code n} rows.
+	 *
+	 * <p>
+	 * The clause exists because of a property of everything above it. A write query cannot stream — it commits before
+	 * delivering a row — so {@code LOAD CSV … CREATE} runs through the materialised path, and its peak memory is the
+	 * whole file. That is fine for a file somebody wrote by hand and useless for the case this clause is for. Batching
+	 * bounds both the heap and the transaction: {@code n} rows are read, the rest of the query runs over just those
+	 * rows, that transaction commits, and the reader continues from where it stopped.
+	 * </p>
+	 *
+	 * <h2>It gives up atomicity, and says so</h2>
+	 *
+	 * <p>
+	 * <b>The query is no longer one transaction, so it can fail half-applied.</b> If row 70,000 of 100,000 violates a
+	 * constraint, the batches before it are committed and durable and there is nothing left to roll back — the
+	 * transaction that would have done so ended successfully some time ago. This is exactly how the clause behaves in
+	 * other engines, and it is the trade being asked for: a bounded transaction cannot also be an all-or-nothing one.
+	 * The failure is re-thrown with the row count that survived, because "some prefix of your file is loaded" is only
+	 * actionable if the caller is told which prefix. Writing the load with {@code MERGE} rather than {@code CREATE}
+	 * makes the retry idempotent, which is the practical answer and is why the documentation leads with it.
+	 * </p>
+	 *
+	 * <h2>What it refuses</h2>
+	 *
+	 * <p>
+	 * <b>A caller's own transaction.</b> Everywhere else a write query joins one the caller opened, and commits
+	 * nothing; here committing is the entire mechanism. Doing that to somebody else's transaction would end a unit of
+	 * work they were still assembling, so it is refused rather than either silently ignoring the batching or silently
+	 * committing on their behalf.
+	 * </p>
+	 */
+	private static void writeInBatches(GraphStore store, Ast.Query parsed, Map<String, Object> parameters,
+		RowSink sink, QueryAbort abort, CsvSource csv) {
+		if (store.hasWriteTransaction()) {
+			throw new CypherWriteException("USING PERIODIC COMMIT cannot run inside a transaction the caller opened: "
+				+ "committing every batch would end that transaction, and this query does not get to decide when a "
+				+ "caller's unit of work is finished. Run it on its own, or drop the PERIODIC COMMIT.");
+		}
+		Ast.SingleQuery part = parsed.parts().get(0);
+		int batchSize = part.periodicCommit();
+		QueryExecutor executor = new QueryExecutor(new GraphAccess(store, abort), parameters, csv);
+
+		// The transaction in flight, and the rows behind the last boundary. Both are single-element arrays because the
+		// boundary is a callback: the executor decides when a batch ends, and this is where that becomes a commit.
+		Transaction[] open = { null };
+		long[] committed = { 0 };
+		CypherStats stats;
+		try {
+			stats = executor.runBatched(part, batchSize, new QueryExecutor.BatchBoundary() {
+
+				@Override
+				public void begin() {
+					open[0] = store.begin();
+				}
+
+				@Override
+				public void commit(long rowsCommitted) {
+					try {
+						open[0].commit();
+					} catch (IOException e) {
+						throw new UncheckedIOException(e);
+					} finally {
+						open[0].close();
+						open[0] = null;
+					}
+					committed[0] = rowsCommitted;
+				}
+			});
+		} catch (RuntimeException e) {
+			throw partiallyApplied(e, committed[0], batchSize);
+		} finally {
+			// The batch that was in flight when something threw. close() without commit() rolls it back, so the store
+			// holds whole batches or nothing — never half of one.
+			if (open[0] != null) {
+				open[0].close();
+			}
+		}
+		// Counters and no rows, in the same way CREATE with no RETURN is.
+		sink.columns(List.of());
+		sink.stats(stats);
+	}
+
+	/**
+	 * Re-throws a failed batched load with the one fact its caller cannot otherwise recover: how much of it is durable.
+	 *
+	 * <p>
+	 * Naming the surviving prefix is the difference between a load that can be reasoned about and one that has to be
+	 * investigated by querying the store. The advice is {@code MERGE} rather than a resume offset, because an offset
+	 * would be wrong the moment the file has a header or the failure was itself a duplicate.
+	 * </p>
+	 */
+	private static RuntimeException partiallyApplied(RuntimeException cause, long committed, int batchSize) {
+		if (committed == 0) {
+			// Nothing was committed, so the transaction that rolled back holds everything this query did. That is
+			// ordinary failure and does not need the explanation below.
+			throw cause;
+		}
+		return new CypherWriteException("The load failed after " + committed + " rows were already committed, in "
+			+ "batches of " + batchSize + ". USING PERIODIC COMMIT is not one transaction, so those rows are durable "
+			+ "and cannot be rolled back — re-running is safe only if the load is written with MERGE rather than "
+			+ "CREATE. Cause: " + cause.getMessage(), cause);
 	}
 
 	private static void deliver(QueryExecutor.Result result, RowSink sink, QueryAbort abort) {

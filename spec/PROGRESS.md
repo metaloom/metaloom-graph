@@ -48,18 +48,18 @@ holds its answers against a reference model, against real SQL, against its own J
 
 **It is also deployable and observable**: it configures itself from the environment, exports Prometheus metrics with
 `/health` and `/ready` on a port of their own, writes a slow query log that never logs a parameter value, ships as a
-container image in two flavours, installs from a Helm chart that refuses a second replica by name, and speaks the
-Model Context Protocol so an agent can query it.
+container image in two flavours — each carrying the backup CLI as well as the server — installs from a Helm chart that
+refuses a second replica by name, and speaks the Model Context Protocol so an agent can query it.
 
-It is **not** usable where concurrent writers, `OPTIONAL MATCH`, an online backup or an **authenticated** network are
-requirements. None of those exists and none is faked — and the last one is worth repeating, because everything in the
-paragraph above makes it easier to expose.
+It is **not** usable where concurrent writers, `OPTIONAL MATCH` or an **authenticated** network are requirements. None
+of those exists and none is faked — and the last one is worth repeating, because everything in the paragraph above
+makes it easier to expose.
 
 ---
 
 ## 2. Evidence
 
-The repository is five modules — `graph-core`, `graph-cypher`, `graph-protocol`, `graph-client`,
+The repository is six modules — `graph-core`, `graph-cypher`, `graph-protocol`, `graph-client`, `graph-cli`,
 `graph-server` — under one parent pom, and every profile below applies across all of them. `mvn clean install` builds the lot, Rust and
 the browser UI included: `graph-core` drives cargo at four points, **build** (generate-resources),
 **package** the shared object into the jar (process-classes), **test** the crate with clippy (test),
@@ -319,8 +319,8 @@ that a steal policy cannot be made correct over a `MAP_SHARED` mapping.
 ### Phase 15 — Cypher writes
 
 - [x] `CREATE`, `SET`, `REMOVE`, `DELETE` and `DETACH DELETE`, with `RETURN` optional for a write and
-      required for a read. `FOREACH`, `LOAD CSV` and `CALL` refused at parse time, each by name with a
-      caret (`MERGE` was too, until Phase 17 built it)
+      required for a read. `FOREACH` refused at parse time by name with a caret (`MERGE`, `CALL` and
+      `LOAD CSV` were too, until they were built)
 - [x] `Ast.Query.isWrite()`, so both servers can refuse a write on the event loop and `Cypher.stream`
       can choose a transaction over a read view without running anything first
 - [x] One transaction per write query, joined when the caller holds one, **committed before the first
@@ -778,8 +778,11 @@ trusting anything that depends on it, and skips when it does not. On ext4 or xfs
       [OPERATIONS.md §8](OPERATIONS.md#8-the-manual-power-loss-test) is a full procedure, down to
       checking whether the device's write cache is honest. Until it is performed, the assumption
       underneath every durability claim here is documented but unverified.
-- [ ] **No backup mechanism.** Cold copy with the process stopped is the only supported procedure, and
-      [OPERATIONS.md §5](OPERATIONS.md#5-backup-and-restore) says so rather than working around it.
+- [x] **Online logical backup**, with a CLI that ships inside both container images and compiles to a native
+      binary of its own ([BACKUP.md](BACKUP.md), [GRAALVM.md §10](GRAALVM.md#10-the-second-binary)). A cold copy
+      is still the only thing that preserves ids and index structures byte for byte.
+- [ ] **No incremental or physical backup.** The log is trimmed at each checkpoint, so a dump cannot be rolled
+      forward, and `NativeLib.reflink` is still bound and called by nothing.
 - [ ] **The API is not frozen**, and [reports/API_REVIEW.md](reports/API_REVIEW.md) recommends against
       freezing it: MVCC, cursors and backup would each change the surface.
 
@@ -883,9 +886,10 @@ Recorded so nobody re-opens them as oversights:
   [reports/PHASE_STATUS.md §1](reports/PHASE_STATUS.md#1-phase-4--what-was-built).
 - **Replacing Postgres as MetaLoom's system of record.** The vector index is the precedent: Postgres
   is the source of truth and the specialised store is a derived index with a defined rebuild path.
-- **A 1.0 API freeze**, until at least the cursor and backup surfaces exist.
+- **A 1.0 API freeze**, until at least the cursor surface exists. The backup half of this is now built
+  ([BACKUP.md](BACKUP.md)), and it added `options()` and the paced `forEachNodeWhile` to the public API.
 
 ---
 
-_Git HEAD revision: `0970e6b`_
-_Last updated: 2026-08-16 (IDX-7: the declared composite index, dropIndex, and its HTTP and UI surface)_
+_Git HEAD revision: `3edb034`_
+_Last updated: 2026-08-17 (LOAD CSV; the online logical backup, its CLI, and that CLI's native build and container packaging)_

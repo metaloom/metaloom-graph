@@ -24,6 +24,20 @@ import io.metaloom.graph.cypher.ast.Ast.Op;
  */
 public final class CypherParser {
 
+	/**
+	 * Rows per transaction when {@code USING PERIODIC COMMIT} names no number.
+	 *
+	 * <p>
+	 * The same 4,000 the demo seeder settled on, and for the same reason: it is large enough that the per-commit fsync
+	 * is amortised across a useful amount of work, and small enough that a batch's rows and the writes they produce are
+	 * a bounded amount of heap.
+	 * </p>
+	 */
+	public static final int DEFAULT_PERIODIC_COMMIT = 4_000;
+
+	/** An upper bound, because a batch is materialised before it is committed. */
+	public static final int MAX_PERIODIC_COMMIT = 1_000_000;
+
 	private final String source;
 	private final List<Token> tokens;
 	private int position;
@@ -58,6 +72,9 @@ public final class CypherParser {
 	private Ast.SingleQuery singleQuery() {
 		List<Ast.Clause> clauses = new ArrayList<>();
 		boolean returned = false;
+		// Read before the loop, because it is not a clause: it qualifies the part as a whole and may appear only at
+		// the front of it. See periodicCommitPrefix.
+		int periodicCommit = periodicCommitPrefix();
 		while (true) {
 			Token token = peek();
 			if (token.type() == Token.Type.EOF || token.isKeyword("UNION")) {
@@ -86,6 +103,8 @@ public final class CypherParser {
 				clauses.add(deleteClause());
 			} else if (token.isKeyword("CALL")) {
 				clauses.add(callClause());
+			} else if (token.isKeyword("LOAD")) {
+				clauses.add(loadCsvClause());
 			} else if (token.isKeyword("RETURN")) {
 				clauses.add(returnClause());
 				returned = true;
@@ -98,7 +117,13 @@ public final class CypherParser {
 		if (clauses.isEmpty()) {
 			throw error(peek(), "Empty query; expected MATCH, CREATE, UNWIND, WITH or RETURN");
 		}
-		Ast.SingleQuery part = new Ast.SingleQuery(clauses);
+		Ast.SingleQuery part = new Ast.SingleQuery(clauses, periodicCommit);
+		if (periodicCommit > 0 && !(clauses.get(0) instanceof Ast.LoadCsv)) {
+			// A batch boundary is only meaningful when the CSV is what drives the rows: with anything else first, the
+			// rows were already fixed before the load ran and "commit every n of them" has no defined meaning.
+			throw error(peek(), "USING PERIODIC COMMIT requires LOAD CSV to be the first clause of the query, "
+				+ "because the batches it commits are batches of CSV rows");
+		}
 		if (!returned && !part.isWrite()) {
 			// A read with nowhere to put its answer. Refused rather than run, because it looks like a query whose
 			// RETURN was forgotten and running it would report success having produced nothing.
@@ -122,7 +147,6 @@ public final class CypherParser {
 		}
 		return switch (token.text()) {
 			case "FOREACH" -> "FOREACH is not supported: use UNWIND, which this build does implement";
-			case "LOAD" -> "LOAD CSV is not supported: this build has no file-reading mechanism";
 			default -> null;
 		};
 	}
@@ -156,6 +180,91 @@ public final class CypherParser {
 		Expr expression = expression();
 		expectKeyword("AS");
 		return new Ast.Unwind(expression, identifier("a variable name after AS"));
+	}
+
+	/**
+	 * {@code USING PERIODIC COMMIT [n]}, if it is there. Returns 0 when it is not.
+	 *
+	 * <p>
+	 * Read before the clause loop rather than inside it because it is not a clause — it takes no input and produces no
+	 * rows. It qualifies the part, and openCypher allows it only at the very front, which is also the only position
+	 * where it means anything (see the refusal in {@link #singleQuery()}).
+	 * </p>
+	 */
+	private int periodicCommitPrefix() {
+		if (!peek().isKeyword("USING")) {
+			return 0;
+		}
+		take();
+		expectKeyword("PERIODIC");
+		expectKeyword("COMMIT");
+		if (peek().type() != Token.Type.INTEGER) {
+			return DEFAULT_PERIODIC_COMMIT;
+		}
+		Token size = take();
+		long rows = Long.parseLong(size.text());
+		if (rows <= 0) {
+			// Zero would be "commit every no rows", which is either an infinite loop or the whole file in one
+			// transaction depending on how it were read. Neither is what was written.
+			throw error(size, "USING PERIODIC COMMIT needs a positive batch size, not " + rows);
+		}
+		if (rows > MAX_PERIODIC_COMMIT) {
+			throw error(size, "A periodic commit batch of " + rows + " rows is above the limit of "
+				+ MAX_PERIODIC_COMMIT + "; a batch is held in memory before it is committed");
+		}
+		return (int) rows;
+	}
+
+	/**
+	 * {@code LOAD CSV [WITH HEADERS] FROM <expr> AS <var> [FIELDTERMINATOR '<c>']}.
+	 *
+	 * <p>
+	 * <b>{@code FROM}, {@code HEADERS} and {@code FIELDTERMINATOR} are matched here rather than lexed as keywords</b>,
+	 * and that is not a shortcut. A keyword token carries a folded spelling, and both {@code labelName} and
+	 * {@code propertyKeyName} accept keywords as ordinary names — so reserving {@code FROM} would silently turn every
+	 * {@code r.from} and every {@code {from: …}} in the language into {@code FROM}. A column called {@code from} is
+	 * near-universal in the edge lists this clause exists to load, which makes it exactly the wrong word to reserve.
+	 * They are ordinary identifiers everywhere, including inside this clause's own {@code AS} variable.
+	 * </p>
+	 */
+	private Ast.LoadCsv loadCsvClause() {
+		expectKeyword("LOAD");
+		expectKeyword("CSV");
+		boolean withHeaders = false;
+		if (peek().isKeyword("WITH")) {
+			// WITH is a clause starter, so it cannot simply be consumed: `LOAD CSV WITH HEADERS` is this clause and a
+			// bare `LOAD CSV WITH` is a mistake that must not be reported as a projection with nothing in it.
+			Token with = take();
+			if (!peek().is(Token.Type.IDENTIFIER, "headers")) {
+				throw error(with, "Expected WITH HEADERS or FROM after LOAD CSV, but found " + describe(peek())
+					+ " after WITH");
+			}
+			take();
+			withHeaders = true;
+		}
+		if (!peek().is(Token.Type.IDENTIFIER, "from")) {
+			throw error(peek(), "Expected FROM after LOAD CSV but found " + describe(peek()));
+		}
+		take();
+		Expr url = expression();
+		expectKeyword("AS");
+		String variable = identifier("a variable name after AS");
+
+		char terminator = ',';
+		if (peek().is(Token.Type.IDENTIFIER, "fieldterminator")) {
+			take();
+			Token value = peek();
+			if (value.type() != Token.Type.STRING || value.text().length() != 1) {
+				throw error(value, "FIELDTERMINATOR takes a single-character string, as in FIELDTERMINATOR ';'");
+			}
+			take();
+			terminator = value.text().charAt(0);
+			if (terminator == '"' || terminator == '\r' || terminator == '\n') {
+				throw error(value, "A field terminator may not be a quote or a line break: those already have a "
+					+ "meaning in the format");
+			}
+		}
+		return new Ast.LoadCsv(url, variable, withHeaders, terminator);
 	}
 
 	private Ast.With withClause() {
@@ -554,12 +663,19 @@ public final class CypherParser {
 		return labels;
 	}
 
-	/** A label or relationship type. Keywords are allowed here: {@code :END} and {@code :Order} are ordinary names. */
+	/**
+	 * A label or relationship type. Keywords are allowed here: {@code :END} and {@code :Order} are ordinary names.
+	 *
+	 * <p>
+	 * {@link Token#raw()} rather than {@code text()}, because a keyword token carries the folded spelling and a label is
+	 * case-sensitive: {@code :Order} stored as {@code ORDER} is a wrong answer that throws nothing.
+	 * </p>
+	 */
 	private String labelName() {
 		Token token = peek();
 		if (token.type() == Token.Type.IDENTIFIER || token.type() == Token.Type.KEYWORD) {
 			take();
-			return token.text();
+			return token.raw();
 		}
 		throw error(token, "Expected a label or type name but found " + describe(token));
 	}
@@ -660,11 +776,12 @@ public final class CypherParser {
 		return entries;
 	}
 
+	/** A property key. As with {@link #labelName()}, a keyword is an ordinary name here and keeps its spelling. */
 	private String propertyKeyName() {
 		Token token = peek();
 		if (token.type() == Token.Type.IDENTIFIER || token.type() == Token.Type.KEYWORD) {
 			take();
-			return token.text();
+			return token.raw();
 		}
 		throw error(token, "Expected a property name but found " + describe(token));
 	}
@@ -1085,8 +1202,10 @@ public final class CypherParser {
 			if (out.length() > 0 && needsSpace(tokens.get(i - 1), token)) {
 				out.append(' ');
 			}
-			out.append(token.type() == Token.Type.STRING ? "'" + token.text() + "'"
-				: token.type() == Token.Type.PARAMETER ? "$" + token.text() : token.text());
+			// raw(), for the reason this method exists at all: the column is named after what the caller wrote, and a
+			// property key that happens to be a keyword — RETURN n.end — must not come back as `n.END`.
+			out.append(token.type() == Token.Type.STRING ? "'" + token.raw() + "'"
+				: token.type() == Token.Type.PARAMETER ? "$" + token.raw() : token.raw());
 		}
 		return out.toString();
 	}

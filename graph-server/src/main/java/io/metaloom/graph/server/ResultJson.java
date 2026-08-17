@@ -120,6 +120,12 @@ final class ResultJson {
 	/** Adds any renderable value to the graph, recursing into lists so {@code collect(n)} still draws. */
 	private static void collect(Object value, Map<String, JsonObject> nodes, JsonArray links, Set<String> seen) {
 		switch (value) {
+			// A pattern switch throws on null unless null is a case, so without this line every query returning a null
+			// cell — `RETURN null`, a missing property, an empty CSV field — was a 500 with an NPE and no message.
+			// A null draws nothing, which is what the default branch already says about every other scalar.
+			case null -> {
+				// Nothing to draw.
+			}
 			case CypherNode node -> nodes.putIfAbsent(String.valueOf(node.id()), nodeJson(node));
 			case CypherRelationship relationship -> addLink(relationship, links, seen);
 			case CypherPath path -> {

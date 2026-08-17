@@ -66,7 +66,11 @@ Comparison with `null` yields `null`, not false. `WHERE` keeps a row only when t
 
 `OPTIONAL MATCH`, `FOREACH`, list comprehensions, map projections, pattern comprehensions,
 `ALL` / `ANY` / `NONE` / `SINGLE` predicates, `EXISTS` subqueries, user-defined procedures,
-`LOAD CSV`, temporal and spatial types.
+temporal and spatial types.
+
+`LOAD CSV` is implemented, but **not over this port**: it names a file rather than anything in the
+graph, and loading one is an operator action. It is refused here whatever the server was started
+with. Do not retry it.
 
 ## Performance
 

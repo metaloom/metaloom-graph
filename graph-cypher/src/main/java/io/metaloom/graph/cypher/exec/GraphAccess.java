@@ -73,6 +73,23 @@ public final class GraphAccess {
 		if (++ticks % ABORT_CHECK_INTERVAL != 0) {
 			return;
 		}
+		checkAbortNow();
+	}
+
+	/**
+	 * Consults the abort signal immediately, for a caller doing its own counting.
+	 *
+	 * <p>
+	 * {@link #checkAbort()} is driven by store touches, which is the right trigger for everything that reads the graph
+	 * and the wrong one for {@code LOAD CSV}: a load that only produces rows touches the store never, so a deadline
+	 * would never be consulted and could not bound it. The executor counts CSV rows and calls this, which keeps the
+	 * abort machinery — and the choice of what "too long" means — in one place.
+	 * </p>
+	 */
+	public void checkAbortNow() {
+		if (abort == QueryAbort.NEVER) {
+			return;
+		}
 		String reason = abort.abortReason();
 		if (reason != null) {
 			throw new QueryAbortedException(reason);

@@ -233,6 +233,54 @@ public class GraphDatabasesTest {
 		}
 	}
 
+	/**
+	 * The gap {@code replace} exists to close, stated as the two halves it has to satisfy at once.
+	 *
+	 * <p>
+	 * {@code drop} refuses to remove the last database in a root, and it is right to: a server left holding none has
+	 * no useful behaviour. But a restore has to be able to put a database back <i>over</i> that last one, and a root
+	 * opened for a restore very often holds exactly one — the {@code default} that opening an empty directory creates.
+	 * Before this existed, the most obvious restore there is could not be performed.
+	 * </p>
+	 */
+	@Test
+	public void testTheLastDatabaseCanBeReplacedEvenThoughItCannotBeDropped() throws Exception {
+		try (GraphDatabases databases = GraphDatabases.open(root())) {
+			GraphStore original = databases.database(GraphDatabases.DEFAULT_NAME);
+			try (Transaction txn = original.begin()) {
+				original.createNode("Order", Properties.of().set("total", 1L));
+				txn.commit();
+			}
+			assertThrows(GraphStoreException.class, () -> databases.drop(GraphDatabases.DEFAULT_NAME));
+
+			GraphStore replaced = databases.replace(GraphDatabases.DEFAULT_NAME, null);
+			assertNotSame(original, replaced, "the old store is closed and a new one opened in its place");
+			assertEquals(0, replaced.stats().nodeCount(), "replaced, not merged into");
+			// The root is never observed empty: the replacement is made before the lock is released, which is what
+			// makes this different from dropping without the check.
+			assertEquals(List.of(GraphDatabases.DEFAULT_NAME), databases.names());
+			assertTrue(databases.isOpen(GraphDatabases.DEFAULT_NAME));
+
+			// And it is a working store, not just a directory.
+			try (Transaction txn = replaced.begin()) {
+				replaced.createNode("Invoice");
+				txn.commit();
+			}
+			assertEquals(1, replaced.stats().nodeCount());
+		}
+	}
+
+	/** Replacing something that was never there is a create, so a restore does not have to know which case it is in. */
+	@Test
+	public void testReplacingOneThatDoesNotExistCreatesIt() throws Exception {
+		try (GraphDatabases databases = GraphDatabases.open(root())) {
+			GraphStore fresh = databases.replace("sales", null);
+			assertEquals(0, fresh.stats().nodeCount());
+			assertTrue(databases.exists("sales"));
+			assertSame(fresh, databases.database("sales"));
+		}
+	}
+
 	// ---------------------------------------------------------------- the legacy layout
 
 	@Test

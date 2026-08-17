@@ -25,6 +25,7 @@ import io.metaloom.graph.cypher.QueryAbortedException;
 import io.metaloom.graph.cypher.RowSink;
 import io.metaloom.graph.cypher.ast.Ast;
 import io.metaloom.graph.cypher.exec.CypherTypeException;
+import io.metaloom.graph.cypher.io.CsvSource;
 import io.metaloom.graph.cypher.parse.CypherSyntaxException;
 import io.metaloom.graph.protocol.FrameReader;
 import io.metaloom.graph.protocol.Frames;
@@ -162,6 +163,12 @@ public final class WireServer implements AutoCloseable {
 	private final ScheduledExecutorService watchdog;
 	/** Whether a query may change a store. Off unless an operator asked for it. */
 	private final boolean allowWrite;
+
+	/** Where LOAD CSV may read on this port. Refuses everything unless {@link #csvSource} has been called. */
+	private CsvSource csv = CsvSource.DENY;
+
+	/** Cached from {@link #csv}, so the event-loop refusal is a field read. */
+	private boolean allowLoadCsv;
 	/**
 	 * One permit per store, so a writer's wait has a deadline and a name.
 	 *
@@ -286,6 +293,19 @@ public final class WireServer implements AutoCloseable {
 	 * @param slowQueryMillis
 	 *            0 to log nothing
 	 */
+	/**
+	 * Enables {@code LOAD CSV} on this port, against the same sandbox the HTTP front end uses.
+	 *
+	 * <p>
+	 * The flag is a property of the server rather than of a port, so both front ends get it or neither does. Not
+	 * calling this leaves {@link CsvSource#DENY}, which is what an embedder constructing a wire server directly gets.
+	 * </p>
+	 */
+	public void csvSource(CsvSource csv) {
+		this.csv = csv == null ? CsvSource.DENY : csv;
+		this.allowLoadCsv = this.csv != CsvSource.DENY;
+	}
+
 	public void instrument(GraphMetrics metrics, long slowQueryMillis) {
 		this.metrics = metrics;
 		this.slowQueryMillis = slowQueryMillis;
@@ -616,6 +636,15 @@ public final class WireServer implements AutoCloseable {
 				return;
 			}
 
+			// Not covered by the check above: a `LOAD CSV ... RETURN row` writes nothing, so isWrite() is false and a
+			// read-only server would otherwise read files for any client that can reach this port.
+			if (parsed.readsFiles() && !allowLoadCsv) {
+				metrics.recordQueryRejected("wire", "loadcsv");
+				fail(streamId, WireError.READ_ONLY, "This server does not read files. Start it with "
+					+ "--allow-load-csv and --import-dir=<path> to enable LOAD CSV.", 0, 0);
+				return;
+			}
+
 			// Fail fast rather than queue. A client waiting on a queued query cannot tell a busy server from a stuck
 			// one, and the whole point of the bound is that the server stays predictable when it is at its limit.
 			if (!permits.tryAcquire()) {
@@ -757,7 +786,7 @@ public final class WireServer implements AutoCloseable {
 						return;
 					}
 				}
-				Cypher.stream(connection.store, parsed, parameters, sink, this::abortReason);
+				Cypher.stream(connection.store, parsed, parameters, sink, this::abortReason, csv);
 				sink.flush();
 				complete(sink.rowsSent, sink.stats);
 			} catch (InterruptedException e) {

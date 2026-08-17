@@ -33,6 +33,10 @@ fi
 
 JAR="$ROOT/graph-server/target/graph-server-0.0.1-SNAPSHOT.jar"
 BINARY="$ROOT/graph-server/target/native/graph-server"
+# Both images also carry the backup tool, because a backup that needs a second artifact fetched and
+# version-matched is a backup that gets taken once. Two artifacts per image, so two checks.
+CLI_JAR="$ROOT/graph-cli/target/graph-cli-0.0.1-SNAPSHOT-cli.jar"
+CLI_BINARY="$ROOT/graph-cli/target/native/metaloom-graph-cli"
 
 build_jvm() {
 	# Checked rather than built: this script does one thing, and a script that silently ran a Maven
@@ -42,8 +46,16 @@ build_jvm() {
 		echo "Build it first:  mvn -o clean package -DskipTests" >&2
 		exit 1
 	fi
+	# The -cli classifier, which is the shaded one. graph-cli-<version>.jar without it is the library
+	# graph-server depends on for the dump format, and has no engine inside it — ADDing that one would
+	# produce an image whose CLI fails on the first class it loads.
+	if [ ! -f "$CLI_JAR" ]; then
+		echo "No CLI jar at $CLI_JAR" >&2
+		echo "Build it first:  mvn -o clean package -DskipTests" >&2
+		exit 1
+	fi
 	warn_about_skipped_parts "$JAR"
-	echo "==> $IMAGE:$TAG  (JVM, from $(basename "$JAR"))"
+	echo "==> $IMAGE:$TAG  (JVM, from $(basename "$JAR") and $(basename "$CLI_JAR"))"
 	"$ENGINE" build -f "$ROOT/container/Containerfile" -t "$IMAGE:$TAG" "$ROOT"
 }
 
@@ -55,23 +67,34 @@ build_jvm() {
 #
 warn_about_skipped_parts() {
 	local jar="$1"
-	if ! unzip -l "$jar" 2>/dev/null | grep -q "webroot/index.html"; then
+	# Listed ONCE, into a variable, and not piped into `grep -q`. Under `set -o pipefail` that pipeline
+	# reports 141: grep exits at the first match, unzip is SIGPIPEd part-way through a twelve-megabyte
+	# listing, and the pipeline's status is unzip's. So `if ! ...` fired on every jar that HAD a UI —
+	# the check warned exactly when it should have been quiet, which is worse than not checking at all,
+	# because a warning that is always there is a warning nobody reads.
+	local listing
+	listing="$(unzip -l "$jar" 2>/dev/null || true)"
+	if ! grep -q "webroot/index.html" <<< "$listing"; then
 		echo "WARNING: this jar has no browser UI (built with -Dui.skip=true, or without npm)." >&2
 		echo "         The image will serve the API and a page explaining the UI is missing." >&2
 	fi
-	if ! unzip -l "$jar" 2>/dev/null | grep -qE "\.so$"; then
+	if ! grep -qE "\.so$" <<< "$listing"; then
 		echo "WARNING: this jar has no native library (built with -Dnative.skip=true, or without cargo)." >&2
 		echo "         The image falls back to pure Java; /api/stats will report nativeLayer 'not built'." >&2
 	fi
 }
 
 build_native() {
-	if [ ! -x "$BINARY" ]; then
-		echo "No native binary at $BINARY" >&2
-		echo "Build it first:  GRAALVM_HOME=${GRAALVM_HOME:-/opt/jvm/graalvm-25} mvn -o -Pgraalvm clean package -DskipTests" >&2
-		exit 1
-	fi
-	echo "==> $IMAGE:$TAG-native  (GraalVM)"
+	# `verify`, not `package`: native-image is bound to the verify phase in both poms, so `mvn package`
+	# with -Pgraalvm finishes happily and produces no binary at all — which reads as a broken profile.
+	for missing in "$BINARY" "$CLI_BINARY"; do
+		if [ ! -x "$missing" ]; then
+			echo "No native binary at $missing" >&2
+			echo "Build it first:  GRAALVM_HOME=${GRAALVM_HOME:-/opt/jvm/graalvm-25} mvn -o -Pgraalvm clean verify -DskipTests" >&2
+			exit 1
+		fi
+	done
+	echo "==> $IMAGE:$TAG-native  (GraalVM, server and CLI)"
 	"$ENGINE" build -f "$ROOT/container/Containerfile.native" -t "$IMAGE:$TAG-native" "$ROOT"
 }
 
@@ -84,6 +107,9 @@ esac
 
 echo
 echo "Run it:"
-echo "  $ENGINE run --rm -e GRAPH_DEMO=true -p 8080:8080 -p 8082:8082 $IMAGE:$TAG"
+echo "  $ENGINE run --rm -d --name g -e GRAPH_DEMO=true -e GRAPH_ALLOW_BACKUP=true -p 8080:8080 -p 8082:8082 $IMAGE:$TAG"
 echo "  curl -s localhost:8080/api/stats     # nativeLayer says whether the Rust layer loaded"
 echo "  curl -s localhost:8082/metrics | head"
+echo
+echo "Back it up (--server, because the running server holds the store's lock):"
+echo "  $ENGINE exec g metaloom-graph-cli database backup default --server=http://localhost:8080 --out=- > g.dump"

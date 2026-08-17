@@ -104,8 +104,10 @@ public final class CypherLexer {
 			}
 			String text = word.toString();
 			String upper = text.toUpperCase(java.util.Locale.ROOT);
+			// The keyword token carries both spellings: the folded one the parser matches on, and the original, which
+			// is what a label or a property key named after a keyword has to be stored under. See Token#raw.
 			return KEYWORDS.contains(upper)
-				? new Token(Token.Type.KEYWORD, upper, startLine, startColumn)
+				? new Token(Token.Type.KEYWORD, upper, text, startLine, startColumn)
 				: new Token(Token.Type.IDENTIFIER, text, startLine, startColumn);
 		}
 
