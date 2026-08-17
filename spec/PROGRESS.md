@@ -283,13 +283,19 @@ that a steal policy cannot be made correct over a `MAP_SHARED` mapping.
       `gen_floor` in the page metadata array — a region that is never punched — carries the history
       across. [ID_ENCODING.md §4](ID_ENCODING.md), [FILE_FORMAT.md §3.3](FILE_FORMAT.md),
       `NativeReclaimTest`
-- [ ] **`Compactor` calls `set.reclaim()` outside `runWrite()`**, and two things follow from it.
+- [x] **`Compactor` called `set.reclaim()` outside `runWrite()`**, and two things followed from it.
       `force()` there calls `flushChecksums()`, which clears the segment's dirty-page set and so
-      discards a concurrent foreground writer's marks, leaving its pages with stale checksums — an
-      intermittent `CompactionTest` failure, reproduced. And a page can be punched while a writer is
-      allocating into it. `GraphStore.reclaim()` takes the writer lock; compaction should too. Until
-      that lands, the punch path deliberately does **not** force, so the checksum fix-up and the floor
-      are only as durable as the next checkpoint
+      discarded a concurrent foreground writer's marks, leaving its pages with stale checksums — an
+      intermittent `CompactionTest` failure, reproduced. And a page could be punched while a writer was
+      allocating into it. **Fixed**: `set.reclaim()` and `set.retireEmptySegments()` now run inside
+      `runner.runWrite(...)`, like `shrinkHighWater` beside them.
+      <br>The same defect existed on the **public `verify()` path**, and was worse there because
+      verification is what an operator reaches for when they already suspect corruption. It held only
+      the apply read latch, which does not exclude an *open write transaction* — so it compared a
+      free-slot bitmap still sitting in the overlay against a superblock live count already advanced,
+      and reported `accounting mismatch` on a perfectly healthy store, within a second, every time.
+      `verify()` takes the writer lock now, and its throttling pacer releases both locks between
+      batches so a writer can still get in. `VerifyUnderLoadTest` covers both
 - [ ] **The free ring does not survive a restart.** It is in-memory, is never rebuilt from the bitmap,
       and `allocate()` only scans the bitmap once the active segment's bump cursor is exhausted — and
       only ever looks at the newest segment. So holes below the high water mark, and every hole in a

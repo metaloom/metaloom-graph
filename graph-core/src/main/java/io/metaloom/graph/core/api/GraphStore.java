@@ -40,6 +40,12 @@ public interface GraphStore extends AutoCloseable {
 	/**
 	 * Starts a write transaction. Only one may be active at a time; other writers block. Every mutating method below
 	 * joins the caller's transaction if there is one, and otherwise runs in its own auto-commit transaction.
+	 *
+	 * <p>
+	 * Nesting is <b>refused</b>: calling this on a thread that already holds an open write transaction raises a
+	 * {@link GraphStoreException} rather than quietly opening a second one. Ask {@link #hasWriteTransaction()} to
+	 * decide whether to begin one.
+	 * </p>
 	 */
 	Transaction begin();
 
@@ -68,10 +74,11 @@ public interface GraphStore extends AutoCloseable {
 	 * Whether this thread already holds a write transaction.
 	 *
 	 * <p>
-	 * Unlike {@link #beginRead()}, {@link #begin()} does <b>not</b> refuse to nest, and a nested transaction is not a
-	 * caught mistake but a silent one: the inner transaction publishes its own page overlay, and committing it clears
-	 * the overlay while the outer transaction is still live, after which the outer transaction's writes go straight to
-	 * the mapping — unlogged, and past the point where a rollback could take them back.
+	 * {@link #begin()} refuses to nest, as {@link #beginRead()} does. It has to: the writer lock is reentrant, so a
+	 * nested transaction used to succeed and then lose data silently — the inner transaction publishes its own page
+	 * overlay, and committing it clears the overlay while the outer transaction is still live, after which the outer
+	 * transaction's writes went straight to the mapping, unlogged and past the point where a rollback could take them
+	 * back. A refusal is a caught mistake; that was an uncaught one.
 	 * </p>
 	 *
 	 * <p>

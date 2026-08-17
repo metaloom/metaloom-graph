@@ -137,7 +137,13 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 	private long nextTxnId;
 	private long lastCheckpointLsn;
-	private boolean closed;
+	/**
+	 * Volatile because {@code checkOpen()} reads it on every operation from every thread, while {@code close()} writes
+	 * it under the writer lock — which readers never take. In practice the surrounding lock traffic publishes it, and
+	 * {@code CloseUnderLoadTest} does not catch the difference; it is volatile so that the guarantee does not rest on
+	 * that happening to be true.
+	 */
+	private volatile boolean closed;
 
 	private GraphStoreImpl(Path path, Geometry geometry, Manifest manifest, Catalog catalog,
 		Map<Kind, SegmentSet> segmentSets, WalManager wal, FileChannel lockChannel, FileLock lock,
@@ -275,6 +281,17 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	@Override
 	public Transaction begin() {
 		checkOpen();
+		// Refused rather than allowed to nest. The writer lock is reentrant, so nesting used to succeed and then lose
+		// data silently: the inner transaction publishes its own overlay, and committing it clears that overlay while
+		// the outer transaction is still live, after which every remaining write in the outer transaction goes straight
+		// to the mapping — unlogged, and past the point where a rollback could take it back. A caller that wants to join
+		// an existing transaction asks with hasWriteTransaction() and simply does not call begin().
+		if (writerLock.isHeldByCurrentThread() && currentTransaction != null) {
+			throw new GraphStoreException("A write transaction (id " + currentTransaction.id()
+				+ ") is already open on thread '" + Thread.currentThread().getName()
+				+ "'. Nested write transactions are not supported: commit or roll back the open one first, or test"
+				+ " hasWriteTransaction() and join it instead of beginning another.");
+		}
 		writerLock.lock();
 		try {
 			TransactionImpl txn = new TransactionImpl(nextTxnId++, geometry.pageSize(), this);
@@ -289,6 +306,46 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 	@Override
 	public long commit(TransactionImpl txn) throws IOException {
+		return uninterruptible(() -> commitInternal(txn));
+	}
+
+	/**
+	 * Runs a durable write with this thread's interrupt status held back, and restores it afterwards.
+	 *
+	 * <p>
+	 * {@link java.nio.channels.FileChannel} is an {@link java.nio.channels.InterruptibleChannel}: reaching one with the
+	 * interrupt flag set makes the JDK <b>close the channel</b> rather than fail the single call. The WAL channel is
+	 * shared by the whole store, so one interrupted writer used to leave every subsequent commit — on every thread —
+	 * failing with {@code ClosedChannelException}, and {@code close()} failing the same way on the way out. One
+	 * cancelled task bricked the store for the life of the process, which is not a cost cancellation is allowed to
+	 * have. Callers interrupt for ordinary reasons: {@code shutdownNow()}, {@code Future.cancel(true)}, a query
+	 * deadline.
+	 * </p>
+	 *
+	 * <p>
+	 * Masking is not swallowing: the flag is restored before returning, so the caller's cancellation is still
+	 * delivered — just not in the middle of making a transaction durable. <b>The residual window is an interrupt that
+	 * arrives from another thread while the force is already in flight</b>; closing that one needs the log writes moved
+	 * onto a thread nobody else can interrupt, which is a larger change than this.
+	 * </p>
+	 */
+	private <T> T uninterruptible(IoWork<T> work) throws IOException {
+		boolean interrupted = Thread.interrupted();
+		try {
+			return work.run();
+		} finally {
+			if (interrupted) {
+				Thread.currentThread().interrupt();
+			}
+		}
+	}
+
+	@FunctionalInterface
+	private interface IoWork<T> {
+		T run() throws IOException;
+	}
+
+	private long commitInternal(TransactionImpl txn) throws IOException {
 		try {
 			// Counters live in the segment headers; flushing them inside the transaction makes them part of the
 			// atomic unit rather than a separate, unlogged write.
@@ -1989,12 +2046,16 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		writerLock.lock();
 		long started = System.nanoTime();
 		try {
-			catalog.force();
-			long lsn = wal.checkpoint();
-			manifest.checkpoint(lsn, lsn, nextTxnId);
-			manifest.force();
-			wal.trim(lsn);
-			lastCheckpointLsn = lsn;
+			// Same reason as commit(): an interrupt reaching the channel closes it for everybody.
+			uninterruptible(() -> {
+				catalog.force();
+				long lsn = wal.checkpoint();
+				manifest.checkpoint(lsn, lsn, nextTxnId);
+				manifest.force();
+				wal.trim(lsn);
+				lastCheckpointLsn = lsn;
+				return null;
+			});
 		} finally {
 			counters.checkpointed(System.nanoTime() - started);
 			writerLock.unlock();
@@ -2110,37 +2171,70 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		verify(level, VerifyOptions.consistentSnapshot());
 	}
 
+	/**
+	 * Verifies the store.
+	 * <p>
+	 * <b>Takes the writer lock, not merely the apply latch.</b> The apply latch excludes only the instant a commit
+	 * copies its pages into the mapping; it does not exclude a write transaction that is still open. Two of the things
+	 * verification looks at disagree for exactly as long as one is:
+	 * <ul>
+	 * <li>{@link SegmentSet#verify()} compares the free-slot bitmap against the superblock's live count. The bitmap is
+	 * written through the page overlay and so is still the pre-transaction image, while {@code liveCountDelta} has
+	 * already moved the in-memory superblock. Mid-transaction the two differ by exactly what the transaction has
+	 * allocated, and verification reported that as an accounting mismatch — corruption on a healthy store.</li>
+	 * <li>It then reaches {@code SegmentFile.flushChecksums}, which walks and clears the dirty-page {@code BitSet} that
+	 * the writer sets under the writer lock. An unsynchronised {@link java.util.BitSet} shared between two threads is a
+	 * data race whichever way it resolves.</li>
+	 * </ul>
+	 * Reporting corruption that is not there is worse than missing some: it sends somebody hunting. So verification
+	 * waits for the writer rather than racing it, which is also what {@code checkpoint()} already does for the same
+	 * flush.
+	 */
 	@Override
 	public void verify(VerifyLevel level, VerifyOptions options) {
 		checkOpen();
-		long[] stamp = { applyLock.readLock() };
+		writerLock.lock();
 		try {
-			for (SegmentSet set : segmentSets.values()) {
-				set.verify();
-			}
-			if (level == VerifyLevel.FULL) {
-				List<String> violations = new InvariantChecker(nodes, rels, adjacency, properties, blobs, vectors, segmentSets)
-					.check(options, pacer(options, stamp));
-				if (!violations.isEmpty()) {
-					throw new GraphStoreException("Structural invariants violated (" + violations.size()
-						+ "):\n  " + String.join("\n  ", violations));
+			// Reentrant: a caller verifying from inside its own open transaction still holds it, and must not have it
+			// released underneath by the throttling pacer.
+			boolean ownsWriterLock = writerLock.getHoldCount() == 1;
+			long[] stamp = { applyLock.readLock() };
+			try {
+				for (SegmentSet set : segmentSets.values()) {
+					set.verify();
 				}
+				if (level == VerifyLevel.FULL) {
+					List<String> violations = new InvariantChecker(nodes, rels, adjacency, properties, blobs, vectors, segmentSets)
+						.check(options, pacer(options, stamp, ownsWriterLock));
+					if (!violations.isEmpty()) {
+						throw new GraphStoreException("Structural invariants violated (" + violations.size()
+							+ "):\n  " + String.join("\n  ", violations));
+					}
+				}
+			} finally {
+				applyLock.unlockRead(stamp[0]);
 			}
 		} finally {
-			applyLock.unlockRead(stamp[0]);
+			writerLock.unlock();
 		}
 	}
 
 	/**
-	 * Drops the read latch between batches so a writer waiting behind a long verification waits for a batch instead.
+	 * Drops both locks between batches so a writer waiting behind a long verification waits for a batch instead.
 	 * The scan therefore no longer sees a single instant; {@link VerifyOptions} documents what that costs.
+	 * <p>
+	 * The writer lock is released in the same window as the read latch, because holding it is now the thing a writer
+	 * is actually waiting for — throttling that released only the latch would no longer let anybody through.
 	 */
-	private InvariantChecker.Pacer pacer(VerifyOptions options, long[] stamp) {
+	private InvariantChecker.Pacer pacer(VerifyOptions options, long[] stamp, boolean ownsWriterLock) {
 		if (!options.isThrottled()) {
 			return InvariantChecker.Pacer.NONE;
 		}
 		return () -> {
 			applyLock.unlockRead(stamp[0]);
+			if (ownsWriterLock) {
+				writerLock.unlock();
+			}
 			boolean interrupted = false;
 			try {
 				if (options.pauseMicrosPerBatch() > 0) {
@@ -2152,7 +2246,10 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				Thread.currentThread().interrupt();
 				interrupted = true;
 			}
-			// Retaken unconditionally, including on interrupt: the caller's finally block will unlock it.
+			// Retaken unconditionally, including on interrupt: the caller's finally blocks will release both.
+			if (ownsWriterLock) {
+				writerLock.lock();
+			}
 			stamp[0] = applyLock.readLock();
 			return !interrupted;
 		};
@@ -2301,7 +2398,12 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		// closes a store whose transaction is about to be rolled back by the overlay being discarded.
 		writerLock.lock();
 		try {
-			closeUnderWriterLock();
+			// A store being closed on an interrupted thread — the shutdownNow() case — must still be able to write its
+			// final checkpoint.
+			uninterruptible(() -> {
+				closeUnderWriterLock();
+				return null;
+			});
 		} finally {
 			writerLock.unlock();
 		}

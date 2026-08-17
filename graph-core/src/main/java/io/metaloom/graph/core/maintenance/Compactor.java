@@ -162,7 +162,13 @@ public final class Compactor {
 		for (Kind kind : options.kinds()) {
 			SegmentSet set = sets.get(kind);
 			if (set != null) {
-				result.pagesPunched += set.reclaim();
+				// Under the writer lock, like every other mutation here. Punching rewrites the file underneath a
+				// concurrent foreground writer that may be allocating into that very page, and the force() on the
+				// way through calls flushChecksums(), which clears the dirty-page marks that writer has set,
+				// leaving its pages with stale checksums. Both were reproduced as an intermittent failure.
+				int[] punched = new int[1];
+				runner.runWrite(() -> punched[0] = set.reclaim());
+				result.pagesPunched += punched[0];
 			}
 		}
 		for (Kind kind : options.kinds()) {
@@ -182,7 +188,10 @@ public final class Compactor {
 			for (Kind kind : options.kinds()) {
 				SegmentSet set = sets.get(kind);
 				if (set != null) {
-					result.segmentsRetired += set.retireEmptySegments();
+					// Unlinking a file takes its mapping with it, so no foreground writer may be inside one.
+					int[] retired = new int[1];
+					runner.runWrite(() -> retired[0] = set.retireEmptySegments());
+					result.segmentsRetired += retired[0];
 				}
 			}
 		}

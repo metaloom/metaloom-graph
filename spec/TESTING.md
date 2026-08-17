@@ -36,9 +36,20 @@ to what they asserted ([CURRENT_STATE.md §5](CURRENT_STATE.md#5-test-reality-ch
 | `LongRunningReaderTest` | 1 — reclamation walked every version chain on every commit to discover there was nothing to cut, which is quadratic while a reader is pinned. The test did not fail, it *did not finish*, which is the failure mode a shorter test would have reported as merely slow |
 | A full `mvn test` hanging, plus a thread dump | **2, and no test could see either** — both in the client's flow control, both leaving a consumer blocked forever on a server that had already sent every row. `readsPaused` was not `volatile`, so a stale read could skip the socket resume; and the ROWS handler published a batch to the consuming thread *before* adding it to the budget, so a consumer could spend bytes that had not been counted and the pause that followed had no callback left to lift it. Green in isolation, hung the reactor under load. The dump named the area in one look — client parked in `LinkedBlockingQueue.take()`, server worker **idle in its pool**; an idle server, not a stuck one, puts the lost wakeup on the client — but **fixing only the first left it still hanging**, which is the lesson: a plausible cause that explains the symptom is not the same as the cause ([WIRE.md §5.1](WIRE.md)) |
 
+| `VerifyUnderLoadTest` | **2, and the first is the one that matters most.** `verify()` held only the apply read latch, which excludes the commit *apply step* but not an **open write transaction**. Mid-transaction the free-slot bitmap is still the pre-transaction image sitting in the page overlay while the superblock's live count has already moved, so verification compared the two and reported `accounting mismatch` — corruption, on a healthy store, within a second of a writer running. On the way through it also reached `flushChecksums()`, which walks and then clears the dirty-page `BitSet` that the writer sets under a *different* lock. This is the same defect `PROGRESS.md` had already recorded against compaction, reached instead through the public API an operator turns to precisely when they already suspect corruption |
+| `WriterLockLivenessTest` | **1, and it bricked the store.** Interrupting a committing thread: `FileChannel` is an `InterruptibleChannel`, so reaching `force()` with the interrupt flag set makes the JDK *close the channel*, and the WAL channel is shared — every later commit **on every thread** then failed with `ClosedChannelException`, and so did `close()`. One `Future.cancel(true)`, one `shutdownNow()`, one query deadline, and the store is dead for the life of the process. Found by a case written only to check the lock was released. The lock was released; everything else was gone |
+| `SnapshotLinearizabilityTest` | 0 so far, and it is the one that generalises the anomaly matrix: because writers are serialised and the snapshot timestamp *is* the LSN, the state a view is entitled to see is computable rather than merely constrainable. So it asserts equality against a model history keyed by commit LSN, instead of asserting the absence of four named anomalies |
+
 The pattern is worth naming: **every one of these came from a test that compared the engine against
 something outside it** — a model, a counter, a corrupt file, a thread count — rather than from a test
 that asserted what its author already believed.
+
+The two concurrency rows sharpen it in a different direction. Both were found by running one ordinary
+operation *at the same time as* another ordinary operation, with no fault injected and nothing corrupt:
+`verify()` beside a writer, `commit()` beside an interrupt. Neither is reachable by any single-threaded
+test however thorough, and neither needed a rare interleaving — the verification defect reproduced
+within a second, every time. **The concurrency defects here were not tail events to be hunted with long
+soaks. They were ordinary pairs of operations that nobody had yet run together.**
 
 The fuzzer rows sharpen that into something more specific. A differential test compares two
 implementations, and therefore finds only the mistakes they do not share. Both decoders here were
@@ -91,6 +102,19 @@ src/test/java/io/metaloom/graph/core/
   nativelib/     NativeCodecTest, IoEngineTest, UringIoEngineTest — the crate and the IO engines
                  ForeignDowncallMetadataTest — the GraalVM downcall registrations against the code
   txn/           snapshot isolation: visibility, the anomaly matrix, vacuum, rollback, long readers
+                 SnapshotLinearizabilityTest — the general form of the anomaly matrix: a view at LSN L
+                 must show exactly the committed state at L, compared whole-graph against a model
+                 history. NestedTransactionTest — begin() refusing to nest, and the open transaction
+                 surviving the refusal intact
+  concurrency/   ScalingTest, plus the load and consistency harnesses:
+                 VerifyUnderLoadTest — verification beside writers, a checkpointer and a second
+                 verifier; the regression test for the accounting-mismatch false positive
+                 ParallelConsistencyTest — a conserved total audited continuously under SNAPSHOT while
+                 writers move it, READ_COMMITTED proven to be genuinely weaker, and structural
+                 invariants checked *through an open view*, which verify(FULL) cannot do
+                 WriterLockLivenessTest — every abnormal end to a write transaction, each asserting
+                 another thread can still get in. A leaked writer lock wedges the whole process
+                 CloseUnderLoadTest — close() typed properly under load; abandon() left recoverable
 
 graph-cypher/src/test/java/io/metaloom/graph/cypher/
                  parser, null semantics, execution, the versus-API differential, variable-length paths
@@ -485,6 +509,23 @@ diagnostic artefact and deleting it on failure is the most frustrating thing a t
       is supposed to permit*, reclamation and the retention budget, sixteen concurrent views against a
       continuous writer, rollback to byte-identical files, rollback-equals-recovery with a control, and
       a reader held across 60,000 commits
+- [x] **A model-history oracle for isolation** (`SnapshotLinearizabilityTest`, `fixture/ModelHistory`):
+      a view at LSN `L` must show exactly the state committed at `L`, compared whole-graph rather than
+      sampled. Writers being serialised and `snapshot_ts` being the LSN together make the correct
+      answer computable, so this generalises the four named anomalies into one equality
+- [x] **Consistency under parallel load** (`ParallelConsistencyTest`): an application invariant — a
+      conserved total — audited continuously under `SNAPSHOT` while writers move it, plus the same
+      workload proving `READ_COMMITTED` really can tear, plus structural invariants checked through an
+      open view, which `verify(FULL)` cannot do because it inspects the store rather than the view
+- [x] **Verification safe to run against a live store** (`VerifyUnderLoadTest`) — it was not
+- [x] **Writer-lock liveness** (`WriterLockLivenessTest`): every abnormal end to a transaction leaves
+      the lock usable by another thread. Found the interrupt-closes-the-WAL-channel defect
+- [x] `fixture/Hammer`: seeded, weighted, watchdogged load generation, bounded by op count in the
+      default build and by `-Dgraph.hammer.seconds` under `-Pslow`, counting what it actually ran so a
+      workload that silently stopped exercising writes cannot pass
+- [ ] The same harnesses driven through `graph-cypher` and the wire server rather than the embedded API
+- [ ] `SyncModeDurabilityTest`: the acknowledged-commit ledger per `WalSyncMode`
+- [ ] `CrashWorkload` made multi-threaded, so `kill9-loop.sh` exercises concurrency
 - [x] Soak harness with leak and growth detection, at a configurable duration
 - [x] `kill -9` loop harness (`tools/kill9-loop.sh`, `CrashWorkload`) with acknowledgement checking
 - [x] Performance gates in `-Pbench`, throughput floors and exact structural ceilings

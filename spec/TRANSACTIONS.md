@@ -366,9 +366,21 @@ the kind field already selects the addressing policy. Do not do this speculative
   the caller already holds one. It opens **no read view**: a writer reads the current mapping anyway,
   and a view would only add a liveness check that an abandoned view can fail. A write inside an open
   read view is refused rather than silently run outside it ([CYPHER.md §4.1](CYPHER.md)).
-- **`begin()` does not refuse to nest, and nesting is silent.** The inner commit clears the published
-  overlay, after which the outer transaction's writes go straight to the mapping — unlogged, and past
-  any rollback. `hasWriteTransaction()` exists so a library can ask rather than find out.
+- **`begin()` refuses to nest**, as `beginRead()` does. It used not to, and nesting was silent: the
+  inner commit cleared the published overlay, after which the outer transaction's writes went straight
+  to the mapping — unlogged, and past any rollback. `hasWriteTransaction()` exists so a library can ask
+  rather than find out. `NestedTransactionTest` covers the refusal and, more to the point, that the
+  transaction already open is unharmed by it and still rollback-able.
+- **Never interrupt a thread that is committing.** `FileChannel` is an `InterruptibleChannel`, so
+  reaching one with the interrupt flag set makes the JDK close the channel rather than fail the call —
+  and the WAL channel is shared, so one cancelled task used to leave every later commit *on every
+  thread* failing with `ClosedChannelException`, `close()` included. `commit()`, `checkpoint()` and
+  `close()` now hold the interrupt back across their durable section and restore it on the way out, so
+  cancellation is delivered but not in the middle of making a transaction durable. The residual window
+  is an interrupt arriving from another thread while the force is already in flight; closing that one
+  needs the log writes moved onto a thread nobody else can interrupt.
+- **`verify()` takes the writer lock**, not just the apply latch, because it both reads state a writer
+  is mid-way through changing and mutates the dirty-page set on its way through. See §9.
 - **Close read views.** An open view holds every version committed since it began. A forgotten one is
   a memory leak with a name: `snapshotStats()` reports its age and what it is holding, and past
   `retainedVersionBytes` the store abandons it rather than growing.
@@ -401,6 +413,17 @@ Built, in `io.metaloom.graph.core.txn`:
 | `RollbackTest` | 7 | Every mutation type rolled back to **byte-identical** segment files, with no flush; repeated rollbacks not ratcheting the allocator |
 | `RollbackEqualsRecoveryTest` | 2 | The same transaction rolled back and crashed reaching the same state, plus a control proving the comparison can tell them apart |
 | `LongRunningReaderTest` | 2 | `@Tag("slow")`. A view held across 60,000 commits; and the same run against a budget too small, abandoned cleanly with the store unharmed |
+| `SnapshotLinearizabilityTest` | 2 | The general form of the anomaly matrix: a view at LSN `L` must show **exactly** the committed state at `L`, whole-graph, checked against a model history keyed by commit LSN. Around 5,000 views per run |
+| `NestedTransactionTest` | 5 | `begin()` refusing to nest; the open transaction surviving the refusal; writes after it still rollback-able; the writer lock not leaked |
+
+And in `io.metaloom.graph.core.concurrency`:
+
+| Class | Cases | What it holds down |
+|---|---|---|
+| `VerifyUnderLoadTest` | 4 | Verification concurrent with writers, with a checkpointer, and with a second verifier; the throttled form making progress without hanging. The regression test for the accounting-mismatch false positive |
+| `ParallelConsistencyTest` | 3 | A conserved total across ~840,000 snapshot audits while writers move it; `READ_COMMITTED` *observing* a torn total, so the weaker level is proven weaker; structural invariants checked through an open view, which `verify(FULL)` cannot do |
+| `WriterLockLivenessTest` | 7 | The writer lock released after a runtime exception, an `Error`, an unclosed transaction, a rollback, a non-retryable failure inside `inTransaction`, an interrupt, and a storm of failing writers |
+| `CloseUnderLoadTest` | 2 | `close()` under load failing only in the engine's own vocabulary; `abandon()` under load left recoverable, verifying clean on reopen |
 
 Not built, with reasons: `ConflictTest` (§6 — no conflict can arise), `SnapshotTooOldTest` (folded
 into `VacuumTest` and `LongRunningReaderTest`, which reach the condition through real workloads rather
