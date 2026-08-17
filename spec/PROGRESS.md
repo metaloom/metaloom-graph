@@ -217,7 +217,8 @@ that a steal policy cannot be made correct over a `MAP_SHARED` mapping.
 - [x] Reference-model differential harness (`GraphModel`, `ReferenceModelTest`)
 - [x] Hostile-input suite against every format parser (`HostileInputTest`), each case under a hard
       timeout because "it hangs" is the failure being tested for
-- [x] Soak harness asserting leak, growth and fragmentation bounds (`SoakTest`)
+- [x] Soak harness asserting leak, growth and fragmentation bounds (`SoakTest`) — built, and currently
+      **failing** its growth bound; see the open defect in the Phase 14 list below
 - [x] `kill -9` harness checking acknowledged commits against a separately fsynced ack file
 - [x] Optimistic `StampedLock` read path; lock-free `Dictionary`; striped `LongAdder` counters
 - [x] Observability: `StoreMetrics`, `IoStats`, `IoCounters`
@@ -301,6 +302,19 @@ that a steal policy cannot be made correct over a `MAP_SHARED` mapping.
       only ever looks at the newest segment. So holes below the high water mark, and every hole in a
       sealed segment, are unreachable after a reopen until `compact()` runs. Measured: delete slot 3,
       reopen, next insert gets slot 10
+- [ ] **`SoakTest` is red, and has been for at least three commits.** `testSteadyStateDoesNotGrowWithoutBound`
+      fails at the default twenty seconds: committed bytes per live element grow from 346 B at the settled
+      sample to 566–610 B at the end, against a bound of 1.5x. Attributed with a worktree at `95860b1`,
+      which is before the concurrency-test work: it fails there too, and marginally worse (609.9 B/element
+      against 565.8 B/element after), so it is not a regression from that work.
+      <br>It is **not** a measurement artefact of the shrinking edge count either, which was the obvious
+      first suspicion: the workload settles at roughly 5,800 live elements and stays there, while storage
+      goes from 2.0 MB to 3.6 MB over the run. That is real growth against a flat live set, with
+      `reclaim()`, `compact(always())` and `checkpoint()` all being called every hundred rounds. The
+      neighbouring free-ring defect above is the obvious place to look first, though `SoakTest` never
+      reopens the store, so it cannot be the whole story.
+      <br>Note that this file previously recorded the soak harness as passing. It asserts the right things;
+      the engine does not satisfy them
 
 ### Phase 15 — Cypher writes
 

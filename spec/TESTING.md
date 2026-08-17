@@ -115,6 +115,12 @@ src/test/java/io/metaloom/graph/core/
                  WriterLockLivenessTest — every abnormal end to a write transaction, each asserting
                  another thread can still get in. A leaked writer lock wedges the whole process
                  CloseUnderLoadTest — close() typed properly under load; abandon() left recoverable
+                 HammerTest — the whole public API at once, with Witness values so a torn read is
+                 caught by the value rather than needing a model
+                 CursorLeaseLivenessTest — an open cursor holds the read latch and therefore blocks
+                 every writer; the cases pin that the cost is exactly "until close"
+                 MultiStoreIsolationTest — several stores written concurrently, which is the only
+                 place in the suite where two writers really do run at the same time
 
 graph-cypher/src/test/java/io/metaloom/graph/cypher/
                  parser, null semantics, execution, the versus-API differential, variable-length paths
@@ -465,6 +471,18 @@ diagnostic artefact and deleting it on failure is the most frustrating thing a t
 - **Assert on structure, not on incidental values.** The property-count assertions in
   `GraphStorageTest` hold only because of a bug; assert what the API promises.
 - **Seeds are printed, always.** A flaky property test that cannot be reproduced is noise.
+- **An oracle that has never been seen to fail is not an oracle.** Every concurrency oracle added in the
+  isolation work was deliberately broken once and confirmed red before being trusted, and the controls
+  are worth repeating if any of them is ever rewritten:
+  - `SnapshotLinearizabilityTest` — stop advancing the model on one mutation. Expect per-node property
+    mismatches naming the exact node and both values.
+  - `ParallelConsistencyTest` — drop the credit half of each transfer. Expect the conserved total to
+    collapse (16,000 to 16) and both the snapshot and the quiescent assertions to fail.
+  - `HammerTest` — stamp a `Witness` with `id + 1`. Expect thousands of "actually belongs to" reports.
+  - `AutoCommitAtomicityTest` — **the most informative one**: swap its readers from `SNAPSHOT` to
+    `READ_COMMITTED`. It immediately catches `has no matching in-edge`, which proves in one move both
+    that the checker detects a genuinely half-applied write and that the snapshot level is what
+    prevents it. A checker that stayed green under read-committed would be checking nothing.
 - **Crash tests must verify the acknowledgement, not the intent.** See §6 point 3.
 - **Benchmarks never run in the same JVM as correctness tests**, and never on a machine doing
   anything else.
@@ -523,10 +541,24 @@ diagnostic artefact and deleting it on failure is the most frustrating thing a t
 - [x] `fixture/Hammer`: seeded, weighted, watchdogged load generation, bounded by op count in the
       default build and by `-Dgraph.hammer.seconds` under `-Pslow`, counting what it actually ran so a
       workload that silently stopped exercising writes cannot pass
-- [ ] The same harnesses driven through `graph-cypher` and the wire server rather than the embedded API
-- [ ] `SyncModeDurabilityTest`: the acknowledged-commit ledger per `WalSyncMode`
-- [ ] `CrashWorkload` made multi-threaded, so `kill9-loop.sh` exercises concurrency
-- [x] Soak harness with leak and growth detection, at a configurable duration
+- [x] The same conserved-total oracle driven through `graph-cypher` (`CypherConcurrencyTest`) and over the
+      wire (`WireHammerTest`), so isolation is checked at the layer applications actually use. The wire
+      case also covers clients that hang up mid-stream, which must not strand a read view on the server
+- [x] `SyncModeDurabilityTest`: the acknowledged-commit ledger per `WalSyncMode`, with the prefix
+      property required of every mode. Note what it cannot show — an in-process `abandon()` leaves the
+      OS page cache intact, so `GROUP_COMMIT` and `ASYNC` recover everything here and only `kill -9`
+      and real power loss separate them from `FSYNC_ON_COMMIT`
+- [x] `CrashWorkload` made multi-threaded (`-Dcrash.workload.threads`, default 4), so `kill9-loop.sh`
+      crashes a store with writers queued behind the writer lock rather than an idle one. The
+      committed-but-unacknowledged window widens with the thread count, as it should
+- [x] Virtual-thread callers (`VirtualThreadCallerTest`): 500 concurrent callers making progress rather
+      than starving a carrier, a view per virtual thread released with it, and confinement still enforced.
+      The engine's own server continues to avoid virtual threads deliberately — a page fault on a mapped
+      segment blocks the carrier — but the API is public and applications will not
+- [ ] A jcstress harness for the optimistic read path; jcstress is not in the offline repository
+- [x] Soak harness with leak and growth detection, at a configurable duration. **Its growth assertion is
+      currently red** and has been for at least three commits — `mvn test -Pslow` does not pass. Measured
+      and attributed in [PROGRESS.md](PROGRESS.md); it is not a regression from the concurrency work
 - [x] `kill -9` loop harness (`tools/kill9-loop.sh`, `CrashWorkload`) with acknowledgement checking
 - [x] Performance gates in `-Pbench`, throughput floors and exact structural ceilings
 - [x] Dual-run CI (native on/off), plus slow, crash, gates and a Rust build

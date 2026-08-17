@@ -57,6 +57,14 @@ public final class CrashWorkload {
 		}
 	}
 
+	/**
+	 * Number of writer threads. More than one so that the {@code kill -9} loop exercises the writer lock, the commit
+	 * queue and the acknowledgement path under contention rather than in the quiet single-threaded case — a crash
+	 * landing while several threads are queued behind the writer lock is a different state from one landing on an idle
+	 * store, and it is the state a real deployment is usually in. Override with {@code -Dcrash.workload.threads=N}.
+	 */
+	private static final int WRITERS = Integer.getInteger("crash.workload.threads", 4);
+
 	/** Writes until killed or until the time is up, acknowledging each commit to an independently synced file. */
 	public static void write(Path dir, long seconds) throws IOException {
 		Files.createDirectories(dir);
@@ -65,17 +73,43 @@ public final class CrashWorkload {
 			FileOutputStream ackFile = new FileOutputStream(ackPath(dir).toFile(), true)) {
 
 			OutputStream acks = ackFile;
-			long counter = 0;
-			System.out.println("workload: writing to " + dir + " for up to " + seconds + "s");
-			while (System.nanoTime() < deadline) {
-				long value = counter++;
-				// The commit happens here; the store has reported it durable when createNode returns.
-				long id = store.createNode(LABEL, Properties.of().set("value", value));
-				acks.write((id + " " + value + "\n").getBytes(StandardCharsets.UTF_8));
-				acks.flush();
-				ackFile.getFD().sync();
+			java.util.concurrent.atomic.AtomicLong counter = new java.util.concurrent.atomic.AtomicLong();
+			// One lock for the ack file. It has to be a different lock from the store's, and the ordering has to be
+			// commit-then-acknowledge: acknowledging first would let a crash between the two produce an ack for a
+			// commit that never happened, and the checker would report a lost commit that was never made.
+			Object ackLock = new Object();
+			System.out.println("workload: writing to " + dir + " for up to " + seconds + "s on "
+				+ WRITERS + " thread(s)");
+
+			List<Thread> writers = new ArrayList<>();
+			for (int w = 0; w < WRITERS; w++) {
+				writers.add(Thread.ofPlatform().name("crash-writer-" + w).start(() -> {
+					try {
+						while (System.nanoTime() < deadline) {
+							long value = counter.getAndIncrement();
+							// The commit happens here; the store has reported it durable when createNode returns.
+							long id = store.createNode(LABEL, Properties.of().set("value", value));
+							synchronized (ackLock) {
+								acks.write((id + " " + value + "\n").getBytes(StandardCharsets.UTF_8));
+								acks.flush();
+								ackFile.getFD().sync();
+							}
+						}
+					} catch (IOException e) {
+						// A crash arriving mid-write is the point of this program, not a failure of it.
+						System.out.println("workload: writer stopped: " + e);
+					}
+				}));
 			}
-			System.out.println("workload: finished cleanly after " + counter + " commits");
+			for (Thread writer : writers) {
+				try {
+					writer.join();
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+					return;
+				}
+			}
+			System.out.println("workload: finished cleanly after " + counter.get() + " commits");
 		}
 	}
 

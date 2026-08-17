@@ -424,6 +424,19 @@ And in `io.metaloom.graph.core.concurrency`:
 | `ParallelConsistencyTest` | 3 | A conserved total across ~840,000 snapshot audits while writers move it; `READ_COMMITTED` *observing* a torn total, so the weaker level is proven weaker; structural invariants checked through an open view, which `verify(FULL)` cannot do |
 | `WriterLockLivenessTest` | 7 | The writer lock released after a runtime exception, an `Error`, an unclosed transaction, a rollback, a non-retryable failure inside `inTransaction`, an interrupt, and a storm of failing writers |
 | `CloseUnderLoadTest` | 2 | `close()` under load failing only in the engine's own vocabulary; `abandon()` under load left recoverable, verifying clean on reopen |
+| `HammerTest` | 1 | The whole public API concurrently — both levels, cursors, traversals, retries, checkpoints, refused maintenance — with self-checksumming property values, which is the only oracle available for the optimistic read path |
+| `CursorLeaseLivenessTest` | 3 | An open cursor blocking every writer, and releasing them on close; double-close safe; many short-lived cursors not wedging the store |
+| `MultiStoreIsolationTest` | 2 | Four stores written concurrently with no cross-talk — the one place two writers genuinely overlap; a second handle on one store refused |
+| `AutoCommitAtomicityTest` | 1 | A single `createRelationship` writes a REL, two adjacency entries and two degree counters; no view may catch that half done |
+| `SnapshotBudgetUnderLoadTest` | 1 | Six views of different ages against a budget too small: abandonment follows age, and the survivors are still *right* rather than merely alive |
+| `CatalogDurabilityWindowTest` | 2 | The dictionary is forced before the commit that introduced it, so a rolled-back or crashed label outlives its transaction — pinned as harmless and reusable |
+
+And at the layers above the engine:
+
+| Class | Module | What it holds down |
+|---|---|---|
+| `CypherConcurrencyTest` | `graph-cypher` | A conserved total read through Cypher while writers move it — a query is dozens of storage calls and the view is what stops it spanning two states; concurrent write queries each committing exactly once |
+| `WireHammerTest` | `graph-server` | The same total over a real socket from many clients; clients hanging up mid-stream leaving no read view behind; no leaked event loops |
 
 Not built, with reasons: `ConflictTest` (§6 — no conflict can arise), `SnapshotTooOldTest` (folded
 into `VacuumTest` and `LongRunningReaderTest`, which reach the condition through real workloads rather
