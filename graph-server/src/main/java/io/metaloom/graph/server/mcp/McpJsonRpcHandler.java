@@ -7,6 +7,7 @@ import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.metaloom.graph.core.api.Principal;
 import io.metaloom.graph.server.mcp.model.JsonRpcRequest;
 import io.metaloom.graph.server.mcp.model.JsonRpcResponse;
 import io.metaloom.graph.server.mcp.tool.GraphMcpTool;
@@ -37,9 +38,20 @@ public final class McpJsonRpcHandler {
 
 	private final GraphMetrics metrics;
 
+	private final String defaultDatabase;
+
+	private final List<GraphMcpTool> tools;
+
 	public McpJsonRpcHandler(List<GraphMcpTool> tools, boolean allowWrite, GraphMetrics metrics) {
+		this(tools, allowWrite, metrics, io.metaloom.graph.core.api.GraphDatabases.DEFAULT_NAME);
+	}
+
+	public McpJsonRpcHandler(List<GraphMcpTool> tools, boolean allowWrite, GraphMetrics metrics,
+		String defaultDatabase) {
 		this.allowWrite = allowWrite;
 		this.metrics = metrics;
+		this.defaultDatabase = defaultDatabase;
+		this.tools = List.copyOf(tools);
 		this.visible = GraphMcpTools.visible(tools, allowWrite);
 		// Every tool, not just the visible ones: dispatch has to be able to recognise a write tool by name in order
 		// to refuse it properly, rather than answering "no such tool" and inviting the model to guess again.
@@ -48,6 +60,31 @@ public final class McpJsonRpcHandler {
 
 	/** @return the response, or null for a notification, which the specification says must not be answered */
 	public Future<JsonRpcResponse> handle(JsonRpcRequest request) {
+		return handle(request, Principal.ANONYMOUS);
+	}
+
+	/** @param principal who is asking, which decides both what is listed and what may be dispatched */
+	public Future<JsonRpcResponse> handle(JsonRpcRequest request, Principal principal) {
+		this.principal.set(principal);
+		try {
+			return handleAs(request);
+		} finally {
+			this.principal.remove();
+		}
+	}
+
+	/**
+	 * The principal of the call in progress.
+	 *
+	 * <p>
+	 * A thread local rather than a parameter threaded through six private methods. The handler is a singleton shared
+	 * by three transports and every one of them dispatches on the event loop that read the request, so the value is
+	 * set and removed within one turn and never spans a suspension point.
+	 * </p>
+	 */
+	private final ThreadLocal<Principal> principal = ThreadLocal.withInitial(() -> Principal.ANONYMOUS);
+
+	private Future<JsonRpcResponse> handleAs(JsonRpcRequest request) {
 		String method = request.method();
 		if (method == null) {
 			return Future.succeededFuture(
@@ -89,7 +126,10 @@ public final class McpJsonRpcHandler {
 
 	private JsonObject toolsList() {
 		JsonArray tools = new JsonArray();
-		visible.forEach(tool -> tools.add(tool.descriptor().toJson()));
+		// Filtered by the caller as well as by the flag. An agent shown a capability it cannot use will spend turns
+		// trying to use it, which is the whole reason this list is filtered at all — spec/MCP.md section 5.
+		GraphMcpTools.visible(this.tools, allowWrite, principal.get(), defaultDatabase)
+			.forEach(tool -> tools.add(tool.descriptor().toJson()));
 		return new JsonObject().put("tools", tools);
 	}
 
@@ -108,13 +148,21 @@ public final class McpJsonRpcHandler {
 		}
 		// The second enforcement point. tools/list already hides write tools on a read-only server; this is what
 		// stops a client calling one by a name it remembers from an earlier session against a different server.
+		// The other half of the second enforcement point. tools/list already hid what this principal cannot use; this
+		// is what stops a call naming a tool remembered from a session as somebody else.
+		if (!tool.descriptor().permits(principal.get(), defaultDatabase)) {
+			metrics.recordMcpToolCall(name, "refused");
+			return Future.succeededFuture(JsonRpcResponse.ok(request.id(), GraphMcpToolResults.error(
+				"'" + principal.get().name() + "' has not been granted what '" + name + "' needs ("
+					+ tool.descriptor().requiredPrivileges() + "). Do not retry; ask an administrator.")));
+		}
 		if (tool.descriptor().write() && !allowWrite) {
 			metrics.recordMcpToolCall(name, "refused");
 			return Future.succeededFuture(JsonRpcResponse.ok(request.id(), GraphMcpToolResults.error(
 				"'" + name + "' changes the store, and this server was started without --allow-write. Do not "
 					+ "retry; ask the operator.")));
 		}
-		return tool.execute(arguments)
+		return tool.execute(arguments, principal.get())
 			.map(result -> {
 				metrics.recordMcpToolCall(name, result.getBoolean("isError", false) ? "refused" : "ok");
 				return JsonRpcResponse.ok(request.id(), result);

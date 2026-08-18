@@ -15,6 +15,13 @@
 # --allow-write is on here and off in the shipped default. This is a local demo of the feature, on a generated graph
 # in a target directory, and the browser suite has to be able to exercise the editor. A real deployment gets the
 # safe default; see spec/OPERATIONS.md section 9.1.
+#
+# Authentication is LEFT ON, which is the shipped default, and GRAPH_INITIAL_PASSWORD fixes the first password so the
+# Playwright suite can sign in. That is deliberate: this script is what the browser suite drives, and Playwright is the
+# only suite that can exercise a login page at all — a demo server with authentication off would leave the one screen
+# that needs a real browser untested by the one thing able to test it.
+#
+# Set GRAPH_AUTH_ENABLED=false in the environment to turn it off for a quick look at the UI without signing in.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,6 +46,9 @@ fi
 # Vert.x copies classpath resources into .vertx/file-cache-* and serves the copy, so a server left running across a UI
 # rebuild keeps serving the previous bundle. Off here because this script is the development and test loop, where that
 # is a trap rather than a saving.
+# Only if unset, so an operator can override it without editing this file.
+export GRAPH_INITIAL_PASSWORD="${GRAPH_INITIAL_PASSWORD:-demo-password}"
+
 exec mvn -o -q -f "$ROOT/pom.xml" -pl graph-server exec:java \
     -Dvertx.disableFileCaching=true \
     -Dexec.args="--demo --allow-write --demo-size=$SIZE $STORE $PORT"

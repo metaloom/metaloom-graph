@@ -1,12 +1,14 @@
 package io.metaloom.graph.server.mcp.tool.impl;
 
 import java.util.List;
+import java.util.Set;
 
 import io.metaloom.graph.core.api.GraphDatabases;
 import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.SnapshotStats;
 import io.metaloom.graph.core.api.StoreStats;
 import io.metaloom.graph.core.nativelib.NativeCapabilities;
+import io.metaloom.graph.core.api.Privilege;
 import io.metaloom.graph.server.mcp.model.McpToolDescriptor;
 import io.metaloom.graph.server.mcp.model.McpToolDescriptor.McpToolParam;
 import io.metaloom.graph.server.mcp.tool.GraphMcpToolResults;
@@ -28,7 +30,7 @@ public final class StatsTool extends StoreTool {
 				+ "whether the native layer loaded. Use it to decide whether a full scan is affordable.",
 			McpToolDescriptor.buildInputSchema(List.of(
 				new McpToolParam("database", "string", DATABASE_DESCRIPTION, false))),
-			false);
+			false, Set.of(Privilege.INTROSPECT));
 	}
 
 	@Override

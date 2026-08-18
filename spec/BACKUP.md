@@ -217,7 +217,7 @@ looking at their data.
 `GET /api/databases/{name}/backup`, behind **`--allow-backup`**.
 
 **Its own flag, not `--allow-write`.** A backup is a read — and it is the read that hands over *every
-byte* of a database in a single request, on a port with no authentication. That is a different decision
+byte* of a database in a single request. A principal needs `BACKUP` on the database as well, and both have to permit. That is a different decision
 from "answer queries", in exactly the way `--allow-drop` is a different decision from "accept writes".
 Folding it into either would mean an operator enabling one had silently enabled this.
 
@@ -341,8 +341,18 @@ Two changes, both narrow:
 - **No compression.** A dump is very compressible and `gzip` is one pipe away; building it in would mean
   choosing a codec on everyone's behalf.
 - **No parallel restore.** The engine has one writer, so there is nothing to parallelise into.
+- **No identities.** A dump is one database, and the users, roles and grants live in `<root>/.auth/`, which is not a
+  database ([AUTH.md §3.1](AUTH.md)). So **a restore does not restore who may use what** — it puts the data back and
+  leaves the identity file alone, which is right when restoring onto a machine that already has one and a surprise when
+  restoring onto a bare machine. On a bare machine the server bootstraps a fresh administrator on first start and prints
+  a password; the grants that named the restored database have to be made again. Back `.auth/` up separately, or record
+  the grants somewhere; `metaloom-graph-cli auth list` prints them in the form `auth grant` accepts, which makes that
+  practical.
+- **A credential for the online half.** `--server` mode now has to log in, so a scripted backup needs a principal
+  granted `BACKUP` on the database — and the server still needs `--allow-backup`, because the flag and the grant both
+  have to permit.
 
 ---
 
-_Git HEAD revision: `3edb034`_
-_Last updated: 2026-08-17 (the logical dump, the paced scan, metaloom-graph-cli, and its native build and container packaging)_
+_Git HEAD revision: `da8c93e`_
+_Last updated: 2026-08-17 (authentication and RBAC authorization)_

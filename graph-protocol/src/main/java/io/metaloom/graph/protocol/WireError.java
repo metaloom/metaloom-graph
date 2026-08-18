@@ -65,7 +65,37 @@ public enum WireError {
 	 * the one store refusal that a caller can act on, by sending different data.
 	 * </p>
 	 */
-	CONSTRAINT_VIOLATION(11);
+	CONSTRAINT_VIOLATION(11),
+	/**
+	 * No credential was presented, or it was wrong.
+	 *
+	 * <p>
+	 * Ends the connection, like every other handshake failure. Distinct from {@link #UNAUTHORIZED} because the remedy
+	 * is different and is held by a different person: this one is fixed by presenting different credentials, and a
+	 * client can say so to whoever is running it.
+	 * </p>
+	 *
+	 * <p>
+	 * It says nothing about which part was wrong. A server that answered differently for a user that does not exist
+	 * would be a user enumerator on an unauthenticated port.
+	 * </p>
+	 */
+	UNAUTHENTICATED(12),
+	/**
+	 * Authenticated, and not granted this.
+	 *
+	 * <p>
+	 * Per stream, and the connection survives — structurally the same as {@link #READ_ONLY}, and for the same reason:
+	 * the next query on it may well be one this principal may run.
+	 * </p>
+	 *
+	 * <p>
+	 * Distinct from {@link #READ_ONLY}, which is a property of the <em>server</em> and is fixed by restarting it with
+	 * a flag. This is a property of the <em>caller</em> and is fixed by an administrator granting something. Reporting
+	 * one as the other sends somebody after a change that would not help.
+	 * </p>
+	 */
+	UNAUTHORIZED(13);
 
 	private final int code;
 

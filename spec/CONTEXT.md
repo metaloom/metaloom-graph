@@ -95,6 +95,7 @@ CONTEXT.md (this file)
         ├─ METRICS.md ................ the Prometheus meter catalogue, and the alert rules it implies
         ├─ BACKUP.md ................. the logical dump, the paced scan it needs, and the CLI
         ├─ MCP.md .................... the Model Context Protocol port and its tools
+        ├─ AUTH.md ................... users, roles, grants, and where each port checks them
         └─ DEPLOYMENT.md ............. the container images, the Helm chart and the k3d harness
 ```
 
@@ -130,6 +131,7 @@ CONTEXT.md (this file)
 | [BACKUP.md](BACKUP.md) | The logical dump: why not a file copy, how one snapshot makes the walk online without stopping writers, the paced scan that keeps it that way, the format and its hostile-input rules, why ids are not preserved, the restore order, and `metaloom-graph-cli` | The storage format (FILE_FORMAT.md); the operational procedure (OPERATIONS.md §5) |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | The container images and the Helm chart: why the base image is not Alpine, why `/tmp` is load-bearing, why both images also carry `metaloom-graph-cli`, StatefulSet versus Deployment, probes on the monitoring port, and the k3d harness | How the server is configured (OPERATIONS.md §3.1); the native binary itself (GRAALVM.md) |
 | [MCP.md](MCP.md) | The Model Context Protocol port: why it is the one port that is off by default, the two transports and the h2c trap that breaks SSE, the eight tools, the row cap, and the write gate's two enforcement points | The query language (CYPHER.md); the meter catalogue (METRICS.md) |
+| [AUTH.md](AUTH.md) | Identity and what it may do: the fifteen privileges and the three surfaces they span, per-database grants, the `.auth/` file and why it is binary, PBKDF2, why a grant cannot override a capability flag, how each port establishes a principal, why the monitoring port is exempt, and what is still not covered | The frame layout (WIRE.md); the port table and operational posture (OPERATIONS.md §9); the root layout (DATABASES.md) |
 | [METRICS.md](METRICS.md) | The Prometheus catalogue: every `graph_` meter with its type, labels and call site, the cached-versus-live tiers and why size gauges are refreshed on a timer, and the map from OPERATIONS.md §4's thresholds to alert rules. **Parsed by `MetricsCatalogScrapeTest`** — editing it can break the build | Which signals to watch and when to worry (OPERATIONS.md §4) |
 | [PLAN.md](PLAN.md) | The phased implementation plan with per-phase deliverables, exit criteria and checkboxes | Design rationale |
 | [PROGRESS.md](PROGRESS.md) | The consolidated done/pending checklist across every phase, and the backlog in priority order | Deliverable definitions, rationale for a gap |
@@ -365,6 +367,10 @@ Full description in [ARCHITECTURE.md](ARCHITECTURE.md).
 | `InvariantChecker` | `io.metaloom.graph.core.store` | Every structural invariant, throttled or not |
 | `WalManager` / `WalWriter` / `WalReader` | `io.metaloom.graph.core.wal` | Commit, redo recovery, checkpoint |
 | `Crc` / `VarInt` / `Layouts` | `io.metaloom.graph.core.util` | CRC32C, LEB128, explicit little-endian layouts |
+| `AuthStore` | `io.metaloom.graph.core.api` | `<root>/.auth/`: users, roles, grants; authenticates, and edits under a short-lived lock |
+| `Privilege` / `Grant` / `Principal` | `io.metaloom.graph.core.api` | The fifteen names, a privilege on a database or `*`, and the one call every gate makes |
+| `User` / `Role` | `io.metaloom.graph.core.api` | The stored records. `User` carries **no hash** — that is the point of it |
+| `AuthCodec` / `PasswordHash` | `io.metaloom.graph.core.auth` | The byte format and its whole hostile-input surface; PBKDF2-HMAC-SHA512 |
 
 ---
 
@@ -383,15 +389,18 @@ deliverables and exit criteria are in [PLAN.md](PLAN.md).
 - [x] Phase 2 — Record stores and catalog
 - [x] Phase 3 — Adjacency and traversal
 - [x] Phase 4 — WAL, recovery, checkpoints (redo-only, no-steal)
-- [~] Phase 5 — Transactions: ACID, serialised writers, **snapshot isolation for readers** with a
+- [x] Phase 5 — Transactions: ACID, **concurrent writers**, snapshot isolation for readers and writers with a
       horizon, a retention budget and vacuum; **no concurrent writers**
 - [~] Phase 6 — Native layer: libc via FFM works; the Rust crate is written but never compiled
 - [x] Phase 7 — Indexes
 - [x] Phase 8 — Compaction and space reclamation
 - [~] Phase 9 — Budgets, differential harness, hostile input, scaling, soak, kill -9, gates, CI, operations doc
 - [x] Phase 10 — Built as a MetaLoom index, measured against real SQL, recommended against adopting
+- [x] Authentication and RBAC authorization — users, roles and per-database grants; the HTTP, binary and MCP ports;
+      a login page; the binary client; a CLI recovery command. **No TLS**, which is now the largest gap
+      ([AUTH.md](AUTH.md))
 
 ---
 
 _Git HEAD revision: `3edb034`_
-_Last updated: 2026-08-17 (LOAD CSV; the logical backup with its CLI, natively compiled and in both container images)_
+_Last updated: 2026-08-17 (authentication and RBAC authorization: AUTH.md, protocol version 4, a login page, and metaloom-graph-cli auth)_

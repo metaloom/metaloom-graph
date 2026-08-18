@@ -2,6 +2,8 @@ package io.metaloom.graph.client;
 
 import java.time.Duration;
 
+import io.metaloom.graph.protocol.Credentials;
+
 /**
  * How the client behaves, independently of any one query.
  *
@@ -18,7 +20,22 @@ import java.time.Duration;
  *            socket into the megabytes under a fast sender, and a client that pauses at four mebibytes of heap while
  *            the kernel holds another six has not paused at four mebibytes
  */
-public record ClientOptions(Duration connectTimeout, int readBufferBytes, int socketReceiveBufferBytes) {
+public record ClientOptions(Duration connectTimeout, int readBufferBytes, int socketReceiveBufferBytes,
+	Credentials credentials) {
+
+	/**
+	 * The four-argument form, so every existing caller keeps compiling.
+	 *
+	 * <p>
+	 * Credentials live here rather than in a {@code connect} overload because there are already six of those and
+	 * adding the pair would make twelve. This record is the place for everything about how a client behaves that is
+	 * not its address, it already has {@code with*} copy methods, and a component gets a paragraph of javadoc where a
+	 * seventh positional parameter gets a name.
+	 * </p>
+	 */
+	public ClientOptions(Duration connectTimeout, int readBufferBytes, int socketReceiveBufferBytes) {
+		this(connectTimeout, readBufferBytes, socketReceiveBufferBytes, null);
+	}
 
 	public static final Duration DEFAULT_CONNECT_TIMEOUT = Duration.ofSeconds(10);
 
@@ -61,14 +78,40 @@ public record ClientOptions(Duration connectTimeout, int readBufferBytes, int so
 	}
 
 	public ClientOptions withReadBufferBytes(int bytes) {
-		return new ClientOptions(connectTimeout, bytes, socketReceiveBufferBytes);
+		return new ClientOptions(connectTimeout, bytes, socketReceiveBufferBytes, credentials);
 	}
 
 	public ClientOptions withSocketReceiveBufferBytes(int bytes) {
-		return new ClientOptions(connectTimeout, readBufferBytes, bytes);
+		return new ClientOptions(connectTimeout, readBufferBytes, bytes, credentials);
+	}
+
+	/** A copy that will log in as {@code user}. Null credentials mean this client offers none. */
+	public ClientOptions withCredentials(Credentials credentials) {
+		return new ClientOptions(connectTimeout, readBufferBytes, socketReceiveBufferBytes, credentials);
+	}
+
+	public ClientOptions withCredentials(String user, String password) {
+		return withCredentials(new Credentials(user, password));
+	}
+
+	/**
+	 * Everything except the password.
+	 *
+	 * <p>
+	 * A record's generated {@code toString} prints every component, and this one holds a credential. Anything that
+	 * logs its options — a connection failure, a debugger, a diagnostic dump — would otherwise put a password
+	 * wherever that went. {@code Credentials} redacts its own half as well, so both layers have to be removed before
+	 * this can leak.
+	 * </p>
+	 */
+	@Override
+	public String toString() {
+		return "ClientOptions[connectTimeout=" + connectTimeout + ", readBufferBytes=" + readBufferBytes
+			+ ", socketReceiveBufferBytes=" + socketReceiveBufferBytes
+			+ ", credentials=" + (credentials == null ? "<none>" : credentials) + "]";
 	}
 
 	public ClientOptions withConnectTimeout(Duration timeout) {
-		return new ClientOptions(timeout, readBufferBytes, socketReceiveBufferBytes);
+		return new ClientOptions(timeout, readBufferBytes, socketReceiveBufferBytes, credentials);
 	}
 }

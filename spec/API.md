@@ -73,8 +73,10 @@ try (Transaction tx = store.begin()) {                 // SNAPSHOT by default
 | `store.beginRead()` | A `SNAPSHOT` read view over many reads | **Yes** |
 | `store.beginRead(IsolationLevel)` | `SNAPSHOT` or `READ_COMMITTED` | **Yes** |
 | `store.snapshotStats()` | What open views cost right now | **Yes** |
-| `store.begin(IsolationLevel)` | Per-transaction write isolation | No — writers are serialised, so there is one level |
-| `SERIALIZABLE` | SSI conflict tracking | No — nothing to detect; see TRANSACTIONS.md §3 |
+| `store.begin(IsolationLevel)` | Per-transaction write isolation | **Yes** — `SNAPSHOT` or `SERIALIZABLE`; a writer at `READ_COMMITTED` is refused |
+| `store.inTransaction(work, attempts, IsolationLevel)` | The same, with the retry seam | **Yes** |
+| `SERIALIZABLE` | Serializable write transactions | **Yes**, by validating what the transaction read at commit rather than by SSI; see TRANSACTIONS.md §6.4 |
+| `TransactionConflictException` | The loser of a write-write or read-write conflict | **Yes** — a normal outcome; `inTransaction` retries it, and auto-commit mutations and Cypher write queries retry it internally |
 
 Both handles are `AutoCloseable` and **thread-confined**. A read view is published to the thread that
 opened it and using it from another is refused rather than tolerated, because the reconstruction cache
@@ -470,5 +472,28 @@ scopes them for the calling thread rather than duplicating them.
 
 ---
 
-_Git HEAD revision: `0970e6b`_
-_Last updated: 2026-08-16 (IDX-7: createIndex, nodesByLabelAndProperty, label-scoped constraints)_
+## Identity
+
+`AuthStore` is part of graph-core's public API, in `io.metaloom.graph.core.api`, alongside `Privilege`,
+`Grant`, `Principal`, `User` and `Role`. It is there rather than in a module of its own because
+`GraphDatabases` already owns the root and `<root>/.auth/` is a directory in it — see
+[AUTH.md §1](AUTH.md) for why that beat a new leaf module.
+
+**It changes nothing about the engine's own guarantees.** `GraphStore` has no notion of a principal, no
+method takes one, and nothing in the storage layer consults one. Authorization is enforced by the
+servers, on the ports, which is the same line `--allow-write` has always drawn — and
+[OPERATIONS.md §9](OPERATIONS.md)'s statement that anything able to open the directory has full access
+is unchanged.
+
+The one public type that is deliberately incomplete is `User`: it carries no password hash, because the
+hash lives in the unexported `io.metaloom.graph.core.auth` and a field that is not on the object cannot
+be serialised into a response or printed by a generated `toString()`.
+
+New exceptions, both under `GraphStoreException`: `AuthException` for a refused edit, and
+`AuthFormatException` for an identity file that cannot be read. A wrong password is neither — 
+`authenticate` returns an empty `Optional`, and returns the same one for every reason.
+
+---
+
+_Git HEAD revision: `da8c93e`_
+_Last updated: 2026-08-17 (authentication and RBAC authorization)_

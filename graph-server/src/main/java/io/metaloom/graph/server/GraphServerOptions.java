@@ -31,8 +31,10 @@ import io.metaloom.graph.server.wire.WireServerOptions;
  * <p>
  * The variables are declared once in {@link #VARIABLES}, which is what both the reading and the {@code --help} output
  * are generated from — a variable that is read and not documented, or documented and not read, is the failure this
- * shape rules out. There is no {@code sensitive} marker on them because nothing in this system is a credential:
- * neither port has authentication, which {@code spec/OPERATIONS.md §9} states rather than hides.
+ * shape rules out. One of them, {@code GRAPH_INITIAL_PASSWORD}, <b>is</b> a credential and is marked
+ * {@link EnvVar#sensitive}: {@code --help} describes it and nothing here ever prints its value, including
+ * {@link #toString()}. This paragraph used to say that nothing in this system was a credential, which stopped being
+ * true when {@code spec/AUTH.md} was built.
  * </p>
  *
  * @param root
@@ -94,12 +96,24 @@ import io.metaloom.graph.server.wire.WireServerOptions;
  *            {@code allowWrite}</b>: a backup is a read, but it is the read that hands over every byte of a database
  *            in a single request, which on a port with no authentication is its own decision — the same reasoning
  *            that gives {@code allowDrop} a flag of its own
+ * @param auth
+ *            whether a request has to say who it is. <b>On by default</b>, unlike every capability flag here, because
+ *            this is the one setting whose unsafe value is the one somebody gets by not thinking about it. It composes
+ *            with the flags above rather than replacing them: a request needs the privilege <b>and</b> the flag, so
+ *            turning this on can never widen what a deployment is able to do — {@code spec/AUTH.md} section 5
+ * @param initialPassword
+ *            the first administrator's password, used <b>only</b> when there is no identity file yet. Ignored, with a
+ *            log line saying so, once there is one: a chart that left this set would otherwise reset the password on
+ *            every pod restart and silently undo whatever an administrator had changed it to. <b>Sensitive</b> — it is
+ *            never printed by {@code --help}, by {@link #toString()} or by anything else here
+ * @param sessionTimeoutMillis
+ *            how long a browser session may sit idle before it has to log in again
  */
 public record GraphServerOptions(Path root, int port, boolean demo, int demoAirports, long queryTimeoutMillis,
 	long slowQueryMillis, boolean wire, int wirePort, String wireHost, int maxConcurrentStreams,
 	boolean metrics, int metricsPort, boolean mcp, int mcpPort, String mcpHost,
 	String database, boolean allowDrop, boolean allowWrite, boolean allowLoadCsv, Path importDir,
-	boolean allowBackup) {
+	boolean allowBackup, boolean auth, String initialPassword, long sessionTimeoutMillis) {
 
 	static final int DEFAULT_PORT = 8080;
 
@@ -130,6 +144,17 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 
 	public static final int DEFAULT_MCP_PORT = 8083;
 
+	/**
+	 * Thirty minutes of inactivity before a session has to log in again.
+	 *
+	 * <p>
+	 * Long enough that reading a result and coming back to the editor does not sign somebody out, short enough that an
+	 * unattended browser is not a standing credential. An absolute cap applies as well, in {@code SessionTable}, so a
+	 * client polling every minute cannot hold one indefinitely.
+	 * </p>
+	 */
+	public static final long DEFAULT_SESSION_TIMEOUT_MILLIS = 30 * 60 * 1000L;
+
 	/** The same reasoning as {@link WireServerOptions#DEFAULT_HOST}, and deliberately the same value. */
 	public static final String DEFAULT_MCP_HOST = WireServerOptions.DEFAULT_HOST;
 
@@ -144,7 +169,12 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 	 * set that is actually read.
 	 * </p>
 	 */
-	public record EnvVar(String name, String description) {
+	public record EnvVar(String name, String description, boolean sensitive) {
+
+		/** Most variables are not credentials; the one that is says so. */
+		public EnvVar(String name, String description) {
+			this(name, description, false);
+		}
 	}
 
 	/** Every variable this server reads, in the order {@code --help} prints them. */
@@ -171,7 +201,13 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 		new EnvVar("GRAPH_MCP_HOST", "What the MCP port binds. Loopback by default."),
 		new EnvVar("GRAPH_ALLOW_LOAD_CSV", "Accept LOAD CSV. Off by default, and needs GRAPH_IMPORT_DIR. true/false."),
 		new EnvVar("GRAPH_IMPORT_DIR", "The one directory LOAD CSV may read, and the whole of what it may read."),
-		new EnvVar("GRAPH_ALLOW_BACKUP", "Serve GET /api/databases/<name>/backup. Off by default. true/false."));
+		new EnvVar("GRAPH_ALLOW_BACKUP", "Serve GET /api/databases/<name>/backup. Off by default. true/false."),
+		new EnvVar("GRAPH_AUTH_ENABLED", "Require a login on the HTTP, binary and MCP ports. ON by default. "
+			+ "true/false."),
+		new EnvVar("GRAPH_INITIAL_PASSWORD", "The first administrator's password, used only when there is no "
+			+ "identity file yet. Ignored afterwards. Set it from a Secret, never inline.", true),
+		new EnvVar("GRAPH_SESSION_TIMEOUT_MILLIS", "How long a browser session may sit idle before it has to log "
+			+ "in again."));
 
 	public GraphServerOptions {
 		if (wireHost == null || wireHost.isBlank()) {
@@ -193,6 +229,38 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 			throw new IllegalArgumentException("--import-dir was given but --allow-load-csv was not, so LOAD CSV "
 				+ "would still be refused. Pass both, or neither");
 		}
+		// The same shape as the pair above, and the more dangerous of the two misunderstandings it guards: a chart
+		// that sets a password on a server with authentication switched off reads as protected and is not.
+		if (!auth && initialPassword != null) {
+			throw new IllegalArgumentException("An initial password was given but authentication is off, so nothing "
+				+ "would ever ask for it. Drop --no-auth, or drop the password");
+		}
+		if (sessionTimeoutMillis < 0) {
+			throw new IllegalArgumentException("A session timeout must not be negative, was " + sessionTimeoutMillis);
+		}
+	}
+
+	/**
+	 * Everything except the password.
+	 *
+	 * <p>
+	 * A record's generated {@code toString} prints every component, which would put a credential into any log line,
+	 * exception message or debugger view that touched this object. Overriding it is the only way to make that
+	 * impossible rather than merely unlikely, and {@code GraphServerOptionsTest} asserts it.
+	 * </p>
+	 */
+	@Override
+	public String toString() {
+		return "GraphServerOptions[root=" + root + ", port=" + port + ", demo=" + demo
+			+ ", demoAirports=" + demoAirports + ", queryTimeoutMillis=" + queryTimeoutMillis
+			+ ", slowQueryMillis=" + slowQueryMillis + ", wire=" + wire + ", wirePort=" + wirePort
+			+ ", wireHost=" + wireHost + ", maxConcurrentStreams=" + maxConcurrentStreams
+			+ ", metrics=" + metrics + ", metricsPort=" + metricsPort + ", mcp=" + mcp + ", mcpPort=" + mcpPort
+			+ ", mcpHost=" + mcpHost + ", database=" + database + ", allowDrop=" + allowDrop
+			+ ", allowWrite=" + allowWrite + ", allowLoadCsv=" + allowLoadCsv + ", importDir=" + importDir
+			+ ", allowBackup=" + allowBackup + ", auth=" + auth
+			+ ", initialPassword=" + (initialPassword == null ? "<unset>" : "<set>")
+			+ ", sessionTimeoutMillis=" + sessionTimeoutMillis + "]";
 	}
 
 	/** Parses the command line against the real environment. */
@@ -235,6 +303,11 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 		boolean allowLoadCsv = false;
 		Path importDir = null;
 		boolean allowBackup = false;
+		// The one default here that is not "off". Authentication is the setting whose unsafe value is the one an
+		// operator gets by not thinking about it, so not thinking about it has to be the safe outcome.
+		boolean auth = true;
+		String initialPassword = null;
+		long sessionTimeout = DEFAULT_SESSION_TIMEOUT_MILLIS;
 		int positional = 0;
 
 		// The environment first, so that every flag below overwrites it rather than the other way round.
@@ -263,6 +336,15 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 		}
 		if ((value = read(env, "GRAPH_ALLOW_BACKUP")) != null) {
 			allowBackup = parseBoolean(value, "GRAPH_ALLOW_BACKUP");
+		}
+		if ((value = read(env, "GRAPH_AUTH_ENABLED")) != null) {
+			auth = parseBoolean(value, "GRAPH_AUTH_ENABLED");
+		}
+		if ((value = read(env, "GRAPH_INITIAL_PASSWORD")) != null) {
+			initialPassword = value;
+		}
+		if ((value = read(env, "GRAPH_SESSION_TIMEOUT_MILLIS")) != null) {
+			sessionTimeout = parseMillis(value, "GRAPH_SESSION_TIMEOUT_MILLIS");
 		}
 		if ((value = read(env, "GRAPH_DEMO")) != null) {
 			demo = parseBoolean(value, "GRAPH_DEMO");
@@ -346,6 +428,12 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 				allowWrite = true;
 			} else if (argument.equals("--allow-backup")) {
 				allowBackup = true;
+			} else if (argument.equals("--no-auth")) {
+				auth = false;
+			} else if (argument.startsWith("--initial-password=")) {
+				initialPassword = argument.substring("--initial-password=".length());
+			} else if (argument.startsWith("--session-timeout=")) {
+				sessionTimeout = parseMillis(argument.substring("--session-timeout=".length()), "--session-timeout");
 			} else if (argument.equals("--allow-load-csv")) {
 				allowLoadCsv = true;
 			} else if (argument.startsWith("--import-dir=")) {
@@ -372,7 +460,7 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 
 		return new GraphServerOptions(store, port, demo, airports, queryTimeout, slowQuery, wire, wirePort, wireHost,
 			streams, metrics, metricsPort, mcp, mcpPort, mcpHost, database, allowDrop, allowWrite, allowLoadCsv,
-			importDir, allowBackup);
+			importDir, allowBackup, auth, initialPassword, sessionTimeout);
 	}
 
 	private static String read(UnaryOperator<String> env, String name) {
@@ -474,7 +562,13 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 	static String usage() {
 		StringBuilder environment = new StringBuilder();
 		for (EnvVar variable : VARIABLES) {
-			environment.append("  ").append(variable.name()).append('\n');
+			environment.append("  ").append(variable.name());
+			if (variable.sensitive()) {
+				// Marked in the help rather than silently treated differently, so an operator can see which one needs
+				// a Secret rather than a plain value in a manifest.
+				environment.append("   (a credential: set it from a secret, never inline)");
+			}
+			environment.append('\n');
 			environment.append("        ").append(variable.description()).append('\n');
 		}
 		return """
@@ -486,9 +580,20 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 			  --database=<name>     The database a request that does not name one gets. Created at
 			                        startup if it is not there. Letters, digits, '-' and '_'.
 			                        (default: %s)
-			  --allow-write         Accept CREATE, SET, REMOVE and DELETE queries. Off by default:
-			                        no port has authentication, so enabling this hands anything
-			                        that can reach the server the ability to change and delete data.
+			  --no-auth             Do not require a login on any port. Authentication is ON by
+			                        default. With it off every request is anonymous, and the flags
+			                        below are the only thing bounding what a peer can do.
+			  --initial-password=<pw>
+			                        The first administrator's password, used only when there is no
+			                        identity file yet and ignored once there is. Without it one is
+			                        generated and printed to stdout, once. Prefer the environment
+			                        variable: an argument is visible in 'ps' to every other user.
+			  --session-timeout=<ms>
+			                        How long a browser session may sit idle. (default: %d)
+			  --allow-write         Accept CREATE, SET, REMOVE and DELETE queries. Off by default,
+			                        and a separate question from who is asking: a request needs the
+			                        privilege AND this flag, so this bounds the whole deployment
+			                        whatever anybody has been granted.
 			  --allow-drop          Enable DELETE /api/databases/<name>, which deletes a database and
 			                        everything in it. Off by default, and separate from --allow-write:
 			                        it destroys a whole database in one request, including ones no
@@ -535,13 +640,22 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 			The HTTP port serves the browser UI and /api/query, which materialises a whole result as
 			JSON. The binary port streams rows as they are produced; use graph-client to read it.
 
-			No port has authentication or transport security. The binary and MCP ports bind loopback
-			for that reason; the HTTP and monitoring ports do not.
+			The HTTP, binary and MCP ports require a login unless --no-auth is given. The monitoring
+			port never does: a kubelet probe and a Prometheus scrape carry no credential, and a probe
+			failing over a misconfigured secret would turn that into a restart loop. Do not publish it
+			anyway - a scrape carries database names, node counts and store sizes.
+
+			There is no transport security on any port, so a password crosses in cleartext. Put TLS in
+			front of it, or keep it on a network you trust. The binary and MCP ports bind loopback.
+
+			A privilege and a flag answer different questions: --allow-write and its neighbours bound
+			what this SERVER will ever do, a grant bounds what one USER may do within that, and both
+			have to permit.
 
 			The demo graph is an air route network: airports in cities in countries, airlines with
 			hubs, and routes between airports carrying distance, duration and flight number. See
 			spec/CYPHER.md for queries to try.
-			""".formatted(GraphDatabases.DEFAULT_NAME, DemoData.TINY, DemoData.SMALL, DemoData.MEDIUM,
+			""".formatted(GraphDatabases.DEFAULT_NAME, DEFAULT_SESSION_TIMEOUT_MILLIS, DemoData.TINY, DemoData.SMALL, DemoData.MEDIUM,
 				DemoData.LARGE, DEFAULT_QUERY_TIMEOUT_MILLIS, DEFAULT_SLOW_QUERY_MILLIS, Protocol.DEFAULT_PORT,
 				WireServerOptions.DEFAULT_HOST, DEFAULT_MAX_CONCURRENT_STREAMS, DEFAULT_METRICS_PORT,
 				DEFAULT_MCP_PORT, DEFAULT_MCP_HOST, environment);

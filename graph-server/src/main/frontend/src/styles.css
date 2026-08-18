@@ -740,3 +740,147 @@ table.results tr:hover td {
 .number {
   font-variant-numeric: tabular-nums;
 }
+
+/* ---------------------------------------------------------------- the login screen
+
+   Its own full-page layout rather than a dialog over the app, because while nobody is signed in there is nothing
+   behind it: every API call the app makes on mount comes back 401. */
+
+.loginScreen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  background: var(--bg, #12141a);
+}
+
+.loginCard {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  width: min(24rem, 90vw);
+  padding: 2rem;
+  border: 1px solid var(--border, #2a2f3a);
+  border-radius: 6px;
+  background: var(--panel, #191c24);
+}
+
+.loginCard h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.1rem;
+}
+
+.loginHint {
+  margin: 0 0 0.75rem;
+  color: var(--muted, #8b93a7);
+  font-size: 0.85rem;
+}
+
+.loginCard label {
+  font-size: 0.8rem;
+  color: var(--muted, #8b93a7);
+}
+
+.loginCard input {
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--border, #2a2f3a);
+  border-radius: 4px;
+  background: var(--bg, #12141a);
+  color: inherit;
+  font: inherit;
+}
+
+.loginCard button {
+  margin-top: 0.75rem;
+  padding: 0.45rem;
+  cursor: pointer;
+}
+
+.loginError {
+  margin: 0.5rem 0 0;
+  color: var(--error, #ff6b6b);
+  font-size: 0.85rem;
+}
+
+.loginFooter {
+  margin: 1rem 0 0;
+  color: var(--muted, #8b93a7);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+.loginFooter code {
+  font-size: 0.72rem;
+  word-break: break-all;
+}
+
+/* ---------------------------------------------------------------- who is signed in */
+
+.signedInAs {
+  color: var(--muted, #8b93a7);
+  font-size: 0.85rem;
+}
+
+/* ---------------------------------------------------------------- users and roles */
+
+.userPanel {
+  flex: 1;
+  padding: 1rem 1.5rem;
+  overflow: auto;
+}
+
+.userPanel h2 {
+  margin-top: 0;
+  font-size: 1rem;
+}
+
+.panelSection {
+  margin-bottom: 2rem;
+}
+
+.panelSection h3 {
+  font-size: 0.85rem;
+  color: var(--muted, #8b93a7);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.userPanel ul {
+  list-style: none;
+  padding-left: 0;
+}
+
+.userPanel li {
+  padding: 0.35rem 0;
+}
+
+.grantList {
+  margin: 0.25rem 0 0.25rem 1.5rem;
+}
+
+.disabledBadge {
+  color: var(--error, #ff6b6b);
+  font-size: 0.8rem;
+}
+
+.userRoles {
+  color: var(--muted, #8b93a7);
+  font-size: 0.8rem;
+}
+
+.newRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.5rem;
+}
+
+.panelError {
+  color: var(--error, #ff6b6b);
+  font-size: 0.85rem;
+}
+
+.panelHint {
+  color: var(--muted, #8b93a7);
+  font-size: 0.85rem;
+}

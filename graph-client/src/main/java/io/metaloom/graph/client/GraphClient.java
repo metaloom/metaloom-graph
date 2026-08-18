@@ -11,6 +11,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
+import io.metaloom.graph.protocol.Credentials;
 import io.metaloom.graph.protocol.FrameReader;
 import io.metaloom.graph.protocol.Frames;
 import io.metaloom.graph.protocol.Protocol;
@@ -130,8 +131,19 @@ public final class GraphClient implements AutoCloseable {
 	 *            the database this connection is bound to. Worth echoing rather than assuming: a client that sent
 	 *            {@code ""} asked for the server's default and has no other way to find out which one that was
 	 */
-	public record Welcome(int version, int maxFrameBytes, int maxConcurrentStreams, String database) {
+	public record Welcome(int version, int maxFrameBytes, int maxConcurrentStreams, String database,
+		String principal, List<String> grants) {
+
+		public Welcome {
+			grants = List.copyOf(grants);
+		}
+
+		/** True when the server asked who this connection was and accepted the answer. */
+		public boolean authenticated() {
+			return principal != null && !principal.isEmpty();
+		}
 	}
+
 
 	private GraphClient(Vertx vertx, boolean ownsVertx, NetClient netClient, NetSocket socket, ClientOptions options) {
 		this.vertx = vertx;
@@ -171,6 +183,25 @@ public final class GraphClient implements AutoCloseable {
 	 */
 	public static GraphClient connect(String host, int port, ClientOptions options) {
 		return connect(host, port, DEFAULT_DATABASE, options);
+	}
+
+	/**
+	 * Connects and logs in.
+	 *
+	 * <p>
+	 * The credentials are presented during the handshake rather than afterwards, and there is deliberately no
+	 * {@code client.login(...)} to call on an open connection. A connection whose principal could change mid-flight
+	 * would be one whose open read views outlive their subject — the same argument {@link Protocol} makes for fixing
+	 * the database at the handshake. Ask {@link #server()} who this connection turned out to be.
+	 * </p>
+	 *
+	 * <p>
+	 * The password is only sent if the server asks for it: against a server running with {@code --no-auth} the
+	 * handshake completes without it ever leaving this process.
+	 * </p>
+	 */
+	public static GraphClient login(String host, int port, String database, String user, String password) {
+		return connect(host, port, database, ClientOptions.defaults().withCredentials(user, password));
 	}
 
 	public static GraphClient connect(String host, int port, String database, ClientOptions options) {
@@ -216,6 +247,7 @@ public final class GraphClient implements AutoCloseable {
 		}
 
 		GraphClient client = new GraphClient(vertx, ownsVertx, netClient, socket, options);
+		client.credentials = options.credentials();
 		client.start(database);
 		try {
 			client.server = client.handshake.get(timeoutMillis, TimeUnit.MILLISECONDS);
@@ -235,6 +267,9 @@ public final class GraphClient implements AutoCloseable {
 		}
 		return client;
 	}
+
+	/** Held between HELLO and AUTH, because the server only asks for them after it has seen the version. */
+	private Credentials credentials;
 
 	private void start(String database) {
 		socket.closeHandler(v -> connectionLost(new GraphClientException("The server closed the connection")));
@@ -366,7 +401,34 @@ public final class GraphClient implements AutoCloseable {
 				int maxStreams = reader.i32();
 				String resolved = WireValueCodec.expect(WireValueCodec.decode(reader), String.class,
 					"the resolved database name");
-				handshake.complete(new Welcome(version, maxFrame, maxStreams, resolved));
+				String principal = WireValueCodec.expect(WireValueCodec.decode(reader), String.class,
+					"the principal name");
+				// Grant names as strings, decoded into nothing. The client makes no authorization decision — the
+				// server does — so it neither needs the enum nor a dependency on the module that holds it, and a
+				// client built before a privilege existed still prints it.
+				Object encoded = WireValueCodec.decode(reader);
+				List<String> grants = new java.util.ArrayList<>();
+				if (encoded instanceof List<?> list) {
+					for (Object grant : list) {
+						grants.add(String.valueOf(grant));
+					}
+				}
+				handshake.complete(new Welcome(version, maxFrame, maxStreams, resolved, principal, grants));
+			}
+			case Frames.AUTH_REQUIRED -> {
+				if (credentials == null) {
+					// A typed failure rather than a hang. This is the whole reason the server announces the
+					// requirement instead of waiting to be guessed at.
+					connectionLost(new GraphClientException("This server requires a login and no credentials were "
+						+ "given. Use GraphClient.login(...), or ClientOptions.withCredentials(...)."));
+					socket.close();
+					return;
+				}
+				WireValueCodec.Writer auth = new WireValueCodec.Writer(128);
+				auth.i32(Frames.MECHANISM_PASSWORD);
+				WireValueCodec.encode(auth, credentials.user());
+				WireValueCodec.encode(auth, credentials.password());
+				socket.write(Frames.frame(Frames.AUTH, Frames.CONNECTION_STREAM, auth));
 			}
 			case Frames.COLUMNS -> {
 				RowStream stream = streams.get(streamId);

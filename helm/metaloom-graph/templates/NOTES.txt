@@ -3,17 +3,54 @@
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "graph.fullname" . }} 8080:{{ .Values.service.httpPort }}
   open http://localhost:8080
 
-  curl -XPOST localhost:8080/api/query -H 'content-type: application/json' \
-    -d '{"query":"MATCH (n) RETURN n LIMIT 10"}'
+{{ if .Values.auth.enabled -}}
+AUTHENTICATION IS ON.
 
+{{ if or .Values.auth.initialPassword .Values.auth.existingSecret -}}
+  The first administrator's password came from a Secret. Sign in as 'admin'.
+{{- else -}}
+  A password for 'admin' was generated on first start and printed to the container log. It is shown
+  once and stored nowhere else, so read it now -- and treat it as exposed, because the log is:
+
+    kubectl -n {{ .Release.Namespace }} logs {{ include "graph.fullname" . }}-0 | grep -A4 'password:'
+
+  Then change it, either by setting auth.initialPassword from a Secret on a fresh install or with:
+
+    kubectl -n {{ .Release.Namespace }} exec {{ include "graph.fullname" . }}-0 -- \
+      metaloom-graph-cli auth reset-admin --path=/data
+{{- end }}
+
+  Log in and query:
+
+    curl -c jar -XPOST localhost:8080/api/login -H 'content-type: application/json' \
+      -d '{"user":"admin","password":"<the password>"}'
+    curl -b jar -XPOST localhost:8080/api/query -H 'content-type: application/json' \
+      -d '{"query":"MATCH (n) RETURN n LIMIT 10"}'
+
+  There is NO TRANSPORT SECURITY, so that password crosses in cleartext. Put TLS in front of the
+  Service, or keep it inside the cluster.
+
+  A session is valid only on the pod that issued it, and a restart logs everyone out. With more than
+  one replica, a client has to be pinned to a pod.
+
+  The monitoring port ({{ .Values.service.metricsPort }}) is deliberately NOT authenticated: a kubelet
+  probe and a Prometheus scrape carry no credential. Do not publish it -- a scrape carries database
+  names, node counts and store sizes.
+{{- else -}}
 THERE IS NO AUTHENTICATION ON ANY PORT.
 
-  There is no password to set and no secret in this chart, because the server has no concept of a
-  user. Anything that can reach the Service can read every database under the root. Access control
-  has to come from somewhere else: a NetworkPolicy, an authenticating proxy, or not exposing it.
+  auth.enabled is false, so anything that can reach the Service can read every database under the
+  root. Access control has to come from somewhere else: a NetworkPolicy, an authenticating proxy, or
+  not exposing it. Set auth.enabled=true to require a login.
+
+  curl -XPOST localhost:8080/api/query -H 'content-type: application/json' \
+    -d '{"query":"MATCH (n) RETURN n LIMIT 10"}'
+{{- end }}
 
 {{ if .Values.graph.allowWrite -}}
-  graph.allowWrite is ON. Anything that can reach this Service can also change and delete data.
+  graph.allowWrite is ON. {{ if .Values.auth.enabled }}A user still needs the matching privilege --
+  the flag and the grant both have to permit -- but this bounds nothing on its own.{{ else }}Anything
+  that can reach this Service can also change and delete data.{{ end }}
 {{- else -}}
   Writes are off. CREATE, SET, REMOVE and DELETE are refused with 403. Set graph.allowWrite=true to
   enable them, having read the paragraph above.

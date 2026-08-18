@@ -9,6 +9,7 @@ import java.util.Map;
 import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.ReadTransaction;
 import io.metaloom.graph.core.api.Transaction;
+import io.metaloom.graph.core.api.TransactionConflictException;
 import io.metaloom.graph.cypher.ast.Ast;
 import io.metaloom.graph.cypher.exec.GraphAccess;
 import io.metaloom.graph.cypher.exec.QueryExecutor;
@@ -239,26 +240,51 @@ public final class Cypher {
 			writeInBatches(store, parsed, parameters, sink, abort, csv);
 			return;
 		}
-		// begin() does not refuse to nest, and a nested transaction is not caught but silently ruinous: committing the
-		// inner one clears the overlay, after which the outer one's writes bypass the log entirely.
-		Transaction txn = store.hasWriteTransaction() ? null : store.begin();
-		try {
-			QueryExecutor.Result result = new QueryExecutor(new GraphAccess(store, abort), parameters, csv)
-				.run(parsed);
-			if (txn != null) {
+		if (store.hasWriteTransaction()) {
+			// The caller's transaction. Their commit, their conflict: this query is part of a unit of work somebody
+			// else is assembling, so it neither commits nor retries.
+			deliver(new QueryExecutor(new GraphAccess(store, abort), parameters, csv).run(parsed), sink, abort);
+			return;
+		}
+		// Its own transaction, and therefore its own conflicts to absorb.
+		//
+		// A write query is one statement. Writers run concurrently, so two of them touching the same node — or, far
+		// more often, inserting into the same index leaf — collide, and the commit of the loser is refused. There is
+		// nothing for the caller to reconsider about a single query, so it is re-run against the newer state, which is
+		// the same bargain store.setNodeProperties() makes for a single mutation. Progress is guaranteed: a conflict
+		// has a winner, so each attempt runs with one fewer competitor.
+		//
+		// Re-running is safe because the query has produced nothing yet — a write query commits before it delivers a
+		// row, which is the property the javadoc above is built on — and because a refused transaction has written no
+		// log record and touched no data file.
+		TransactionConflictException conflict = null;
+		for (int attempt = 0; attempt < WRITE_CONFLICT_ATTEMPTS; attempt++) {
+			try (Transaction txn = store.begin()) {
+				QueryExecutor.Result result = new QueryExecutor(new GraphAccess(store, abort), parameters, csv)
+					.run(parsed);
 				txn.commit();
-			}
-			deliver(result, sink, abort);
-			// Nothing streams here by design; see the javadoc above.
-		} catch (IOException e) {
-			throw new UncheckedIOException(e);
-		} finally {
-			// Rolls back when commit() was not reached, which is every failure path including an abort mid-scan.
-			if (txn != null) {
-				txn.close();
+				deliver(result, sink, abort);
+				// Nothing streams here by design; see the javadoc above.
+				return;
+			} catch (TransactionConflictException e) {
+				conflict = e;
+				java.util.concurrent.locks.LockSupport.parkNanos(Math.min(5_000_000L, 50_000L << Math.min(attempt, 7)));
+			} catch (IOException e) {
+				throw new UncheckedIOException(e);
 			}
 		}
+		throw conflict;
 	}
+
+	/**
+	 * How many times a write query re-runs itself after losing a conflict.
+	 *
+	 * <p>
+	 * Generous rather than unlimited: a store under more contention than this has a problem that a retry loop should
+	 * surface rather than absorb.
+	 * </p>
+	 */
+	private static final int WRITE_CONFLICT_ATTEMPTS = 64;
 
 	/** The batch size of a {@code USING PERIODIC COMMIT} query, or 0. Only a single-part query can carry one. */
 	private static int periodicCommitOf(Ast.Query parsed) {

@@ -17,6 +17,9 @@ import io.metaloom.graph.core.api.ConstraintViolationException;
 import io.metaloom.graph.core.api.GraphDatabases;
 import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.GraphStoreException;
+import io.metaloom.graph.core.api.AuthStore;
+import io.metaloom.graph.core.api.Principal;
+import io.metaloom.graph.core.api.Privilege;
 import io.metaloom.graph.core.api.StoreStats;
 import io.metaloom.graph.core.nativelib.NativeCapabilities;
 import io.metaloom.graph.cli.dump.GraphBackup;
@@ -38,6 +41,9 @@ import io.metaloom.graph.server.mcp.McpConstants;
 import io.metaloom.graph.server.mcp.McpJsonRpcHandler;
 import io.metaloom.graph.server.mcp.McpServer;
 import io.metaloom.graph.server.mcp.tool.GraphMcpTools;
+import io.metaloom.graph.server.auth.AuthPolicy;
+import io.metaloom.graph.server.auth.Bootstrap;
+import io.metaloom.graph.server.auth.AuthRoutes;
 import io.metaloom.graph.server.metrics.GraphMetrics;
 import io.metaloom.graph.server.metrics.MicrometerGraphMetrics;
 import io.metaloom.graph.server.metrics.StoreMetricsBinder;
@@ -140,6 +146,17 @@ public final class GraphServer implements AutoCloseable {
 
 	/** Whether GET /api/databases/{name}/backup exists. Off unless an operator asked for it. */
 	private boolean allowBackup;
+
+	/**
+	 * Who a request is from, and whether that is even asked.
+	 *
+	 * <p>
+	 * {@link AuthPolicy#disabled()} until {@link #authPolicy} says otherwise, so every constructor and every existing
+	 * embedder gets the behaviour it had before authentication existed. {@link #main} is the only caller that turns it
+	 * on, which is what keeps "on by default" a property of the command line rather than of the API.
+	 * </p>
+	 */
+	private AuthPolicy auth = AuthPolicy.disabled();
 	/** Past this, a query is abandoned rather than allowed to hold a worker thread and a read view indefinitely. */
 	private final long queryTimeoutMillis;
 	/** How long an abandoned query is given to unwind before the stores are closed regardless. */
@@ -222,6 +239,25 @@ public final class GraphServer implements AutoCloseable {
 		this.allowBackup = allowBackup;
 	}
 
+	/**
+	 * Requires a login on this front end.
+	 *
+	 * <p>
+	 * A setter for the same reason {@link #csvSource} and {@link #allowBackup} are: the four constructors are a public
+	 * surface that several tests and embedders already use, and adding a parameter to them would make every one of
+	 * those call sites choose something about authentication. Not calling this leaves every request anonymous and
+	 * permitted, which is what those callers already had.
+	 * </p>
+	 */
+	public void authPolicy(AuthPolicy policy) {
+		this.auth = policy == null ? AuthPolicy.disabled() : policy;
+	}
+
+	/** The policy, for the wire and MCP front ends that share this server's identity store. */
+	public AuthPolicy authPolicy() {
+		return auth;
+	}
+
 	public void csvSource(CsvSource csv) {
 		this.csv = csv == null ? CsvSource.DENY : csv;
 		this.allowLoadCsv = this.csv != CsvSource.DENY;
@@ -259,6 +295,19 @@ public final class GraphServer implements AutoCloseable {
 		}
 		seedIfAsked(databases.database(options.database()), options);
 
+		// Before any port binds. A server that opened its listeners and then discovered it had nobody who could log in
+		// would be answering requests it could not serve, and a refusal here is one an operator can act on.
+		AuthPolicy authPolicy = AuthPolicy.disabled();
+		if (options.auth()) {
+			AuthStore identities = AuthStore.open(options.root());
+			Bootstrap.ensureAdministrator(identities, options.initialPassword(), System.out);
+			authPolicy = AuthPolicy.enabled(identities, options.sessionTimeoutMillis());
+			logger.info("Authentication is on. The identity file is {}", identities.path());
+		} else {
+			logger.warn("Authentication is OFF (--no-auth). Every request is anonymous and may do anything the "
+				+ "capability flags allow.");
+		}
+
 		// The registry is built BEFORE Vert.x and handed to it. That order is the whole trick: Vert.x instruments its
 		// own event loops, pools and HTTP servers into whatever registry it is given at construction, and a registry
 		// created afterwards gets the application's meters and none of the runtime's.
@@ -293,6 +342,7 @@ public final class GraphServer implements AutoCloseable {
 		GraphServer server = new GraphServer(vertx, databases, options.database(), true,
 			options.queryTimeoutMillis(), options.allowDrop(), options.allowWrite());
 		server.slowQueryMillis = options.slowQueryMillis();
+		server.authPolicy(authPolicy);
 		server.allowBackup(options.allowBackup());
 		if (options.allowLoadCsv()) {
 			// Constructed here rather than lazily, so an unreadable or missing import directory is a start-up failure
@@ -328,6 +378,9 @@ public final class GraphServer implements AutoCloseable {
 			wire.csvSource(server.csv);
 			int wirePort = wire.listen().toCompletionStage().toCompletableFuture().join();
 			logger.info("Binary streaming port on {}:{} — see graph-client", wire.options().host(), wirePort);
+			// The same policy object as the HTTP front end, so one identity store backs every port and a reset is seen
+			// by all of them at once.
+			wire.authPolicy(server::authPolicy);
 			wire.instrument(metrics, options.slowQueryMillis());
 			server.wire = wire;
 		}
@@ -335,8 +388,9 @@ public final class GraphServer implements AutoCloseable {
 		if (options.mcp()) {
 			McpServer mcp = new McpServer(vertx,
 				new McpJsonRpcHandler(GraphMcpTools.all(vertx, databases, options.database(), options.allowWrite(),
-					options.queryTimeoutMillis()), options.allowWrite(), metrics),
+					options.queryTimeoutMillis()), options.allowWrite(), metrics, options.database()),
 				options.mcpHost());
+			mcp.authPolicy(server::authPolicy);
 			int mcpPort = mcp.listen(options.mcpPort()).toCompletionStage().toCompletableFuture().join();
 			logger.info("MCP on http://{}:{}{} (and {}) — {}", options.mcpHost(), mcpPort, McpConstants.SSE_PATH,
 				McpConstants.WEBSOCKET_PATH, options.allowWrite() ? "writable" : "read-only");
@@ -391,6 +445,12 @@ public final class GraphServer implements AutoCloseable {
 	public Future<Integer> listen(int port) {
 		Router router = Router.router(vertx);
 		router.route().handler(BodyHandler.create().setBodyLimit(1 << 20));
+
+		// Before every other /api route, because Vert.x matches in order and a filter that ran after them would not be
+		// one. Mounted on /api/* only: the login page is served by StaticHandler from this same origin, and a filter
+		// over /* would refuse the bundle to a browser that has not logged in yet — a blank page, no error, nothing in
+		// the log.
+		new AuthRoutes(this::authPolicy, vertx).mount(router);
 
 		router.post("/api/query").handler(this::query);
 		router.get("/api/stats").handler(this::stats);
@@ -460,6 +520,15 @@ public final class GraphServer implements AutoCloseable {
 			metrics.recordQuery("http", "unknown", outcomeOf(e), 0, 0);
 			respondToFailure(context, e);
 			return;
+		}
+
+		// What the query needs, before what the server permits. Both have to say yes, and this order is what decides
+		// which refusal a caller sees: somebody who simply lacks MERGE is told that, rather than being advised to
+		// restart the server with --allow-write, which is not a change they can make and would not help if they did.
+		for (Privilege privilege : parsed.requiredPrivileges()) {
+			if (!permit(context, privilege)) {
+				return;
+			}
 		}
 
 		// Refused here, on the event loop, for the same reason a syntax error is: the tree already knows whether the
@@ -651,6 +720,11 @@ public final class GraphServer implements AutoCloseable {
 	 * </p>
 	 */
 	private void schema(RoutingContext context) {
+		// INTROSPECT rather than MATCH: this is a scan of every label and relationship type in the store, which is a
+		// different disclosure from a query somebody wrote themselves.
+		if (!permit(context, Privilege.INTROSPECT)) {
+			return;
+		}
 		boolean refresh = "true".equals(context.request().getParam("refresh"));
 		SchemaScanner scanner;
 		try {
@@ -665,6 +739,9 @@ public final class GraphServer implements AutoCloseable {
 	}
 
 	private void stats(RoutingContext context) {
+		if (!permit(context, Privilege.INTROSPECT)) {
+			return;
+		}
 		GraphStore store;
 		String name;
 		try {
@@ -712,6 +789,34 @@ public final class GraphServer implements AutoCloseable {
 		return lookup(nameFor(context));
 	}
 
+	/**
+	 * Whether this request may do {@code privilege} to the database it named.
+	 *
+	 * <p>
+	 * Answers the refusal itself and returns false, so a handler reads
+	 * {@code if (!permit(context, Privilege.MATCH)) { return; }} — one line, and the same line everywhere. With
+	 * authentication off the principal is {@code ANONYMOUS} and this is always true, so the shape does not change
+	 * between the two configurations.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>This is not the whole gate.</b> The capability flags are checked separately and first; see
+	 * {@code spec/AUTH.md} section 5 for why a grant can never widen what the flags allow.
+	 * </p>
+	 */
+	private boolean permit(RoutingContext context, Privilege privilege) {
+		return permit(context, privilege, nameFor(context));
+	}
+
+	private boolean permit(RoutingContext context, Privilege privilege, String database) {
+		if (AuthRoutes.principal(context).may(privilege, database)) {
+			return true;
+		}
+		metrics.recordQueryRejected("http", "forbidden");
+		AuthRoutes.forbidden(context, privilege, database);
+		return false;
+	}
+
 	private SchemaScanner scannerFor(RoutingContext context) {
 		String name = nameFor(context);
 		GraphStore store = lookup(name);
@@ -748,11 +853,25 @@ public final class GraphServer implements AutoCloseable {
 	 * The counts come from stores that are already open; a database nobody has touched is listed without them rather
 	 * than opened to find out. Listing a root of fifty databases should not map fifty sets of segment files.
 	 * </p>
+	 *
+	 * <h2>Filtered, not refused</h2>
+	 *
+	 * <p>
+	 * A principal sees the databases they hold any privilege on, and the route itself needs none. That is why there is
+	 * no {@code LIST_DATABASES} privilege: refusing the whole list would leave a picker with nothing to draw and tell
+	 * the caller nothing they could act on, while filtering answers the question they actually asked — which
+	 * databases are there <em>for me</em>. It also means the existence of a database is not disclosed to somebody who
+	 * cannot use it.
+	 * </p>
 	 */
 	private void listDatabases(RoutingContext context) {
+		Principal principal = AuthRoutes.principal(context);
 		vertx.<JsonObject>executeBlocking(() -> {
 			JsonArray array = new JsonArray();
 			for (String name : databases.names()) {
+				if (!visibleTo(principal, name)) {
+					continue;
+				}
 				JsonObject entry = new JsonObject()
 					.put("name", name)
 					.put("default", name.equals(defaultDatabase))
@@ -772,8 +891,30 @@ public final class GraphServer implements AutoCloseable {
 		}, false).onSuccess(context::json).onFailure(error -> respondToFailure(context, error));
 	}
 
+	/**
+	 * Whether a principal holds any privilege at all on a database.
+	 *
+	 * <p>
+	 * Any, rather than a specific one: the question a picker asks is "is this database mine to work with", and
+	 * somebody granted only {@code BACKUP} on it still needs to see that it is there.
+	 * </p>
+	 */
+	private static boolean visibleTo(Principal principal, String database) {
+		for (Privilege privilege : Privilege.values()) {
+			if (!privilege.isGlobalOnly() && principal.may(privilege, database)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	private void createDatabase(RoutingContext context) {
 		String name = context.pathParam("name");
+		// Scoped to the name being created, so a grant can name a database agreed in advance rather than having to be
+		// a licence to create any database at all.
+		if (!permit(context, Privilege.CREATE_DATABASE, name)) {
+			return;
+		}
 		vertx.<JsonObject>executeBlocking(() -> {
 			GraphDatabases.validate(name);
 			databases.create(name);
@@ -795,6 +936,9 @@ public final class GraphServer implements AutoCloseable {
 	 */
 	private void dropDatabase(RoutingContext context) {
 		String name = context.pathParam("name");
+		if (!permit(context, Privilege.DROP_DATABASE, name)) {
+			return;
+		}
 		if (!allowDrop) {
 			fail(context, 403, "forbidden", "This server was started without --allow-drop, so it will not delete a"
 				+ " database. Stop it and remove the directory, or restart it with the flag.");
@@ -837,6 +981,9 @@ public final class GraphServer implements AutoCloseable {
 	 * </p>
 	 */
 	private void backupDatabase(RoutingContext context) {
+		if (!permit(context, Privilege.BACKUP, context.pathParam("name"))) {
+			return;
+		}
 		if (!allowBackup) {
 			metrics.recordQueryRejected("http", "backup");
 			fail(context, 403, "backup", "This server does not serve backups. Start it with --allow-backup, which is "
@@ -944,6 +1091,9 @@ public final class GraphServer implements AutoCloseable {
 	 * </p>
 	 */
 	private void listIndexes(RoutingContext context) {
+		if (!permit(context, Privilege.INTROSPECT)) {
+			return;
+		}
 		GraphStore store;
 		String name;
 		try {
@@ -992,6 +1142,9 @@ public final class GraphServer implements AutoCloseable {
 	 * </p>
 	 */
 	private void createIndex(RoutingContext context) {
+		if (!permit(context, Privilege.CREATE_INDEX)) {
+			return;
+		}
 		JsonObject body = context.body().asJsonObject();
 		String label = body == null ? null : body.getString("label");
 		String key = body == null ? null : body.getString("key");
@@ -1038,6 +1191,9 @@ public final class GraphServer implements AutoCloseable {
 	 * </p>
 	 */
 	private void dropIndex(RoutingContext context) {
+		if (!permit(context, Privilege.DROP_INDEX)) {
+			return;
+		}
 		String label = context.pathParam("label");
 		String key = context.pathParam("key");
 		if (!allowWrite) {
@@ -1099,6 +1255,9 @@ public final class GraphServer implements AutoCloseable {
 
 	@Override
 	public void close() throws IOException {
+		// Sessions go first and unconditionally: they are in-memory credentials, and a shutdown that failed part way
+		// through should not leave them behind for whatever inherits the process.
+		auth.close();
 		shutdown(WireServer.DEFAULT_GRACE_MILLIS);
 	}
 

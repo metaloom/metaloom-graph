@@ -127,6 +127,24 @@ spec:
             - name: GRAPH_MCP_HOST
               value: {{ .Values.mcp.host | quote }}
             {{- end }}
+            # Authentication. On by default, which is the server's own default: the HTTP, binary and MCP ports then
+            # require a login and the monitoring port deliberately does not, because a kubelet probe and a scrape carry
+            # no credential and a probe failing over a misconfigured secret would be a restart loop.
+            - name: GRAPH_AUTH_ENABLED
+              value: {{ .Values.auth.enabled | quote }}
+            {{- if .Values.auth.enabled }}
+            - name: GRAPH_SESSION_TIMEOUT_MILLIS
+              value: {{ .Values.auth.sessionTimeoutMillis | quote }}
+            {{- if or .Values.auth.initialPassword .Values.auth.existingSecret }}
+            # secretKeyRef and never a literal: an env var set with `value:` is visible in `kubectl describe pod` and
+            # in /proc/<pid>/environ to anything sharing the namespace.
+            - name: GRAPH_INITIAL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret | default (printf "%s-auth" (include "graph.fullname" .)) }}
+                  key: {{ .Values.auth.secretKey }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

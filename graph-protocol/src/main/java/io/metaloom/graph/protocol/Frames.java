@@ -74,6 +74,23 @@ public final class Frames {
 	public static final int ERROR = 8;
 
 	/**
+	 * Server to client: this server wants a credential before it will say WELCOME.
+	 *
+	 * <p>
+	 * Its own frame rather than an error, because it is not one — it is the server's half of a negotiation. A client
+	 * with no credential to offer learns that immediately and fails with a message, instead of parking on a socket
+	 * waiting for a WELCOME that is never coming.
+	 * </p>
+	 */
+	public static final int AUTH_REQUIRED = 9;
+
+	/** Client to server: the credential. */
+	public static final int AUTH = 10;
+
+	/** The only mechanism there is. A second one would be a new value here rather than a new frame. */
+	public static final int MECHANISM_PASSWORD = 1;
+
+	/**
 	 * The largest frame either side will write or accept.
 	 *
 	 * <p>
@@ -132,6 +149,8 @@ public final class Frames {
 			case ROWS -> "ROWS";
 			case COMPLETE -> "COMPLETE";
 			case ERROR -> "ERROR";
+			case AUTH_REQUIRED -> "AUTH_REQUIRED";
+			case AUTH -> "AUTH";
 			default -> "frame type " + type;
 		};
 	}

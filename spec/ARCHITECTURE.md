@@ -184,12 +184,13 @@ sequential log append.
 |-------|-----------|
 | Element reads | Lock-free. Optimistic page read via the PMA `epoch`: read epoch, copy the record, re-read epoch, retry on change. |
 | Reads | No lock in the common case. The commit apply step is the only thing a reader must be excluded from, so a read runs under an optimistic `StampedLock` stamp and is repeated under a real read lock only if an apply happened underneath. **Built:** a `ReentrantReadWriteLock` here was measured making reads *slower* as threads were added — acquiring a read lock writes to a shared counter — and replacing it was worth 1.4x at two threads. |
-| Element writes | Per-page write latch (a `VarHandle` CAS on a 64-bit latch word held in an off-heap latch array, one per page). Latches are held for the duration of a memcpy, never across I/O. |
-| Transaction conflicts | Optimistic. A write records `(id -> txn)` in a striped lock table; a second writer on the same element aborts the later transaction. Detected at write time, not at commit time, to fail fast. |
+| Element writes | Per-page write latch (a `VarHandle` CAS on a 64-bit latch word held in an off-heap latch array, one per page). **Not built, and not needed:** a writer mutates a private copy of the page, so no two writers ever touch the same bytes of the mapping. |
+| Transaction conflicts | Optimistic, and **detected at commit rather than at write time**. The plan's striped `(id -> txn)` intent table would fail faster; what was built compares the byte ranges each transaction changed against the version chains of the pages it changed them on, which the engine is already keeping and which costs nothing until a commit happens. First committer wins. See [TRANSACTIONS.md §6](TRANSACTIONS.md). |
+| Writers | **Concurrent.** They exclude each other for slot allocation and for the commit point — validate, log, apply — and nothing else. Maintenance (`verify`, `checkpoint`, `reclaim`, compaction, `close`) excludes them outright, through a shared/exclusive gate writers hold shared for a transaction. |
 | WAL append | A single append lock protecting LSN allocation and buffer reservation, held for tens of nanoseconds; the copy into the buffer happens outside it. |
 | Commit | Group commit: committers queue, one thread performs the fsync for the batch. |
 | Page cache | Striped clock/LRU with per-stripe locks. Eviction never blocks a reader holding an optimistic read. |
-| Background | Checkpointer, vacuum, compactor and scrubber each run on their own single thread, coordinated through the manifest. **Built: none of them run on a thread.** Compaction is a foreground call that takes the writer lock one batch at a time, so a concurrent writer waits for one batch rather than for the whole run; `pauseBetweenBatchesMillis` widens the gap. That is the entire scheduling policy, and it keeps the caller in control of when maintenance happens. |
+| Background | Checkpointer, vacuum, compactor and scrubber each run on their own single thread, coordinated through the manifest. **Built: none of them run on a thread.** Compaction is a foreground call that excludes writers one batch at a time, so a concurrent writer waits for one batch rather than for the whole run; `pauseBetweenBatchesMillis` widens the gap. That is the entire scheduling policy, and it keeps the caller in control of when maintenance happens. |
 
 **Rule**: no lock is ever held across an I/O operation or across a call into native code that can
 block. Violating this is how a storage engine acquires unexplainable latency spikes.
@@ -336,5 +337,33 @@ exist" makes three different conditions indistinguishable.
 
 ---
 
-_Git HEAD revision: `c016a41`_
-_Last updated: 2026-08-13 (synced with the Phase 0 to 3 implementation)_
+## Identity, and where it deliberately is not
+
+Users, roles and grants live in **graph-core**: the model in `io.metaloom.graph.core.api` and the codec
+and password function in an unexported `io.metaloom.graph.core.auth`. `module-info.java` needed no
+change, because only `api` is exported.
+
+That placement is the one design decision here worth recording, and it was made against three
+alternatives:
+
+- **A new JDK-only leaf module** is the textbook layering, and was rejected as a module, a reactor entry
+  and a `ClientDependencyTest` rewrite bought in exchange for giving the client a type it never branches
+  on. graph-core wins because `GraphDatabases` already owns `<root>` and `.auth/` is a directory in it;
+  because graph-cypher already depends on graph-core's `api` package, which is what lets
+  `Ast.Query.requiredPrivileges()` return a `Set<Privilege>` with **no new dependency**; and because
+  `tools/native-image.sh` already relies on both binaries inheriting graph-core's reachability metadata,
+  which is where the JCA provider registration has to go.
+- **The storage engine enforcing it** was never on the table. `GraphStore` takes no principal and
+  consults none. Enforcement is per front end, which is the same line `--allow-write` draws.
+- **The client naming a `Privilege`** would have put graph-core on the client's classpath, which
+  `ClientDependencyTest` fails the build over. Grants cross the wire as **strings** instead, which costs
+  nothing — the client makes no authorization decision — and buys forward tolerance: a client built
+  before a privilege existed still prints it.
+
+Flip to a leaf module if a second wire-level consumer ever needs to reason *structurally* about grants,
+because at that point the string form becomes a parser in two places.
+
+---
+
+_Git HEAD revision: `da8c93e`_
+_Last updated: 2026-08-17 (authentication and RBAC authorization)_

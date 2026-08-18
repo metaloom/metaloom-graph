@@ -143,6 +143,16 @@ export class ApiError extends Error {
   get hasCaret(): boolean {
     return this.message.includes('^');
   }
+
+  /** The session is gone. The app has to show the login form again rather than render this as a failed query. */
+  get isUnauthenticated(): boolean {
+    return this.kind === 'unauthenticated';
+  }
+
+  /** Signed in, and not allowed this. Worth showing as text, because an administrator can fix it. */
+  get isForbidden(): boolean {
+    return this.kind === 'forbidden';
+  }
 }
 
 async function parse<T>(response: Response): Promise<T> {
@@ -155,7 +165,13 @@ async function parse<T>(response: Response): Promise<T> {
   }
   if (!response.ok) {
     const error = body as { error?: string; message?: string; line?: number; column?: number };
-    throw new ApiError(error.error ?? 'http', error.message ?? `${response.status} ${response.statusText}`,
+    // 401 always becomes 'unauthenticated', whatever the body said, because it is the one failure the app has to
+    // react to structurally rather than display: a session that expired mid-session has to drop back to the login
+    // screen, and it must not depend on the server having filled in an error kind.
+    const kind = response.status === 401 ? 'unauthenticated'
+      : response.status === 403 ? (error.error ?? 'forbidden')
+        : (error.error ?? 'http');
+    throw new ApiError(kind, error.message ?? `${response.status} ${response.statusText}`,
       error.line ?? 0, error.column ?? 0);
   }
   return body as T;
@@ -180,6 +196,117 @@ function scoped(path: string, database: string, extra?: string): string {
   }
   const query = params.toString();
   return query ? `${path}?${query}` : path;
+}
+
+export interface WhoAmI {
+  authEnabled: boolean;
+  authenticated: boolean;
+  user: string | null;
+  grants: string[];
+}
+
+/**
+ * Who the browser is, and whether this server even asks.
+ *
+ * Answered without a session, deliberately: it is the question the app asks before it has anything to present, and the
+ * answer decides whether a login form is drawn at all.
+ */
+export async function whoami(): Promise<WhoAmI> {
+  return parse<WhoAmI>(await fetch('api/whoami', { credentials: 'same-origin' }));
+}
+
+export async function login(user: string, password: string): Promise<WhoAmI> {
+  const response = await fetch('api/login', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ user, password })
+  });
+  const body = await parse<{ user: string; grants: string[] }>(response);
+  return { authEnabled: true, authenticated: true, user: body.user, grants: body.grants ?? [] };
+}
+
+export async function logout(): Promise<void> {
+  await parse<unknown>(await fetch('api/logout', { method: 'POST', credentials: 'same-origin' }));
+}
+
+export interface ApiUser {
+  name: string;
+  enabled: boolean;
+  roles: string[];
+  grants: string[];
+}
+
+export interface ApiRole {
+  name: string;
+  grants: string[];
+}
+
+export async function fetchUsers(): Promise<ApiUser[]> {
+  return (await parse<{ users: ApiUser[] }>(await fetch('api/users', { credentials: 'same-origin' }))).users;
+}
+
+export async function fetchRoles(): Promise<ApiRole[]> {
+  return (await parse<{ roles: ApiRole[] }>(await fetch('api/roles', { credentials: 'same-origin' }))).roles;
+}
+
+export async function createUser(name: string, password: string, roles: string[]): Promise<void> {
+  await parse<unknown>(await fetch('api/users', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name, password, roles })
+  }));
+}
+
+export async function dropUser(name: string): Promise<void> {
+  await parse<unknown>(await fetch(`api/users/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+    credentials: 'same-origin'
+  }));
+}
+
+export async function setPassword(name: string, password: string): Promise<void> {
+  await parse<unknown>(await fetch(`api/users/${encodeURIComponent(name)}/password`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ password })
+  }));
+}
+
+export async function createRole(name: string): Promise<void> {
+  await parse<unknown>(await fetch('api/roles', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name })
+  }));
+}
+
+export async function dropRole(name: string): Promise<void> {
+  await parse<unknown>(await fetch(`api/roles/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+    credentials: 'same-origin'
+  }));
+}
+
+export async function grantToRole(role: string, grant: string): Promise<void> {
+  await parse<unknown>(await fetch(`api/roles/${encodeURIComponent(role)}/grants`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ grant })
+  }));
+}
+
+export async function revokeFromRole(role: string, grant: string): Promise<void> {
+  await parse<unknown>(await fetch(`api/roles/${encodeURIComponent(role)}/grants`, {
+    method: 'DELETE',
+    credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ grant })
+  }));
 }
 
 export async function runQuery(

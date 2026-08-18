@@ -42,6 +42,14 @@ ENV GRAPH_ALLOW_DROP=false
 ENV GRAPH_ALLOW_LOAD_CSV=false
 ENV GRAPH_ALLOW_BACKUP=false
 
+# Authentication is ON, which is this server's own default and the one setting here whose unsafe value is the one
+# somebody gets by not thinking about it. On a first start with no identity file the server creates an 'admin' user and
+# prints a generated password to standard output, which in a container means the container log — so it is exposed the
+# moment it is printed, and the right move is to set GRAPH_INITIAL_PASSWORD from a secret instead.
+#
+# Deliberately NOT given a value here: a password baked into an image is a password every copy of the image shares.
+ENV GRAPH_AUTH_ENABLED=true
+
 EXPOSE 8080
 EXPOSE 8081
 EXPOSE 8082

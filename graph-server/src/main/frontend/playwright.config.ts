@@ -32,10 +32,32 @@ export default defineConfig({
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure'
   },
-  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
+  /**
+   * Signed in once, in globalSetup, and reused by every spec.
+   *
+   * Authentication is on by default now, so without this every one of the forty-odd existing specs would have to get
+   * past a login screen. A saved storageState keeps them exactly as they were.
+   */
+  globalSetup: './e2e/global-setup.ts',
+  projects: [
+    {
+      name: 'chromium',
+      testIgnore: /login\.spec\.ts/,
+      use: { ...devices['Desktop Chrome'], storageState: './e2e/.auth/state.json' }
+    },
+    {
+      // The login specs need a browser that has NOT signed in, so they get their own project with no storageState.
+      name: 'login',
+      testMatch: /login\.spec\.ts/,
+      use: { ...devices['Desktop Chrome'] }
+    }
+  ],
   webServer: {
     command: `bash ../../../../tools/demo-server.sh ../../../target/e2e-store ${PORT}`,
-    url: `http://localhost:${PORT}/api/stats`,
+    // /api/whoami rather than /api/stats: Playwright treats a status of 400 or above as not-ready, and /api/stats now
+    // requires INTROSPECT. Probing it would make an auth-enabled server never report ready and burn the whole 240s
+    // budget before failing. whoami is deliberately outside the auth filter for exactly this kind of reason.
+    url: `http://localhost:${PORT}/api/whoami`,
     reuseExistingServer: !process.env.CI,
     // A cold start compiles the module first.
     timeout: 240_000,

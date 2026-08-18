@@ -7,6 +7,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.metaloom.graph.core.api.Principal;
+import io.metaloom.graph.server.auth.AuthPolicy;
 import io.metaloom.graph.server.mcp.model.JsonRpcRequest;
 import io.metaloom.graph.server.mcp.model.JsonRpcResponse;
 import io.vertx.core.Future;
@@ -64,6 +66,32 @@ public final class McpServer {
 		this.host = host;
 	}
 
+	/**
+	 * Who a client has to be, read per request.
+	 *
+	 * <p>
+	 * A supplier for the reason the other two front ends hold one: the policy is set through a setter and capturing it
+	 * would make a later call silently do nothing.
+	 * </p>
+	 */
+	private java.util.function.Supplier<AuthPolicy> auth = AuthPolicy::disabled;
+
+	public void authPolicy(java.util.function.Supplier<AuthPolicy> policy) {
+		this.auth = policy == null ? AuthPolicy::disabled : policy;
+	}
+
+	/** The bearer token on a request, or null. There is no cookie here: an MCP client is not a browser. */
+	private static String token(io.vertx.core.MultiMap headers) {
+		String header = headers.get("Authorization");
+		return header != null && header.startsWith("Bearer ") ? header.substring("Bearer ".length()).trim() : null;
+	}
+
+	/** The principal for a request, or empty when it presented nothing this server accepts. */
+	private java.util.Optional<Principal> principal(io.vertx.core.MultiMap headers) {
+		AuthPolicy policy = auth.get();
+		return policy.isEnabled() ? policy.resolve(token(headers)) : java.util.Optional.of(Principal.ANONYMOUS);
+	}
+
 	public Future<Integer> listen(int port) {
 		Router router = Router.router(vertx);
 		router.route().handler(BodyHandler.create().setBodyLimit(1 << 20));
@@ -95,6 +123,12 @@ public final class McpServer {
 	// ------------------------------------------------------------------ SSE
 
 	private void openStream(RoutingContext context) {
+		if (principal(context.request().headers()).isEmpty()) {
+			context.response().setStatusCode(401)
+				.putHeader("WWW-Authenticate", "Bearer realm=\"metaloom-graph\"")
+				.end("This MCP port requires a bearer token. See spec/AUTH.md.");
+			return;
+		}
 		String sessionId = UUID.randomUUID().toString();
 		HttpServerResponse response = context.response();
 		response.setChunked(true)
@@ -113,6 +147,13 @@ public final class McpServer {
 	}
 
 	private void acceptMessage(RoutingContext context) {
+		java.util.Optional<Principal> caller = principal(context.request().headers());
+		if (caller.isEmpty()) {
+			context.response().setStatusCode(401)
+				.putHeader("WWW-Authenticate", "Bearer realm=\"metaloom-graph\"")
+				.end("This MCP port requires a bearer token. See spec/AUTH.md.");
+			return;
+		}
 		String sessionId = context.request().getParam("sessionId");
 		HttpServerResponse stream = sessionId == null ? null : sessions.get(sessionId);
 		if (stream == null) {
@@ -134,7 +175,7 @@ public final class McpServer {
 			return;
 		}
 
-		handler.handle(JsonRpcRequest.from(message)).onComplete(outcome -> {
+		handler.handle(JsonRpcRequest.from(message), caller.get()).onComplete(outcome -> {
 			JsonRpcResponse response = outcome.succeeded() ? outcome.result()
 				: JsonRpcResponse.error(message.getValue("id"), McpConstants.INTERNAL_ERROR,
 					String.valueOf(outcome.cause()));
@@ -163,6 +204,14 @@ public final class McpServer {
 			socket.close((short) 1008, "Use " + McpConstants.WEBSOCKET_PATH);
 			return;
 		}
+		java.util.Optional<Principal> caller = principal(socket.headers());
+		if (caller.isEmpty()) {
+			// Vert.x 5 removed accept()/reject() from ServerWebSocket, so reaching this handler means the handshake is
+			// already done. 1008 is "policy violation", which is exactly what this is, and is the same mechanism the
+			// wrong-path branch above uses.
+			socket.close((short) 1008, "This MCP port requires a bearer token");
+			return;
+		}
 		socket.textMessageHandler(text -> {
 			JsonObject message;
 			try {
@@ -172,7 +221,7 @@ public final class McpServer {
 					.error(null, McpConstants.PARSE_ERROR, malformed.getMessage()).toJson().encode());
 				return;
 			}
-			handler.handle(JsonRpcRequest.from(message)).onComplete(outcome -> {
+			handler.handle(JsonRpcRequest.from(message), caller.get()).onComplete(outcome -> {
 				JsonRpcResponse response = outcome.succeeded() ? outcome.result()
 					: JsonRpcResponse.error(message.getValue("id"), McpConstants.INTERNAL_ERROR,
 						String.valueOf(outcome.cause()));

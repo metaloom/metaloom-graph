@@ -7,25 +7,27 @@ this file is about what a transaction *means*.
 
 ## 1. Guarantees
 
-> **Implementation status.** Atomicity, durability, rollback, **snapshot isolation, the reclamation horizon and
-> vacuum** are implemented. Writers are still serialised — one at a time — and **concurrent writers are not built**.
+> **Implementation status.** Atomicity, durability, rollback, snapshot isolation, the reclamation horizon, vacuum
+> **and concurrent writers** are implemented. `SERIALIZABLE` is implemented, by read-set validation rather than by SSI.
 >
 > The mechanism differs from what the rest of this file describes, and section 5 explains why: visibility is resolved
 > per **page** from in-memory before-images, not per record from an on-disk `UNDO` segment. `xmin`, `version_ptr` and
 > the undo record layout are therefore **not used**; the fields stay in the record layouts, written as zero, and the
-> format is unchanged. Sections 2, 3, 4.1, 5.1 and 6 describe what was built; sections 4 and 5's record-level
-> machinery is retained as the design that would be needed if the writer ever stopped being singular.
+> format is unchanged. Section 5.2's record-level machinery was predicted to be the price of concurrent writers and
+> turned out not to be — §6 explains what was built instead — so it is retained only as the design a record-granular
+> engine would need.
 
 | Property | Mechanism | Notes |
 |----------|-----------|-------|
 | **Atomicity** | No-steal redo WAL; private page copies discarded on rollback | A transaction is all-or-nothing across all seven record kinds, the dictionaries and the indexes |
 | **Consistency** | Invariant checkers plus cascade rules | The engine enforces structural invariants (bidirectional edges, degree counters, no orphan property blocks); application-level constraints are out of scope |
-| **Isolation** | Serialised writers; MVCC snapshot isolation for readers | See §3 |
+| **Isolation** | MVCC snapshot isolation, for readers and writers alike; first-committer-wins between writers | See §3 |
 | **Durability** | WAL group commit with `fdatasync` | See [WAL.md §4](WAL.md#4-group-commit) |
 
 A read on its own sees the latest commit. `store.beginRead()` opens a **snapshot** view that fixes what
 every read on that thread sees until it is closed; `beginRead(READ_COMMITTED)` opts out and costs
-nothing. Writes are serialised, so they are effectively serializable — see §3.
+nothing. `store.begin()` opens a write transaction, which reads through a view of its own and is
+validated against everything committed since when it commits — see §3 and §6.
 
 ---
 
@@ -52,42 +54,58 @@ the session's first commit reports where the store actually is.
 
 | Level | Reads see | Anomalies possible | Built |
 |-------|-----------|--------------------|-------|
-| `READ_COMMITTED` | The latest commit, per operation | Non-repeatable read, phantom | **Yes** |
-| `SNAPSHOT` (default for `beginRead`) | Everything committed at or before `snapshot_ts` | None reachable — see below | **Yes** |
-| `SERIALIZABLE` | As snapshot, plus SSI conflict tracking | None | **Not built, and not needed** |
+| `READ_COMMITTED` | The latest commit, per operation | Non-repeatable read, phantom | **Yes** — read views only |
+| `SNAPSHOT` (default for both `beginRead` and `begin`) | Everything committed at or before `snapshot_ts` | Write skew | **Yes** |
+| `SERIALIZABLE` | As snapshot, plus validation of what the transaction read | None | **Yes** — write transactions only |
+
+**A write transaction cannot run at `READ_COMMITTED`**, and asking for it raises rather than being
+upgraded. A writer decides what to write from what it reads; reading the live mapping would mean
+deciding from a state that has already moved, which is the lost update the whole design exists to
+make impossible.
 
 `SnapshotIsolationTest` asserts each anomaly at each level, and asserts the read-committed ones
 **actually occur** — a level that silently behaves like a stricter one is a level nobody should be
 paying for.
 
-| Anomaly | `READ_COMMITTED` | `SNAPSHOT` |
-|---|---|---|
-| Dirty read | prevented | prevented |
-| Non-repeatable read | **possible** | prevented |
-| Phantom | **possible** | prevented |
-| Lost update | prevented | prevented |
-| Write skew | prevented | prevented |
+| Anomaly | `READ_COMMITTED` | `SNAPSHOT` | `SERIALIZABLE` |
+|---|---|---|---|
+| Dirty read | prevented | prevented | prevented |
+| Non-repeatable read | **possible** | prevented | prevented |
+| Phantom | **possible** | prevented | prevented |
+| Lost update | prevented | prevented | prevented |
+| Write skew | — | **possible** | prevented |
 
-The last two rows are stronger than this file originally predicted, and the reason is structural
-rather than clever. **Write transactions are serialised by one writer lock, and a writer reads the
-current mapping rather than any view** — `SegmentFile.readSlice` returns the writer its own
-uncommitted pages and otherwise the mapping, never a reconstruction, even when the same thread has a
-view open. Two writers therefore never overlap, and neither can decide on stale input. That is what
-removes write skew, and with it the entire reason `SERIALIZABLE` and SSI existed in this plan: SSI
-detects dangerous structures between *concurrent* writers, and there are none. It is not built
-because there is nothing left for it to find, which is a different thing from being unfinished.
+**The write-skew row used to say "prevented", and the change is the honest cost of concurrent
+writers.** It said so because writers were serialised and read the current mapping, so the second
+transaction saw the first's commit and declined — safety by scheduling rather than by isolation
+level. Writers now overlap and each reads a fixed view, so two of them can each read what the other
+is about to change and both commit. That is textbook snapshot isolation, and `SERIALIZABLE` is the
+level that rules it out.
 
-**The writer-reads-current rule is load-bearing, not an optimisation.** A writer decides what to
-write from what it reads — which slot to allocate, where to append in an adjacency block, whether an
-index page must split. Reading any of that through a view fixed in the past would compute the new
-state from stale input and overwrite everything committed since: a lost update, silent, with no
-conflict for anything to report. `SnapshotIsolationTest.testLostUpdateIsPrevented` runs four threads
-incrementing one counter with a snapshot view held open throughout, precisely to pin that down.
+**Lost update is still prevented, by a different mechanism.** A transaction's writes are validated
+at commit against everything committed since its snapshot; overlapping bytes mean the second
+committer is refused with `TransactionConflictException` and retries against the new value. First
+committer wins. `SnapshotIsolationTest.testLostUpdateIsPrevented` runs four threads incrementing one
+counter with a snapshot view held open throughout, and now also pins down that the retry seam is what
+carries it.
+
+**Write skew is hard to observe here, and that is layout rather than isolation.** Two transactions
+updating different nodes usually still collide, because both insert into the same property index and
+rewrite the same bytes of it — a write-write conflict, reported before anything about reads is
+considered. `SnapshotIsolationTest` therefore asserts the mechanism instead of the outcome: at
+`SNAPSHOT` a transaction is **never** refused for something it only read
+(`TransactionConflictException.isReadConflict()`), and at `SERIALIZABLE` one of the pair always is
+refused. Relying on the index collision for safety would be relying on an accident.
 
 ### 3.1 Visibility rule
 
 Visibility is resolved per **page**, at one choke point — `SegmentFile.readSlice` — rather than per
 record. For a page with a chain of before-images (§5):
+
+The rule is the same for a writer, and that is the change concurrent writers made. A writer used to
+read the live mapping; now it reads through a view of its own, and its overlay in front of that. What
+used to be true by scheduling — a writer could not be shown a state that had moved under it, because
+nothing else could move it — is now true by construction.
 
 ```java
 // null means "the mapping already is what this view should see", which is the common answer.
@@ -126,11 +144,14 @@ sequenceDiagram
     participant PV as PageVersions
 
     App->>ST: store.begin()
-    Note over ST: takes the writer lock; one writer at a time
+    Note over ST: opens a view at appliedLsn; writers do not exclude each other
     App->>ST: setNodeProperties(id, ...)
-    ST->>ST: copy the page into this transaction's overlay on first write
-    Note over ST: reads see the overlay, then the current mapping — never a view
+    ST->>ST: copy the page into this transaction's overlay, from its own view
+    Note over ST: reads see the overlay, then that view — never the live mapping
     App->>W: commit()
+    W->>W: diff each overlay page against the image it was copied from
+    W->>W: refuse if anything else changed those bytes since the snapshot
+    W->>W: fold the metadata journal onto the live bitmap and counters
     W->>W: append the changed byte runs, then TXN_COMMIT, then fsync
     Note over W: the barrier — nothing above it has touched a data file
     W->>PV: keep the bytes about to be overwritten (only if a view is open)
@@ -156,10 +177,29 @@ sequenceDiagram
     Note over TM: leaves the active set; the horizon moves at the next commit
 ```
 
+The commit steps are in that order for reasons that are not interchangeable. **Validation comes before
+the fold**, because the fold moves shared counters: a conflict raised after it left the live count
+advanced over a bitmap whose bits were then discarded with the overlay, and `verify()` reported an
+accounting mismatch on a store where nothing had gone wrong except a transaction losing a race.
+**Validation comes before the log**, so a refused transaction has written no log record and touched no
+data file and is over the instant it is refused. **The fold comes before the diff**, because until it
+runs the transaction's allocations are operations rather than bytes and there is nothing to log.
+
 ### 4.1 Rollback
 
-Discard the overlay and reload the allocator state from the bitmap, which is the authority. There are
-no undo records to walk and no CLRs to emit, because nothing was written.
+Discard the overlay and the metadata journal, and hand back the slots the transaction reserved out of
+the allocator. There are no undo records to walk and no CLRs to emit, because nothing was written.
+
+Rollback used to also reload every superblock from the mapping and empty the allocator's free rings.
+That was right when a rollback could only be undoing the one transaction there was, and is destructive
+with several: those are shared, and another writer's uncommitted work is not in them to be restored.
+The one piece that cannot simply be discarded is the **high water mark**, which is shared and moves the
+moment a slot is reserved — two writers each bumping a private copy would both claim the same slot. It
+is put back, but only when this transaction is the only one in the store: the mark bounds every scan,
+so lowering it under a concurrent view hides records that view is entitled to see, and lowering it
+under a free-ring entry naming the same slot hands that slot out twice. Alone, neither can happen, and
+alone is the case the property is about — `RollbackEqualsRecoveryTest` requires a rolled-back store and
+a store crashed mid-transaction to agree down to `storageBytes`.
 
 `RollbackTest` asserts the strong form of that: after a transaction performing every mutation kind is
 rolled back, the segment files are **byte-identical** and no flush was needed — not "the store behaves
@@ -207,7 +247,9 @@ runs a commit changes, in order to log them. Recording the previous content of t
 copy, and it is **skipped entirely when no snapshot view is open**, which is the state a write-only
 or read-committed workload stays in permanently.
 
-**Why not the record-level design below.** Two reasons, and the first is the decisive one:
+**Why not the record-level design below.** Two reasons, and the first is the decisive one. (§5.2
+predicted a third — that page-granular versions could not survive concurrent writers — and it was
+wrong; §6.1 explains what actually made them survive.)
 
 1. **Record-level undo cannot cover what a reader actually reads.** A traversal touches adjacency
    blocks; a lookup touches index pages; every read of anything consults the free-slot bitmap and the
@@ -259,9 +301,12 @@ already invalidates every id a caller holds, so refusing costs nothing.
 
 ### 5.2 The record-level design, retained
 
-Not built. It is what would be needed if concurrent writers were added, because two writers cannot
-share page-granular versions: their private copies of one page would compose by last-writer-wins and
-lose each other's records.
+Not built, and **no longer expected to be needed**. This section used to say it was the price of
+concurrent writers, on the grounds that two writers cannot share page-granular versions because their
+private copies of one page compose by last-writer-wins. Concurrent writers were built without it: the
+overlay keeps the image each page was copied from, so a commit writes only the bytes it actually
+changed and two writers on one page compose by union. §6.1 has the detail. What is below is retained
+as the design a record-granular engine would need, not as unfinished work.
 
 Undo records would live in `UNDO` segments, 64 bytes each:
 
@@ -289,20 +334,120 @@ page's history.
 
 ## 6. Conflict Detection
 
-**There is nothing to detect, because writers are serialised.** `store.begin()` takes one writer lock;
-a second writer waits rather than conflicting. No `LockTable`, no write intents, no
-`TransactionConflictException` — a striped intent table whose every lookup misses would be machinery
-that documents an ambition rather than doing work, and `ConflictTest` against it would assert a
-conflict that cannot arise.
+**Built, as backward validation at commit.** A transaction reads a fixed view, keeps its changes in a
+private overlay, and at commit is checked against everything committed since it began. Overlapping
+writes mean the second committer is refused with `TransactionConflictException`; first committer
+wins. There is no lock table, no write intent and no waiting — a conflict is discovered rather than
+prevented, and discovering it costs one walk of a chain the engine was already keeping.
 
-What is built instead is the retry seam the spec asks for in a different item:
-`store.inTransaction(work, attempts)` runs a unit of work in a transaction and retries it, refusing to
-retry the failures that repeating cannot fix — a constraint violation is about data that has not
-changed, and `SnapshotTooOldException` is about a reader that no longer exists. If concurrent writers
-are ever built, that is where eager per-element detection would surface, and the design below is what
-it should be.
+### 6.1 What made it possible
 
-### 6.1 The design, if writers ever go concurrent
+§6.1 used to say that page overlays were the blocker: *"two writers each take a private copy of a
+page, and applying both at commit resolves by last-writer-wins across the whole page, losing the
+other's records"*. That was true of the overlay as it was, and the fix turned out to be smaller than
+the record-granular rewrite it seemed to demand. **The overlay keeps the image each page was copied
+from.** The commit then diffs `copy` against that base rather than against the live mapping, so the
+runs it writes are exactly the bytes *this* transaction changed and nothing else. Two writers on one
+page compose by union. Diffing against the mapping is what would have reverted the other writer, and
+it was never load-bearing — it was just the cheapest way to find the diff when only one writer could
+exist.
+
+The same runs are the transaction's write set, so conflict detection comes out of it for free:
+`PageVersions` already records, per page, which byte ranges each commit overwrote and at which LSN.
+Asking "did anything change these bytes after my snapshot" is one walk of that chain, stopping at the
+first entry the transaction is entitled to see.
+
+### 6.2 The part that is not byte-merged
+
+Records compose; **the metadata does not**. Sixty-four slots share one bitmap word, the superblock
+holds counters every writer moves, and the page metadata array holds a live count per page. Two
+writers allocating adjacent slots write the same eight bytes from different starting images, and no
+byte-level merge of those is correct — one of them is always describing a world in which the other's
+allocation never happened. Treating it as a conflict instead would be sound and useless: a bump
+allocator hands out consecutive slots, so nearly every pair of concurrent inserts would abort.
+
+So metadata changes are recorded as **operations** in a per-transaction `MetaJournal` — set this bit,
+add this delta, raise this floor — and folded onto the live state at commit, under the commit lock,
+onto pages rebased from the mapping as it stands at that instant. The metadata is not contended data,
+it is a resource ledger, and a ledger merges by replaying entries. Those pages are exempt from
+conflict detection, because by the time they reach the overlay they are already resolved against
+every writer that committed since.
+
+**Slot allocation is the one thing that is still serialised**, per `SegmentSet`, and it has to be.
+Every other collision between two writers is detectable afterwards — they wrote the same bytes, so
+one aborts — but two writers handed the same slot have already put two records at one id, and no
+bitmap, checksum or invariant can tell them apart later. The lock is held for a bitmap scan and a
+record fill, not for a transaction. Alongside it sits a set of slots reserved by transactions that
+have not committed: the bitmap in the mapping only knows about slots that *have*, so on its own it
+would hand the same slot to two writers in flight at once.
+
+Three reads of a bitmap word therefore have three different right answers, and confusing them is
+where the sharp edges are:
+
+| Question | Source | Asked by |
+|---|---|---|
+| What does this transaction see? | its view, plus its own journal | `isAllocated`, every ordinary read |
+| What is actually taken? | the live mapping, plus the reservation set | the allocator, and only the allocator |
+| What is durable? | the live mapping | the commit's journal fold |
+
+The **generation counter** is allocator state by the same argument, and reading it through the view
+was a real defect: a transaction reusing a slot freed after its snapshot wrote back the generation
+from before the delete, handing out an id byte-for-byte identical to one already given away — and
+because the copy then matched its base at those bytes, the diff did not carry them and the record
+landed under a generation on disk its own id did not match. A reader was told, one read later, that a
+property block it had just resolved was stale. It is read from the mapping now, except for a slot the
+transaction freed itself, where the advanced value lives only in the overlay.
+
+**A transaction may reuse a slot it freed itself, and only if the ids of that kind never leave the
+engine.** A freed slot does not reach the shared allocator until the delete commits — offering it
+earlier would let a rollback restore a record somebody else now owns — but a transaction that frees a
+structure and rebuilds it inside one transaction is the ordinary case, not an exotic one, and without
+reuse the rebuild takes fresh slots and the high water mark ratchets up once per rebuild for the life
+of the store (`IndexSpaceReuseTest`). Reuse is nevertheless restricted to `INDEX`. While the delete is
+uncommitted the generation counter is advanced in the overlay and not in the mapping, so the two
+disagree for as long as the transaction runs — and every other kind is reachable through an id held
+somewhere else while that is true. Enabling it for `PROP` was measured breaking the conserved total of
+`ParallelConsistencyTest` under four writers. The index is the case that needs it and the case where
+it holds: `resetTrees()` frees and rebuilds the whole structure in one transaction and no id survives
+that rebuild, which is the same argument `SegmentSet.packFreeRing()` is limited by.
+
+### 6.3 Conflicts a caller never sees
+
+**An auto-commit mutation retries its own conflicts**, and so does a Cypher write query. This is the
+difference between an explicit transaction and a single statement: a caller who opened a transaction
+has a unit of work to reconsider, and a caller who called `setNodeProperties` has nothing to
+reconsider — re-running the one statement against a newer state is what they meant. Raising it would
+make every mutation on a store with two writers a checked failure, and the commonest conflict is not
+even between the callers' data, it is two inserts landing in one B+tree leaf.
+
+The retry **backs off**, which is not decoration. A conflict against a transaction that is still
+running is resolved by that transaction finishing, and a durable commit takes milliseconds where a
+failed attempt takes microseconds. Four writers racing to create the one index catalog page burned
+all sixty-four of their attempts inside the winner's first commit and then raised a conflict on a
+store where the only thing wrong was that somebody else was ahead of them.
+
+### 6.4 `SERIALIZABLE`
+
+`begin(SERIALIZABLE)` additionally records the pages the transaction **read** and validates them the
+same way. That is backward validation rather than SSI, and it gives the same guarantee: a transaction
+that decided something from a page another transaction has since committed over did not run at any
+single instant, so it is aborted.
+
+**SSI is not built and is not the obvious next step.** It exists to abort *less* — it looks for the
+dangerous structure of an in-conflict and an out-conflict meeting at a pivot, rather than aborting on
+any stale read. Buying that here would mean an in/out flag per transaction and a second pass to find
+the pivot, against a read set the engine already computes for free. The cost of the simpler rule is
+paid in granularity: reads are tracked per page, not per record, so two transactions touching
+unrelated records that share a page are a conflict. Sound, never a wrong answer, and a level to ask
+for where it is needed rather than to default to.
+
+**`LockTable` is not built and will not be.** Eager per-element intents fail fast and make the abort
+cheap, which is a real advantage; what they cost is a striped table on the write path of every
+statement, and a decision about lock granularity that the byte-ranged validation does not need to
+make. Validation at commit costs nothing until a commit happens. If aborts ever become the
+bottleneck, the intent table of the original design is where to go, and it is described below.
+
+### 6.5 The eager design, retained
 
 **Write intents, detected eagerly.** A striped table mapping `ElementId -> txn_id` for elements
 currently being written. Acquiring an intent already held by a live transaction throws immediately
@@ -312,13 +457,6 @@ specific statement rather than to a commit.
 The table would be memory-only and its loss harmless — after a crash there are no live transactions.
 **Granularity** per element, not per page, so two transactions writing different nodes in one page
 never conflict logically. **Deadlock** impossible, because intents are never waited on.
-
-**The harder half is not the table.** Page overlays are what make concurrent writers difficult here:
-two writers each take a private copy of a page, and applying both at commit resolves by
-last-writer-wins across the whole page, losing the other's records. That needs either record-granular
-overlays or per-writer allocation arenas plus commit-time validation, and it is a rewrite of the write
-path rather than an addition to it — which is the honest reason concurrent writers are not in this
-phase.
 
 ## 7. Where Copy-on-Write Actually Applies
 
@@ -358,14 +496,37 @@ the kind field already selects the addressing policy. Do not do this speculative
 
 ## 8. Conventions and Gotchas
 
-- **A writer reads the current mapping, never a view** — even on a thread that has one open. This is
-  the rule that prevents a lost update, not a convenience. See §3.
+- **A writer reads through a view of its own**, not the live mapping. It used to be the opposite, and
+  the reversal is the heart of the concurrent-writer change: with one writer at a time the mapping
+  could not move underneath a transaction, and now it can. What prevents a lost update is no longer
+  the read but the commit-time validation of the write set. See §3 and §6.
+- **The allocator is the exception, and only the allocator.** It reads the live mapping plus the set
+  of slots reserved by transactions in flight, because "is this slot taken" is not a question about
+  data and a slot somebody committed since is taken however invisible its contents are. Everything
+  else in the engine must read what its transaction is entitled to see. The generation counter is
+  allocator state by the same argument — §6.2.
+- **A writer holds the apply latch for the length of one operation.** Not for the transaction: a
+  commit waits for one statement, not for a unit of work. The single writer lock used to provide this
+  by accident and it was load-bearing — without it a writer checks a page's version chain, finds
+  nothing newer than its snapshot, and reads the mapping, while in between a commit publishes its
+  before-image and copies its bytes in.
+- **`TransactionConflictException` is a normal outcome**, like `SnapshotTooOldException`. Retry it;
+  `inTransaction` does. Auto-commit mutations and Cypher write queries retry it internally, so it only
+  reaches a caller who opened the transaction themselves. Progress is guaranteed: a conflict has a
+  winner, so each attempt runs with one fewer competitor.
+- **Vacuum is serialised.** It runs outside every other lock, which was safe while one writer meant
+  one commit meant one vacuum. Two of them cutting the same chains at different horizons truncate a
+  tail the other is still walking, and what that looks like from outside is a page whose newest
+  before-image is older than it should be — so a view entitled to reconstruct the page decides it does
+  not need to, and reads bytes from the future.
 - **A transaction sees its own writes.** The overlay is consulted before anything else, so
   read-your-writes outranks both the mapping and any view.
 - **A Cypher write query is one transaction**, opened and committed by `Cypher.stream`, or joined when
-  the caller already holds one. It opens **no read view**: a writer reads the current mapping anyway,
-  and a view would only add a liveness check that an abandoned view can fail. A write inside an open
-  read view is refused rather than silently run outside it ([CYPHER.md §4.1](CYPHER.md)).
+  the caller already holds one. It opens no read view of its own — the write transaction already has
+  one, and a second would only add a liveness check that an abandoned view can fail. A write inside an
+  open read view is refused rather than silently run outside it ([CYPHER.md §4.1](CYPHER.md)). When it
+  owns the transaction it **retries its own conflicts**, because a query is a single statement with
+  nothing for the caller to reconsider; when it joined the caller's, it neither commits nor retries.
 - **`begin()` refuses to nest**, as `beginRead()` does. It used not to, and nesting was silent: the
   inner commit cleared the published overlay, after which the outer transaction's writes went straight
   to the mapping — unlogged, and past any rollback. `hasWriteTransaction()` exists so a library can ask
@@ -379,8 +540,11 @@ the kind field already selects the addressing policy. Do not do this speculative
   cancellation is delivered but not in the middle of making a transaction durable. The residual window
   is an interrupt arriving from another thread while the force is already in flight; closing that one
   needs the log writes moved onto a thread nobody else can interrupt.
-- **`verify()` takes the writer lock**, not just the apply latch, because it both reads state a writer
-  is mid-way through changing and mutates the dirty-page set on its way through. See §9.
+- **`verify()`, `checkpoint()`, `reclaim()`, compaction and `close()` exclude writers outright.** They
+  reach past the transaction mechanism rather than through it — relocating a record, punching a page,
+  unmapping a segment file — so they take the write gate exclusively while an ordinary transaction
+  holds it shared. Compaction takes it one batch at a time, so a foreground writer waits for a batch
+  rather than for a whole segment.
 - **Close read views.** An open view holds every version committed since it began. A forgotten one is
   a memory leak with a name: `snapshotStats()` reports its age and what it is holding, and past
   `retainedVersionBytes` the store abandons it rather than growing.
@@ -396,7 +560,15 @@ the kind field already selects the addressing policy. Do not do this speculative
   mechanism — a punched hole reads back as zeros, and a retired segment file takes its mapping with
   it — and a refusal is much better than either failure.
 - **Reclamation runs at the end of a commit**, not on a timer. A store that has stopped committing
-  never releases what its last reader was holding until the next commit.
+  never releases what its last reader was holding until the next commit. It is also *skipped* when
+  another commit is already reclaiming, which is safe for the same reason it is serialised: the vacuum
+  in flight is cutting everything this one could, at a horizon no older.
+- **A run of changed bytes can be wider than the bytes that changed.** The commit merges changed runs
+  within 64 bytes of each other into one log record, because a record header costs more than a few
+  unchanged bytes — and conflict detection reads the same runs. So two transactions writing
+  *neighbouring* records can be reported as conflicting when neither touched the other's bytes. It is
+  sound, it only ever costs a retry, and it is why a test that wants to prove two writers compose has
+  to put their records more than a merge gap apart.
 
 ---
 
@@ -407,26 +579,27 @@ Built, in `io.metaloom.graph.core.txn`:
 | Class | Cases | What it holds down |
 |---|---|---|
 | `VisibilityTest` | 13 | Create, update, delete and edge changes invisible to an earlier view; adjacency blocks and both indexes read as of the view; a freed **and reused** slot still resolving; read-your-writes outranking the view; thread confinement |
-| `SnapshotIsolationTest` | 7 | The anomaly matrix of §3, including the read-committed anomalies actually occurring; lost update and write skew under real concurrency |
+| `SnapshotIsolationTest` | 8 | The anomaly matrix of §3, including the read-committed anomalies actually occurring; lost update surviving four concurrent incrementers through the retry seam; and the two halves of write skew — that `SNAPSHOT` never refuses a transaction for what it *read*, and that `SERIALIZABLE` does |
 | `VacuumTest` | 8 | Nothing retained with no view open; read-committed views retaining nothing; the oldest view setting the horizon; a pinned view holding what a later one does not need; the budget abandoning a view rather than serving it wrongly |
 | `ConcurrentReaderTest` | 4 | Sixteen views at sixteen instants against a continuous writer; reconstruction proportional to what is read; maintenance refused while a view is open; no view left behind on a pooled thread |
 | `RollbackTest` | 7 | Every mutation type rolled back to **byte-identical** segment files, with no flush; repeated rollbacks not ratcheting the allocator |
-| `RollbackEqualsRecoveryTest` | 2 | The same transaction rolled back and crashed reaching the same state, plus a control proving the comparison can tell them apart |
+| `RollbackEqualsRecoveryTest` | 2 | The same transaction rolled back and crashed reaching the same state, plus a control proving the comparison can tell them apart. Also the regression test for the high water mark: the two have to agree down to `storageBytes`, which is what §4.1's restore rule exists for |
 | `LongRunningReaderTest` | 2 | `@Tag("slow")`. A view held across 60,000 commits; and the same run against a budget too small, abandoned cleanly with the store unharmed |
 | `SnapshotLinearizabilityTest` | 2 | The general form of the anomaly matrix: a view at LSN `L` must show **exactly** the committed state at `L`, whole-graph, checked against a model history keyed by commit LSN. Around 5,000 views per run |
-| `NestedTransactionTest` | 5 | `begin()` refusing to nest; the open transaction surviving the refusal; writes after it still rollback-able; the writer lock not leaked |
+| `NestedTransactionTest` | 5 | `begin()` refusing to nest; the open transaction surviving the refusal; writes after it still rollback-able; the write gate not leaked |
 
 And in `io.metaloom.graph.core.concurrency`:
 
 | Class | Cases | What it holds down |
 |---|---|---|
+| `ConcurrentWriterTest` | 4 | The four statements the feature makes, each unable to pass against a single writer lock: two transactions open at once; two writers on **one page** both surviving; two writers on **one record** ending with one refused; and a refused transaction giving its slot back. Seen to fail against the pre-concurrency diff |
 | `VerifyUnderLoadTest` | 4 | Verification concurrent with writers, with a checkpointer, and with a second verifier; the throttled form making progress without hanging. The regression test for the accounting-mismatch false positive |
-| `ParallelConsistencyTest` | 3 | A conserved total across ~840,000 snapshot audits while writers move it; `READ_COMMITTED` *observing* a torn total, so the weaker level is proven weaker; structural invariants checked through an open view, which `verify(FULL)` cannot do |
-| `WriterLockLivenessTest` | 7 | The writer lock released after a runtime exception, an `Error`, an unclosed transaction, a rollback, a non-retryable failure inside `inTransaction`, an interrupt, and a storm of failing writers |
+| `ParallelConsistencyTest` | 3 | A conserved total across ~840,000 snapshot audits while writers move it; `READ_COMMITTED` *observing* a torn total, so the weaker level is proven weaker; structural invariants checked through an open view, which `verify(FULL)` cannot do. The transfers now retry — a transfer that loses a conflict is the ordinary case — so the invariant is asserted across however many attempts it takes |
+| `WriterLockLivenessTest` | 7 | The write gate released after a runtime exception, an `Error`, an unclosed transaction, a rollback, a non-retryable failure inside `inTransaction`, an interrupt, and a storm of failing writers |
 | `CloseUnderLoadTest` | 2 | `close()` under load failing only in the engine's own vocabulary; `abandon()` under load left recoverable, verifying clean on reopen |
 | `HammerTest` | 1 | The whole public API concurrently — both levels, cursors, traversals, retries, checkpoints, refused maintenance — with self-checksumming property values, which is the only oracle available for the optimistic read path |
-| `CursorLeaseLivenessTest` | 3 | An open cursor blocking every writer, and releasing them on close; double-close safe; many short-lived cursors not wedging the store |
-| `MultiStoreIsolationTest` | 2 | Four stores written concurrently with no cross-talk — the one place two writers genuinely overlap; a second handle on one store refused |
+| `CursorLeaseLivenessTest` | 3 | An open cursor blocking every commit, and releasing them on close; double-close safe; many short-lived cursors not wedging the store |
+| `MultiStoreIsolationTest` | 2 | Four stores written concurrently with no cross-talk; a second handle on one store refused. It used to be described as "the one place two writers genuinely overlap", which is no longer true of anything |
 | `AutoCommitAtomicityTest` | 1 | A single `createRelationship` writes a REL, two adjacency entries and two degree counters; no view may catch that half done |
 | `SnapshotBudgetUnderLoadTest` | 1 | Six views of different ages against a budget too small: abandonment follows age, and the survivors are still *right* rather than merely alive |
 | `CatalogDurabilityWindowTest` | 2 | The dictionary is forced before the commit that introduced it, so a rolled-back or crashed label outlives its transaction — pinned as harmless and reusable |
@@ -435,12 +608,28 @@ And at the layers above the engine:
 
 | Class | Module | What it holds down |
 |---|---|---|
-| `CypherConcurrencyTest` | `graph-cypher` | A conserved total read through Cypher while writers move it — a query is dozens of storage calls and the view is what stops it spanning two states; concurrent write queries each committing exactly once |
+| `CypherConcurrencyTest` | `graph-cypher` | A conserved total read through Cypher while writers move it — a query is dozens of storage calls and the view is what stops it spanning two states; concurrent write queries each committing exactly once, which now means each absorbing its own conflicts rather than each being alone |
 | `WireHammerTest` | `graph-server` | The same total over a real socket from many clients; clients hanging up mid-stream leaving no read view behind; no leaked event loops |
 
-Not built, with reasons: `ConflictTest` (§6 — no conflict can arise), `SnapshotTooOldTest` (folded
-into `VacuumTest` and `LongRunningReaderTest`, which reach the condition through real workloads rather
-than by construction), jcstress harnesses (jcstress is not in the offline repository).
+Not built, with reasons: `SnapshotTooOldTest` (folded into `VacuumTest` and `LongRunningReaderTest`,
+which reach the condition through real workloads rather than by construction), jcstress harnesses
+(jcstress is not in the offline repository). `ConflictTest` was listed here as impossible — "no
+conflict can arise" — and conflicts are now the ordinary case; they are asserted where they occur
+rather than in a test of their own, which is `SnapshotIsolationTest` for the levels,
+`ParallelConsistencyTest` and `HammerTest` for the retry seam under load.
+
+**What the concurrent-writer work found, by test:**
+
+| Defect | Found by |
+|---|---|
+| A conflict raised after the metadata fold left the live count advanced over a discarded bitmap | `AutoCommitAtomicityTest`, `VerifyUnderLoadTest` — as an accounting mismatch on a healthy store |
+| The allocator handing out a slot still live in the caller's own view | `VirtualThreadCallerTest` — "Double allocation of PROP segment 0 slot 0" |
+| A reused slot taking its generation from the view rather than the mapping | `ParallelConsistencyTest` — a reader told its property block was stale one read later |
+| A writer reading the mapping without the apply latch | `ParallelConsistencyTest` — same symptom, different cause, found after the first was fixed |
+| Two vacuums cutting the same version chains at once | `ParallelConsistencyTest` — a conserved total that was not conserved |
+| The high water mark restored on rollback under a stale free-ring entry | `ReferenceModelTest`, single-threaded — the same slot handed out twice |
+| A retry loop spinning through all its attempts inside the winner's first commit | `MultiStoreIsolationTest` — four writers racing to create one index catalog page |
+| The index catalog page cached in a field shared across threads | `MultiStoreIsolationTest` — `Stale id NULL` mid-lookup |
 
 ---
 
@@ -458,13 +647,20 @@ than by construction), jcstress harnesses (jcstress is not in the offline reposi
 - [x] `store.inTransaction` with retry
 - [x] Optimistic lock-free reads via the `StampedLock`; a view forces the locked path only to rebuild a page
 - [x] Tests per §9
-- [ ] **Concurrent writers.** The remaining half of the phase, and the one that needs the write path
-      rewritten rather than extended — §6.1
+- [x] **Concurrent writers.** Writers overlap; the commit point is what is serialised, and only for
+      validate, log and apply. The write path was rewritten to the extent §6.1 describes and no further
+- [x] Write-write conflict detection, byte-ranged, at commit — `TransactionConflictException`
+- [x] `SERIALIZABLE`, by read-set validation rather than SSI — §6.4
+- [x] The metadata journal: bitmap, superblock counters and page metadata merged as operations — §6.2
 - [ ] `xmin` placeholder scheme, the recent-commit map, the lazy rewrite pass — **not needed** by the
-      page-level scheme; part of §5.2, which concurrent writers would require
+      page-level scheme, and no longer expected to be: §5.2 predicted concurrent writers would require
+      it and they did not
 - [ ] `UndoStore` and the 64-byte undo record — as above
-- [ ] `LockTable` with eager conflict detection — **nothing to detect** while writers are serialised (§6)
-- [ ] `SERIALIZABLE` via SSI — **nothing to detect** (§3): write skew is already unreachable
+- [ ] `LockTable` with eager conflict detection — **not needed**, and a deliberate choice rather than a
+      gap: validation at commit costs nothing until a commit happens, where intents cost a striped table
+      on every statement. §6.4 and §6.5
+- [ ] SSI — it aborts *less* than the validation that is built, which is a performance question rather
+      than a correctness one (§6.4)
 - [ ] jcstress harnesses — jcstress is not in the offline repository
 
 ## 11. Key Classes Reference
@@ -476,13 +672,19 @@ than by construction), jcstress harnesses (jcstress is not in the offline reposi
 | `SnapshotHolder` | `io.metaloom.graph.core.txn` | Thread-local publication of a view to the segment layer |
 | `PageVersions` | `io.metaloom.graph.core.txn` | Per-page before-image chains, reconstruction and reclamation |
 | `Transaction` | `io.metaloom.graph.core.api` | Per-transaction write state |
+| `WriteContext`, `WriteContextHolder` | `io.metaloom.graph.core.txn` | Everything one in-flight writer owns — overlay, view, journal, reservations — published to its own thread |
+| `MetaJournal` | `io.metaloom.graph.core.txn` | Metadata changes as operations rather than bytes, folded onto the live state at commit (§6.2) |
+| `PageOverlay.Page` | `io.metaloom.graph.core.page` | A private page copy **and the image it was copied from**, which is what makes two writers on one page compose (§6.1) |
+| `TransactionConflictException` | `io.metaloom.graph.core.api` | The loser of a conflict, with the page and byte range it lost on |
 | `ReadTransaction` | `io.metaloom.graph.core.api` | The public view handle; `Snapshot` implements it |
 | `IsolationLevel`, `SnapshotStats`, `SnapshotTooOldException` | `io.metaloom.graph.core.api` | The level, what a view costs, and what happens when it costs too much |
 
 Not built, and named here so nobody looks for them: `LockTable`, `UndoStore`, `Vacuum` as a separate
-worker (reclamation is a call at the end of commit, not a thread).
+worker (reclamation is a call at the end of commit, not a thread). Gone: the single `writerLock`,
+replaced by a shared/exclusive write gate plus a commit lock; and `OverlayHolder`, replaced by
+`WriteContextHolder`.
 
 ---
 
-_Git HEAD revision: `e4601d1`_
-_Last updated: 2026-08-15 (Cypher writes)_
+_Git HEAD revision: `da8c93e`_
+_Last updated: 2026-08-17 (concurrent writers)_

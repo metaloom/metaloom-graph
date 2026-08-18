@@ -6,6 +6,7 @@ import java.io.OutputStream;
 import java.io.PrintStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.SecureRandom;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -14,9 +15,14 @@ import io.metaloom.graph.cli.dump.DumpFormatException;
 import io.metaloom.graph.cli.dump.DumpReader;
 import io.metaloom.graph.cli.dump.GraphBackup;
 import io.metaloom.graph.cli.dump.GraphRestore;
+import io.metaloom.graph.core.api.AuthStore;
+import io.metaloom.graph.core.api.Grant;
 import io.metaloom.graph.core.api.GraphDatabases;
 import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.GraphStoreException;
+import io.metaloom.graph.core.api.Privilege;
+import io.metaloom.graph.core.api.Role;
+import io.metaloom.graph.core.api.User;
 import io.metaloom.graph.core.api.VerifyLevel;
 
 /**
@@ -52,7 +58,7 @@ public final class GraphCli {
 	public static void main(String[] args) {
 		CliOptions options;
 		try {
-			options = CliOptions.parse(args);
+			options = CliOptions.parse(args, System::getenv, System.in);
 		} catch (CliOptions.HelpRequested help) {
 			System.out.println(CliOptions.usage());
 			return;
@@ -79,9 +85,15 @@ public final class GraphCli {
 				case "database restore" -> restore();
 				case "database list" -> list();
 				case "database inspect" -> inspect();
+				case "auth reset-admin" -> resetAdmin();
+				case "auth list" -> authList();
+				case "auth user" -> authUser();
+				case "auth role" -> authRole();
+				case "auth grant" -> authGrant(true);
+				case "auth revoke" -> authGrant(false);
 				default -> {
 					err.println("Unknown command '" + options.command() + "'.");
-					err.println("Try: database backup | database restore | database list | database inspect");
+					err.println("Try: " + String.join(" | ", commands()));
 					return 2;
 				}
 			}
@@ -227,6 +239,193 @@ public final class GraphCli {
 		}
 	}
 
+	// ---------------------------------------------------------------- auth
+
+	/**
+	 * Puts the administrator back, however they were locked out.
+	 *
+	 * <p>
+	 * The generated password goes to <b>stdout</b> and every word of explanation to stderr, so
+	 * {@code auth reset-admin --path=/data > password.txt} yields a file holding the password and nothing else. That
+	 * is the same split {@code --out=-} relies on for a dump, applied to the one other thing this program produces
+	 * that a script might want to capture.
+	 * </p>
+	 */
+	private void resetAdmin() throws IOException {
+		requireOffline("auth reset-admin");
+		boolean generated = options.password() == null;
+		char[] password = passwordOrGenerated();
+		try {
+			try (AuthStore auth = openAuth()) {
+				auth.resetAdmin(password);
+				err.println("Reset the '" + AuthStore.ADMIN + "' user in " + auth.path() + ": password set, user "
+					+ "recreated if it was missing, and every privilege re-granted on every database.");
+			}
+			if (generated) {
+				println(new String(password));
+				err.println("The password above is on stdout and is not stored anywhere else. It is shown once.");
+			}
+			err.println("A running server picks this up on the next login; it does not need a restart.");
+		} finally {
+			scrub(password);
+		}
+	}
+
+	private void authList() throws IOException {
+		requireOffline("auth list");
+		try (AuthStore auth = openAuth()) {
+			if (auth.isEmpty()) {
+				err.println("There are no users in " + auth.path() + ". A server with authentication enabled will "
+					+ "create an administrator when it starts.");
+				return;
+			}
+			println("users");
+			for (User user : auth.users()) {
+				println("  " + user.name() + (user.enabled() ? "" : "  (disabled)")
+					+ (user.roles().isEmpty() ? "" : "  roles: " + String.join(", ", user.roles())));
+				for (Grant grant : user.grants()) {
+					println("    " + grant);
+				}
+			}
+			println("roles");
+			for (Role role : auth.roles()) {
+				println("  " + role.name());
+				for (Grant grant : role.grants()) {
+					println("    " + grant);
+				}
+			}
+		}
+	}
+
+	private void authUser() throws IOException {
+		requireOffline("auth user");
+		List<String> arguments = options.arguments();
+		if (arguments.size() < 2) {
+			throw new IllegalArgumentException("auth user needs 'add <name>' or 'drop <name>'");
+		}
+		String action = arguments.get(0);
+		String name = arguments.get(1);
+		try (AuthStore auth = openAuth()) {
+			switch (action) {
+				case "add" -> {
+					boolean generated = options.password() == null;
+					char[] password = passwordOrGenerated();
+					try {
+						auth.createUser(name, password, arguments.subList(2, arguments.size()));
+						err.println("Created the user '" + name + "'.");
+						if (generated) {
+							println(new String(password));
+							err.println("The password above is on stdout and is shown once.");
+						}
+					} finally {
+						scrub(password);
+					}
+				}
+				case "drop" -> {
+					auth.dropUser(name);
+					err.println("Removed the user '" + name + "'.");
+				}
+				default -> throw new IllegalArgumentException("auth user takes 'add' or 'drop', not '" + action + "'");
+			}
+		}
+	}
+
+	private void authRole() throws IOException {
+		requireOffline("auth role");
+		List<String> arguments = options.arguments();
+		if (arguments.size() < 2) {
+			throw new IllegalArgumentException("auth role needs 'add <name>' or 'drop <name>'");
+		}
+		String action = arguments.get(0);
+		String name = arguments.get(1);
+		try (AuthStore auth = openAuth()) {
+			switch (action) {
+				case "add" -> {
+					auth.createRole(name);
+					err.println("Created the role '" + name + "'.");
+				}
+				case "drop" -> {
+					auth.dropRole(name);
+					err.println("Removed the role '" + name + "', and every reference to it.");
+				}
+				default -> throw new IllegalArgumentException("auth role takes 'add' or 'drop', not '" + action + "'");
+			}
+		}
+	}
+
+	private void authGrant(boolean granting) throws IOException {
+		String command = granting ? "auth grant" : "auth revoke";
+		requireOffline(command);
+		List<String> arguments = options.arguments();
+		if (arguments.size() != 3) {
+			throw new IllegalArgumentException(command + " needs '<role> <PRIVILEGE> <database|"
+				+ Grant.ALL_DATABASES + ">', for example '" + command + " analyst MERGE sales'");
+		}
+		Grant grant = new Grant(Privilege.parse(arguments.get(1)), arguments.get(2));
+		try (AuthStore auth = openAuth()) {
+			if (granting) {
+				auth.grantToRole(arguments.get(0), grant);
+				err.println("Granted " + grant + " to '" + arguments.get(0) + "'.");
+			} else {
+				auth.revokeFromRole(arguments.get(0), grant);
+				err.println("Revoked " + grant + " from '" + arguments.get(0) + "'.");
+			}
+		}
+	}
+
+	private AuthStore openAuth() throws IOException {
+		return AuthStore.open(options.path());
+	}
+
+	/** The auth commands never take {@code --server}; {@code CliOptions} refuses it, and this is the second line. */
+	private void requireOffline(String command) {
+		if (!options.offline()) {
+			throw new IllegalArgumentException(command + " needs --path=<root>");
+		}
+	}
+
+	/**
+	 * The password given, or a fresh one.
+	 *
+	 * <p>
+	 * Twenty-four characters from a thirty-two symbol alphabet is 120 bits, which is far past anything that will be
+	 * attacked offline. {@code I}, {@code O}, {@code 0} and {@code 1} are left out because this string's most likely
+	 * next journey is being read off one screen and typed into another.
+	 * </p>
+	 */
+	private char[] passwordOrGenerated() {
+		if (options.password() != null) {
+			return options.password().toCharArray();
+		}
+		return generatePassword();
+	}
+
+	/**
+	 * Best-effort scrub of a password this program is finished with.
+	 *
+	 * <p>
+	 * Written out here rather than borrowed from the engine's {@code PasswordHash}, which lives in a package
+	 * {@code module-info} does not export: reaching into it happens to work on the classpath and would stop working
+	 * the day anybody put this on the module path.
+	 * </p>
+	 */
+	private static void scrub(char[] password) {
+		if (password != null) {
+			java.util.Arrays.fill(password, '\0');
+		}
+	}
+
+	/** The alphabet, and the length, shared with the server's first-start announcement. */
+	static char[] generatePassword() {
+		final String alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+		SecureRandom random = new SecureRandom();
+		char[] password = new char[24];
+		for (int i = 0; i < password.length; i++) {
+			password[i] = alphabet.charAt(random.nextInt(alphabet.length()));
+		}
+		return password;
+	}
+
 	// ---------------------------------------------------------------- plumbing
 
 	private void println(String line) {
@@ -289,6 +488,7 @@ public final class GraphCli {
 	}
 
 	static List<String> commands() {
-		return List.of("database backup", "database restore", "database list", "database inspect");
+		return List.of("database backup", "database restore", "database list", "database inspect",
+			"auth reset-admin", "auth list", "auth user", "auth role", "auth grant", "auth revoke");
 	}
 }

@@ -7,6 +7,8 @@ import java.util.concurrent.TimeUnit;
 
 import io.metaloom.graph.core.api.GraphDatabases;
 import io.metaloom.graph.core.api.GraphStore;
+import io.metaloom.graph.core.api.Principal;
+import io.metaloom.graph.core.api.Privilege;
 import io.metaloom.graph.cypher.Cypher;
 import io.metaloom.graph.cypher.CypherStats;
 import io.metaloom.graph.cypher.QueryAbort;
@@ -76,6 +78,21 @@ public final class QueryTool extends StoreTool {
 
 	@Override
 	public Future<JsonObject> execute(JsonObject arguments) {
+		return execute(arguments, Principal.ANONYMOUS);
+	}
+
+	/**
+	 * Runs a query for a principal.
+	 *
+	 * <p>
+	 * The per-query privilege check sits next to the per-query write check, and for the same reason the descriptor
+	 * cannot carry either: what a query needs depends on the query. It comes <b>before</b> the {@code --allow-write}
+	 * refusal, so a caller who has not been granted {@code MERGE} is told that rather than being told to ask the
+	 * operator for a flag that would not help them.
+	 * </p>
+	 */
+	@Override
+	public Future<JsonObject> execute(JsonObject arguments, Principal principal) {
 		String queryText = arguments.getString("query");
 		if (queryText == null || queryText.isBlank()) {
 			return Future.succeededFuture(GraphMcpToolResults.error("A 'query' is required."));
@@ -91,6 +108,12 @@ public final class QueryTool extends StoreTool {
 			// Returned as a tool error rather than a JSON-RPC error: the model wrote it and the model can fix it, and
 			// the engine's message names the position.
 			return Future.succeededFuture(GraphMcpToolResults.error("Syntax error: " + syntax.getMessage()));
+		}
+		for (Privilege privilege : parsed.requiredPrivileges()) {
+			if (!principal.may(privilege, database)) {
+				return Future.succeededFuture(GraphMcpToolResults.error("'" + principal.name() + "' has not been "
+					+ "granted " + privilege + " on '" + database + "'. Do not retry; ask an administrator."));
+			}
 		}
 		if (parsed.isWrite() && !allowWrite) {
 			return Future.succeededFuture(GraphMcpToolResults.error(

@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import io.metaloom.graph.core.api.GraphDatabases;
+import io.metaloom.graph.core.api.Principal;
 import io.metaloom.graph.server.mcp.tool.impl.CreateIndexTool;
 import io.metaloom.graph.server.mcp.tool.impl.CypherGuideTool;
 import io.metaloom.graph.server.mcp.tool.impl.DropIndexTool;
@@ -62,5 +63,21 @@ public final class GraphMcpTools {
 	/** The subset a client is told about: everything on a writable server, the read-only tools otherwise. */
 	public static List<GraphMcpTool> visible(List<GraphMcpTool> tools, boolean allowWrite) {
 		return allowWrite ? tools : tools.stream().filter(tool -> !tool.descriptor().write()).toList();
+	}
+
+	/**
+	 * The subset <b>this principal</b> is told about.
+	 *
+	 * <p>
+	 * Both filters, and in this order, because they answer different questions: the flag says what the server will
+	 * ever do and the grant says what this caller may do within that. An agent shown a capability it cannot use will
+	 * spend turns trying, which is the reason {@code tools/list} filters at all.
+	 * </p>
+	 */
+	public static List<GraphMcpTool> visible(List<GraphMcpTool> tools, boolean allowWrite, Principal principal,
+		String defaultDatabase) {
+		return visible(tools, allowWrite).stream()
+			.filter(tool -> tool.descriptor().permits(principal, defaultDatabase))
+			.toList();
 	}
 }

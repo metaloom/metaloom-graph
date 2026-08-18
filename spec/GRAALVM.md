@@ -236,6 +236,38 @@ java -agentlib:native-image-agent=config-output-dir=<dir> \
   direct calls. Anyone who assumes the agent's `foreign` section is complete gets a binary that dies
   on the first `pread`.
 
+### 7.1 The JCA provider, which no green build proves anything about
+
+`PasswordHash` derives with `SecretKeyFactory.getInstance("PBKDF2WithHmacSHA512")`, and a JCA service
+lookup reaches its provider **reflectively**. So a missing registration fails at **run** time under
+`--no-fallback`, with `NoSuchAlgorithmException`, and at no earlier point: `mvn verify` stays green and
+the binary cannot verify a password. The first symptom in the field is an operator concluding they have
+forgotten it.
+
+The registrations live in **graph-core's** `reachability-metadata.json`, not the server's, because both
+binaries need them — `metaloom-graph-cli auth reset-admin` generates and hashes a password, and §10.2's
+claim that the CLI needs no metadata of its own depends on it inheriting the engine's:
+
+```
+com.sun.crypto.provider.SunJCE
+com.sun.crypto.provider.PBKDF2Core$HmacSHA512
+com.sun.crypto.provider.HmacCore$HmacSHA512
+com.sun.crypto.provider.PBKDF2KeyImpl
+sun.security.provider.SHA512
+sun.security.provider.NativePRNG
+```
+
+The last two were already there, which is the evidence that this file is where such things go.
+
+**What catches it** is the CLI smoke test in `tools/native-image.sh`, which now runs
+`auth reset-admin` against a throwaway root, checks that a 24-character password came out on stdout,
+and fails the build if the output mentions `NoSuchAlgorithmException`. A `--help` check would pass with
+the provider missing; so would starting the server, right up until somebody logged in.
+
+The escape hatch, if the provider ever proves hostile: PBKDF2 is about twenty lines over
+`javax.crypto.Mac` with `HmacSHA512`, which is a much smaller JCA surface — and the pre-existing
+`sun.security.provider.SHA` entry is evidence that path works. Do not hand-roll SHA-512.
+
 ## 8. Building It
 
 ```bash
@@ -423,5 +455,5 @@ Two details are load-bearing and were both got wrong first:
 
 ---
 
-_Git HEAD revision: `3edb034`_
-_Last updated: 2026-08-17 (the CLI's native build; written against GraalVM 25.0.3, netty 4.2.12, Vert.x 5.0.11)_
+_Git HEAD revision: `da8c93e`_
+_Last updated: 2026-08-17 (authentication and RBAC authorization)_

@@ -26,8 +26,8 @@ to the framing; it also names the one thing the losing arm did better, which sha
 | **Modules** | `graph-protocol` (frames, codec, error codes), `graph-client` (the Java client), `io.metaloom.graph.server.wire` (the server) |
 | **Default port** | 8081, bound to **127.0.0.1**. HTTP stays on 8080 |
 | **Surface** | Cypher, reads and writes. **Writes off unless the server has `--allow-write`**; §4.1. No schema call |
-| **Security** | **None.** No authentication, no transport security. §7 |
-| **Protocol version** | 3. Negotiated on connect; a mismatch is an error, not a hang |
+| **Security** | **Authentication, yes; transport security, no.** An `AUTH` frame during the handshake; the password crosses in cleartext. §7 and [AUTH.md](AUTH.md) |
+| **Protocol version** | 4. Negotiated on connect; a mismatch is an error, not a hang, and it happens *before* any credential is asked for |
 | **Database** | Chosen per connection at `HELLO` — see [DATABASES.md](DATABASES.md) |
 | **Client dependencies** | `graph-protocol` and vertx-core. **Not** graph-core, **not** graph-cypher, no FFM, no native library — asserted by `ClientDependencyTest` |
 
@@ -70,13 +70,15 @@ connection itself.
 | Frame | Direction | Payload |
 |---|---|---|
 | `HELLO` 1 | client | `i32` protocol version, value: database name (`""` = the server's default) |
-| `WELCOME` 2 | server | `i32` version, `i32` max frame bytes, `i32` max concurrent streams, value: the database it resolved |
+| `WELCOME` 2 | server | `i32` version, `i32` max frame bytes, `i32` max concurrent streams, value: the database it resolved, value: the principal (empty when the server does not authenticate), value: its grants as strings |
 | `QUERY` 3 | client | value: query text, value: parameter map, `i64` deadline millis (0 = the server's own) |
 | `CANCEL` 4 | client | empty |
 | `COLUMNS` 5 | server | value: list of column names |
 | `ROWS` 6 | server | `i32` row count, then `rows × columns` values |
 | `COMPLETE` 7 | server | `QuerySummary`: nine `i64`s — row count, elapsed micros, then nodes created and deleted, relationships created and deleted, properties set, labels added and removed |
 | `ERROR` 8 | server | `i32` error code, value: message, `i32` line, `i32` column |
+| `AUTH_REQUIRED` 9 | server | `i32` mechanism bitmask (bit 0 = password), value: realm |
+| `AUTH` 10 | client | `i32` mechanism, value: user name, value: secret |
 
 Everything that is not a fixed-width scalar is a codec value, so there is one decoder to get right and
 one to fuzz rather than a bespoke reader per frame type.
@@ -95,9 +97,40 @@ the empty case wrongly.
 ### Version negotiation
 
 The client sends `HELLO` — its version and the database it wants — and **waits** before sending
-anything else; the server answers `WELCOME` or an `ERROR` carrying `UNSUPPORTED_VERSION` or
-`NO_SUCH_DATABASE`, and closes. A client that started querying without waiting would meet a version
-mismatch as a stream of frames it could not read, with no explanation.
+anything else; the server answers `WELCOME`, or `AUTH_REQUIRED` if it wants a credential, or an
+`ERROR` carrying `UNSUPPORTED_VERSION` or `NO_SUCH_DATABASE`, and closes. A client that started
+querying without waiting would meet a version mismatch as a stream of frames it could not read, with
+no explanation.
+
+```
+client                          server
+  HELLO (version, database) ──►
+                            ◄── WELCOME                  authentication off: as it always was
+                            ◄── AUTH_REQUIRED            authentication on
+  AUTH (mech, user, secret) ──►
+                            ◄── WELCOME (…, principal, grants)
+                            ◄── ERROR UNAUTHENTICATED, and the connection closes
+```
+
+**Credentials are not in `HELLO`**, and that is the decision worth knowing. Three reasons, the third
+decisive:
+
+1. `HELLO` resolves the database, and *which* database a principal may open depends on the principal.
+   One frame with two failure modes and two error codes is worse than two frames with one each.
+2. A future mechanism — a bearer token, mTLS, an external provider — becomes a `mechanism` value
+   rather than a third `HELLO` layout.
+3. **A password is only ever sent to a server that asked for it.** A client holding credentials that
+   meets a server running with `--no-auth` completes the handshake without them ever leaving the
+   process. Credentials in `HELLO` would hand them to any port that answered.
+
+`AUTH_REQUIRED` is a frame rather than an inference, for the reason the handshake exists at all: a
+client with no credential to offer learns so immediately and fails with a message, instead of parking
+on a socket waiting for a `WELCOME` that is never coming.
+
+The connection has four states rather than two — `NEW`, `GREETED`, `AUTHENTICATING`, `READY` — and the
+third earns its place. A password is verified on a worker thread, so between the `AUTH` frame arriving
+and the answer coming back there is a window in which a client could pipeline a `QUERY`. Everything is
+refused in that window: a query racing an unfinished credential check is not a race worth having.
 
 **The database is fixed for the connection.** A stream therefore never has to say which database it
 belongs to, and the server resolves the store once instead of per query. That is not only simplicity:
@@ -364,18 +397,28 @@ engine in it.
 
 ## 7. Security posture
 
-**There is none.** No authentication, no transport security, no rate limit beyond
-`maxConcurrentStreams`.
+**Authentication, yes. Transport security, no.** A connection presents a credential during the
+handshake and is refused without one ([AUTH.md](AUTH.md)), and that credential crosses the socket **in
+cleartext**. There is no rate limit on queries beyond `maxConcurrentStreams`; logging in has its own,
+because verifying a password costs the server ~100 ms of CPU that an unauthenticated caller can ask
+for.
 
-That is why the binary port binds **loopback** by default — a new unauthenticated port should not
-default to every interface. The HTTP port does not bind loopback and predates this note;
-[OPERATIONS.md §9](OPERATIONS.md) carries the operational form of both.
+The port still binds **loopback** by default, and authentication is not a reason to change that. The two
+answer different questions: a credential says who the peer is, and only the network under it says who
+could have read the credential on its way past. `GRAPH_WIRE_HOST` widens it, deliberately and with TLS
+in front of it or a network you trust behind it.
 
-What the surface actually is: **Cypher over an unauthenticated socket**. It can read every byte of every
-database under the root, and — if the server was started with `--allow-write` — change and delete any of
-it. Without the flag a write is refused with `READ_ONLY` before it reaches a worker thread, which is a
-posture and not a control: it bounds what an unauthenticated peer can do, not who the peer is. Anything
-beyond a trusted host needs something in front of it.
+What the surface actually is: **Cypher over an authenticated but unencrypted socket.** A principal can
+read every byte of every database it holds a grant on, and — if the server was started with
+`--allow-write` *and* that principal was granted the clause — change it. Both have to permit: without
+the flag a write is refused with `READ_ONLY`, and without the grant with `UNAUTHORIZED`, and the two
+are distinguishable because their remedies are held by different people. `UNAUTHENTICATED` ends the
+connection, like every other handshake failure; `UNAUTHORIZED` is per stream and the connection
+survives, because the next query on it may well be one this principal may run.
+
+A refusal never says which part of a credential was wrong, and a database a principal may not use
+answers `UNAUTHORIZED` with a message that does not reveal whether it exists — the same rule
+`LOAD CSV` follows for a file it will not read.
 
 The frame decoder is the part an attacker reaches first, and it is the part with a non-differential
 oracle rather than only a round-trip test — see §8.
@@ -426,6 +469,5 @@ decoder on corrupt input.
 
 ---
 
-_Git HEAD revision: `20f7e3d`_
-_Last updated: 2026-08-16 (new §5.1: the two client flow-control defects behind the
-intermittent build hang, and the two guards that turn a hang into a failure)_
+_Git HEAD revision: `da8c93e`_
+_Last updated: 2026-08-17 (authentication and RBAC authorization)_

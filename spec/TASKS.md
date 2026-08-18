@@ -247,5 +247,85 @@ these ids leads somewhere.
 
 ---
 
-_Git HEAD revision: `0970e6b`_
-_Last updated: 2026-08-16 (created; seeded with the io_uring items deferred out of IO_URING.md §5–6)_
+## AUTH — identity and what it does not yet cover
+
+[AUTH.md §9](AUTH.md) states these as gaps; this is what closing each would mean. Nothing here is started.
+
+### AUTH-1 · TLS on the HTTP, binary and MCP ports
+
+**Worth building: yes, and it is now the largest gap in the system.** Authentication without transport security means a
+password crosses in cleartext, so anything on the path has it — which makes every other control here conditional on the
+network. Vert.x terminates TLS with a few lines, so the work is not the code: it is the key material. Where a
+certificate comes from, how it is rotated without a restart, whether the chart expects cert-manager, and what the
+binary client does about verification are four decisions, and getting them wrong produces a server that looks encrypted.
+
+**Cost**: small in the server, real in the chart and the client.
+**Done**: `--tls-cert`/`--tls-key` (and the chart's equivalent), `GraphClient` verifying by default with an opt-out that
+is loud, `OPERATIONS.md §9.1` no longer saying "no transport security", and a k3d phase that talks to it over HTTPS.
+**What would change the verdict**: nothing. This is the one item here that is not optional if the ports are exposed.
+
+### AUTH-2 · An audit log
+
+**Worth building: probably.** There is a record of *what* ran — the slow query log — and none of *who* ran it, which is
+the question asked after an incident rather than during one. The reason it is not free: the useful version records
+logins, refusals and administrative edits, and the shape has to survive being the thing somebody greps at 3am.
+
+**Cost**: small. An appender and a decision about what not to record.
+**Done**: logins and refusals with principal and source address, every `.auth/` edit with who made it, parameter values
+never recorded (the rule `SlowQueryLog` already follows), and a documented retention story.
+
+### AUTH-3 · An external identity provider
+
+**Worth building: only on request.** One password per user is enough for a single deployment and is the wrong answer for
+an organisation that already has OIDC or LDAP. The protocol is ready for it — `AUTH` carries a `mechanism` — so this is
+additive rather than a rework.
+
+**Cost**: medium, and it brings a dependency this build has so far avoided.
+**Done**: a second mechanism, a mapping from external groups to roles, and `.auth/` still holding the local
+administrator so a provider outage is not a lockout.
+
+### AUTH-4 · Authorization below a database
+
+**Worth building: no, not as it stands.** Per-label or per-property rules cannot be checked once before a query runs;
+they have to be checked on every element it touches, inside `GraphAccess`. That is a different feature with a different
+cost model — the check lands on the read path, where a node read by id is 21 ns — and the honest version also has to
+answer what a filtered `count(*)` means.
+
+**Cost**: large, and it lands on the hottest path in the engine.
+**What would change the verdict**: a concrete requirement, plus a measurement showing the per-element check is
+affordable. Both, in that order.
+
+### AUTH-5 · A `RESTORE` privilege and a restore route
+
+**Worth building: only alongside a restore route.** The name is reserved in `Privilege`'s javadoc and there is nothing
+to gate: restore is offline, under the store `LOCK` ([BACKUP.md §6](BACKUP.md)). A privilege for an operation that does
+not exist would be exactly the empty check `McpToolDescriptor` used to argue against.
+
+### AUTH-6 · A shared session store
+
+**Worth building: when there is a second replica.** Sessions are in memory, so a token issued by one pod is not
+recognised by another and a restart logs everyone out. The engine is single-writer and the chart defaults to one
+replica, so this is not currently reachable — but it is the first thing that breaks if anybody scales the Deployment
+for read capacity.
+
+**Cost**: medium, and it wants a store this project does not have.
+**Done**: tokens honoured across replicas, or a documented refusal to support more than one.
+
+### AUTH-7 · Login and session meters
+
+**Worth building: yes, and it is small.** A login-failure rate is the signal that says somebody is guessing, and there
+is no meter for it: refusals are counted through `graph_queries_rejected{reason}`, which now carries `unauthenticated`
+and `forbidden`, and that covers queries rather than logins.
+
+The reason it was left out of the change that built everything else: a new meter needs a row in
+[METRICS.md](METRICS.md) §3 **and** a line in `MetricsCatalogExercise`, because `MetricsCatalogScrapeTest` scrapes a real
+registry and fails on a meter that is documented and never fires. Two files and a test, for a signal nothing yet alerts
+on.
+
+**Done**: `graph_auth_logins_total{outcome}`, a session gauge, both in §3, both exercised, and an alert rule in
+`OPERATIONS.md §4` on the failure rate.
+
+---
+
+_Git HEAD revision: `da8c93e`_
+_Last updated: 2026-08-17 (authentication and RBAC authorization)_

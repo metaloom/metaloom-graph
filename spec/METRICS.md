@@ -20,7 +20,7 @@ curl localhost:8082/ready          # readiness — 503 once shutdown has begun
 
 Port 8082 by default, `--metrics-port=` or `GRAPH_METRICS_PORT`, `--no-metrics` to turn the whole thing off.
 **Do not publish this port.** It carries database names, node counts and store sizes, and like every other port in this
-server it has no authentication.
+server the monitoring port deliberately has none: a kubelet probe and a Prometheus scrape carry no credential, and a probe failing over a misconfigured secret would be a restart loop. See [AUTH.md section 7](AUTH.md).
 
 Everything this project emits is prefixed `graph_`. Alongside it a scrape carries `jvm_*`, `process_*`,
 `system_*` and `vertx_*`, which come from the Micrometer JVM binders and from `vertx-micrometer-metrics` and are not
@@ -250,9 +250,9 @@ Two that §4 could not express and this can:
   query, which is how a monitoring system is taken down by a monitored one. Naming the offending query is the
   [slow query log](OPERATIONS.md#42-the-slow-query-log)'s job, and the two are deliberately complementary: the
   histogram says how often and how bad, the log says which one.
-- **No authentication on the monitoring port**, in common with every other port here. See
+- **No authentication on the monitoring port**, and now the *only* port without it. Deliberate, not an oversight: see [AUTH.md section 7](AUTH.md) for why a probe cannot carry a credential. The other three require one. See
   [OPERATIONS.md §9](OPERATIONS.md#9-security-posture).
 
 ---
 
-_Last updated: 2026-08-16_
+_Last updated: 2026-08-17 (authentication and RBAC authorization)_

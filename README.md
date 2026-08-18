@@ -17,12 +17,12 @@ Durable, transactional, indexed, compacting, hardened, with snapshot isolation f
 | **Durability** | Write-ahead log. Every commit is fsynced *before* it touches a data file, so uncommitted data cannot reach disk and recovery is a single redo pass. |
 | **Query language** | An openCypher subset — `MATCH` with variable-length paths and `shortestPath` / `allShortestPaths`, `WHERE`, `RETURN`, `WITH`, `UNWIND`, `CASE`, aggregation, parameters, and `CREATE` / `MERGE` / `SET` / `REMOVE` / `DELETE` — in its own module, plus a single-jar Vert.x server and a React and D3 graph browser. Writes are off on both ports unless the server is started with `--allow-write`. [spec/CYPHER.md](spec/CYPHER.md) |
 | **Transactions** | `begin` / `commit` / `rollback`, plus auto-commit for single operations. |
-| **Isolation** | One writer at a time; many concurrent readers. `store.beginRead()` gives a reader **MVCC snapshot isolation** — a view fixed at one instant across many reads, while the writer keeps committing. Reads take no lock and scale to 10x at 32 threads; writes are flat by design. **No concurrent writers.** |
+| **Isolation** | **MVCC snapshot isolation for readers and writers alike.** `store.beginRead()` fixes a reader's view at one instant across many reads; `store.begin()` does the same for a writer and validates its writes at commit, so two writers that touch the same bytes end with one of them retrying rather than one of them lost. `SERIALIZABLE` additionally validates what a transaction read. Reads take no lock and scale to 10x at 32 threads. |
 | **Indexes** | Label and property B+trees, unique constraints, and an index-versus-scan differential test. |
 | **Space reclamation** | Two halves. `reclaim()` punches all-free pages and breaks no ids. `compact()` relocates records to close holes within pages, rewrites every internal reference, and pulls the high water marks down; it is the one operation that invalidates ids. A store churned to a tenth of its slots comes back to 0.95 liveness. |
 | **Native layer** | Rust via FFM, with `cargo test` and `clippy -D warnings` inside `mvn test`. **io_uring is 12.4x** over a `pread` loop on 64 scattered reads — the one capability the JVM cannot approach. The hot-loop codecs are not: 1.38x on edges, 7.8x *slower* on CRC32C. |
 | **Hardening** | Reads-per-operation and write-amplification budgets enforced as build failures; a differential harness against an in-memory model across crashes and compaction; every format parser tested against corrupt and hostile input; a `kill -9` loop that checks acknowledged commits. |
-| **Not there** | No concurrent writers, no `OPTIONAL MATCH`, no repair tool, no authentication on either port, and no *physical* snapshot or point-in-time recovery. [spec/OPERATIONS.md](spec/OPERATIONS.md) says so plainly. |
+| **Not there** | No `OPTIONAL MATCH`, no repair tool, **no TLS on any port**, and no *physical* snapshot or point-in-time recovery. Authentication and per-database RBAC do exist — [spec/AUTH.md](spec/AUTH.md) — but a password crosses in cleartext. [spec/OPERATIONS.md](spec/OPERATIONS.md) says so plainly. |
 | **Adjacency sizing** | A block is a run of 512 byte cells that doubles as the node fills, so degree 3 costs 512 bytes rather than a page. Fixing this took a 10M-node random graph from 61 GiB to 6.2 GiB and its load from 43 to 11 minutes. [spec/reports/SCALE.md](spec/reports/SCALE.md) has the before and after. |
 
 What is done and what is left, as one checklist: [spec/PROGRESS.md](spec/PROGRESS.md). The reason for
@@ -147,7 +147,7 @@ try (Transaction txn = store.begin()) {
 ```
 
 **Both servers refuse writes unless started with `--allow-write`**; embedded callers are unaffected.
-Neither port has authentication, so that default is the difference between handing out a copy of the
+The flag bounds the whole deployment whatever anybody was granted, so that default is the difference between handing out a copy of the
 data and handing out the ability to delete it.
 
 ## Several databases
@@ -162,7 +162,7 @@ from the client at connect time: [spec/DATABASES.md](spec/DATABASES.md).
   sales/       MANIFEST  seg/  wal/  dict/  LOCK
 ```
 
-A name arrives from a port with no authentication and becomes a path component, so it is checked
+A name arrives from the network and becomes a path component, so it is checked
 against an allow-list — letters, digits, `-` and `_` — rather than a search for the sequences known to
 be dangerous. Nothing is created implicitly: asking for a database that is not there is an error, not
 a create.
@@ -196,8 +196,10 @@ query's peak *server* memory is its widest intermediate result. What streaming b
 memory, a first row that arrives before the last one is found, cancellation, and a deadline the engine
 honours while it scans.
 
-**Neither port has authentication or transport security.** The binary one binds loopback for that
-reason. Which transport, and the measured trial that chose it:
+**Both ports require a login; neither has transport security.** A connection presents a credential in
+the handshake and a password crosses in cleartext, so the binary one still binds loopback — a credential
+says who the peer is, and only the network under it says who could read the credential on its way past.
+[spec/AUTH.md](spec/AUTH.md) is the design. Which transport, and the measured trial that chose it:
 [spec/TRANSPORT_DECISION.md](spec/TRANSPORT_DECISION.md).
 
 ## The graph browser

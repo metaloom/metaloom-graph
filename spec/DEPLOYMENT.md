@@ -173,7 +173,7 @@ Nine phases; **35 assertions, all passing** as of this writing. Three of them ar
 
 ## 5. What is not here
 
-- **No authentication, in the image or the chart.** Consistent with the engine; see
+- **Authentication is on in the image and configurable in the chart**, and there is a Secret now — see the section above. What is still missing is TLS, so a password crosses in cleartext. See
   [OPERATIONS.md §9.1](OPERATIONS.md#91-the-network-which-has-the-same-posture-and-a-wider-blast-radius).
 - **No backup in the chart.** The tool is in the image (§2.3) and `kubectl exec <pod> -- metaloom-graph-cli
   database backup default --server=http://localhost:8080 --out=- > g.dump` works today, given
@@ -186,4 +186,42 @@ Nine phases; **35 assertions, all passing** as of this writing. Three of them ar
 
 ---
 
-_Last updated: 2026-08-17 (metaloom-graph-cli in both images)_
+---
+
+## Authentication in the image and the chart
+
+Both images set `GRAPH_AUTH_ENABLED=true`, which is the server's own default and the one setting here
+whose unsafe value is what somebody gets by not thinking about it. Neither bakes a password: a password
+in an image is a password every copy of that image shares.
+
+The chart now ships a **Secret**, which `NOTES.txt` used to state it did not — that statement was true
+and is not any more:
+
+| Value | Effect |
+|---|---|
+| `auth.enabled` (`true`) | Sets `GRAPH_AUTH_ENABLED`. The monitoring port stays open either way |
+| `auth.initialPassword` | Rendered into `<release>-auth` and referenced with `secretKeyRef` |
+| `auth.existingSecret` | Reference a Secret you manage; takes precedence, and no Secret is created |
+| `auth.secretKey` (`initial-password`) | The key inside whichever Secret is used |
+| `auth.sessionTimeoutMillis` | Idle timeout; a 12 hour absolute cap applies as well |
+
+**`secretKeyRef` and never `value:`.** An env var set with a literal is visible in
+`kubectl describe pod` and in `/proc/<pid>/environ` to anything sharing the namespace, which for a
+credential is the whole point of using a Secret at all.
+
+With no password configured, the server generates one on first start and prints it to standard output —
+which in a pod **is** the container log. So it is exposed the moment it is printed, `kubectl logs` is
+where to read it, and rotating it afterwards is the sensible next step. `NOTES.txt` prints the exact
+`kubectl logs` and `auth reset-admin` commands rather than leaving that to be worked out.
+
+Two consequences of the session table being per process, both stated in `NOTES.txt`:
+
+- **A restart logs everyone out.** Sessions are in memory; that is the trade for having no shared store.
+- **More than one replica needs a client pinned to a pod**, because a token issued by one is not
+  recognised by another. The chart's `replicas: 1` default was already the right shape for a
+  single-writer engine and is now load-bearing for a second reason.
+
+`helm/test/run.sh` deploys the chart on k3d and runs a real pipeline; a phase that logs in and runs an
+authenticated query is the obvious next addition to it and has not been written.
+
+_Last updated: 2026-08-17 (authentication and RBAC authorization)_

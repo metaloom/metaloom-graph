@@ -28,6 +28,9 @@ import io.metaloom.graph.cypher.exec.CypherTypeException;
 import io.metaloom.graph.cypher.io.CsvSource;
 import io.metaloom.graph.cypher.parse.CypherSyntaxException;
 import io.metaloom.graph.protocol.FrameReader;
+import io.metaloom.graph.core.api.Grant;
+import io.metaloom.graph.core.api.Principal;
+import io.metaloom.graph.core.api.Privilege;
 import io.metaloom.graph.protocol.Frames;
 import io.metaloom.graph.protocol.Protocol;
 import io.metaloom.graph.protocol.QuerySummary;
@@ -35,6 +38,7 @@ import io.metaloom.graph.protocol.WireError;
 import io.metaloom.graph.protocol.WireFormatException;
 import io.metaloom.graph.protocol.WireValueCodec;
 import io.metaloom.graph.server.SlowQueryLog;
+import io.metaloom.graph.server.auth.AuthPolicy;
 import io.metaloom.graph.server.metrics.GraphMetrics;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
@@ -306,6 +310,22 @@ public final class WireServer implements AutoCloseable {
 		this.allowLoadCsv = this.csv != CsvSource.DENY;
 	}
 
+	/**
+	 * Who a connection has to be.
+	 *
+	 * <p>
+	 * A supplier and not a value, for the reason {@code AuthRoutes} holds one: the policy is set through a setter that
+	 * a caller may reach for before or after {@code listen()}, and capturing it would make the later case silently do
+	 * nothing. A setter rather than a constructor argument because there are already five public constructors and
+	 * every existing test and embedder uses one of them.
+	 * </p>
+	 */
+	private java.util.function.Supplier<AuthPolicy> auth = AuthPolicy::disabled;
+
+	public void authPolicy(java.util.function.Supplier<AuthPolicy> policy) {
+		this.auth = policy == null ? AuthPolicy::disabled : policy;
+	}
+
 	public void instrument(GraphMetrics metrics, long slowQueryMillis) {
 		this.metrics = metrics;
 		this.slowQueryMillis = slowQueryMillis;
@@ -331,6 +351,9 @@ public final class WireServer implements AutoCloseable {
 			case READ_ONLY -> "readonly";
 			case OVERLOADED -> "overloaded";
 			case PROTOCOL, UNSUPPORTED_VERSION -> "protocol";
+			// The same two words GraphServer's refusals use, so one dashboard covers both front ends.
+			case UNAUTHENTICATED -> "unauthenticated";
+			case UNAUTHORIZED -> "forbidden";
 			case INTERNAL -> "internal";
 		};
 	}
@@ -503,7 +526,25 @@ public final class WireServer implements AutoCloseable {
 		private final NetSocket socket;
 		private final Map<Integer, Stream> streams = new ConcurrentHashMap<>();
 		private volatile boolean open = true;
-		private boolean greeted;
+
+		/**
+		 * Where this connection is in the handshake.
+		 *
+		 * <p>
+		 * Three states rather than a boolean, and {@link State#AUTHENTICATING} is the one that earns the change: a
+		 * password is verified on a worker thread, so between the AUTH frame arriving and the answer coming back there
+		 * is a window in which a client could pipeline a QUERY. Refusing everything in that window is what stops a
+		 * query racing an unfinished credential check.
+		 * </p>
+		 */
+		private enum State {
+			NEW, GREETED, AUTHENTICATING, READY
+		}
+
+		private State state = State.NEW;
+
+		/** Resolved at AUTH, or {@link Principal#ANONYMOUS} when this server does not ask. Fixed for the connection. */
+		private Principal principal = Principal.ANONYMOUS;
 		/** Resolved once, at HELLO, and fixed for the life of the connection. See {@link Protocol}. */
 		private GraphStore store;
 		private String database;
@@ -529,11 +570,35 @@ public final class WireServer implements AutoCloseable {
 
 		private void frame(int type, int streamId, Buffer payload) {
 			try {
-				if (!greeted && type != Frames.HELLO) {
-					throw new WireFormatException("Expected HELLO, got " + Frames.typeName(type));
+				switch (state) {
+					case NEW -> {
+						if (type != Frames.HELLO) {
+							throw new WireFormatException("Expected HELLO, got " + Frames.typeName(type));
+						}
+					}
+					case GREETED -> {
+						if (type != Frames.AUTH) {
+							throw new WireFormatException("Expected AUTH, got " + Frames.typeName(type));
+						}
+					}
+					case AUTHENTICATING -> {
+						// Nothing at all until the answer is back. A QUERY pipelined behind an AUTH would otherwise
+						// race a password check still running on a worker.
+						fail(Frames.CONNECTION_STREAM, WireError.UNAUTHENTICATED,
+							"This connection is still being authenticated", 0, 0);
+						open = false;
+						socket.close();
+						return;
+					}
+					case READY -> {
+						if (type == Frames.HELLO || type == Frames.AUTH) {
+							throw new WireFormatException(Frames.typeName(type) + " after the handshake");
+						}
+					}
 				}
 				switch (type) {
 					case Frames.HELLO -> hello(payload);
+					case Frames.AUTH -> authenticate(payload);
 					case Frames.QUERY -> query(streamId, payload);
 					case Frames.CANCEL -> cancel(streamId);
 					default -> throw new WireFormatException(
@@ -580,13 +645,93 @@ public final class WireServer implements AutoCloseable {
 				return;
 			}
 			database = resolved;
-			greeted = true;
-			WireValueCodec.Writer welcome = new WireValueCodec.Writer(64);
+			if (auth.get().isEnabled()) {
+				// The credential is asked for rather than assumed, which is what lets a client with one talk to a
+				// server without one and never send it.
+				state = State.GREETED;
+				WireValueCodec.Writer required = new WireValueCodec.Writer(64);
+				required.i32(Frames.MECHANISM_PASSWORD);
+				WireValueCodec.encode(required, "metaloom-graph");
+				socket.write(Frames.frame(Frames.AUTH_REQUIRED, Frames.CONNECTION_STREAM, required));
+				return;
+			}
+			state = State.READY;
+			welcome();
+		}
+
+		/** The frame that ends the handshake, whichever way it got here. */
+		private void welcome() {
+			WireValueCodec.Writer welcome = new WireValueCodec.Writer(128);
 			welcome.i32(Protocol.VERSION);
 			welcome.i32(Frames.MAX_FRAME_BYTES);
 			welcome.i32(options.maxConcurrentStreams());
-			WireValueCodec.encode(welcome, resolved);
+			WireValueCodec.encode(welcome, database);
+			WireValueCodec.encode(welcome, principal.authenticated() ? principal.name() : "");
+			// Grant names, so a client can say what it may do without carrying the enum that defines it.
+			java.util.List<Object> grants = new java.util.ArrayList<>();
+			for (Grant grant : principal.grants()) {
+				grants.add(grant.toString());
+			}
+			WireValueCodec.encode(welcome, grants);
 			socket.write(Frames.frame(Frames.WELCOME, Frames.CONNECTION_STREAM, welcome));
+		}
+
+		/**
+		 * Verifies the credential, on a worker.
+		 *
+		 * <p>
+		 * PBKDF2 is a hundred milliseconds of CPU and this is an event loop, so the derivation cannot happen here. The
+		 * connection sits in {@link State#AUTHENTICATING} until the answer arrives and refuses everything meanwhile.
+		 * </p>
+		 */
+		private void authenticate(Buffer payload) {
+			WireValueCodec.Reader reader = new WireValueCodec.Reader(payload.getBytes());
+			int mechanism = reader.i32();
+			if (mechanism != Frames.MECHANISM_PASSWORD) {
+				throw new WireFormatException("This server does not know authentication mechanism " + mechanism);
+			}
+			String user = WireValueCodec.expect(WireValueCodec.decode(reader), String.class, "the user name");
+			String secret = WireValueCodec.expect(WireValueCodec.decode(reader), String.class, "the password");
+
+			String address = socket.remoteAddress() == null ? "unknown" : socket.remoteAddress().host();
+			long wait = auth.get().throttle().retryAfterMillis(user, address);
+			if (wait > 0) {
+				// OVERLOADED rather than UNAUTHENTICATED: nothing is wrong with the credential, the server is simply
+				// declining to spend more on this caller for now, which is exactly what that code means elsewhere.
+				fail(Frames.CONNECTION_STREAM, WireError.OVERLOADED,
+					"Too many failed logins. Try again in " + ((wait + 999) / 1000) + " seconds.", 0, 0);
+				open = false;
+				socket.close();
+				return;
+			}
+
+			state = State.AUTHENTICATING;
+			char[] characters = secret.toCharArray();
+			workers.executeBlocking(() -> auth.get().authenticate(user, characters), false)
+				.onComplete(outcome -> {
+					java.util.Arrays.fill(characters, '\0');
+					if (outcome.failed()) {
+						logger.error("Verifying a password failed", outcome.cause());
+						fail(Frames.CONNECTION_STREAM, WireError.INTERNAL, "Could not verify that password", 0, 0);
+						open = false;
+						socket.close();
+						return;
+					}
+					if (outcome.result().isEmpty()) {
+						auth.get().throttle().recordFailure(user, address);
+						logger.info("A failed login for '{}' from {} on the binary port", user, address);
+						// One message for every reason, so the port is not a user enumerator.
+						fail(Frames.CONNECTION_STREAM, WireError.UNAUTHENTICATED,
+							"That user name and password do not match.", 0, 0);
+						open = false;
+						socket.close();
+						return;
+					}
+					auth.get().throttle().recordSuccess(user);
+					principal = outcome.result().get();
+					state = State.READY;
+					welcome();
+				});
 		}
 
 		private void query(int streamId, Buffer payload) {
@@ -627,6 +772,17 @@ public final class WireServer implements AutoCloseable {
 
 			// Refused on the event loop, like a syntax error: the tree already knows, so this costs no permit, no
 			// worker thread and no writer lock.
+			// What the query needs, before what the server permits. Grant first so a principal who simply lacks MERGE
+			// is told that, rather than being advised to restart a server they cannot restart.
+			for (Privilege privilege : parsed.requiredPrivileges()) {
+				if (!principal.may(privilege, database)) {
+					metrics.recordQueryRejected("wire", "forbidden");
+					fail(streamId, WireError.UNAUTHORIZED, "'" + principal.name() + "' has not been granted "
+						+ privilege + " on '" + database + "'", 0, 0);
+					return;
+				}
+			}
+
 			if (parsed.isWrite() && !allowWrite) {
 				// A rejection and not an outcome: it cost nothing, and counting it as a very fast query would drag
 				// the duration histogram towards zero.

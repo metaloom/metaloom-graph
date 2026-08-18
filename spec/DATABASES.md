@@ -34,7 +34,15 @@ each store at most once, and closing them together.
   sales/                 <- another, entirely independent
     MANIFEST
     seg/  wal/  dict/  LOCK
+  .auth/                 <- the users, roles and grants. NOT a database
+    AUTH  LOCK
 ```
+
+`.auth/` is a sibling of the databases and can never be one, by two independent mechanisms:
+`validate` does not allow `.`, so no name can address it; and `names()` lists only directories
+holding a `MANIFEST`, which it never has. Neither had to change to make room for it —
+[AUTH.md §3.1](AUTH.md). A root holding only `.auth/` is therefore still empty as far as `open()` is
+concerned, and still gets a `default` created in it.
 
 Nothing is shared between them: separate WAL, separate segments, separate dictionaries, separate
 `LOCK`. Two databases in one process are two `GraphStore` instances, and the engine did not have to
@@ -60,7 +68,7 @@ the one file the engine writes first and refuses to open without.
 
 ## 2. The name is the security boundary
 
-A database name arrives from a port with **no authentication** and is about to become a path
+A database name arrives **from the network** and is about to become a path
 component. `GraphDatabases.validate` is therefore an **allow-list**: letters, digits, `-` and `_`, at
 most 64 characters, not starting with `-`.
 
@@ -72,6 +80,12 @@ nothing was created anywhere.
 Validation happens **before** the name is resolved against the root, in every entry point —
 `database`, `create`, `drop`, `exists`, `pathOf` — rather than once at a boundary somebody could route
 around later.
+
+**User and role names face the same rule**, for reasons that only partly overlap: a user name never
+becomes a directory, but it does become a token in a single-space-separated file, a value in a log
+line, and a string compared for equality to decide authority — which makes Unicode normalisation a
+security question. The rule is written out twice, once per message wording, and
+`AuthNamesTest` fires one hostile corpus at both and fails if they ever disagree.
 
 | Failure | HTTP | Wire |
 |---|---|---|
@@ -93,7 +107,7 @@ counts only for databases that are already open, for the same reason — listing
 of segment files.
 
 **Nothing is created implicitly.** Asking for a database that does not exist is an error, not a
-create. The name reaches this code from an unauthenticated port, and a typo that quietly makes a
+create. The name reaches this code from the network, and a typo that quietly makes a
 database is a typo that fills a disk.
 
 **Dropping is opt-in.** `DELETE /api/databases/{name}` returns 403 unless the server was started with
@@ -207,12 +221,16 @@ The initial database comes from `GET /api/databases`, never from a hard-coded `"
   wire server's memory bound ([WIRE.md §5](WIRE.md)) is per server.
 - There is **no cross-database query**. A query runs against one store, and the engine has no notion
   of a second one.
-- There is **no per-database authentication**, because there is no authentication at all
-  ([OPERATIONS.md §9.1](OPERATIONS.md)). Anything that can reach the port can reach every database
-  under the root — and, with `--allow-write`, change every one of them.
-- **`--allow-write` is per server, not per database.** There is no way to open one database for writing
-  and keep another read-only; that would need an identity to attach the distinction to, and there is
-  none.
+- There **is** per-database authorization now, and closing this gap is what [AUTH.md](AUTH.md) was built
+  for. A grant is `(privilege, database)`, so `MATCH ON sales` reads `sales` and is refused `default` —
+  with a message that does not say whether `default` exists, so a database is not disclosed to somebody
+  who cannot use it. `GET /api/databases` is **filtered** rather than refused for the same reason, which
+  is also why there is no `LIST_DATABASES` privilege.
+- **`--allow-write` is still per server, not per database**, and has not been replaced. It is the
+  deployment's ceiling: a request needs the privilege *and* the flag. So "one database open for writing
+  and another read-only" is now expressible — as two grants — while the flag continues to bound the
+  whole server whatever anybody was granted. The sentence this bullet used to carry, that such a thing
+  "would need an identity to attach the distinction to, and there is none", is what changed.
 
 ---
 
@@ -227,5 +245,5 @@ The initial database comes from `GET /api/databases`, never from a hard-coded `"
 
 ---
 
-_Git HEAD revision: `3edb034`_
-_Last updated: 2026-08-17 (replace, for restore over the last database)_
+_Git HEAD revision: `da8c93e`_
+_Last updated: 2026-08-17 (authentication and RBAC authorization)_

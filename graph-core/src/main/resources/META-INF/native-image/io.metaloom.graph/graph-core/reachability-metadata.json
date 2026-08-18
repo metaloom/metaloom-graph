@@ -31,30 +31,210 @@
     "ForeignDowncallMetadataTest reads this file and those five classes and fails when they disagree.",
     "",
     "The single resource is the Rust crate, which NativeCapabilities.fromClasspath unpacks to a temporary",
-    "file and dlopens. Without it the image runs on the pure-Java fallback, exactly as the jar does."
+    "file and dlopens. Without it the image runs on the pure-Java fallback, exactly as the jar does.",
+    "",
+    "The reflection entries are the JCA provider classes PasswordHash reaches through",
+    "SecretKeyFactory.getInstance(\"PBKDF2WithHmacSHA512\"). A service lookup is reflective, so without these",
+    "the image throws NoSuchAlgorithmException at RUN time - never at build time - and the first symptom is an",
+    "operator concluding they have forgotten their password. See spec/AUTH.md section 4.2.",
+    "",
+    "They live here rather than in graph-server because both native binaries need them: metaloom-graph-cli",
+    "generates and hashes a password in 'auth reset-admin', and tools/native-image.sh already relies on the",
+    "CLI inheriting graph-core's registrations rather than carrying any of its own."
   ],
   "foreign": {
     "downcalls": [
-      { "returnType": "jint", "parameterTypes": [] },
-      { "returnType": "jlong", "parameterTypes": [] },
-      { "returnType": "jint", "parameterTypes": ["jint"] },
-      { "returnType": "jlong", "parameterTypes": ["jint"] },
-      { "returnType": "jint", "parameterTypes": ["jint", "jint", "jint"] },
-      { "returnType": "jint", "parameterTypes": ["jint", "jint", "jlong", "jlong"] },
-      { "returnType": "jint", "parameterTypes": ["void*", "jint", "jint"] },
-      { "returnType": "jint", "parameterTypes": ["void*", "jlong", "jint"] },
-      { "returnType": "jint", "parameterTypes": ["jint", "jlong", "jlong", "jint"] },
-      { "returnType": "jlong", "parameterTypes": ["jint", "void*", "jlong", "jlong"] },
-      { "returnType": "jint", "parameterTypes": ["jint", "void*", "jint", "jint", "void*"] },
-      { "returnType": "jlong", "parameterTypes": ["void*", "jlong", "void*", "jlong"] },
-      { "returnType": "void*", "parameterTypes": ["jint"] },
-      { "returnType": "void", "parameterTypes": ["void*"] },
-      { "returnType": "jint", "parameterTypes": ["void*", "jint"] },
-      { "returnType": "jint", "parameterTypes": ["void*", "void*", "jint"] },
-      { "returnType": "jint", "parameterTypes": ["void*", "jint", "void*", "jint", "jlong", "jlong"] }
+      {
+        "returnType": "jint",
+        "parameterTypes": []
+      },
+      {
+        "returnType": "jlong",
+        "parameterTypes": []
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": [
+          "jint"
+        ]
+      },
+      {
+        "returnType": "jlong",
+        "parameterTypes": [
+          "jint"
+        ]
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": [
+          "jint",
+          "jint",
+          "jint"
+        ]
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": [
+          "jint",
+          "jint",
+          "jlong",
+          "jlong"
+        ]
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": [
+          "void*",
+          "jint",
+          "jint"
+        ]
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": [
+          "void*",
+          "jlong",
+          "jint"
+        ]
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": [
+          "jint",
+          "jlong",
+          "jlong",
+          "jint"
+        ]
+      },
+      {
+        "returnType": "jlong",
+        "parameterTypes": [
+          "jint",
+          "void*",
+          "jlong",
+          "jlong"
+        ]
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": [
+          "jint",
+          "void*",
+          "jint",
+          "jint",
+          "void*"
+        ]
+      },
+      {
+        "returnType": "jlong",
+        "parameterTypes": [
+          "void*",
+          "jlong",
+          "void*",
+          "jlong"
+        ]
+      },
+      {
+        "returnType": "void*",
+        "parameterTypes": [
+          "jint"
+        ]
+      },
+      {
+        "returnType": "void",
+        "parameterTypes": [
+          "void*"
+        ]
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": [
+          "void*",
+          "jint"
+        ]
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": [
+          "void*",
+          "void*",
+          "jint"
+        ]
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": [
+          "void*",
+          "jint",
+          "void*",
+          "jint",
+          "jlong",
+          "jlong"
+        ]
+      }
     ]
   },
   "resources": [
-    { "glob": "native/**" }
+    {
+      "glob": "native/**"
+    }
+  ],
+  "reflection": [
+    {
+      "type": "com.sun.crypto.provider.SunJCE",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "com.sun.crypto.provider.PBKDF2Core$HmacSHA512",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "com.sun.crypto.provider.HmacCore$HmacSHA512",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "com.sun.crypto.provider.PBKDF2KeyImpl",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "sun.security.provider.SHA512",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "sun.security.provider.NativePRNG",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": [
+            "java.security.SecureRandomParameters"
+          ]
+        }
+      ]
+    }
   ]
 }

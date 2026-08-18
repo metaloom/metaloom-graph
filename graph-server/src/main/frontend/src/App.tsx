@@ -1,9 +1,14 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   ApiError, createDatabase, createIndex, dropDatabase, dropIndex, fetchDatabases, fetchIndexes, fetchSchema,
-  fetchStats, runQuery,
+  fetchStats, logout, runQuery, whoami,
   type DatabaseList, type IndexList, type QueryResult, type Schema, type Stats
 } from './api';
+import {
+  needsLogin, parseGrants, sessionCanWrite, sessionMay, unrestricted, type Session
+} from './auth';
+import { LoginForm } from './components/LoginForm';
+import { UserPanel } from './components/UserPanel';
 import { applyResult, clear, emptyGraph, removeNode, type GraphData, type MergeMode } from './model/graph';
 import { DatabasePicker } from './components/DatabasePicker';
 import { GraphView } from './components/GraphView';
@@ -32,9 +37,58 @@ export function App() {
   const [tab, setTab] = useState<'graph' | 'table'>('graph');
   const [fitKey, setFitKey] = useState(0);
   const [databases, setDatabases] = useState<DatabaseList | null>(null);
-  /** What the server will accept, not what this page would like: every write is refused without the flag. */
-  const allowWrite = databases?.allowWrite ?? false;
   const [database, setDatabase] = useState('');
+  /**
+   * Who this browser is, or null until the server has been asked.
+   *
+   * Null is "not known yet" and is deliberately distinct from a session with `authenticated: false`: the first renders
+   * nothing, the second renders a login form. Rendering the app during the gap would fire half a dozen requests that
+   * all come back 401.
+   */
+  const [session, setSession] = useState<Session | null>(null);
+  const [showAdmin, setShowAdmin] = useState(false);
+
+  /**
+   * What the server will accept, not what this page would like.
+   *
+   * Both gates, because both refuse independently: the flag bounds the whole deployment and the grant bounds this user
+   * within it. Offering the editor when either says no would produce a 403 on every run.
+   */
+  const allowWrite = (databases?.allowWrite ?? false) && sessionCanWrite(session, database);
+
+  /** Asked once, before anything else: it decides whether there is an application to render at all. */
+  useEffect(() => {
+    void (async () => {
+      try {
+        const who = await whoami();
+        setSession({
+          authEnabled: who.authEnabled,
+          authenticated: who.authenticated,
+          user: who.user,
+          grants: parseGrants(who.grants)
+        });
+      } catch {
+        // Unreachable or not a graph server. Assume a login is needed rather than rendering an app that cannot work.
+        setSession({ authEnabled: true, authenticated: false, user: null, grants: [] });
+      }
+    })();
+  }, []);
+
+  /**
+   * Drops back to the login screen when a session has gone.
+   *
+   * Called from every catch, because an idle timeout does not announce itself: it presents as the next request
+   * failing, and without this the app would render "request failed" over a UI that can no longer do anything.
+   */
+  const signedOut = useCallback((failure: unknown) => {
+    if (failure instanceof ApiError && failure.isUnauthenticated) {
+      setSession(previous => previous === null
+        ? { authEnabled: true, authenticated: false, user: null, grants: [] }
+        : { ...previous, authenticated: false, user: null, grants: [] });
+      return true;
+    }
+    return false;
+  }, []);
 
   const loadSchema = useCallback(async (name: string, refresh: boolean) => {
     setSchemaLoading(true);
@@ -43,11 +97,13 @@ export function App() {
       setSchema(await fetchSchema(name, refresh));
       setStats(await fetchStats(name));
     } catch (failure) {
-      setSchemaError(failure instanceof Error ? failure.message : String(failure));
+      if (!signedOut(failure)) {
+        setSchemaError(failure instanceof Error ? failure.message : String(failure));
+      }
     } finally {
       setSchemaLoading(false);
     }
-  }, []);
+  }, [signedOut]);
 
   /**
    * The declared indexes of one database.
@@ -60,9 +116,11 @@ export function App() {
       setIndexes(await fetchIndexes(name));
       setIndexError(null);
     } catch (failure) {
-      setIndexError(failure instanceof Error ? failure.message : String(failure));
+      if (!signedOut(failure)) {
+        setIndexError(failure instanceof Error ? failure.message : String(failure));
+      }
     }
-  }, []);
+  }, [signedOut]);
 
   const declareIndex = useCallback(async (label: string, key: string, unique: boolean) => {
     try {
@@ -189,8 +247,12 @@ export function App() {
         void loadSchema(database, false);
       }
     } catch (failure) {
-      setError(failure instanceof ApiError ? failure : new ApiError('transport', String(failure)));
-      setStatus(null);
+      // A session that expired mid-session presents as the next query failing. Without this the screen would read
+      // "request failed" over a UI that can no longer do anything at all.
+      if (!signedOut(failure)) {
+        setError(failure instanceof ApiError ? failure : new ApiError('transport', String(failure)));
+        setStatus(null);
+      }
     } finally {
       setRunning(false);
     }
@@ -203,6 +265,19 @@ export function App() {
     void run(text, mode);
   }, [run, mode]);
 
+  // Nothing at all until the server has said whether it wants a login. Rendering the app in the gap would fire half a
+  // dozen requests that all come back 401 and leave the screen covered in failures that mean nothing.
+  if (session === null) {
+    return <div className="app" data-testid="loading" />;
+  }
+
+  if (needsLogin(session)) {
+    return <LoginForm onSignedIn={setSession} />;
+  }
+
+  const mayAdminister = unrestricted(session)
+    || sessionMay(session, 'MANAGE_USERS', '*') || sessionMay(session, 'MANAGE_ROLES', '*');
+
   return (
     <div className="app">
       <header className="topBar">
@@ -211,6 +286,31 @@ export function App() {
           openCypher{allowWrite ? '' : ', read-only'}
         </span>
         <span className="spacer" />
+        {mayAdminister && (
+          <button
+            data-testid="toggle-admin"
+            className={showAdmin ? 'active' : ''}
+            onClick={() => setShowAdmin(!showAdmin)}
+          >Users</button>
+        )}
+        {session.authenticated && (
+          <>
+            <span className="signedInAs" data-testid="signed-in-as">{session.user}</span>
+            <button
+              data-testid="sign-out"
+              onClick={() => void (async () => {
+                try {
+                  await logout();
+                } finally {
+                  // Locally regardless of what the server said: a logout that failed still means this browser is
+                  // finished with the session, and leaving the app up would be worse than a stale server-side entry
+                  // that expires on its own.
+                  setSession({ authEnabled: true, authenticated: false, user: null, grants: [] });
+                }
+              })()}
+            >Sign out</button>
+          </>
+        )}
         <DatabasePicker
           databases={databases}
           current={database}
@@ -221,7 +321,13 @@ export function App() {
         />
       </header>
 
-      <div className="body">
+      {showAdmin && mayAdminister && (
+        <div className="body">
+          <UserPanel session={session} />
+        </div>
+      )}
+
+      <div className="body" style={showAdmin && mayAdminister ? { display: 'none' } : undefined}>
         <Sidebar
           schema={schema}
           schemaError={schemaError}

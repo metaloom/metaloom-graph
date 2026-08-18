@@ -1,9 +1,11 @@
 package io.metaloom.graph.server.mcp.tool.impl;
 
 import java.util.List;
+import java.util.Set;
 
 import io.metaloom.graph.core.api.GraphDatabases;
 import io.metaloom.graph.core.api.GraphStore;
+import io.metaloom.graph.core.api.Privilege;
 import io.metaloom.graph.server.mcp.model.McpToolDescriptor;
 import io.metaloom.graph.server.mcp.model.McpToolDescriptor.McpToolParam;
 import io.metaloom.graph.server.mcp.tool.GraphMcpToolResults;
@@ -33,7 +35,7 @@ public final class DropIndexTool extends StoreTool {
 				new McpToolParam("label", "string", "The node label.", true),
 				new McpToolParam("key", "string", "The property key.", true),
 				new McpToolParam("database", "string", DATABASE_DESCRIPTION, false))),
-			true);
+			true, Set.of(Privilege.DROP_INDEX));
 	}
 
 	@Override

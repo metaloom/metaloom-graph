@@ -30,13 +30,13 @@ npx @modelcontextprotocol/inspector                     # → http://127.0.0.1:8
 Every other port here defaults to on, and this one does not. That is the single place this implementation
 deliberately diverges from MetaLoom's `loom-service-mcp`, which sits behind a token.
 
-There is no authentication anywhere in this process. For the HTTP and binary ports that means "anyone who can reach
+Every port here now requires a credential ([AUTH.md](AUTH.md)), and this one is still off by default. When it had none, the argument was that for the HTTP and binary ports the exposure meant "anyone who can reach
 it can read everything", which is stated plainly and bounded by where you put it. MCP is different in kind: it is a
 remote code path an **LLM** drives, against a database, over a protocol whose whole purpose is to let a model decide
 what to run. The blast radius of leaving it open is not the same as for a port a person has to point a client at on
 purpose.
 
-So it is opt-in, and when it is on it binds loopback, and widening it is a second deliberate act.
+So it is opt-in, and when it is on it binds loopback, and widening it is a second deliberate act. **That has not changed now that it requires a credential.** A password says who the peer is; it says nothing about who could read it off a cleartext network, and it says nothing about whether an LLM deciding what to run is a thing this deployment wants reachable. Authentication is a reason to be less worried about the first, not about the second.
 
 ---
 
@@ -126,15 +126,22 @@ when it did not will draw a conclusion from half an answer, which is a worse out
 
 ## 5. The write gate, and why it is checked twice
 
-One rule — the server's own `--allow-write` — and two enforcement points:
+Two rules now — the server's own `--allow-write` **and** what the caller was granted — and the same two enforcement
+points, which is why the shape survived the change:
 
-1. **`tools/list` omits write tools** on a read-only server. An agent should not be shown a capability it cannot
-   use, because it will spend turns trying.
-2. **`tools/call` re-checks before dispatch.** A call naming a tool remembered from an earlier session, against a
-   different server, must not work.
+1. **`tools/list` omits what this caller cannot use**, whether the reason is the flag or the grant. An agent should not
+   be shown a capability it cannot use, because it will spend turns trying.
+2. **`tools/call` re-checks before dispatch.** A call naming a tool remembered from an earlier session — or from a
+   session as somebody else — must not work.
 
 Either alone is a hole: listing without dispatch checking trusts the client's memory; dispatch checking without
-listing wastes the model's time. `McpProtocolTest` asserts both.
+listing wastes the model's time. `McpProtocolTest` and `McpAuthTest` assert both.
+
+`McpToolDescriptor` carries a `requiredPrivileges` set for the coarse cases, and `graph_query` is checked **per call**
+against the query, because what a query needs depends on the query — exactly as whether it *writes* does. That class
+used to explain why there was deliberately no such field: "this server has no authentication and therefore no
+identities; inventing a permission field that is always empty would suggest a check that does not happen". The
+reasoning was right, and the field arrived when the check did; the comment is kept rather than deleted.
 
 A refusal comes back as a **tool result with `isError`**, not as a JSON-RPC error, and its text names the flag and
 says *do not retry*. The distinction matters: a JSON-RPC error is a transport failure the model may reasonably retry,
@@ -165,14 +172,20 @@ See [METRICS.md](METRICS.md).
 }
 ```
 
-There is no token to configure, because there is no authentication. If the port is reachable, so is everything in
-every database under the root.
+**There is a token now.** All three transports require `Authorization: Bearer <session>`, obtained from
+`POST /api/login` on the HTTP port — this port has no login route of its own, deliberately: one identity store, one
+place to log in. The websocket cannot decline an upgrade, because Vert.x 5 removed `accept()`/`reject()` from
+`ServerWebSocket`, so an unauthenticated `/mcp/ws` is closed with **1008** (policy violation), exactly as the
+wrong-path branch already does.
+
+What the token does not buy is privacy: it crosses in cleartext like everything else here.
 
 ---
 
 ## 8. What is not here
 
-- **No authentication.** Consistent with every other port, and the reason this one is off by default.
+- **No transport security.** The bearer token crosses in cleartext. Authentication exists ([AUTH.md](AUTH.md)); privacy does not.
+- **No token of its own.** A session comes from the HTTP port's `POST /api/login`; there is one identity store and one place to log in.
 - **No resources and no prompts.** Only `tools`. A `resources/list` over a graph would have to invent a URI scheme
   for nodes, and nothing has asked for it.
 - **No streaming of a long result.** A tool result is one message. The row cap is what makes that acceptable; the
@@ -182,4 +195,4 @@ every database under the root.
 
 ---
 
-_Last updated: 2026-08-16_
+_Last updated: 2026-08-17 (authentication and RBAC authorization)_

@@ -22,6 +22,26 @@ nameOverride: ""
 # -- Override the generated fullname.
 fullnameOverride: ""
 
+# -- Who a request has to be.
+auth:
+  # -- Require a login on the HTTP, binary and MCP ports. On by default, which is the server's own default: it is the
+  # one setting here whose unsafe value is what somebody gets by not thinking about it. The monitoring port is
+  # deliberately exempt either way -- a kubelet probe and a Prometheus scrape carry no credential.
+  #
+  # A grant does not override the allow* flags below. Both have to permit, so turning this on can never widen what this
+  # deployment is able to do. See spec/AUTH.md section 5.
+  enabled: true
+  # -- The first administrator's password, used only on a first start with no identity file and ignored afterwards.
+  # Rendered into a Secret and referenced with secretKeyRef, never as a literal env var: `value:` would put it in
+  # `kubectl describe pod`. Leave it empty to have one generated and printed to the container log on first start.
+  initialPassword: ""
+  # -- Use a Secret you already manage instead of having the chart create one. Takes precedence over initialPassword.
+  existingSecret: ""
+  # -- The key inside whichever Secret is used.
+  secretKey: initial-password
+  # -- How long a browser session may sit idle before it has to log in again. An absolute 12 hour cap applies as well.
+  sessionTimeoutMillis: 1800000
+
 graph:
   # -- The database a request that does not name one gets. Created at start-up if absent.
   database: default

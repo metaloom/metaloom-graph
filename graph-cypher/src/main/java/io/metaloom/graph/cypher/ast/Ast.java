@@ -1,7 +1,11 @@
 package io.metaloom.graph.cypher.ast;
 
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+
+import io.metaloom.graph.core.api.Privilege;
 
 /**
  * The syntax tree of the accepted subset, as one sealed family.
@@ -74,6 +78,30 @@ public final class Ast {
 			}
 			return false;
 		}
+
+		/**
+		 * Every privilege a principal needs before this may run.
+		 *
+		 * <p>
+		 * The third policy question answered from the tree, alongside {@link #isWrite()} and {@link #readsFiles()}, and
+		 * for their reason: a refusal decided here costs no worker thread, no transaction and no read view. The union
+		 * over the union parts, because running the query runs all of them.
+		 * </p>
+		 *
+		 * <p>
+		 * <b>This is not the whole gate.</b> The server-wide flags are checked first and separately, and can only
+		 * subtract — see {@code spec/AUTH.md} section 5. It is also not consulted by embedded callers at all: the
+		 * enforcement point is each front end, exactly as it is for {@code --allow-write}, which
+		 * {@code spec/CYPHER.md} section 5.1 states as "a property of the servers, not of the language".
+		 * </p>
+		 */
+		public Set<Privilege> requiredPrivileges() {
+			Set<Privilege> required = EnumSet.noneOf(Privilege.class);
+			for (SingleQuery part : parts) {
+				required.addAll(part.requiredPrivileges());
+			}
+			return required;
+		}
 	}
 
 	/**
@@ -108,6 +136,54 @@ public final class Ast {
 				}
 			}
 			return false;
+		}
+
+		/**
+		 * See {@link Query#requiredPrivileges()}.
+		 *
+		 * <h2>Why this is a switch where its two neighbours are {@code instanceof} chains</h2>
+		 *
+		 * <p>
+		 * {@link Clause} is sealed, so an exhaustive {@code switch} with no {@code default} makes adding a twelfth
+		 * clause a <b>compile error here</b> until its privilege is declared. That is worth more than the symmetry:
+		 * {@link #isWrite()} answering "no" for a clause nobody classified is a wrong answer about whether to open a
+		 * write transaction, but this answering "nothing required" for one would be a clause that authorises itself.
+		 * The compiler is a better guard for that than any test could be, which is why no test asserts exhaustiveness.
+		 * </p>
+		 *
+		 * <p>
+		 * {@code UNWIND}, {@code WITH} and {@code RETURN} map to {@link Privilege#MATCH} rather than to nothing. They
+		 * compute over rows something else bound, so they authorise no access of their own — but a query made only of
+		 * them still occupies a worker thread, and {@code MATCH} is the floor for "may issue a read query at all".
+		 * </p>
+		 *
+		 * <p>
+		 * {@code MERGE} yields two, because it matches before it creates: a principal who may {@code MERGE} but not
+		 * read would otherwise learn whether a pattern exists by watching whether one appeared.
+		 * </p>
+		 */
+		public Set<Privilege> requiredPrivileges() {
+			Set<Privilege> required = EnumSet.noneOf(Privilege.class);
+			for (Clause clause : clauses) {
+				switch (clause) {
+					case Match _ -> required.add(Privilege.MATCH);
+					case Unwind _ -> required.add(Privilege.MATCH);
+					case With _ -> required.add(Privilege.MATCH);
+					case Return _ -> required.add(Privilege.MATCH);
+					// The one procedure is vector.query, which reads. A writing procedure would declare itself here.
+					case Call _ -> required.add(Privilege.MATCH);
+					case Create _ -> required.add(Privilege.CREATE);
+					case Merge _ -> {
+						required.add(Privilege.MATCH);
+						required.add(Privilege.MERGE);
+					}
+					case SetClause _ -> required.add(Privilege.SET);
+					case Remove _ -> required.add(Privilege.REMOVE);
+					case Delete _ -> required.add(Privilege.DELETE);
+					case LoadCsv _ -> required.add(Privilege.LOAD_CSV);
+				}
+			}
+			return required;
 		}
 	}
 

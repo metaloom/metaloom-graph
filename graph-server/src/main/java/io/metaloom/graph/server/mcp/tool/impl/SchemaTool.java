@@ -1,11 +1,13 @@
 package io.metaloom.graph.server.mcp.tool.impl;
 
 import java.util.List;
+import java.util.Set;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 import io.metaloom.graph.core.api.GraphDatabases;
 import io.metaloom.graph.server.SchemaScanner;
+import io.metaloom.graph.core.api.Privilege;
 import io.metaloom.graph.server.mcp.model.McpToolDescriptor;
 import io.metaloom.graph.server.mcp.model.McpToolDescriptor.McpToolParam;
 import io.metaloom.graph.server.mcp.tool.GraphMcpToolResults;
@@ -37,7 +39,7 @@ public final class SchemaTool extends StoreTool {
 				+ "writing a query: a guessed label name returns an empty result rather than an error.",
 			McpToolDescriptor.buildInputSchema(List.of(
 				new McpToolParam("database", "string", DATABASE_DESCRIPTION, false))),
-			false);
+			false, Set.of(Privilege.INTROSPECT));
 	}
 
 	@Override

@@ -242,7 +242,30 @@ smoke_cli() {
 	[ "$TRUNCATED_STATUS" -eq 1 ] || fail "a truncated dump should exit 1, got $TRUNCATED_STATUS"
 	echo "$TRUNCATED" | grep -q "dump could not be read" || fail "a truncated dump was not diagnosed: $TRUNCATED"
 
-	echo "[native] smoke test passed: $FIRST backed up, restored and backed up again; a truncated dump refused"
+	# The JCA path, which is the one thing in this binary that a green `mvn verify` proves nothing about.
+	# SecretKeyFactory.getInstance is a reflective service lookup, so a missing entry in graph-core's
+	# reachability-metadata.json fails at RUN time under --no-fallback and at no earlier point. This command
+	# generates a password with SecureRandom, derives it with PBKDF2-HMAC-SHA512 and writes the file, which
+	# is every part of that path in one go. See spec/AUTH.md section 4.2.
+	AUTH_ROOT="$OUT_DIR/smoke-auth-root"
+	mkdir -p "$AUTH_ROOT"
+	set +e
+	AUTH_OUTPUT=$("$BINARY" auth reset-admin --path="$AUTH_ROOT" 2>&1)
+	AUTH_STATUS=$?
+	set -e
+	[ "$AUTH_STATUS" -eq 0 ] || fail "auth reset-admin: $AUTH_OUTPUT"
+	case "$AUTH_OUTPUT" in
+		*NoSuchAlgorithmException*|*"is not available from this JVM"*)
+			fail "the JCA provider is missing from graph-core's reachability-metadata.json: $AUTH_OUTPUT" ;;
+	esac
+	# The password is the only thing on stdout, so a 24-character line is the proof it was both generated and
+	# printed where a script can capture it.
+	PASSWORD=$("$BINARY" auth reset-admin --path="$AUTH_ROOT" 2>/dev/null | tr -d '\r\n')
+	[ "${#PASSWORD}" -eq 24 ] || fail "auth reset-admin printed a ${#PASSWORD} character password, expected 24"
+	"$BINARY" auth list --path="$AUTH_ROOT" 2>>"$LOG" | grep -q "admin" || fail "auth list"
+
+	echo "[native] smoke test passed: $FIRST backed up, restored and backed up again; a truncated dump refused;"
+	echo "[native] PBKDF2 and SecureRandom work in the image"
 }
 
 case "$NAME" in

@@ -189,19 +189,22 @@ public class CypherConcurrencyTest {
 		}
 		long from = accounts.get(fromIndex);
 		long to = accounts.get(toIndex);
-		try (Transaction txn = store.begin()) {
+		// inTransaction, not begin(): the writers of this test are the storage API rather than Cypher, and with
+		// concurrent writers two transfers touching one account are a genuine conflict — each read a balance the other
+		// has since replaced. Retrying is the contract. What the test is about is the reader: a Cypher query is dozens
+		// of storage calls, and the view is what stops it spanning two states however many attempts the writers take.
+		store.inTransaction(() -> {
 			long fromBalance = (Long) store.nodeProperty(from, "balance");
 			long amount = fromBalance <= 1 ? 0 : 1 + rnd.nextInt((int) Math.min(50, fromBalance - 1));
 			if (amount == 0) {
-				txn.rollback();
-				return;
+				return null;
 			}
 			long toBalance = (Long) store.nodeProperty(to, "balance");
 			store.setNodeProperties(from, Properties.of().set("balance", fromBalance - amount));
 			store.setNodeProperties(to, Properties.of().set("balance", toBalance + amount));
 			store.createEdge(from, "PAID", to);
-			txn.commit();
-		}
+			return null;
+		}, 200);
 	}
 
 	private List<Long> openAccounts(GraphStore store) throws Exception {

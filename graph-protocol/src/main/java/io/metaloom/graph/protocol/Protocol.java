@@ -34,10 +34,25 @@ package io.metaloom.graph.protocol;
 public final class Protocol {
 
 	/**
-	 * Version 3: {@link Frames#COMPLETE} carries what the query changed, so a write query can report itself.
+	 * Version 4: the connection says who it is.
 	 *
 	 * <p>
-	 * Version 2 added the database to {@link Frames#HELLO} and {@link Frames#WELCOME}; version 1 had neither.
+	 * A server that wants a credential answers {@link Frames#HELLO} with {@link Frames#AUTH_REQUIRED} instead of
+	 * {@link Frames#WELCOME}, and the client replies with {@link Frames#AUTH}. {@code WELCOME} then also carries the
+	 * principal's name and its grants.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>Credentials are not in {@code HELLO}</b>, and the reason is worth keeping: a client holding a password and
+	 * talking to a server that does not want one completes the handshake without ever sending it. Putting them in
+	 * {@code HELLO} would hand a password to any port that answered. It also keeps the two failures apart — the
+	 * database a connection asked for depends on who is asking, and one frame with two error codes is worse than two
+	 * frames with one each.
+	 * </p>
+	 *
+	 * <p>
+	 * Version 3 gave {@link Frames#COMPLETE} what the query changed; version 2 added the database to
+	 * {@link Frames#HELLO} and {@link Frames#WELCOME}; version 1 had neither.
 	 * </p>
 	 *
 	 * <p>
@@ -46,7 +61,7 @@ public final class Protocol {
 	 * has shipped on any version, so there is no range to accept — when there is, this is where it goes.
 	 * </p>
 	 */
-	public static final int VERSION = 3;
+	public static final int VERSION = 4;
 
 	/** Not 8080, so the binary port and the HTTP port can both run over one store without an argument about it. */
 	public static final int DEFAULT_PORT = 8081;

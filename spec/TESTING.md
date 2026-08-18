@@ -40,6 +40,10 @@ to what they asserted ([CURRENT_STATE.md §5](CURRENT_STATE.md#5-test-reality-ch
 | `VerifyUnderLoadTest` | **2, and the first is the one that matters most.** `verify()` held only the apply read latch, which excludes the commit *apply step* but not an **open write transaction**. Mid-transaction the free-slot bitmap is still the pre-transaction image sitting in the page overlay while the superblock's live count has already moved, so verification compared the two and reported `accounting mismatch` — corruption, on a healthy store, within a second of a writer running. On the way through it also reached `flushChecksums()`, which walks and then clears the dirty-page `BitSet` that the writer sets under a *different* lock. This is the same defect `PROGRESS.md` had already recorded against compaction, reached instead through the public API an operator turns to precisely when they already suspect corruption |
 | `WriterLockLivenessTest` | **1, and it bricked the store.** Interrupting a committing thread: `FileChannel` is an `InterruptibleChannel`, so reaching `force()` with the interrupt flag set makes the JDK *close the channel*, and the WAL channel is shared — every later commit **on every thread** then failed with `ClosedChannelException`, and so did `close()`. One `Future.cancel(true)`, one `shutdownNow()`, one query deadline, and the store is dead for the life of the process. Found by a case written only to check the lock was released. The lock was released; everything else was gone |
 | `CompactionTest#testCompactionInterleavesWithForegroundWrites` | 1, **and it had been reported as flaky for months while the test was quietly not testing it**. Compaction's reclaim phase ran outside the writer lock and its `flushChecksums()` cleared a concurrent writer's dirty marks, leaving pages with checksums that no longer described them. What hid it was the test's own writer: a fixed 200 nodes, finishing in milliseconds, long before compaction reached the reclaim phase at the end of the pass. So the case named for an interleaving never interleaved with the code that had the bug, and its failures were rare enough to read as flakiness. Holding the writer open for the whole `compact()` call turns it into 8 failures in 10. **A test that reproduces a defect one run in twelve is usually not a timing problem, it is a coverage problem wearing one as a disguise** |
+| `ParallelConsistencyTest` | 3, and all three only reachable with concurrent writers. A conserved total is a blunt instrument and it caught the subtle ones: a reused slot taking its generation from the transaction's view rather than from the mapping, so the record landed under a generation its own id did not match; a writer reading the mapping without the apply latch, which the single writer lock had been providing by accident; and two vacuums cutting the same version chains at once, which left a page whose newest before-image was older than it should be — so a view entitled to reconstruct it decided it did not need to, and read bytes from the future. **Each of the three presented as the same symptom**, a reader told its property block was stale, and the first two fixes did not make the third go away |
+| `VerifyUnderLoadTest`, `AutoCommitAtomicityTest` | 1. A conflict raised after the commit had already folded the transaction's metadata onto the live counters left the live count advanced over a bitmap whose bits were then discarded with the overlay. `verify()` reported an accounting mismatch on a store where nothing had gone wrong except a transaction losing a race — the same false-corruption shape as the defect this file already records for `verify()` itself |
+| `ReferenceModelTest` | 1, **single-threaded**, from a concurrency change. Restoring a rolled-back transaction's high water mark left free-ring entries naming slots above the new mark, so the same slot was handed out twice: once off the ring and once off the bump cursor on its way back up. The concurrent tests never saw it; the sequential model differential did |
+| `MultiStoreIsolationTest` | 2. Four writers racing to create the one index catalog page burned all sixty-four of their retry attempts inside the winner's first commit, because the retry yielded rather than backed off — a conflict against a transaction that is still running is resolved by that transaction *finishing*, and a durable commit takes milliseconds where a failed attempt takes microseconds. Behind it, the catalog page id was cached in a field shared across threads, so one thread cleared it while another was mid-lookup |
 | `SnapshotLinearizabilityTest` | 0 so far, and it is the one that generalises the anomaly matrix: because writers are serialised and the snapshot timestamp *is* the LSN, the state a view is entitled to see is computable rather than merely constrainable. So it asserts equality against a model history keyed by commit LSN, instead of asserting the absence of four named anomalies |
 
 The pattern is worth naming: **every one of these came from a test that compared the engine against
@@ -598,5 +602,42 @@ diagnostic artefact and deleting it on failure is the most frustrating thing a t
 
 ---
 
-_Git HEAD revision: `3edb034`_
-_Last updated: 2026-08-17 (graph-cli's tests, and the counts re-derived from the surefire reports)_
+## Authentication and authorization
+
+[AUTH.md §11](AUTH.md) has the full table. What is worth knowing here is which of them are unusual:
+
+- **`AuthHostileInputTest`** (graph-core, `unit`) holds `AuthCodec.decode` to the contract
+  `HostileInputTest`, `WireDecoderHostileInputTest` and `DumpHostileInputTest` hold their parsers to —
+  and adds one those three do not need. Their formats carry data; this one carries **authority**, so it
+  is not enough that a corrupt file fails to crash: it must not decode into a *different, valid* set of
+  grants. `testEverySingleBitMutationIsRefused` walks every bit of the fixture, about 1,600 mutations,
+  and requires all of them to be refused — not "the overwhelming majority", which is the right bar for
+  a dump and the wrong one here. The CRC is what makes it achievable.
+- **`PasswordHashCostTest`** (graph-core, **`slow`**) asserts that one verification takes between 20 ms
+  and 1 s. It exists because every functional assertion about passwords passes just as happily at one
+  iteration as at 210,000, so the single most damaging change anyone could make here is invisible to the
+  rest of the suite. The bounds are wide on purpose: the defect it catches is out by three orders of
+  magnitude, and a tight bound on shared hardware would be a flaky test rather than a guarantee.
+- **`WireAuthTest`** (graph-server, `unit`) carries the class-level `@Timeout` *and* the `eventLoops()`
+  counter, for the two reasons `WireServerTest` does: the failure mode of a handshake is not answering,
+  and `WireServer`'s caller-owned-Vert.x constructor never closes what it is given.
+- **`AuthFlagCompositionTest`** (graph-server, `unit`) is the one that pins the rule down in both
+  directions, and asserts the `--no-auth` response **verbatim** — the equivalence that made it safe to
+  land this in stages.
+- **`AuthNamesTest`** guards a rule that is deliberately written out twice, and records in passing that
+  the allow-list accepts `CON`: it saves you from anticipating dangerous *characters*, not reserved
+  Windows *words*, which `spec/DATABASES.md` §2 slightly overstates. Harmless on Linux.
+- **The browser suite** signs in once in `e2e/global-setup.ts` and reuses a `storageState`, so the
+  thirty-five pre-existing specs are untouched. `e2e/login.spec.ts` runs in its own Playwright project
+  with no saved state, because it is about not being signed in. `tools/demo-server.sh` therefore leaves
+  authentication **on** and fixes the first password with `GRAPH_INITIAL_PASSWORD`, since Playwright is
+  the only suite that can exercise a login page at all.
+- **Two traps worth knowing** if the e2e suite hangs: `webServer.url` must probe `/api/whoami` and not
+  `/api/stats`, because Playwright treats 401 as not-ready and would burn its whole 240 s budget; and
+  `reuseExistingServer` is true outside CI, so anything already listening on `E2E_PORT` is silently
+  adopted — including something that is not this server at all.
+
+---
+
+_Git HEAD revision: `da8c93e`_
+_Last updated: 2026-08-17 (authentication and RBAC authorization)_

@@ -1,9 +1,11 @@
 package io.metaloom.graph.server.mcp.tool.impl;
 
 import java.util.List;
+import java.util.Set;
 
 import io.metaloom.graph.core.api.CompositeIndex;
 import io.metaloom.graph.core.api.GraphDatabases;
+import io.metaloom.graph.core.api.Privilege;
 import io.metaloom.graph.server.mcp.model.McpToolDescriptor;
 import io.metaloom.graph.server.mcp.model.McpToolDescriptor.McpToolParam;
 import io.metaloom.graph.server.mcp.tool.GraphMcpToolResults;
@@ -33,7 +35,7 @@ public final class ListIndexesTool extends StoreTool {
 				+ "a lookup; on an unindexed one it is a full scan.",
 			McpToolDescriptor.buildInputSchema(List.of(
 				new McpToolParam("database", "string", DATABASE_DESCRIPTION, false))),
-			false);
+			false, Set.of(Privilege.INTROSPECT));
 	}
 
 	@Override

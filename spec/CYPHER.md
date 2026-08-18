@@ -278,11 +278,33 @@ writing a key the value it already had counts as nothing.
 ### 5.1 Writes are off by default
 
 `--allow-write`, and it governs the HTTP route, the binary port and the UI together. Off is the only
-defensible default: neither port has authentication, the HTTP one binds every interface, and the
-difference between handing out a copy of the data and handing out the ability to delete it is worth an
-explicit act. A write without it is **403** over HTTP and `READ_ONLY` on the wire, refused on the event
-loop before a worker thread or a transaction is spent. **Embedded Java callers are unaffected** — the
-flag is a property of the servers, not of the language.
+defensible default: the difference between handing out a copy of the data and handing out the ability
+to delete it is worth an explicit act. A write without it is **403** over HTTP and `READ_ONLY` on the
+wire, refused on the event loop before a worker thread or a transaction is spent. **Embedded Java
+callers are unaffected** — the flag is a property of the servers, not of the language.
+
+**A grant is the other half, and both have to permit.** Every clause maps to a privilege
+([AUTH.md §1.1](AUTH.md)), and `Ast.Query.requiredPrivileges()` answers what a query needs from the
+tree — the third policy question decided there, beside `isWrite()` and `readsFiles()`, and for their
+reason: the refusal costs no worker thread. The grant is checked first, so a principal who simply
+lacks `MERGE` is told that rather than being advised to restart a server they cannot restart. The flag
+can only subtract: enabling authentication never widens what a read-only deployment can do.
+
+| Clause | Privilege |
+|---|---|
+| `MATCH`, `UNWIND`, `WITH`, `RETURN`, `CALL` | `MATCH` |
+| `CREATE` | `CREATE` |
+| `MERGE` | `MERGE` **and** `MATCH` — it matches before it creates, so a principal who could merge without reading would learn whether a pattern existed by watching whether one appeared |
+| `SET` | `SET` |
+| `REMOVE` | `REMOVE` |
+| `DELETE`, `DETACH DELETE` | `DELETE` |
+| `LOAD CSV` | `LOAD_CSV` |
+
+`UNWIND`, `WITH` and `RETURN` map to `MATCH` rather than to nothing: they authorise no access of their
+own, but a query made only of them still occupies a worker thread, so `MATCH` is the floor for "may
+issue a read query at all". One consequence is surprising and correct — `LOAD CSV … CREATE` needs no
+`MATCH` while `LOAD CSV … RETURN row` does, because the importing form reads nothing out of the graph
+and the previewing form hands rows back to the caller.
 
 `--allow-drop` stays separate. Dropping destroys a whole database and its directory in one request,
 including databases no query addressed; enabling writes is not asking for that.
@@ -487,7 +509,7 @@ companion predicate, answered from the tree so the refusal costs nothing.
 check runs, which makes containment structural rather than a filter. Then `normalize()`, then a
 `startsWith` check, then `toRealPath()` and the check again, because an import directory is very often
 somewhere a less-trusted process drops files and a symlink planted in one is a realistic way out.
-`http://` is refused **by name**: an SSRF primitive on an unauthenticated port is worse than the file
+`http://` is refused **by name**: an SSRF primitive reachable by anything that can log in is worse than the file
 read it would be replacing. A refusal never says whether the file exists, so the clause cannot be used
 to probe a filesystem the caller cannot otherwise see.
 
@@ -818,9 +840,10 @@ inventing plausible-looking facts about real places.
 It is seeded, so a size always produces the same graph — which is what lets the browser suite name Heathrow and
 expect an answer.
 
-**No authentication.** With `--allow-write` the query language can change and delete data; without it,
-it still reads everything. Bind to localhost unless something else provides access control —
-[OPERATIONS.md §9.1](OPERATIONS.md).
+**Authentication, and no transport security.** The HTTP and binary ports require a login
+([AUTH.md](AUTH.md)) and a password crosses in cleartext, so put TLS in front of anything beyond a host
+you trust — [OPERATIONS.md §9.1](OPERATIONS.md). What a principal may do is the grant and the flag
+together: both have to permit, and the flag can only subtract.
 
 ---
 
@@ -932,5 +955,5 @@ previous bundle. Every assertion in the first run failed against markup that no 
 
 ---
 
-_Git HEAD revision: `3edb034`_
-_Last updated: 2026-08-17 (LOAD CSV, USING PERIODIC COMMIT, and the keyword-spelling fix)_
+_Git HEAD revision: `da8c93e`_
+_Last updated: 2026-08-17 (authentication and RBAC authorization)_

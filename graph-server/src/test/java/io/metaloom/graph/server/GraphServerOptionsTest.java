@@ -239,7 +239,7 @@ public class GraphServerOptionsTest {
 		}
 		// And the reverse direction, spelled out: the count is asserted so that adding a variable to the parser
 		// without adding it to VARIABLES fails here rather than being noticed by an operator.
-		assertEquals(21, GraphServerOptions.VARIABLES.size(),
+		assertEquals(24, GraphServerOptions.VARIABLES.size(),
 			"a variable was added or removed; update this count and check --help still prints all of them");
 	}
 
@@ -363,5 +363,96 @@ public class GraphServerOptionsTest {
 		assertTrue(usage.contains("--database"), "and the flag that picks which database a request gets");
 		assertTrue(usage.contains("--allow-drop"), "and the one that turns on the only route that deletes data");
 		assertTrue(usage.contains("--allow-write"), "and the one that lets a query change a store at all");
+	}
+
+	// ---------------------------------------------------------------- authentication
+
+	/**
+	 * On by default, and it is the only setting here that is.
+	 *
+	 * <p>
+	 * Every capability flag defaults to off because enabling one is a decision. This defaults to on for the mirror
+	 * reason: it is the setting whose <em>unsafe</em> value is the one somebody gets by not thinking about it, so not
+	 * thinking about it has to be the safe outcome.
+	 * </p>
+	 */
+	@Test
+	public void testAuthenticationIsOnByDefault() {
+		assertTrue(GraphServerOptions.parse(new String[] { "/tmp/x" }, name -> null).auth());
+	}
+
+	@Test
+	public void testAuthenticationCanBeTurnedOffByFlagOrVariable() {
+		assertFalse(GraphServerOptions.parse(new String[] { "--no-auth", "/tmp/x" }, name -> null).auth());
+		assertFalse(GraphServerOptions.parse(new String[] { "/tmp/x" },
+			name -> "GRAPH_AUTH_ENABLED".equals(name) ? "false" : null).auth());
+	}
+
+	/** A flag beats a variable, so a shell that exported one cannot decide for a second server. */
+	@Test
+	public void testTheFlagBeatsTheVariable() {
+		assertFalse(GraphServerOptions.parse(new String[] { "--no-auth", "/tmp/x" },
+			name -> "GRAPH_AUTH_ENABLED".equals(name) ? "true" : null).auth());
+	}
+
+	/** A typo must not silently disable authentication, which {@code Boolean.parseBoolean} would do. */
+	@Test
+	public void testAMisspeltBooleanIsRefusedRatherThanReadAsFalse() {
+		IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+			() -> GraphServerOptions.parse(new String[] { "/tmp/x" },
+				name -> "GRAPH_AUTH_ENABLED".equals(name) ? "ture" : null));
+		assertTrue(refused.getMessage().contains("GRAPH_AUTH_ENABLED"), refused.getMessage());
+	}
+
+	/**
+	 * A password with authentication off is refused at parse time.
+	 *
+	 * <p>
+	 * The same shape as {@code --allow-load-csv} without {@code --import-dir}, and the more dangerous of the two
+	 * misunderstandings it guards against: a chart that sets a password on a server that never asks for one reads as
+	 * protected and is not.
+	 * </p>
+	 */
+	@Test
+	public void testAPasswordWithAuthenticationOffIsRefused() {
+		IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+			() -> GraphServerOptions.parse(new String[] { "--no-auth", "--initial-password=x", "/tmp/x" },
+				name -> null));
+		assertTrue(refused.getMessage().contains("authentication is off"), refused.getMessage());
+	}
+
+	@Test
+	public void testTheInitialPasswordComesFromTheEnvironment() {
+		assertEquals("from-a-secret", GraphServerOptions.parse(new String[] { "/tmp/x" },
+			name -> "GRAPH_INITIAL_PASSWORD".equals(name) ? "from-a-secret" : null).initialPassword());
+	}
+
+	/**
+	 * The record must not print the password.
+	 *
+	 * <p>
+	 * A record's generated {@code toString} prints every component, which would put a credential into any log line,
+	 * exception or debugger view that touched this object. Overriding it is the only way to make that impossible
+	 * rather than merely unlikely.
+	 * </p>
+	 */
+	@Test
+	public void testTheOptionsDoNotPrintTheInitialPassword() {
+		GraphServerOptions options = GraphServerOptions.parse(new String[] { "--initial-password=hunter2", "/tmp/x" },
+			name -> null);
+		assertEquals("hunter2", options.initialPassword(), "it is still readable by the code that needs it");
+		assertFalse(options.toString().contains("hunter2"), options.toString());
+		assertTrue(options.toString().contains("initialPassword=<set>"), options.toString());
+		assertTrue(GraphServerOptions.parse(new String[] { "/tmp/x" }, name -> null).toString()
+			.contains("initialPassword=<unset>"));
+	}
+
+	/** And --help describes it as a credential, so an operator knows it needs a Secret. */
+	@Test
+	public void testHelpMarksTheCredentialVariable() {
+		String usage = GraphServerOptions.usage();
+		assertTrue(usage.contains("GRAPH_INITIAL_PASSWORD"), usage);
+		assertTrue(usage.contains("a credential"), "the sensitive marker has to reach --help");
+		assertTrue(usage.contains("--no-auth"), usage);
 	}
 }

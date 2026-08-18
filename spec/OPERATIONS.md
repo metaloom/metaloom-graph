@@ -14,12 +14,12 @@ Design rationale lives in the other files; [CONTEXT.md](CONTEXT.md) routes to th
 
 | | |
 |---|---|
-| **Deployment** | Embedded in a JVM process is the primary shape. `graph-server` also puts up to four ports over a **root of databases**: HTTP on 8080 (browser UI, `/api/query`, whole results as JSON), a binary streaming port on loopback:8081 ([WIRE.md](WIRE.md)), monitoring on 8082 ([METRICS.md](METRICS.md)) and MCP on loopback:8083, off by default ([MCP.md](MCP.md)). **None is authenticated** — see §9. |
+| **Deployment** | Embedded in a JVM process is the primary shape. `graph-server` also puts up to four ports over a **root of databases**: HTTP on 8080 (browser UI, `/api/query`, whole results as JSON), a binary streaming port on loopback:8081 ([WIRE.md](WIRE.md)), monitoring on 8082 ([METRICS.md](METRICS.md)) and MCP on loopback:8083, off by default ([MCP.md](MCP.md)). **Three of the four require a login; the monitoring port deliberately does not** — see §9 and [AUTH.md](AUTH.md). |
 | **Databases** | One directory per database under the root, each a complete independent store ([DATABASES.md](DATABASES.md)). Sizing below is **per database**. |
 | **Concurrency** | One writer process, enforced by a `LOCK` file. One writer *thread*, enforced by a lock. Readers are unlimited and scale (measured to 10x at 32 threads). |
 | **Durability** | A commit is on the device when the call returns, under the default sync mode. |
 | **Failure domain** | The store directory. There is no replication and no failover. Backup is `metaloom-graph-cli`, outside the engine — [BACKUP.md](BACKUP.md). |
-| **Biggest operational gap** | **No authentication on any port.** See §9. Online backup exists now — §5 |
+| **Biggest operational gap** | **No transport security.** Authentication exists ([AUTH.md](AUTH.md)) and a password crosses in cleartext, so put TLS in front of it. §9.1 |
 
 ---
 
@@ -418,7 +418,10 @@ defects of exactly those kinds were found and fixed writing those tests.
 
 What that does **not** cover:
 
-- **There is no authentication or authorisation.** Anything that can open the directory has full access.
+- **There is no authentication or authorisation *at the directory level*.** Anything that can open the directory has
+  full access, and that has not changed: the identity in [AUTH.md](AUTH.md) is enforced by the servers, on the ports,
+  not by the storage engine. An embedded caller holding a `GraphStore` is unaffected — the same line
+  `--allow-write` has always drawn.
 - **There is no encryption**, at rest or otherwise.
 - **A malicious store can still make you do work.** Bounds are enforced, but a store can legitimately declare a large
   blob and make you read it. Do not open untrusted stores in a process that cannot afford the time.
@@ -426,21 +429,24 @@ What that does **not** cover:
 
 ### 9.1 The network, which has the same posture and a wider blast radius
 
-`graph-server` opens up to four ports over one root, and **none of them has authentication or transport security**:
+`graph-server` opens up to four ports over one root. Three of them require a login unless `--no-auth` was given;
+**none of them has transport security**:
 
-| | | |
+| | | Authenticated |
 |---|---|---|
-| HTTP | 8080, **all interfaces** | The browser UI and `/api/query`. Predates the note below, which is why it binds everything |
-| Binary | 8081, **loopback only** | Streaming Cypher ([WIRE.md](WIRE.md)). Loopback because a new unauthenticated port should not default to every interface |
-| Monitoring | 8082, **all interfaces**, on by default | `/metrics`, `/health`, `/ready` ([METRICS.md](METRICS.md)). **Do not publish it**: a scrape carries database names, node counts and store sizes |
-| MCP | 8083, **loopback only**, **off by default** | The Model Context Protocol ([MCP.md](MCP.md)). Off rather than merely loopback, because it is a remote code path an LLM drives against a server with no authentication |
+| HTTP | 8080, **all interfaces** | **Yes.** Session cookie or `Authorization: Bearer`; the browser UI and `/api/query`. `/api/login`, `/api/logout`, `/api/whoami` and the static bundle are outside the filter, the last because the login page is part of it |
+| Binary | 8081, **loopback only** | **Yes.** An `AUTH` frame during the handshake ([WIRE.md](WIRE.md)). Still loopback by default: authentication is not transport security |
+| Monitoring | 8082, **all interfaces**, on by default | **No, deliberately.** `/metrics`, `/health`, `/ready` ([METRICS.md](METRICS.md)) — a kubelet probe and a Prometheus scrape carry no credential, and a probe failing over a misconfigured secret is a restart loop. **Do not publish it**: a scrape carries database names, node counts and store sizes |
+| MCP | 8083, **loopback only**, **off by default** | **Yes.** `Authorization: Bearer` on all three transports ([MCP.md](MCP.md)). Still off by default: it is a remote code path an LLM drives, and a credential is not a reason to widen that |
 
 `GRAPH_WIRE_HOST` and `GRAPH_MCP_HOST` widen the two loopback ports, deliberately and one at a time. In a pod the
-loopback default means those ports are unreachable from outside the pod, which is the correct starting position.
+loopback default means those ports are unreachable from outside the pod, which is still the correct starting position:
+a password on a cleartext port is only as private as the network under it.
 
-Both can read **every byte** of one store — and of **every database under the root**, because there is no
-per-database authentication either. Treat exposing either as equivalent to handing out the root directory, because that
-is what it is.
+**A grant is now the per-database boundary** that §6 of [DATABASES.md](DATABASES.md) said could not exist. A principal
+granted `MATCH ON sales` reads `sales` and is refused `default`, with a message that does not say whether `default`
+exists. What has not changed is that the **flags bound the deployment**: a request needs the privilege *and* the flag,
+so enabling authentication can never widen what a server started read-only is able to do — [AUTH.md §5](AUTH.md).
 
 **A backup hands over everything, and that is off by default too.** `--allow-backup` serves
 `GET /api/databases/{name}/backup`, which streams a whole database in one request. It is a read, so `--allow-write`
@@ -458,9 +464,15 @@ caller's choosing, and a refusal never says whether the file exists. It is refus
 
 **The query language can write, and that is off by default.** `--allow-write` enables `CREATE`, `SET`, `REMOVE` and
 `DELETE` on both ports at once; without it a write query is refused before it reaches a worker thread — 403 over HTTP,
-`READ_ONLY` on the wire. Turning it on hands anything that can reach the port the ability to change and delete data,
-which on an unauthenticated port is the whole population of whatever network it is on. **The flag bounds what a peer
-can do, not who the peer is**; it is a posture, not access control. Embedded Java callers are unaffected either way.
+`READ_ONLY` on the wire. **The flag bounds what a peer can do, not who the peer is**; it is a posture, not access
+control. Embedded Java callers are unaffected either way.
+
+**Who the peer is now has an answer, and it does not replace the flag.** [AUTH.md](AUTH.md) adds users, roles and
+per-database grants, and the two compose as an **AND**: a write needs `CREATE` (or `MERGE`, or `SET`…) *and*
+`--allow-write`. The flag can only subtract. That ordering is deliberate — if a grant could override it, then switching
+authentication on would turn a deliberately read-only deployment into a writable one, which is the one failure mode the
+design exists to make impossible. It also means the two refusals are different and say so: `readonly` names the flag
+and advises a restart, `forbidden` names the missing privilege and advises an administrator.
 
 `DELETE /api/databases/{name}` has its **own** flag, `--allow-drop`, also off by default. It stays separate from
 `--allow-write` because it destroys a whole database and its directory in one request — including databases no query
@@ -468,9 +480,12 @@ addressed — and enabling writes is not asking for that.
 
 Two consequences of enabling writes that are easy to miss:
 
-- **Writers serialise on one lock per store, engine-wide.** A long write query blocks every other writer in the
-  process, including whatever else embeds the store. The binary port bounds that wait and reports `OVERLOADED` rather
-  than hanging; the HTTP route does not, beyond its query deadline.
+- **Writers run concurrently, and may be refused rather than made to wait.** A long write query no longer blocks
+  every other writer in the process; instead two writers that touch the same records collide, and one of them is
+  retried. Cypher write queries absorb their own conflicts — up to a bounded number of attempts — so what a client
+  sees under contention is latency rather than an error, until the bound is reached. Writers do still wait for
+  maintenance: `verify`, `checkpoint`, `reclaim`, compaction and `close` exclude them outright. The binary port bounds
+  that wait and reports `OVERLOADED` rather than hanging; the HTTP route does not, beyond its query deadline.
 - **A write query is materialised and commits before its first row is sent.** Peak memory for a write is the whole
   result, not one batch, whichever port it arrived on.
 
@@ -481,9 +496,14 @@ Two consequences of enabling writes that are easy to miss:
   on the same terms: a non-differential oracle (`WireDecoderHostileInputTest`) asserts that decoding either returns a
   value or throws the protocol's own exception, never runs out of memory on a length field, never overflows the
   stack, and allocates in proportion to its input. It found three real defects the first time it ran.
-- **A single client can occupy the server without authenticating.** `maxConcurrentStreams` (default 8) is the only
-  rate limit there is; past it queries are refused rather than queued. A deadline and a retention watchdog bound how
-  long any one of them can hold a read view — see [WIRE.md §4](WIRE.md).
+- **A single client can occupy the server, though it has to log in first now.** `maxConcurrentStreams` (default 8) is
+  the only rate limit on queries; past it they are refused rather than queued. A deadline and a retention watchdog
+  bound how long any one of them can hold a read view — see [WIRE.md §4](WIRE.md).
+- **Logging in is itself rate limited, and has to be.** Verifying a password is ~100 ms of PBKDF2 that an
+  *unauthenticated* caller can ask for, so the throttle refuses **before** the derivation runs — five failures per user
+  name and per source address inside fifteen minutes, then a minute's wait. Concurrent verifications are capped at the
+  processor count; past that a login is 503 rather than a server that has stopped answering queries because it is busy
+  hashing. Fixed policy, no flag: a tunable lockout is a tunable that gets set to zero.
 
 ---
 
@@ -493,7 +513,14 @@ Stated plainly, because an operations document that implies capabilities the sys
 
 - No incremental backup and no point-in-time recovery (§5). Online *logical* backup exists; a physical snapshot does not.
 - No repair tool for a store that fails `verify` (§6.3).
-- No authentication on any port (§9.1). With backup built, this is now the largest gap.
+- **No transport security on any port.** Authentication exists (§9.1, [AUTH.md](AUTH.md)) and a password crosses in
+  cleartext, which makes TLS in front of it the largest remaining gap rather than authentication itself.
+- **No audit log.** There is a record of what ran — the slow query log — and none of who ran it.
+- **No external identity provider.** One mechanism, one password; no OIDC, no LDAP, no mTLS.
+- **No authorization below a database.** No per-label, per-property or per-row rule; that would have to be enforced on
+  every element a query touches rather than once before it runs.
+- **Sessions are per process.** A second replica does not honour a token the first issued, and a restart logs everyone
+  out.
 - **No bound on what one `LOAD CSV` may cost.** The import directory bounds *which* files, not their size: a load runs
   under the query deadline like anything else, and a batched one holds the writer lock for a batch at a time. Put only
   files you meant to import in that directory.
@@ -506,5 +533,5 @@ Stated plainly, because an operations document that implies capabilities the sys
 
 ---
 
-_Git HEAD revision: `3edb034`_
-_Last updated: 2026-08-17 (the LOAD CSV flag; backup and restore, including from inside a container)_
+_Git HEAD revision: `da8c93e`_
+_Last updated: 2026-08-17 (authentication and RBAC authorization)_

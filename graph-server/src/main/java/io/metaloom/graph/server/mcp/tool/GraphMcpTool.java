@@ -1,5 +1,6 @@
 package io.metaloom.graph.server.mcp.tool;
 
+import io.metaloom.graph.core.api.Principal;
 import io.metaloom.graph.server.mcp.model.McpToolDescriptor;
 import io.vertx.core.Future;
 import io.vertx.core.json.JsonObject;
@@ -25,6 +26,19 @@ public interface GraphMcpTool {
 	 * </p>
 	 */
 	Future<JsonObject> execute(JsonObject arguments);
+
+	/**
+	 * Runs the tool on behalf of a principal.
+	 *
+	 * <p>
+	 * A default that ignores the principal, because for most tools the descriptor's {@code requiredPrivileges} is the
+	 * whole answer and the handler has already checked it. {@code QueryTool} overrides this: what a query needs
+	 * depends on the query, exactly as whether it <em>writes</em> does, and that cannot be declared in advance.
+	 * </p>
+	 */
+	default Future<JsonObject> execute(JsonObject arguments, Principal principal) {
+		return execute(arguments);
+	}
 
 	default String name() {
 		return descriptor().name();

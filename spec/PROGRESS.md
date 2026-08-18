@@ -27,7 +27,7 @@ not**, in one place.
 | 2 — Record stores and catalog | **Done** except `MAP`/`DURATION` value types | `ValueCodecTest`, `PropertyRoundTripTest` |
 | 3 — Adjacency and traversal | **Done** except a streaming `traverse`; neighbour enumeration streams (IDX-4) | `AdjacencyTierTest`, `EdgeCodecTest`, `SpaceEfficiencyTest`, `NeighbourCursorTest` |
 | 4 — WAL, recovery, checkpoints | **Done**, as no-steal redo rather than ARIES | `RecoveryTest` |
-| 5 — Transactions | **Partial** — ACID, serialised writers, **snapshot isolation for readers**. No concurrent writers | `VisibilityTest`, `SnapshotIsolationTest`, `VacuumTest`, `ConcurrentReaderTest`, `RollbackTest` |
+| 5 — Transactions | **Done** — ACID, **concurrent writers**, snapshot isolation for readers and writers, `SERIALIZABLE`, commit-time conflict detection | `VisibilityTest`, `SnapshotIsolationTest`, `VacuumTest`, `ConcurrentReaderTest`, `RollbackTest`, `ParallelConsistencyTest`, `HammerTest` |
 | 6 — Native layer | **Done** except a second build target; `miri` and `fuzz` now installed and run | `NativeCodecTest`, `UringIoEngineTest`, `DirectWalTest`, `BlobCompressionTest`, `StatxTest`, `NativeBindingsTest` |
 | 7 — Indexes | **Done** for the label, property, composite and unique B+trees | `IndexTest`, `CompositeIndexTest`, `UniqueConstraintTest` |
 | 8 — Compaction and reclamation | **Done** except the p99 latency budget | `CompactionTest`, `CompactionCrashTest` |
@@ -41,7 +41,7 @@ not**, in one place.
 | 19 — MCP | **Done** — eight tools over HTTP+SSE and WebSocket, off by default and loopback when on, write-gated at two points | [MCP.md](MCP.md); `McpProtocolTest`, `McpServerTest`, `CypherGuideToolTest` |
 | 20 — Deployment | **Done** — JVM and GraalVM container images, a Helm chart, and a k3d harness that runs a real pipeline against them | [DEPLOYMENT.md](DEPLOYMENT.md); `helm/test/run.sh` — 35 assertions across nine phases |
 
-**The engine is usable today** for a single-writer embedded workload: durable, crash-safe,
+**The engine is usable today** for an embedded workload with concurrent writers: durable, crash-safe,
 transactional, indexed, compacting, with snapshot isolation for readers, a Cypher query
 language that reads **and writes**, a browser UI, a streaming binary port and several databases under one root — and it
 holds its answers against a reference model, against real SQL, against its own Java API, and now over its own wire.
@@ -271,7 +271,8 @@ that a steal policy cannot be made correct over a `MAP_SHARED` mapping.
       `MATCH (n) RETURN n` over a 10M-node store still peaks at 10M rows of server heap. The lazy
       clause prefix — `forEachNode(LongPredicate)`, a push pipeline, and `LIMIT` stopping the scan — is
       the next piece and is not built
-- [ ] **No authentication and no transport security**, deliberately and documented
+- [x] **Authentication**, with per-database RBAC — [AUTH.md](AUTH.md)
+- [ ] **No transport security**, deliberately and documented
       ([OPERATIONS.md §9.1](OPERATIONS.md)). The binary port binds loopback for that reason
 - [ ] The trial harness was never committed, so its numbers are recorded but not reproducible from this
       repository
@@ -433,12 +434,12 @@ would take that away silently. `QueryExecutor.streams` returns false for all fou
       disk
 - [x] **Dropping is opt-in** (`--allow-drop`, 403 otherwise) and refuses the last database. It is the
       only route in the server that destroys data
-- [x] **Protocol version 2**: the database is chosen per connection at `HELLO` and echoed in
+- [x] **Protocol version 4**: the database is chosen per connection at `HELLO` and echoed in
       `WELCOME`. A read view belongs to one store, so a connection cannot change store mid-flight
 - [x] A picker in the browser UI, which **clears the canvas on switch** — an element id is only unique
       within a store, so merging two databases' graphs would draw one circle for two records
 - [ ] **No cross-database query**, and none planned: the engine has no notion of a second store
-- [ ] **No per-database authentication**, because there is no authentication at all. Anything that can
+- [x] **Per-database authorization**, which is what a grant is. Previously: there was no authentication at all, so anything that could
       reach the port can reach every database under the root
 
 ---
@@ -550,27 +551,41 @@ What exists now, beyond the atomicity, durability and rollback that were already
       `ConcurrentReaderTest` (4), `RollbackTest` (7), `RollbackEqualsRecoveryTest` (2),
       `LongRunningReaderTest` (2, `slow`)
 
-Two results worth stating because they are stronger than the plan predicted:
+Two results worth stating:
 
-- **Write skew and lost updates cannot occur**, so `SERIALIZABLE` and SSI have nothing to detect and
-  are not built rather than unfinished. Writers are serialised, and a writer reads the current mapping
-  rather than any view — which is not an optimisation but the rule that prevents a writer computing
-  new state from stale input and silently overwriting everything committed since.
-- **The mechanism costs nothing when unused.** Nothing is retained while no snapshot view is open, so
-  a write-only or read-committed workload never allocates a byte of it.
+- **The mechanism costs nothing when unused.** Nothing is retained while no snapshot view is open and
+  no second writer is running, so a single-writer workload never allocates a byte of it.
+- **Concurrent writers did not need the record-granular rewrite this file predicted.** The blocker was
+  stated as "page overlays resolve two writers on one page by last-writer-wins", and that was true of
+  the overlay as it stood: the commit worked out what it had changed by diffing its copy against the
+  live mapping, which by then contained the other writer's bytes. Keeping the image each page was
+  copied from removes it — the diff is then exactly the bytes this transaction wrote — and the same
+  runs turn out to be the write set that conflict detection needs. [TRANSACTIONS.md §6.1](TRANSACTIONS.md).
+
+**Write skew is now possible at `SNAPSHOT`, and that is a regression this file has to own.** It was
+prevented before because writers were serialised and read the live mapping, which is safety by
+scheduling rather than by isolation level. `SERIALIZABLE` is built and rules it out.
+
+What concurrent writers cost, and what it bought:
+
+| | Before | After |
+|---|---|---|
+| Writers | One at a time, for the length of a transaction | Concurrent; serialised only for slot allocation and the commit point |
+| A writer's reads | The live mapping | Its own view, plus its overlay |
+| Lost update | Prevented by scheduling | Prevented by first-committer-wins, retried by `inTransaction` |
+| Write skew | Unreachable | Possible at `SNAPSHOT`, prevented at `SERIALIZABLE` |
+| Conflicts | Could not arise | A normal outcome; auto-commit and Cypher writes absorb their own |
 
 Still missing:
 
-- [ ] **Concurrent writers.** Page overlays resolve two writers on one page by last-writer-wins, so
-      this needs record-granular overlays, or per-writer allocation arenas plus commit-time
-      validation — a rewrite of the write path rather than an addition to it. This is the item that
-      still gates the group-commit throughput miss in §4.9: one fsync amortised across time instead of
-      across writers, because there is one writer.
 - [ ] `xmin` / `version_ptr` placeholder scheme, `UndoStore`, the 64-byte undo record — **not needed**
-      by the page-level scheme. They belong to the concurrent-writer design, which cannot share
-      page-granular versions. The fields stay in the record layouts, written as zero
-- [ ] `LockTable` with eager conflict detection — **nothing to detect** while writers are serialised.
-      A striped intent table whose every lookup misses would document an ambition rather than do work
+      by the page-level scheme, and no longer expected to be. The fields stay in the record layouts,
+      written as zero
+- [ ] `LockTable` with eager conflict detection — **not needed**, and now a choice rather than a gap:
+      intents fail faster and cost a striped table on every statement, where validation at commit costs
+      nothing until a commit happens
+- [ ] SSI — it would abort *less* than the read-set validation that is built, which is a performance
+      question rather than a correctness one
 - [ ] jcstress harnesses — jcstress is not in the offline repository
 
 ### 4.6 Phase 6 — Native layer
@@ -932,5 +947,45 @@ Recorded so nobody re-opens them as oversights:
 
 ---
 
-_Git HEAD revision: `3edb034`_
-_Last updated: 2026-08-17 (LOAD CSV; the online logical backup, its CLI, and that CLI's native build and container packaging)_
+## Authentication and authorization
+
+Built. [AUTH.md](AUTH.md) is the design; what follows is what moved.
+
+- [x] `Privilege` (15), `Grant` (privilege + database, `*` wildcard), `Principal`, `User`, `Role` in `core.api`
+- [x] `Ast.Query.requiredPrivileges()` — an exhaustive switch over the sealed `Clause`, so a twelfth clause is a
+      compile error until its privilege is declared
+- [x] `<root>/.auth/` — a binary, CRC32C-checked file rewritten whole under a short-lived lock, with a hostile-input
+      oracle that refuses **every single-bit mutation**
+- [x] PBKDF2-HMAC-SHA512 at 210,000 iterations, parameters stored per user so the cost can be raised later
+- [x] GraalVM reachability metadata for the JCA provider, and a CLI smoke test that catches its absence — which no
+      green `mvn verify` can
+- [x] `metaloom-graph-cli auth reset-admin | list | user | role | grant | revoke`, offline only, working against a
+      root a live server has open
+- [x] HTTP: `POST /api/login`, `POST /api/logout`, `GET /api/whoami`, a filter on `/api/*`, sessions keyed by a hash
+      of the token, a login throttle ahead of the derivation
+- [x] Privilege checks on every existing route; `GET /api/databases` filtered rather than refused
+- [x] User and role administration over REST, with `MANAGE_USERS` deliberately not implying `MANAGE_ROLES`
+- [x] Protocol version **4**: `AUTH_REQUIRED`/`AUTH`, `UNAUTHENTICATED`/`UNAUTHORIZED`, and a password that is only
+      ever sent to a server that asked for it
+- [x] `ClientOptions.withCredentials`, `GraphClient.login`, and grants reported in `WELCOME` as strings
+- [x] MCP: bearer on all three transports, and the write gate's two enforcement points extended to privileges
+- [x] The browser UI: a login screen, a users-and-roles panel, and write affordances driven by the grant as well as
+      by the flag
+- [x] Authentication **on by default** in `main`, off in the programmatic constructors; the images and the chart
+- [ ] TLS. Now the largest gap: a password crosses in cleartext on every port — `AUTH-1` in [TASKS.md](TASKS.md)
+- [ ] An audit log — `AUTH-2`
+- [ ] An external identity provider — `AUTH-3`
+- [ ] Authorization below a database — `AUTH-4`
+- [ ] A shared session store, so a second replica honours a token the first issued — `AUTH-6`
+- [ ] `graph_auth_logins_total` and a session gauge. Deliberately not added with the rest: a new meter means a row in
+      [METRICS.md](METRICS.md) §3 *and* a line in `MetricsCatalogExercise`, because `MetricsCatalogScrapeTest` scrapes
+      a real registry and fails on a documented meter that never fires. The refusals are counted today through the
+      existing `graph_queries_rejected{reason}` with two new label values, which needs no catalogue change — `AUTH-7`
+
+**The stale line this change also fixes**: this file said "Protocol version 2: the database is chosen per connection at
+`HELLO`". It was 3 before this work and is 4 now.
+
+---
+
+_Git HEAD revision: `da8c93e`_
+_Last updated: 2026-08-17 (authentication and RBAC authorization)_
