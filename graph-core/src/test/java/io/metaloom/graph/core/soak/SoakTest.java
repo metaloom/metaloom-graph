@@ -1,5 +1,6 @@
 package io.metaloom.graph.core.soak;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayList;
@@ -79,7 +80,8 @@ public class SoakTest {
 			// A little connectivity up front, so the warmup baseline includes adjacency rather than nodes alone.
 			try (Transaction txn = store.begin()) {
 				for (int i = 0; i < STEADY_EDGES; i++) {
-					store.createEdge(live.get(random.nextInt(live.size())), "E", live.get(random.nextInt(live.size())));
+					long from = live.get(random.nextInt(live.size()));
+					store.createEdge(from, "E", otherThan(live, from, random));
 					edges++;
 				}
 				txn.commit();
@@ -89,7 +91,7 @@ public class SoakTest {
 			live.clear();
 			live.addAll(store.nodesByLabel("N"));
 
-			Sample first = sample(store, "after warmup");
+			Sample first = sample(store, live, "after warmup");
 			Sample last = first;
 			Sample settled = null;
 			long rounds = 0;
@@ -114,7 +116,7 @@ public class SoakTest {
 					store.verify(VerifyLevel.FULL);
 					live.clear();
 					live.addAll(store.nodesByLabel("N"));
-					last = sample(store, "round " + rounds);
+					last = sample(store, live, "round " + rounds);
 					if (settled == null && rounds >= 100) {
 						settled = last;
 					}
@@ -126,7 +128,7 @@ public class SoakTest {
 			store.verify(VerifyLevel.FULL);
 			live.clear();
 			live.addAll(store.nodesByLabel("N"));
-			last = sample(store, "final");
+			last = sample(store, live, "final");
 			if (settled == null) {
 				settled = first;
 			}
@@ -162,22 +164,55 @@ public class SoakTest {
 			store.setNodeProperties(id, Properties.of()
 				.set("i", random.nextInt(100_000))
 				.set("blob", random.nextInt(50) == 0 ? "b".repeat(400) : "small"));
-		} else if (roll < 65) {
+		} else if (roll < 60) {
 			if (edges < STEADY_EDGES) {
-				store.createEdge(id, "E", live.get(random.nextInt(live.size())));
+				store.createEdge(id, "E", otherThan(live, id, random));
 				edges++;
-			} else {
-				edges -= removeOneEdge(store, id);
 			}
+		} else if (roll < 65) {
+			// A slice that always deletes an edge by hand, rather than only when the ceiling is hit. The mix
+			// equilibrates near 0.4 edges per node, an order of magnitude under STEADY_EDGES, so a removal branch
+			// gated on that ceiling never runs: over the 12-hour run, deleteEdge was reached only as a side effect
+			// of deleting a node. The 15/5 split keeps the equilibrium positive while exercising it continuously.
+			edges -= removeOneEdge(store, id);
 		} else if (roll < 75) {
 			store.nodeProperties(id);
 			store.neighbours(id, Direction.BOTH);
 		} else if (live.size() > STEADY_STATE) {
 			long doomed = live.remove(random.nextInt(live.size()));
-			edges -= store.degreeOut(doomed) + store.degreeIn(doomed);
+			edges -= incidentEdges(store, doomed);
 			store.deleteNode(doomed);
 		}
 		return 1;
+	}
+
+	/**
+	 * Edges that die with this node, counted once each.
+	 * <p>
+	 * Not {@code degreeOut + degreeIn}: a self-loop is one stored entry standing for both an outgoing and an incoming
+	 * edge, so that sum counts it twice and an edge tally built on it drifts down by one per self-loop deleted. The
+	 * 12-hour run of this test is what found that — the tally crossed zero at round 280,220 and reached -7,335 while
+	 * the store itself was behaving perfectly. {@code SelfLoopTest} pins the semantics.
+	 */
+	private int incidentEdges(GraphStore store, long id) {
+		int loops = 0;
+		for (Edge edge : store.neighbours(id, Direction.OUT)) {
+			if (edge.neighbourId() == id) {
+				loops++;
+			}
+		}
+		return store.degreeOut(id) + store.degreeIn(id) - loops;
+	}
+
+	/** A node other than the given one, so the workload never builds a self-loop by accident. */
+	private long otherThan(List<Long> live, long id, Random random) {
+		for (int attempt = 0; attempt < 4; attempt++) {
+			long candidate = live.get(random.nextInt(live.size()));
+			if (candidate != id) {
+				return candidate;
+			}
+		}
+		return id;
 	}
 
 	/** Removes one outgoing edge of a node, if it has any. Returns how many edges went away. */
@@ -193,12 +228,28 @@ public class SoakTest {
 	/** Live edges, tracked by the workload because counting them would dominate the loop. */
 	private long edges;
 
-	private Sample sample(GraphStore store, String label) {
+	/**
+	 * The true live edge count: every edge counted once, at its source. Cheap enough at sample time — a few thousand
+	 * degree reads against a 21 ns read — and it is the oracle the running tally is checked against, because a tally
+	 * that silently goes wrong turns every number derived from it, {@link Sample#bytesPerElement()} included, into
+	 * noise that still looks like a measurement.
+	 */
+	private long countEdges(GraphStore store, List<Long> live) {
+		long total = 0;
+		for (long id : live) {
+			total += store.degreeOut(id);
+		}
+		return total;
+	}
+
+	private Sample sample(GraphStore store, List<Long> live, String label) {
+		long truth = countEdges(store, live);
+		assertEquals(truth, edges, "the workload's edge tally drifted from the graph it built");
 		System.gc();
 		StoreStats stats = store.stats();
 		Runtime runtime = Runtime.getRuntime();
 		long heap = runtime.totalMemory() - runtime.freeMemory();
-		Sample sample = new Sample(label, stats.nodeCount(), edges, stats.storageBytes(), stats.segmentFileCount(),
+		Sample sample = new Sample(label, stats.nodeCount(), truth, stats.storageBytes(), stats.segmentFileCount(),
 			heap);
 		System.out.println("  " + sample);
 		return sample;
@@ -209,7 +260,7 @@ public class SoakTest {
 		/** Bytes per live element, counting edges: the metric that stays flat when nothing is leaking. */
 		double bytesPerElement() {
 			long elements = nodes + edges;
-			return elements == 0 ? 0 : (double) storageBytes / elements;
+			return elements <= 0 ? 0 : (double) storageBytes / elements;
 		}
 
 		@Override

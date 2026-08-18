@@ -881,8 +881,18 @@ trusting anything that depends on it, and skips when it does not. On ext4 or xfs
       shorter prefix rather than becoming unreadable — which is what the CRC plus self-identifying LSN
       was designed to guarantee and had never been shown to do. The default is 12 transactions so
       `-Pcrash` stays about a minute; `-Dgraph.crash.transactions=24` reproduces the run above.
-- [~] **The long runs have not been run.** The soak harness has run for 25 seconds, not 12 hours. The
-      `kill -9` loop ran 8 iterations clean, not a week of nightlies. Both are one command.
+- [~] **The long runs, partly executed.** On 2026-08-18, against the concurrent-writer write path:
+      - **`kill -9` loop: 200 iterations, all clean** (20 minutes). Each iteration killed a writing store
+        without warning, reopened it and checked its acknowledged-commit ledger. The last one held
+        176,678 acknowledged commits with 176,879 present — the 201 extra committed but never
+        acknowledged, which is the allowed window. **Not one acknowledged commit was lost.** That is up
+        from the 8 iterations this had ever run, but it is still not a week of nightlies.
+      - **Soak: 6h05m of 12, stopped deliberately.** It found a defect *in the workload* — an edge tally
+        built on `degreeOut + degreeIn`, which over-counts a self-loop — that made its own leak metric
+        meaningless (see [TESTING.md §1](TESTING.md)), so the run was stopped and the harness fixed rather
+        than left to produce a number nobody could trust. The engine itself was healthy throughout: storage
+        flat at ~4.6 MB, 5 segment files, heap ~9 MB, and `verify(FULL)` clean every 20 rounds for 962,000
+        rounds. **The 12-hour run still has to be performed on the fixed harness.**
 - [~] **The manual power-loss test is written and untested.**
       [OPERATIONS.md §8](OPERATIONS.md#8-the-manual-power-loss-test) is a full procedure, down to
       checking whether the device's write cache is honest. Until it is performed, the assumption

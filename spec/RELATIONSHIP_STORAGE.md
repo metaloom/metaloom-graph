@@ -481,6 +481,14 @@ The numbers are estimates, but the orders of magnitude are structural, not tunin
   snapshot can see it.
 - **Degree counters are authoritative and must be maintained transactionally.** A drifted
   `degree_out` silently changes traversal plans. The invariant checker recounts them.
+- **A self-loop is one entry that counts in both degrees, so `degreeOut + degreeIn` over-counts it.**
+  Both degrees really are 1 and the invariant checker agrees deliberately (`InvariantChecker`
+  increments `outSeen` and `inSeen` for the same entry), so this is a property of the model rather
+  than a defect. What it means for callers: **the sum of a node's degrees is not the number of edges
+  that die with it**, and `neighbours(n, BOTH)` lists the one entry twice, once per direction. A
+  workload that tracks a live edge count by subtracting the degree sum drifts down by one per
+  self-loop it deletes — which is exactly what the 12-hour soak found, at -7,335 after 962,000
+  rounds. `SelfLoopTest` pins all three behaviours.
 - **The type bitmap is a filter, not an index.** False positives are fine; false negatives are
   corruption.
 - **A materialised entry's type is a cache; type 0 means "not cached", not "type 0".** Never filter
