@@ -343,6 +343,88 @@ public class ConcurrentWriterTest {
 	}
 
 	/**
+	 * Six writers, one index leaf, and nothing but auto-commit writes: none of them may be refused.
+	 *
+	 * <p>
+	 * {@link io.metaloom.graph.core.api.GraphStore#setNodeProperties} is a single statement, so
+	 * {@code TRANSACTIONS.md} section 6.3 promises the engine absorbs its conflicts rather than raising them — the
+	 * caller has no unit of work to reconsider and no seam to add attempts at, which is exactly what makes the bound
+	 * the engine picks the whole of the contract. This test is the case that bound has to cover: every write sets an
+	 * indexed property drawn from eight values, so all six writers collide on the one B+tree leaf holding them, which
+	 * section 6.3 already names as the commonest conflict and the one no caller can restructure their way out of.
+	 * </p>
+	 *
+	 * <p>
+	 * It is written as a load test rather than a two-thread rendezvous on purpose. Losing one race is ordinary and
+	 * absorbed; what fails here is losing every attempt in a row, so the defect only appears against a queue of
+	 * writers deep enough to keep the leaf rewritten for as long as one loser keeps retrying, and it appears as a rate
+	 * rather than a certainty.
+	 * </p>
+	 */
+	@Test
+	public void testAutoCommitAbsorbsIndexLeafContention() throws Exception {
+		assertTimeoutPreemptively(Duration.ofMinutes(2), () -> {
+			try (GraphStore store = stores.open()) {
+				warmSharedStructures(store);
+				store.createIndex("Contended", "bucket");
+
+				List<Long> nodes = new ArrayList<>();
+				try (Transaction txn = store.begin()) {
+					for (int i = 0; i < 64; i++) {
+						nodes.add(store.createNode("Contended", Properties.of().set("bucket", (long) (i % BUCKETS))));
+					}
+					txn.commit();
+				}
+
+				int threads = 6;
+				int writesPerThread = 150;
+				CountDownLatch start = new CountDownLatch(1);
+				List<Throwable> refused = java.util.Collections.synchronizedList(new ArrayList<>());
+				List<Thread> writers = new ArrayList<>();
+				for (int t = 0; t < threads; t++) {
+					final int seed = t;
+					Thread thread = new Thread(() -> {
+						java.util.Random rnd = new java.util.Random(seed);
+						try {
+							start.await();
+							for (int i = 0; i < writesPerThread; i++) {
+								long id = nodes.get(rnd.nextInt(nodes.size()));
+								// Auto-commit: no enclosing transaction, so the engine owns the retry.
+								store.setNodeProperties(id, Properties.of()
+									.set("bucket", (long) rnd.nextInt(BUCKETS))
+									.set("mark", (long) i));
+							}
+						} catch (Throwable e) {
+							refused.add(e);
+						}
+					}, "auto-commit-" + t);
+					writers.add(thread);
+					thread.start();
+				}
+				start.countDown();
+				for (Thread thread : writers) {
+					thread.join();
+				}
+
+				assertTrue(refused.isEmpty(), "an auto-commit write was refused rather than retried: "
+					+ (refused.isEmpty() ? "" : refused.get(0).toString()));
+
+				// The optimistic loop alone does not survive this, so a run that never escalated did not reproduce the
+				// contention the test is about and its pass says nothing. Asserting the escalation happened is what
+				// keeps this a test of the last resort rather than of the machine's timing.
+				long escalations = ((io.metaloom.graph.core.store.GraphStoreImpl) store).autoCommitEscalations();
+				assertTrue(escalations > 0, "no auto-commit write ever exhausted its optimistic attempts, so the "
+					+ "exclusive fallback was never exercised and this run proves nothing");
+
+				store.verify(VerifyLevel.FULL);
+			}
+		});
+	}
+
+	/** Few enough distinct values that every writer lands in the same index leaf. */
+	private static final int BUCKETS = 8;
+
+	/**
 	 * A property payload of more than half a page, so the block holding it has that page to itself.
 	 *
 	 * <p>

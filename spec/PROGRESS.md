@@ -22,12 +22,12 @@ not**, in one place.
 
 | Phase | State | Evidence |
 |-------|-------|----------|
-| 0 — Baseline and harness | **Done** except CI, which has no runner | [reports/BASELINE.md](reports/BASELINE.md) |
+| 0 — Baseline and harness | **Done** except attaching a CI runner; every job has been run locally | [reports/BASELINE.md](reports/BASELINE.md) |
 | 1 — Addressing and segments | **Done** | `ElementIdTest`, `GeometryTest`, `SegmentLifecycleTest` |
 | 2 — Record stores and catalog | **Done** except `MAP`/`DURATION` value types | `ValueCodecTest`, `PropertyRoundTripTest` |
 | 3 — Adjacency and traversal | **Done** except a streaming `traverse`; neighbour enumeration streams (IDX-4) | `AdjacencyTierTest`, `EdgeCodecTest`, `SpaceEfficiencyTest`, `NeighbourCursorTest` |
 | 4 — WAL, recovery, checkpoints | **Done**, as no-steal redo rather than ARIES | `RecoveryTest` |
-| 5 — Transactions | **Done** — ACID, **concurrent writers**, snapshot isolation for readers and writers, `SERIALIZABLE`, commit-time conflict detection | `VisibilityTest`, `SnapshotIsolationTest`, `VacuumTest`, `ConcurrentReaderTest`, `RollbackTest`, `ParallelConsistencyTest`, `HammerTest` |
+| 5 — Transactions | **Done** — ACID, **concurrent writers**, snapshot isolation for readers and writers, `SERIALIZABLE`, commit-time conflict detection | `VisibilityTest`, `SnapshotIsolationTest`, `VacuumTest`, `ConcurrentReaderTest`, `RollbackTest`, `ParallelConsistencyTest`, `HammerTest`, `ConcurrentWriterTest` |
 | 6 — Native layer | **Done** except a second build target; `miri` and `fuzz` now installed and run | `NativeCodecTest`, `UringIoEngineTest`, `DirectWalTest`, `BlobCompressionTest`, `StatxTest`, `NativeBindingsTest` |
 | 7 — Indexes | **Done** for the label, property, composite and unique B+trees | `IndexTest`, `CompositeIndexTest`, `UniqueConstraintTest` |
 | 8 — Compaction and reclamation | **Done** except the p99 latency budget | `CompactionTest`, `CompactionCrashTest` |
@@ -51,9 +51,9 @@ holds its answers against a reference model, against real SQL, against its own J
 container image in two flavours — each carrying the backup CLI as well as the server — installs from a Helm chart that
 refuses a second replica by name, and speaks the Model Context Protocol so an agent can query it.
 
-It is **not** usable where concurrent writers, `OPTIONAL MATCH` or an **authenticated** network are requirements. None
-of those exists and none is faked — and the last one is worth repeating, because everything in the paragraph above
-makes it easier to expose.
+It is **not** usable where `OPTIONAL MATCH` is a requirement. It does not exist and it is not faked.
+Concurrent writers and an authenticated network were on this list and have since been built, which is
+the only reason the list is now one item long.
 
 ---
 
@@ -451,8 +451,17 @@ Ordered by phase. Each item says what it costs to leave undone.
 
 ### 4.0 Phase 0
 
-- [ ] **Run CI.** The workflow exists; this repository has no runner attached, so nothing has ever
-      executed it.
+- [~] **Run CI.** Still no runner attached to the repository, so GitHub has never executed the
+      workflow — but every job in it has now been run locally against this tree, which is the half of
+      the item that was actually carrying the risk. It was worth doing on the first run alone: the
+      matrix leg failed, and the defect it found is recorded in [4.5](#45-phase-5--mvcc). Attaching a
+      runner is the remaining half and needs repository access rather than a code change.
+      <br>**What the six jobs cost here**, as a sizing estimate for whoever attaches one: the two
+      matrix legs a few minutes each, the `slow` leg longest at the 60 second soak plus the
+      concurrency suite, `crash` about a minute at 15 iterations, `gates` a few minutes, `rust` well
+      under one. The jobs now carry `timeout-minutes` for the reason this project has hit twice
+      already — a concurrency test that hangs rather than fails would otherwise hold a runner for the
+      six hour default.
 - [ ] `CountingIoEngine` for device-level read counting — needs the `IoEngine` abstraction from Phase 6.
       Today the budgets count *record* reads, which is the right granularity for the addressing
       invariant but says nothing about the device.
@@ -524,7 +533,7 @@ Genuinely missing:
 
 ### 4.5 Phase 5 — MVCC
 
-**Half built.** Snapshot isolation for readers is done and tested; concurrent writers are not. Several
+**Built.** Snapshot isolation for readers and concurrent writers are both done and tested. Several
 items below turned out to have nothing to do rather than being unfinished, and the difference is
 recorded rather than left as an open checkbox that never closes.
 
@@ -551,6 +560,39 @@ What exists now, beyond the atomicity, durability and rollback that were already
 - [x] Tests: `VisibilityTest` (13), `SnapshotIsolationTest` (7), `VacuumTest` (8),
       `ConcurrentReaderTest` (4), `RollbackTest` (7), `RollbackEqualsRecoveryTest` (2),
       `LongRunningReaderTest` (2, `slow`)
+
+- [x] **Fixed: an auto-commit write could be refused after losing sixty-four conflicts in a row.**
+      Found by the first run of the CI workflow that had never been run, which is the whole argument
+      for attaching a runner. Two tests failed, `HammerTest.testTheWholeApiUnderConcurrentLoad` and
+      `CursorLeaseLivenessTest.testManyShortLivedCursorsDoNotWedgeTheStore`, with one cause between
+      them: a `TransactionConflictException` escaping `setNodeProperties`, which is the single
+      statement path that [TRANSACTIONS.md §6.3](TRANSACTIONS.md#63-conflicts-a-caller-never-sees)
+      promises absorbs its own conflicts. **Measured at 1 failure in 10** runs of `HammerTest`, and
+      the same signature every time: `INDEX segment 0 page 8`, the one B+tree leaf every writer in
+      those tests touches.
+      <br>**The cause**, and it is not the bound being too low. `ConcurrentWriterTest`
+      `testAutoCommitAbsorbsIndexLeafContention` turns the flake into **10 failures in 10** by taking
+      away everything that is not six writers on one index leaf, and it still fails at 256 attempts
+      with jittered backoff (5 in 10). A conflict is decided in the window between a transaction's
+      snapshot and its turn at the commit lock, and a writer that keeps losing that window never
+      improves its odds: the winner does not leave, it comes back with its next write. Making
+      `commitLock` fair — the obvious first idea — makes it **strictly worse**, 6 failures in 6,
+      because FIFO order guarantees everyone ahead of the loser commits before it does.
+      <br>**The fix.** The optimistic attempts stay and are now jittered, so the losers of one round
+      are not scheduled to collide again. When they are exhausted the write takes the write gate
+      **exclusively** and runs once more (`GraphStoreImpl.writeExclusively`): with no other writer in
+      flight there is no window to lose, so progress is guaranteed instead of hoped for. It reuses the
+      gate downgrade compaction already relies on, so it adds no lock ordering.
+      `autoCommitEscalations()` counts it, and the test asserts the count moved — a run that never
+      escalated did not reproduce the contention and its pass would prove nothing. **10 failures in 10
+      before, 0 in 12 after.**
+      <br>**And then the same defect once more, one module along.** With `graph-core` green the run
+      reached `graph-cypher` for the first time and `CypherConcurrencyTest` failed the same way:
+      `Cypher.write` had its own copy of the optimistic loop, so it had its own copy of the defect.
+      Both paths now go through `GraphStore.inStatement(work)`, which is the single-statement contract
+      given a name and an implementation instead of being reimplemented per caller. **0 failures in 12
+      after.** `USING PERIODIC COMMIT` is left alone on purpose — it has committed earlier batches by
+      the time a later one loses, so re-running the statement is not something it can do.
 
 Two results worth stating:
 

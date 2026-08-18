@@ -25,6 +25,26 @@ import org.junit.jupiter.api.Test;
 @Tag("unit")
 public class NativeBindingsTest {
 
+	/**
+	 * When the build says the native layer is required, "not loaded" is a failure and not a skip.
+	 *
+	 * <p>
+	 * Every other native test is guarded by an assumption, which is right: a Java-only contributor with no cargo must
+	 * be able to run the suite, and a capability that is absent cannot be tested. The cost is that absence and success
+	 * are reported identically, so a CI leg whose entire purpose is to exercise the native path passes unchanged when
+	 * the shared object silently failed to build — and the run that was meant to prove the two paths agree quietly
+	 * compared the pure-Java path against itself. This test is the one place that difference is asserted, and it only
+	 * has an opinion when the build states one by setting the property.
+	 * </p>
+	 */
+	@Test
+	public void testTheNativeLayerIsPresentWhenTheBuildRequiresIt() {
+		assumeTrue(Boolean.getBoolean("metaloom.graph.native.required"),
+			"the build did not require the native layer");
+		assertTrue(NativeCapabilities.isLoaded(),
+			"metaloom.graph.native.required=true, but the native library is not loaded: " + NativeCapabilities.status());
+	}
+
 	@Test
 	public void testTheLayoutsAgree() {
 		assertTrue(NativeBindings.agrees(),

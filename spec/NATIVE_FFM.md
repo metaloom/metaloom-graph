@@ -254,9 +254,9 @@ capabilities from inside the binary. See [GRAALVM.md §8.2](GRAALVM.md).
 | Targets | `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` initially; macOS and Windows drop io_uring and use the fallback |
 | Packaging | The `.so` is placed in `src/main/resources/native/<os>-<arch>/libmetaloom_graph_native.so` and shipped inside the jar |
 | Loading | Extract to a temp dir on first use, then `SymbolLookup.libraryLookup(path, arena)`. Honour `-Dmetaloom.graph.native.path` for a developer override |
-| Absence | A missing or unloadable library is **logged at INFO and falls back**, never fatal, unless `native.required=true` |
+| Absence | A missing or unloadable library is **logged at INFO and falls back**, never fatal, unless `-Dmetaloom.graph.native.required=true`, which `NativeBindingsTest` turns into a failing test rather than a skipped one. It is off by default and set by the native CI leg, whose whole subject is the native path and which otherwise passes unchanged when the crate did not build |
 | Ahead of time | Every downcall signature is declared in `META-INF/native-image/.../reachability-metadata.json` so the engine works inside a GraalVM binary. Adding a binding without adding its shape is caught by `ForeignDowncallMetadataTest` in the ordinary `mvn test` — see [GRAALVM.md](GRAALVM.md) |
-| CI | A matrix that builds the crate per target; `cargo clippy -D warnings`, `cargo test`, `cargo miri test` on the codec modules |
+| CI | The `rust` job builds and tests the crate and runs `cargo clippy -D warnings`, on `x86_64-unknown-linux-gnu` only — one target, not a per-target matrix, and `cargo miri test` is a manual command in `tools/verify-native.sh` rather than a CI step. The Java `test` job runs the suite twice, once with `-Dmetaloom.graph.native.required=true` and once with `-Dnative.skip=true` |
 
 **Absence must never be fatal.** The build detects a missing `cargo`, says so, and lets the Java build
 and the full suite proceed on the fallback path — a build that hard-failed without Rust would make the

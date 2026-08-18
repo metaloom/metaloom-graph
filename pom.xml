@@ -84,6 +84,12 @@
             property. Turned off along with native.skip by the profile below.
         -->
         <metaloom.graph.native.enabled>true</metaloom.graph.native.enabled>
+        <!--
+            Turns the native layer from "used if it built" into "the build fails if it did not". Off by default, so a
+            contributor without cargo is unaffected; the CI leg whose subject is the native path sets it, because that
+            leg passing while the shared object was missing is the one outcome it must not have.
+        -->
+        <metaloom.graph.native.required>false</metaloom.graph.native.required>
         <!-- Set to cargo's offline flag by -Poffline, for a machine with a warm registry and no network. -->
         <cargo.offline.flag></cargo.offline.flag>
 
@@ -243,6 +249,7 @@
                             NativeBindingsTest caught it, by failing on a library that was loaded but not packaged.
                         -->
                         <metaloom.graph.native.enabled>${metaloom.graph.native.enabled}</metaloom.graph.native.enabled>
+                        <metaloom.graph.native.required>${metaloom.graph.native.required}</metaloom.graph.native.required>
                     </systemPropertyVariables>
                 </configuration>
             </plugin>

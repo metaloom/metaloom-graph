@@ -142,4 +142,33 @@ public class NestedTransactionTest {
 				"the mutations should have joined the open transaction and committed with it");
 		}
 	}
+
+	/**
+	 * {@code inStatement} is refused inside an open transaction, for the same reason {@code begin} is.
+	 *
+	 * <p>
+	 * It absorbs conflicts by re-running its work, which is only ever safe when the work is the whole transaction.
+	 * Inside somebody else's unit of work it would re-run their statements and commit their transaction on its way
+	 * past — so the refusal is the same judgement nesting gets, and is made for the same reason.
+	 * </p>
+	 */
+	@Test
+	public void testInStatementIsRefusedInsideATransaction() throws Exception {
+		try (GraphStore store = stores.open()) {
+			try (Transaction txn = store.begin()) {
+				long id = store.createNode("Outer", Properties.of());
+
+				assertThrows(IllegalStateException.class,
+					() -> store.inStatement(() -> store.createNode("Inner", Properties.of())),
+					"inStatement() inside an open transaction would commit that transaction to absorb a conflict");
+
+				// The refusal has to leave the caller's transaction untouched, exactly as a refused nesting does.
+				store.setNodeProperties(id, Properties.of().set("mark", 1L));
+				txn.commit();
+			}
+			assertEquals(1, store.nodesByLabel("Outer").size(), "the outer transaction should still have committed");
+			assertTrue(store.nodesByLabel("Inner").isEmpty(), "the refused statement must not have created anything");
+		}
+	}
+
 }

@@ -110,8 +110,9 @@ src/test/java/io/metaloom/graph/core/
   txn/           snapshot isolation: visibility, the anomaly matrix, vacuum, rollback, long readers
                  SnapshotLinearizabilityTest — the general form of the anomaly matrix: a view at LSN L
                  must show exactly the committed state at L, compared whole-graph against a model
-                 history. NestedTransactionTest — begin() refusing to nest, and the open transaction
-                 surviving the refusal intact
+                 history. NestedTransactionTest — begin() refusing to nest, inStatement() refused
+                 inside a transaction for the same reason, and the open transaction surviving both
+                 refusals intact
   concurrency/   ScalingTest, plus the load and consistency harnesses:
                  VerifyUnderLoadTest — verification beside writers, a checkpointer and a second
                  verifier; the regression test for the accounting-mismatch false positive
@@ -125,8 +126,14 @@ src/test/java/io/metaloom/graph/core/
                  caught by the value rather than needing a model
                  CursorLeaseLivenessTest — an open cursor holds the read latch and therefore blocks
                  every writer; the cases pin that the cost is exactly "until close"
-                 MultiStoreIsolationTest — several stores written concurrently, which is the only
-                 place in the suite where two writers really do run at the same time
+                 MultiStoreIsolationTest — several stores written concurrently, which is the case
+                 where two writers on *different* stores must not meet at all
+                 ConcurrentWriterTest — the four statements concurrent writers actually make, each
+                 written so it could only pass with them and would have deadlocked against the single
+                 writer lock; plus testAutoCommitAbsorbsIndexLeafContention, six writers on one index
+                 leaf asserting that a single-statement write is never refused. That one also asserts
+                 the exclusive fallback was reached, because a run that never escalated did not
+                 reproduce the contention and its pass would prove nothing
 
 graph-cypher/src/test/java/io/metaloom/graph/cypher/
                  parser, null semantics, execution, the versus-API differential, variable-length paths
@@ -207,6 +214,8 @@ mvn test -Pslow                  # adds the scaling curve and the soak
 mvn test -Pbench                 # adds the benchmarks and the performance gates
 mvn test -Pall-tests             # everything
 mvn test -Dmetaloom.graph.native.enabled=false   # force the pure-Java path
+mvn test -Dnative.skip=true       # the whole pure-Java path: not built, not packaged, not loaded
+mvn test -Dmetaloom.graph.native.required=true   # fail, rather than skip, if the crate did not build
 
 mvn test -Pslow -Dtest=SoakTest -Dsoak.seconds=43200   # the twelve hour soak
 tools/kill9-loop.sh 20 3                               # the kill -9 loop

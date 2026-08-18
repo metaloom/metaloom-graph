@@ -10,10 +10,25 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Nothing here writes to the repository: no release, no comment, no cache key that outlives the run. Saying so is
+# cheap and means a compromised action in the tree cannot use the run's token to change anything.
+permissions:
+  contents: read
+
+# A push that supersedes another cancels it. These jobs are long and there are six of them, so a branch pushed twice
+# in a minute otherwise occupies two full sets of runners to produce one answer anybody will read.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: test (native ${{ matrix.native }})
     runs-on: ubuntu-latest
+    # Generous against the suite's few minutes, and far below the six hour default. Every job here can hang rather
+    # than fail — they are concurrency tests — and a hang that is not cut short costs a day of runner time and reports
+    # nothing at the end of it.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -30,9 +45,15 @@ jobs:
       - name: Test
         run: |
           if [ "${{ matrix.native }}" = "disabled" ]; then
-            mvn -B test -Dmetaloom.graph.native.enabled=false
+            # -Dnative.skip=true, not -Dmetaloom.graph.native.enabled=false: the pom documents the first as the whole
+            # pure-Java path — not built, not packaged and not loaded — and the second leaves a shared object on disk
+            # for the search path to find. It also saves this leg a cargo build it has no use for.
+            mvn -B test -Dnative.skip=true
           else
-            mvn -B test
+            # required=true turns a missing shared object into a failure. Without it this leg still passes when the
+            # crate did not build: the native tests are guarded by assumptions, so they skip, and the run that exists
+            # to compare the two paths compares the pure-Java one against itself. See NativeBindingsTest.
+            mvn -B test -Dmetaloom.graph.native.required=true
           fi
 
       - name: Keep the failing store
@@ -45,6 +66,7 @@ jobs:
   slow:
     name: slow (concurrency, soak)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -55,9 +77,17 @@ jobs:
       # A short soak in CI, not the twelve hour one. The long run is a manual command; see spec/TESTING.md.
       - run: mvn -B test -Pslow -Dsoak.seconds=60
 
+      - name: Keep the reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-slow
+          path: "**/target/surefire-reports/"
+
   crash:
     name: kill -9 loop
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -68,9 +98,20 @@ jobs:
       - run: mvn -B test-compile
       - run: tools/kill9-loop.sh 15 3
 
+      # The script leaves the store behind on the first failure precisely so it can be looked at, and calls it the most
+      # valuable artefact the project can produce. Uploading it is the difference between that being true and it being
+      # deleted with the runner.
+      - name: Keep the store that failed its durability check
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kill9-store
+          path: /tmp/graphstore-kill9-*
+
   gates:
     name: performance gates
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -83,16 +124,24 @@ jobs:
       # gates — reads per operation, write amplification — are exact and are the ones that carry the weight here.
       - run: mvn -B test -Pbench
 
+      - name: Keep the reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-gates
+          path: "**/target/surefire-reports/"
+
   rust:
     name: rust native layer
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      # The crate has never been compiled in the development environment, which has no cargo. This job is the
-      # first thing that would actually build and test it.
+      # Pinned by native-rust-lib/rust-toolchain.toml, which a plain cargo ignores and rustup honours — so this is
+      # the only place the crate is built and linted against the version the file names.
       - run: cargo build --release --manifest-path graph-core/native-rust-lib/Cargo.toml
       - run: cargo test --manifest-path graph-core/native-rust-lib/Cargo.toml
       - run: cargo clippy --manifest-path graph-core/native-rust-lib/Cargo.toml -- -D warnings

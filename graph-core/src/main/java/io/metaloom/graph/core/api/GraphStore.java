@@ -125,6 +125,28 @@ public interface GraphStore extends AutoCloseable {
 		return inTransaction(work, 3);
 	}
 
+	/**
+	 * Runs work as a <b>single statement</b>: the engine absorbs its conflicts, and progress is guaranteed.
+	 *
+	 * <p>
+	 * This is the seam {@code setNodeProperties} and a Cypher write query already sit behind, exposed for anything
+	 * else that is one statement rather than a unit of work. The difference from {@link #inTransaction} is who owns
+	 * the conflict. A caller who opened a transaction has something to reconsider and is told; a caller with one
+	 * statement has nothing to reconsider, so re-running it against a newer state is what they meant.
+	 * </p>
+	 *
+	 * <p>
+	 * Unlike a bounded retry, this cannot end in a {@code TransactionConflictException}. The optimistic attempts are
+	 * the fast path, and when they are exhausted the work runs once with every other writer excluded, which leaves no
+	 * window for a conflict to be decided in. That last resort costs the throughput of a single-writer engine for the
+	 * duration of one statement, so the work must be short — and it must be safe to run more than once, because it
+	 * will be. Nothing it wrote survives a refused attempt, but anything it did outside the store is its own problem.
+	 * </p>
+	 *
+	 * @see <a href="../../../../../../../spec/TRANSACTIONS.md">spec/TRANSACTIONS.md</a> section 6.3
+	 */
+	<T> T inStatement(TransactionalWork<T> work) throws IOException;
+
 	/** Work performed inside a transaction opened by {@link #inTransaction}. */
 	@FunctionalInterface
 	interface TransactionalWork<T> {

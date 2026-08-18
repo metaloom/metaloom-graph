@@ -75,8 +75,9 @@ try (Transaction tx = store.begin()) {                 // SNAPSHOT by default
 | `store.snapshotStats()` | What open views cost right now | **Yes** |
 | `store.begin(IsolationLevel)` | Per-transaction write isolation | **Yes** — `SNAPSHOT` or `SERIALIZABLE`; a writer at `READ_COMMITTED` is refused |
 | `store.inTransaction(work, attempts, IsolationLevel)` | The same, with the retry seam | **Yes** |
+| `store.inStatement(work)` | One statement, whose conflicts the engine absorbs | **Yes** — cannot end in a conflict: optimistic attempts, then one attempt with every other writer excluded. Refused inside an open transaction |
 | `SERIALIZABLE` | Serializable write transactions | **Yes**, by validating what the transaction read at commit rather than by SSI; see TRANSACTIONS.md §6.4 |
-| `TransactionConflictException` | The loser of a write-write or read-write conflict | **Yes** — a normal outcome; `inTransaction` retries it, and auto-commit mutations and Cypher write queries retry it internally |
+| `TransactionConflictException` | The loser of a write-write or read-write conflict | **Yes** — a normal outcome; `inTransaction` retries it up to its attempt limit and then raises it, while auto-commit mutations and Cypher write queries go through `inStatement` and never raise it at all |
 
 Both handles are `AutoCloseable` and **thread-confined**. A read view is published to the thread that
 opened it and using it from another is refused rather than tolerated, because the reconstruction cache
@@ -372,9 +373,14 @@ format.
 - **Cursors must be closed.** They hold prefetch buffers and, for `GLOBAL_NODE` uniqueness, a
   visited set.
 - **`createEdge` gives no id.** If you need to refer to an edge later, use `createRelationship`.
-- **`inTransaction` retries; `begin` does not.** With writers serialised there is no conflict to
-  retry against today, so what it buys is the retry seam and the refusal to retry a
-  `ConstraintViolationException` or a `SnapshotTooOldException` into the same answer.
+- **`inTransaction` retries; `begin` does not; `inStatement` cannot fail.** The three are a ladder,
+  and which one you want is decided by whether you have anything to reconsider. `begin` hands you the
+  conflict. `inTransaction` retries a bounded number of times and then hands you the conflict, and
+  refuses to retry a `ConstraintViolationException` or a `SnapshotTooOldException` into the same
+  answer. `inStatement` is for work that is one statement: it retries, and when that runs out it
+  excludes every other writer and finishes, so there is no conflict left to hand back. **The default
+  three attempts on `inTransaction` is low** under real contention — six writers on one index leaf
+  need two hundred — so pass an attempt count if writers share an index.
 - **Read views must be closed**, or reclamation stalls and the store eventually abandons them
   ([TRANSACTIONS.md §8](TRANSACTIONS.md#8-conventions-and-gotchas)).
 - **A read view is thread-confined**, and using one from another thread is refused rather than

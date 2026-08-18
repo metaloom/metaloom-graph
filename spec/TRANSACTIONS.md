@@ -424,7 +424,47 @@ The retry **backs off**, which is not decoration. A conflict against a transacti
 running is resolved by that transaction finishing, and a durable commit takes milliseconds where a
 failed attempt takes microseconds. Four writers racing to create the one index catalog page burned
 all sixty-four of their attempts inside the winner's first commit and then raised a conflict on a
-store where the only thing wrong was that somebody else was ahead of them.
+store where the only thing wrong was that somebody else was ahead of them. The delay is **jittered**,
+because the losers of one round are otherwise scheduled to collide again: a winner's commit
+invalidates every snapshot older than it at once, so an unjittered delay hands every loser the same
+wake-up time.
+
+**Retrying optimistically is not on its own a guarantee of progress**, and the argument that said it
+was is recorded here because it was wrong. It ran: a conflict has a winner, so each attempt faces one
+fewer competitor. That describes a queue that drains, and writers in a loop are not one — the winner
+commits and comes straight back with its next write, so the number of competitors is constant and a
+loser's chance never improves. A conflict is decided in the window between a transaction's snapshot
+and its turn at the commit lock, and every writer contending for one hot B+tree leaf invalidates every
+snapshot older than its commit. Six writers on one index leaf starve one of their number past
+sixty-four attempts often enough to measure, and past two hundred and fifty-six as well. It was not a
+bound set too low; it was an unbounded wait wearing a bound.
+
+Making the commit lock **fair** makes it strictly worse, which is worth stating because it is the
+obvious first idea: FIFO order guarantees that everybody ahead of the loser commits before it does, so
+the loser's snapshot is stale every time it reaches the front. Measured, it took the case from half of
+runs failing to all of them.
+
+So an auto-commit write that exhausts its optimistic attempts **takes the write gate exclusively and
+runs once more** (`writeExclusively`). With no other writer in flight there is no window for a
+conflict to be decided in, so the attempt cannot lose one, and progress is guaranteed rather than
+hoped for. The gate is then re-taken shared by the `begin()` inside it — the downgrade
+`ReentrantReadWriteLock` is there for and the same sequence compaction runs — so no new lock ordering
+is introduced. It is deliberately the exception: excluding every other writer for one statement is the
+throughput of a single-writer engine, which is what the optimistic attempts exist to avoid paying. The
+alternative for a caller who wrote one statement is not a slower write but a failed one.
+`GraphStoreImpl.autoCommitEscalations()` counts how often it happens, which is the number that
+separates "the retry loop absorbed contention" from "the engine serialised writers to finish a
+statement".
+
+**One mechanism, both statement paths.** A Cypher write query had its own copy of the optimistic loop
+in `Cypher.write`, and the copy carried the defect with it — the same bounded attempts, the same
+unjittered backoff, and the same raised conflict at the end, which `CypherConcurrencyTest` then
+refused a query over. Both now go through `GraphStore.inStatement(work)`, which is this contract given
+a name: the engine absorbs the conflicts, the work may run more than once, and it cannot end in a
+`TransactionConflictException`. `inStatement` refuses to run inside an open transaction, because
+absorbing a conflict there would re-run the caller's work inside their unit of work and commit it out
+from under them. `USING PERIODIC COMMIT` is deliberately not covered: it has already committed earlier
+batches by the time a later one loses, so re-running the statement is not available to it.
 
 ### 6.4 `SERIALIZABLE`
 

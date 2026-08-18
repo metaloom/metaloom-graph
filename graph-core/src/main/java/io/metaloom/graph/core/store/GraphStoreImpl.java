@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.concurrent.locks.StampedLock;
@@ -156,6 +157,19 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 	/** How many times an auto-commit mutation re-runs itself after losing a conflict. See {@link #write}. */
 	private static final int AUTO_COMMIT_ATTEMPTS = 64;
+
+	/**
+	 * How often an auto-commit write gave up on optimism and took the write gate exclusively.
+	 *
+	 * <p>
+	 * Not in {@link StoreMetrics}, which is the durability and I/O surface. This is here because it is the one number
+	 * that distinguishes "the retry loop absorbed some contention", which is the design working, from "the retry loop
+	 * could not and the engine serialised writers to finish the statement", which is a workload that wants an explicit
+	 * transaction or a less contended index. A test asserts it moved; an operator reading a rising count is being told
+	 * where their write throughput went.
+	 * </p>
+	 */
+	private final LongAdder autoCommitEscalations = new LongAdder();
 
 	/**
 	 * Held for writing only while a commit copies its pages into the mapping, so a reader never observes half of a
@@ -962,13 +976,48 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		// failure — and the commonest conflict is not even between the callers' data, it is two inserts landing in one
 		// B+tree leaf, which no caller can restructure their way out of.
 		//
-		// Progress is guaranteed: a conflict has a winner, so each attempt runs with one fewer competitor. The bound is
-		// generous rather than infinite, because a store under more contention than this has a problem a retry loop
-		// should surface rather than absorb.
+		// Retrying optimistically is the fast path and almost always the only one taken. It is not, on its own, a
+		// guarantee of progress, and the reasoning that said it was is worth recording because it was wrong: "a
+		// conflict has a winner, so each attempt runs with one fewer competitor" describes a queue that drains, and
+		// writers in a loop are not that. The winner commits and immediately comes back with its next write, so the
+		// number of competitors is constant and a loser's chance of winning never improves.
+		//
+		// That matters because the window a conflict is decided in is the one between this transaction's snapshot and
+		// its turn at the commit lock, and every writer contending for one hot B+tree leaf invalidates every snapshot
+		// older than its commit. Six writers on one index leaf starve one of their number past sixty-four attempts
+		// often enough to measure, and past two hundred and fifty-six as well: it is not a bound that was set too low,
+		// it is an unbounded wait wearing a bound. Making the commit lock fair makes it strictly worse, because FIFO
+		// order guarantees that everybody ahead of the loser commits before it does.
+		return asStatement(txn -> underApply(txn, op));
+	}
+
+	@Override
+	public <T> T inStatement(TransactionalWork<T> work) throws IOException {
+		checkOpen();
+		if (currentTransaction.get() != null) {
+			// Already inside somebody's unit of work, so this is not a statement and its conflicts are not the
+			// engine's to absorb: absorbing them here would re-run the caller's work inside their transaction and
+			// commit it out from under them.
+			throw new IllegalStateException("inStatement() cannot run inside an open transaction: the conflict it "
+				+ "absorbs belongs to whoever opened it. Call the work directly, or commit first.");
+		}
+		return asStatement(txn -> work.run());
+	}
+
+	/**
+	 * One statement, retried optimistically and then run with every other writer excluded.
+	 *
+	 * <p>
+	 * Both callers are the same shape and were the same defect: {@link #write} for a single mutation and
+	 * {@link #inStatement} for a Cypher write query, each of which used to end in a raised conflict that its caller
+	 * had no way to act on.
+	 * </p>
+	 */
+	private <T> T asStatement(StatementWork<T> work) throws IOException {
 		TransactionConflictException conflict = null;
 		for (int attempt = 0; attempt < AUTO_COMMIT_ATTEMPTS; attempt++) {
 			try (Transaction txn = begin()) {
-				T result = underApply((TransactionImpl) txn, op);
+				T result = work.run((TransactionImpl) txn);
 				txn.commit();
 				return result;
 			} catch (TransactionConflictException e) {
@@ -976,7 +1025,44 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				backOff(attempt);
 			}
 		}
-		throw conflict;
+		return runExclusively(work, conflict);
+	}
+
+	/** One statement's body, given the transaction opened for it. */
+	@FunctionalInterface
+	private interface StatementWork<T> {
+		T run(TransactionImpl txn) throws IOException;
+	}
+
+	/**
+	 * The last resort of a statement: run it with no other writer in flight.
+	 *
+	 * <p>
+	 * Holding the write gate exclusively is what turns "retry and hope" into a guarantee. Nothing else can commit
+	 * between this transaction's snapshot and its validation, so there is no window for a conflict to be decided in
+	 * and the attempt cannot lose one. The gate is then taken shared again by {@code begin()} inside it, which is the
+	 * downgrade {@link #writeGate} is a {@link ReentrantReadWriteLock} for and the same sequence compaction runs; the
+	 * commit lock is acquired underneath it in the usual order, so this adds no new lock ordering.
+	 * </p>
+	 *
+	 * <p>
+	 * It is deliberately the exception and not the rule. Excluding every other writer for the duration of one
+	 * statement is the throughput of a single-writer engine, which is precisely what the optimistic attempts above
+	 * exist to avoid paying — but a caller who wrote one statement has nothing to reconsider and no seam to retry at,
+	 * so the alternative is not a slower write, it is a failed one.
+	 * </p>
+	 */
+	private <T> T runExclusively(StatementWork<T> work, TransactionConflictException conflict) throws IOException {
+		logger.debug("Statement lost {} conflicts, taking the write gate exclusively", AUTO_COMMIT_ATTEMPTS, conflict);
+		autoCommitEscalations.increment();
+		writeGate.writeLock().lock();
+		try (Transaction txn = begin()) {
+			T result = work.run((TransactionImpl) txn);
+			txn.commit();
+			return result;
+		} finally {
+			writeGate.writeLock().unlock();
+		}
 	}
 
 	/**
@@ -995,7 +1081,12 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			Thread.yield();
 			return;
 		}
-		long nanos = Math.min(5_000_000L, 50_000L << Math.min(attempt - 4, 7));
+		long ceiling = Math.min(5_000_000L, 50_000L << Math.min(attempt - 4, 7));
+		// Jittered, because the losers of one round are otherwise scheduled to collide again. Everything contending
+		// for a hot index leaf loses at the same instant — the winner's commit invalidates every snapshot taken before
+		// it at once — so an unjittered delay hands them all the same wake-up time and reproduces the pile-up that
+		// caused the backoff a fixed number of times in a row.
+		long nanos = ceiling / 2 + java.util.concurrent.ThreadLocalRandom.current().nextLong(ceiling / 2 + 1);
 		java.util.concurrent.locks.LockSupport.parkNanos(nanos);
 	}
 
@@ -2919,6 +3010,11 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	/** The live counters. Tests subtract two snapshots to cost an operation; production wants {@link #metrics()}. */
 	public IoCounters counters() {
 		return counters;
+	}
+
+	/** How many auto-commit writes have had to take the write gate exclusively to finish. See {@link #runExclusively}. */
+	public long autoCommitEscalations() {
+		return autoCommitEscalations.sum();
 	}
 
 	@Override
