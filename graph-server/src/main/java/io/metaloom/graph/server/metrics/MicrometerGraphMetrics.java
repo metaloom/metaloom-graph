@@ -93,6 +93,20 @@ public final class MicrometerGraphMetrics implements GraphMetrics {
 		registry.counter("graph_mcp_tool_calls", "tool", tool, "outcome", outcome).increment();
 	}
 
+	/**
+	 * {@code graph_wire_connections{tls="true"|"false"}}.
+	 *
+	 * <p>
+	 * Both series are registered on the first connection of each kind rather than up front, which means a server that
+	 * has never been reached in the clear publishes no {@code tls="false"} series at all. That reads correctly:
+	 * absence is the good state, and a zero that has always been zero is indistinguishable from a meter nobody wired.
+	 * </p>
+	 */
+	@Override
+	public void recordWireConnection(boolean tls) {
+		registry.counter("graph_wire_connections", "tls", Boolean.toString(tls)).increment();
+	}
+
 	@Override
 	public void bindGauge(String name, String database, Supplier<Number> value) {
 		// strongReference, because the supplier closes over a lookup rather than over a long-lived object and there is

@@ -108,11 +108,34 @@ smoke_server() {
 	# being assumed to work because the HTTP server did. Its own port, so a machine already running a
 	# server on the default 8081 does not make this fail for the wrong reason.
 	WIRE_PORT="${NATIVE_SMOKE_WIRE_PORT:-8130}"
+	# A third listener, for the TLS check below.
+	WIRE_TLS_PORT="${NATIVE_SMOKE_WIRE_TLS_PORT:-8131}"
 	STORE="$OUT_DIR/smoke-store"
 	rm -rf "$STORE"
 
-	echo "[native] smoke test on ports $PORT and $WIRE_PORT"
-	"$BINARY" --demo "$STORE" --wire-port="$WIRE_PORT" "$PORT" > "$LOG" 2>&1 &
+	# A throwaway certificate for the encrypted binary port. Generated rather than committed: a certificate expires,
+	# and a committed one turns into a smoke test that passes for years and then fails on a date nobody chose. Skipped
+	# without openssl, with a message, because the rest of this function is still worth running.
+	TLS_DIR="$OUT_DIR/smoke-tls"
+	TLS_ARGS=""
+	if command -v openssl > /dev/null 2>&1; then
+		rm -rf "$TLS_DIR"
+		mkdir -p "$TLS_DIR"
+		openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=localhost' \
+			-keyout "$TLS_DIR/tls.key" -out "$TLS_DIR/tls.crt" > /dev/null 2>&1 \
+			|| fail "openssl could not generate a smoke certificate"
+		TLS_ARGS="--wire-tls-cert=$TLS_DIR/tls.crt --wire-tls-key=$TLS_DIR/tls.key --wire-tls-port=$WIRE_TLS_PORT"
+	else
+		echo "[native] no openssl on PATH, skipping the TLS check" >&2
+	fi
+
+	echo "[native] smoke test on ports $PORT, $WIRE_PORT and ${TLS_ARGS:+$WIRE_TLS_PORT}"
+	# --no-auth deliberately. What this function tests is whether the image can serve — a route, a mapped segment,
+	# a classpath resource, a netty listener — and every assertion below would otherwise be a 401 that proved only
+	# that authentication works. The path authentication puts at risk in a native image is the JCA lookup, and
+	# smoke_cli exercises that directly through `auth reset-admin`.
+	# shellcheck disable=SC2086
+	"$BINARY" --demo --no-auth $TLS_ARGS "$STORE" --wire-port="$WIRE_PORT" "$PORT" > "$LOG" 2>&1 &
 	PID=$!
 	trap 'kill "$PID" 2>/dev/null || true' EXIT
 
@@ -144,6 +167,12 @@ smoke_server() {
 	WIRE_SMOKE="$ROOT/tools/WireSmoke.java"
 	if command -v java > /dev/null 2>&1; then
 		java "$WIRE_SMOKE" 127.0.0.1 "$WIRE_PORT" || fail "the binary streaming port"
+		# The encrypted listener, which is a JSSE question and therefore a metadata one: a provider missing from the
+		# image fails at RUN time under --no-fallback and at no earlier point, exactly like the PBKDF2 lookup in
+		# smoke_cli. The same handshake and the same query, so a pass here means TLS and nothing else changed.
+		if [ -n "$TLS_ARGS" ]; then
+			java "$WIRE_SMOKE" localhost "$WIRE_TLS_PORT" --tls || fail "the encrypted binary port"
+		fi
 	else
 		echo "[native] no java on PATH, skipping the binary port check" >&2
 	fi
@@ -157,7 +186,8 @@ smoke_server() {
 		[ "$CODE" = "200" ] || fail "$ASSET returned $CODE"
 	fi
 
-	echo "[native] smoke test passed: $NODES nodes, 5 rows over each port, index and $ASSET served; Rust crate: ${CRATE:-unknown}"
+	echo "[native] smoke test passed: $NODES nodes, 5 rows over each port${TLS_ARGS:+ including TLS}, index and"
+	echo "[native] $ASSET served; Rust crate: ${CRATE:-unknown}"
 }
 
 # ------------------------------------------------------------------------------------------- the CLI

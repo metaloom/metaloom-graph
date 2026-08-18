@@ -632,6 +632,19 @@ diagnostic artefact and deleting it on failure is the most frustrating thing a t
   with no saved state, because it is about not being signed in. `tools/demo-server.sh` therefore leaves
   authentication **on** and fixes the first password with `GRAPH_INITIAL_PASSWORD`, since Playwright is
   the only suite that can exercise a login page at all.
+- **`WireTlsTest`** (graph-server, `unit`) generates a certificate per test rather than committing one, because a
+  committed certificate expires and turns into a suite that passes for years and then fails on a date nobody chose,
+  reading like a TLS defect. More of it asserts refusal than success — an untrusted certificate, a certificate for the
+  wrong hostname, a plaintext client on the encrypted port and the reverse — because those are the paths where getting
+  it wrong produces something that *looks* like it is working. The hostname case is the one that earns its place: Vert.x
+  leaves hostname verification off by default, so without the client turning it on, a valid certificate for any name at
+  all would be accepted.
+- **`ClientTlsTest`** (graph-client, `unit`) is cheap assertions about a record, and pins down exactly the value the
+  library underneath defaults the other way.
+- **`tools/WireSmoke.java` and `tools/GraphSeed.java` are outside the reactor**, so nothing compiles them and a protocol
+  change breaks them silently. That is not hypothetical: the authentication work bumped the version to 4 and left
+  `WireSmoke.PROTOCOL_VERSION = 3` behind, which only the native smoke test would have caught and only on a machine with
+  GraalVM. `tools/native-image.sh` is the only thing that runs them.
 - **Two traps worth knowing** if the e2e suite hangs: `webServer.url` must probe `/api/whoami` and not
   `/api/stats`, because Playwright treats 401 as not-ready and would burn its whole 240 s budget; and
   `reuseExistingServer` is true outside CI, so anything already listening on `E2E_PORT` is silently
@@ -639,5 +652,5 @@ diagnostic artefact and deleting it on failure is the most frustrating thing a t
 
 ---
 
-_Git HEAD revision: `da8c93e`_
-_Last updated: 2026-08-17 (authentication and RBAC authorization)_
+_Git HEAD revision: `58cd33e`_
+_Last updated: 2026-08-18 (TLS on the binary port)_

@@ -47,6 +47,7 @@ import io.vertx.core.buffer.Buffer;
 import io.vertx.core.net.NetServer;
 import io.vertx.core.net.NetServerOptions;
 import io.vertx.core.net.NetSocket;
+import io.vertx.core.net.PemKeyCertOptions;
 
 /**
  * The binary port: a Cypher result, streamed as it is produced.
@@ -127,10 +128,21 @@ import io.vertx.core.net.NetSocket;
  * view is only ever closed by the thread that opened it, on its way out of {@link Cypher#stream}.
  * </p>
  *
- * <h2>No authentication, no transport security</h2>
+ * <h2>Two listeners, one server</h2>
  *
  * <p>
- * There is neither, which is why {@link WireServerOptions#DEFAULT_HOST} is loopback. See spec/OPERATIONS.md.
+ * With {@link WireServerOptions#tls} set, this opens a <b>second</b> listener that terminates TLS, on a port of its
+ * own. Everything behind the socket is shared — the stream permits, the worker pool, the write gates, the watchdog —
+ * so {@link WireServerOptions#maxBufferedBytes()} still describes the whole server and not one of two halves. A
+ * connection's encryption is decided by which port it reached and never changes after that; the frames are identical
+ * either way. {@link WireTlsOptions} has the reasoning, including why this is not a negotiated upgrade.
+ * </p>
+ *
+ * <p>
+ * Both are off-by-default in the sense that matters: TLS needs a certificate an operator supplies, and the plaintext
+ * listener still binds {@link WireServerOptions#DEFAULT_HOST} — loopback — because a password crosses it in the clear.
+ * Authentication ({@code spec/AUTH.md}) and transport security are complementary and neither replaces the other. See
+ * spec/OPERATIONS.md.
  * </p>
  *
  * @see <a href="../../../../../../../../spec/WIRE.md">spec/WIRE.md</a>
@@ -195,6 +207,9 @@ public final class WireServer implements AutoCloseable {
 
 	private NetServer server;
 
+	/** The encrypted listener, or null when no certificate was configured. Shares everything behind the socket. */
+	private NetServer tlsServer;
+
 	public WireServer(GraphDatabases databases, String defaultDatabase) {
 		this(Vertx.vertx(), true, databases, defaultDatabase, WireServerOptions.defaults(), false);
 	}
@@ -250,34 +265,111 @@ public final class WireServer implements AutoCloseable {
 		});
 	}
 
+	/**
+	 * Binds every listener this server was configured with.
+	 *
+	 * @return the port a client would connect to: the plaintext one when it is open, otherwise the TLS one. Both are
+	 *         logged, and {@link #port()} and {@link #tlsPort()} report them separately
+	 */
 	public Future<Integer> listen() {
-		// SO_SNDBUF explicitly, because Linux autotunes a loopback socket's buffers into the megabytes under a fast
-		// writer — enough for a four-megabyte result to go out in full against a client that was reading nothing,
-		// with the write queue never once looking full. See WireServerOptions.
-		server = vertx.createNetServer(new NetServerOptions()
-			.setSendBufferSize(options.socketSendBufferBytes())
-			.setTcpNoDelay(true));
-		server.connectHandler(socket -> {
-			socket.setWriteQueueMaxSize(options.writeQueueMaxBytes());
-			new Connection(socket).attach();
-		});
 		if (options.retentionSoftLimitBytes() > 0) {
 			// On a thread of its own rather than a Vert.x timer: it reads store statistics, and "this call is
 			// certainly cheap enough for an event loop" is exactly the assumption that ages badly.
 			watchdog.scheduleWithFixedDelay(this::checkRetention, options.watchdogIntervalMillis(),
 				options.watchdogIntervalMillis(), TimeUnit.MILLISECONDS);
 		}
-		return server.listen(options.port(), options.host()).map(bound -> {
-			logger.info("Binary port on {}:{}, up to {} concurrent streams x ({} write queue + {} send buffer)"
-				+ " = {} bytes held for clients that stop reading",
-				options.host(), bound.actualPort(), options.maxConcurrentStreams(), options.writeQueueMaxBytes(),
-				options.socketSendBufferBytes(), options.maxBufferedBytes());
-			return bound.actualPort();
-		});
+		Future<Integer> plain = options.plaintext()
+			? bind(false, options.host(), options.port()).map(bound -> {
+				server = bound;
+				logger.info("Binary port on {}:{}, up to {} concurrent streams x ({} write queue + {} send buffer)"
+					+ " = {} bytes held for clients that stop reading",
+					options.host(), bound.actualPort(), options.maxConcurrentStreams(), options.writeQueueMaxBytes(),
+					options.socketSendBufferBytes(), options.maxBufferedBytes());
+				return bound.actualPort();
+			})
+			: Future.succeededFuture(-1);
+
+		WireTlsOptions tls = options.tls();
+		if (tls == null) {
+			return plain;
+		}
+		// Sequentially rather than in parallel: a certificate that cannot be loaded should fail before anything is
+		// reachable, and a half-bound server whose other half failed is a state nobody wants to reason about.
+		return plain.compose(plainPort -> bind(true, tls.host(), tls.port())
+			.map(bound -> {
+				tlsServer = bound;
+				logger.info("Binary port over TLS on {}:{} (certificate {}){}", tls.host(), bound.actualPort(),
+					tls.certificate(),
+					options.plaintext() ? "" : " — the plaintext listener is off, this is the only binary port");
+				return plainPort >= 0 ? plainPort : bound.actualPort();
+			})
+			// The failure this exists for is the one that would be worst to get wrong: a bad certificate leaves the
+			// plaintext listener bound, and Vert.x's event loops are not daemon threads, so a caller that let the
+			// exception escape would have a process still serving in the clear after announcing that TLS failed.
+			// "Encryption did not start, so we served without it" is precisely the outcome this feature must not have.
+			.recover(failure -> {
+				if (server != null) {
+					logger.error("The encrypted binary port could not be opened, so the plaintext one on {}:{} is"
+						+ " being closed too rather than left serving in the clear", options.host(), port());
+					NetServer opened = server;
+					server = null;
+					return opened.close().transform(ignored -> Future.failedFuture(failure));
+				}
+				return Future.failedFuture(failure);
+			}));
 	}
 
+	/**
+	 * One listener.
+	 *
+	 * <p>
+	 * The non-TLS settings are applied to both, because they are properties of this server rather than of a transport:
+	 * the send buffer is in {@link WireServerOptions#maxBufferedBytes()} whichever port the peer reached, and a
+	 * connection that skipped {@code TCP_NODELAY} because it happened to be encrypted would be a latency difference
+	 * nobody would think to look for.
+	 * </p>
+	 */
+	private Future<NetServer> bind(boolean tls, String host, int port) {
+		// SO_SNDBUF explicitly, because Linux autotunes a loopback socket's buffers into the megabytes under a fast
+		// writer — enough for a four-megabyte result to go out in full against a client that was reading nothing,
+		// with the write queue never once looking full. See WireServerOptions.
+		NetServerOptions netOptions = new NetServerOptions()
+			.setSendBufferSize(options.socketSendBufferBytes())
+			.setTcpNoDelay(true);
+		if (tls) {
+			WireTlsOptions certificate = options.tls();
+			netOptions.setSsl(true)
+				.setKeyCertOptions(new PemKeyCertOptions()
+					.setCertPath(certificate.certificate().toString())
+					.setKeyPath(certificate.privateKey().toString()));
+		}
+		NetServer bound = vertx.createNetServer(netOptions);
+		bound.connectHandler(socket -> {
+			socket.setWriteQueueMaxSize(options.writeQueueMaxBytes());
+			// Asked of the socket rather than closed over from this lambda, so the counter reports what the transport
+			// actually did rather than what this server intended.
+			metrics.recordWireConnection(socket.isSsl());
+			new Connection(socket).attach();
+		});
+		return bound.listen(port, host)
+			.recover(failure -> Future.failedFuture(tls
+				// Naming the certificate here is the difference between a two-minute fix and an afternoon: Netty's
+				// message for a malformed or mismatched key pair says nothing about which file it came from.
+				? new IllegalStateException("Could not open the encrypted binary port on " + host + ":" + port
+					+ " with certificate " + options.tls().certificate() + " and key " + options.tls().privateKey()
+					+ ". Both must be unencrypted PEM, and the key must match the certificate", failure)
+				: failure))
+			.map(bound);
+	}
+
+	/** The unencrypted listener's port, or -1 when {@code plaintext} is off. */
 	public int port() {
-		return server.actualPort();
+		return server == null ? -1 : server.actualPort();
+	}
+
+	/** The encrypted listener's port, or -1 when no certificate was configured. */
+	public int tlsPort() {
+		return tlsServer == null ? -1 : tlsServer.actualPort();
 	}
 
 	public WireServerOptions options() {
@@ -418,6 +510,11 @@ public final class WireServer implements AutoCloseable {
 		if (server != null) {
 			// After the flag, so a query admitted between the two is still refused rather than half-served.
 			server.close().toCompletionStage().toCompletableFuture().join();
+		}
+		if (tlsServer != null) {
+			// The encrypted listener is a second acceptor over the same everything, so it has to stop accepting too.
+			// Leaving it open would keep the process reachable through a shutdown that had already been announced.
+			tlsServer.close().toCompletionStage().toCompletableFuture().join();
 		}
 
 		if (!awaitQuiet(graceMillis)) {

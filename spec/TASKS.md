@@ -251,18 +251,29 @@ these ids leads somewhere.
 
 [AUTH.md §9](AUTH.md) states these as gaps; this is what closing each would mean. Nothing here is started.
 
-### AUTH-1 · TLS on the HTTP, binary and MCP ports
+### AUTH-1 · TLS — done on the binary port, open on HTTP and MCP
 
-**Worth building: yes, and it is now the largest gap in the system.** Authentication without transport security means a
-password crosses in cleartext, so anything on the path has it — which makes every other control here conditional on the
-network. Vert.x terminates TLS with a few lines, so the work is not the code: it is the key material. Where a
-certificate comes from, how it is rotated without a restart, whether the chart expects cert-manager, and what the
-binary client does about verification are four decisions, and getting them wrong produces a server that looks encrypted.
+**The binary port is done.** `--wire-tls-cert` / `--wire-tls-key` open a **second** listener on 8084 over the same
+`WireServer`; `--wire-tls-only` closes the plaintext one once the clients have moved; `ClientOptions.withTls(...)`
+takes a `ClientTls` that verifies the hostname by default. [WIRE.md §7.1](WIRE.md) has the design and the reasoning for
+two ports rather than a negotiated upgrade. The four decisions this entry warned about were answered: a PEM pair at a
+path (the shape of a Kubernetes `kubernetes.io/tls` secret), rotation by restart, the chart mounts a secret the operator
+names, and the client verifies unless deliberately told not to.
 
-**Cost**: small in the server, real in the chart and the client.
-**Done**: `--tls-cert`/`--tls-key` (and the chart's equivalent), `GraphClient` verifying by default with an opt-out that
-is loud, `OPERATIONS.md §9.1` no longer saying "no transport security", and a k3d phase that talks to it over HTTPS.
-**What would change the verdict**: nothing. This is the one item here that is not optional if the ports are exposed.
+**What remains is the HTTP and MCP ports**, and the verdict on them is different rather than merely unfinished. Both are
+HTTP, and HTTP already has a TLS story — an ingress, a mesh or a reverse proxy, with certificate provisioning and
+renewal built into the platform. Duplicating that inside the server buys little and adds a second place for a
+certificate to be stale. The binary port had no such alternative: nothing in front of it can terminate a raw TCP
+protocol it does not understand, which is why the work landed there first.
+
+**Cost**: small — the same `PemKeyCertOptions` on `HttpServerOptions`, plus the chart wiring.
+**Done**: `--tls-cert` / `--tls-key` for the HTTP and MCP listeners, `Secure` on the session cookie becoming
+unconditional when the server terminates TLS itself, and a k3d phase that talks to it over HTTPS.
+**What would change the verdict**: somebody exposing 8080 without a proxy. Until then a proxy is the better answer and
+this stays open on purpose rather than by neglect.
+
+**Not covered by this, and deliberately**: certificate *rotation* without a restart (the PEM is read once at bind), and
+client certificates, which are `AUTH-8` because they are an authentication mechanism rather than a TLS setting.
 
 ### AUTH-2 · An audit log
 
@@ -325,7 +336,22 @@ on.
 **Done**: `graph_auth_logins_total{outcome}`, a session gauge, both in §3, both exercised, and an alert rule in
 `OPERATIONS.md §4` on the failure rate.
 
+### AUTH-8 · Client certificates as an identity
+
+**Worth building: only on request, and it belongs with `AUTH-3` rather than with TLS.** The binary port terminates TLS
+and does not ask for a client certificate; if it did, the interesting question would not be the handshake but the
+mapping — which certificate subject is which user, who issues them, and what happens when one is revoked between the
+handshake and the next query. That is a second authentication *mechanism*, and the protocol already has the field for
+one: `AUTH` carries a `mechanism`, so this is additive.
+
+The trap to avoid: treating "presented a valid certificate" as "is the principal named in it" without deciding where
+the mapping lives. A certificate is not a grant, and a CA that can issue any name is a CA that can issue `admin`.
+
+**Cost**: small in Vert.x (`setClientAuth`, `PemTrustOptions`), real in the mapping and the revocation story.
+**Done**: `mechanism = CERTIFICATE`, a documented subject-to-user mapping held in `.auth/`, a decision on revocation,
+and `.auth/` still holding a password for the local administrator so a CA outage is not a lockout.
+
 ---
 
-_Git HEAD revision: `da8c93e`_
-_Last updated: 2026-08-17 (authentication and RBAC authorization)_
+_Git HEAD revision: `58cd33e`_
+_Last updated: 2026-08-18 (TLS on the binary port)_

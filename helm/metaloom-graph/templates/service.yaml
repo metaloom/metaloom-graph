@@ -15,12 +15,18 @@ spec:
       port: {{ .Values.service.httpPort }}
       targetPort: http
       protocol: TCP
-    {{- if .Values.wire.enabled }}
+    {{- if and .Values.wire.enabled (not .Values.wire.tls.only) }}
     # Present even when wire.host is loopback, so that widening it is one value change rather than
     # two. Nothing outside the pod can reach it until then.
     - name: wire
       port: {{ .Values.service.wirePort }}
       targetPort: wire
+      protocol: TCP
+    {{- end }}
+    {{- if and .Values.wire.enabled .Values.wire.tls.enabled }}
+    - name: wire-tls
+      port: {{ .Values.service.wireTlsPort }}
+      targetPort: wire-tls
       protocol: TCP
     {{- end }}
     {{- if .Values.metrics.enabled }}

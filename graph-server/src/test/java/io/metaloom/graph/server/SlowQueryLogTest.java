@@ -97,6 +97,11 @@ public class SlowQueryLogTest {
 		}
 
 		@Override
+		public void recordWireConnection(boolean tls) {
+			// Not what this class counts.
+		}
+
+		@Override
 		public void recordQuery(String frontend, String kind, String outcome, long durationNanos, long rows) {
 		}
 

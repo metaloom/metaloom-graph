@@ -840,9 +840,10 @@ inventing plausible-looking facts about real places.
 It is seeded, so a size always produces the same graph — which is what lets the browser suite name Heathrow and
 expect an answer.
 
-**Authentication, and no transport security.** The HTTP and binary ports require a login
-([AUTH.md](AUTH.md)) and a password crosses in cleartext, so put TLS in front of anything beyond a host
-you trust — [OPERATIONS.md §9.1](OPERATIONS.md). What a principal may do is the grant and the flag
+**Authentication, and transport security on one port.** The HTTP and binary ports require a login
+([AUTH.md](AUTH.md)). The binary port can encrypt itself ([WIRE.md §7.1](WIRE.md)); this one — the HTTP
+port, which serves this UI and `/api/query` — cannot, so put a proxy in front of anything beyond a host
+you trust or a password crosses in cleartext — [OPERATIONS.md §9.1](OPERATIONS.md). What a principal may do is the grant and the flag
 together: both have to permit, and the flag can only subtract.
 
 ---
@@ -955,5 +956,5 @@ previous bundle. Every assertion in the first run failed against markup that no 
 
 ---
 
-_Git HEAD revision: `da8c93e`_
-_Last updated: 2026-08-17 (authentication and RBAC authorization)_
+_Git HEAD revision: `58cd33e`_
+_Last updated: 2026-08-18 (TLS on the binary port)_

@@ -34,6 +34,11 @@ ENV GRAPH_HTTP_PORT=8080
 ENV GRAPH_WIRE_PORT=8081
 ENV GRAPH_METRICS_PORT=8082
 ENV GRAPH_MCP_PORT=8083
+# The encrypted binary port. Nothing listens on it until GRAPH_WIRE_TLS_CERT and GRAPH_WIRE_TLS_KEY point at a PEM
+# pair -- mount a kubernetes.io/tls secret and set both. Deliberately given no default certificate: an image that
+# shipped one would ship a private key every copy of the image shares, which is worse than no encryption because it
+# looks like encryption.
+ENV GRAPH_WIRE_TLS_PORT=8084
 ENV GRAPH_WIRE_HOST=127.0.0.1
 ENV GRAPH_MCP_HOST=127.0.0.1
 ENV GRAPH_MCP_ENABLED=false
@@ -54,6 +59,8 @@ EXPOSE 8080
 EXPOSE 8081
 EXPOSE 8082
 EXPOSE 8083
+# Only reachable once a certificate is mounted; see GRAPH_WIRE_TLS_PORT above.
+EXPOSE 8084
 
 # uid 1000, gid 0 and group-writable: the OpenShift convention, where the uid is replaced at runtime by
 # an arbitrary one that is still in group 0 — which is exactly why no user is created here. A numeric

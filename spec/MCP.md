@@ -184,7 +184,10 @@ What the token does not buy is privacy: it crosses in cleartext like everything 
 
 ## 8. What is not here
 
-- **No transport security.** The bearer token crosses in cleartext. Authentication exists ([AUTH.md](AUTH.md)); privacy does not.
+- **No transport security on this port.** The bearer token crosses in cleartext. This port is HTTP, so an ingress or a
+  reverse proxy is where TLS for it belongs; the *binary* port terminates its own ([WIRE.md §7.1](WIRE.md)) because
+  nothing in front of it can terminate a raw TCP protocol. Authentication exists ([AUTH.md](AUTH.md)); privacy here does
+  not.
 - **No token of its own.** A session comes from the HTTP port's `POST /api/login`; there is one identity store and one place to log in.
 - **No resources and no prompts.** Only `tools`. A `resources/list` over a graph would have to invent a URI scheme
   for nodes, and nothing has asked for it.
@@ -195,4 +198,4 @@ What the token does not buy is privacy: it crosses in cleartext like everything 
 
 ---
 
-_Last updated: 2026-08-17 (authentication and RBAC authorization)_
+_Last updated: 2026-08-18 (TLS on the binary port)_

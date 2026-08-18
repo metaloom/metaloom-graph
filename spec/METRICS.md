@@ -185,10 +185,19 @@ the budget §4 states is *reads per operation for one kind*. Summing them would 
 | `graph_http_inflight` | gauge | — | `StoreMetricsBinder:133` |
 | `graph_wire_running_streams` | gauge | — | `StoreMetricsBinder:134` |
 | `graph_wire_buffered_bytes` | gauge | — | `StoreMetricsBinder:135` |
+| `graph_wire_connections` | counter | tls | `MicrometerGraphMetrics:81` |
 | `graph_mcp_tool_calls` | counter | tool, outcome | `MicrometerGraphMetrics:77` |
 
 `graph_wire_buffered_bytes` against `WireServerOptions.maxBufferedBytes()` is the one number
 [WIRE.md](WIRE.md) asks an operator to multiply — this is it, measured rather than configured.
+
+`graph_wire_connections{tls="false"}` answers the question that opening the encrypted binary port
+creates, and nothing else answers it: **is anything still connecting in the clear?** Until that rate
+is zero, `--wire-tls-only` would break somebody. The tag is read off the socket rather than off the
+configuration, so a listener that was meant to be encrypted and was not is counted honestly. A server
+that has never been reached in the clear publishes no `tls="false"` series at all, which reads
+correctly — a zero that has always been zero is indistinguishable from a meter nobody wired.
+[WIRE.md §9](WIRE.md) has the port layout.
 
 ---
 
@@ -250,9 +259,11 @@ Two that §4 could not express and this can:
   query, which is how a monitoring system is taken down by a monitored one. Naming the offending query is the
   [slow query log](OPERATIONS.md#42-the-slow-query-log)'s job, and the two are deliberately complementary: the
   histogram says how often and how bad, the log says which one.
-- **No authentication on the monitoring port**, and now the *only* port without it. Deliberate, not an oversight: see [AUTH.md section 7](AUTH.md) for why a probe cannot carry a credential. The other three require one. See
-  [OPERATIONS.md §9](OPERATIONS.md#9-security-posture).
+- **No authentication on the monitoring port**, and the *only* port without it. Deliberate, not an oversight: see
+  [AUTH.md section 7](AUTH.md) for why a probe cannot carry a credential. Every other port requires one. It has no TLS
+  either, and unlike the binary port ([WIRE.md §7.1](WIRE.md)) it is not going to get any: the answer for this port is
+  not to publish it. See [OPERATIONS.md §9](OPERATIONS.md#9-security-posture).
 
 ---
 
-_Last updated: 2026-08-17 (authentication and RBAC authorization)_
+_Last updated: 2026-08-18 (TLS on the binary port)_

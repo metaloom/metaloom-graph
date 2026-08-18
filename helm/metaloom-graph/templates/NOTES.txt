@@ -27,8 +27,12 @@ AUTHENTICATION IS ON.
     curl -b jar -XPOST localhost:8080/api/query -H 'content-type: application/json' \
       -d '{"query":"MATCH (n) RETURN n LIMIT 10"}'
 
-  There is NO TRANSPORT SECURITY, so that password crosses in cleartext. Put TLS in front of the
-  Service, or keep it inside the cluster.
+  The HTTP port has NO TRANSPORT SECURITY, so that password crosses it in cleartext. Put an Ingress or
+  a mesh in front of the Service, or keep it inside the cluster.
+{{ if not .Values.wire.tls.enabled }}
+  The binary port has none either. wire.tls.enabled=true with a kubernetes.io/tls Secret opens an
+  encrypted listener beside it -- that port is the one an Ingress cannot terminate for you.
+{{- end }}
 
   A session is valid only on the pod that issued it, and a restart logs everyone out. With more than
   one replica, a client has to be pinned to a pod.
@@ -59,9 +63,25 @@ THERE IS NO AUTHENTICATION ON ANY PORT.
 {{ if not .Values.persistence.enabled -}}
   PERSISTENCE IS OFF. The store lives in the pod and dies with it.
 {{ end -}}
-{{ if eq .Values.wire.host "127.0.0.1" -}}
+{{ if and (eq .Values.wire.host "127.0.0.1") (not .Values.wire.tls.only) -}}
   The binary streaming port is bound to loopback, so nothing outside the pod can reach it. Set
   wire.host=0.0.0.0 to use it from elsewhere in the cluster.
+{{ end -}}
+{{ if .Values.wire.tls.enabled -}}
+  Binary port over TLS: {{ .Values.service.wireTlsPort }}, from Secret {{ .Values.wire.tls.secretName }}.
+  {{ if .Values.wire.tls.only -}}
+  The cleartext binary port is closed.
+  {{- else -}}
+  The cleartext port {{ .Values.service.wirePort }} is STILL OPEN. Watch
+  graph_wire_connections{tls="false"} on the monitoring port, and set wire.tls.only=true once it stops
+  rising.
+  {{- end }}
+
+  A client verifies by default:
+    ClientOptions.defaults().withTls(ClientTls.system())          # a certificate from a public CA
+    ClientOptions.defaults().withTls(ClientTls.trusting(pemPath)) # a private CA or a self-signed one
+
+  The certificate is read once at start-up. A renewal takes effect when the pod restarts.
 {{ end -}}
 {{ if .Values.metrics.enabled -}}
   Metrics: port {{ .Values.service.metricsPort }}, /metrics, /health and /ready. Do not expose it

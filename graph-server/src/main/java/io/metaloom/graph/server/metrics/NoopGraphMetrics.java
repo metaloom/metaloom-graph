@@ -41,6 +41,11 @@ final class NoopGraphMetrics implements GraphMetrics {
 	}
 
 	@Override
+	public void recordWireConnection(boolean tls) {
+		// Nothing.
+	}
+
+	@Override
 	public void bindGauge(String name, String database, Supplier<Number> value) {
 		// Nothing, and deliberately without calling value.
 	}

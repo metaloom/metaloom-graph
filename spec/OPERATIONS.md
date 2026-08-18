@@ -14,12 +14,12 @@ Design rationale lives in the other files; [CONTEXT.md](CONTEXT.md) routes to th
 
 | | |
 |---|---|
-| **Deployment** | Embedded in a JVM process is the primary shape. `graph-server` also puts up to four ports over a **root of databases**: HTTP on 8080 (browser UI, `/api/query`, whole results as JSON), a binary streaming port on loopback:8081 ([WIRE.md](WIRE.md)), monitoring on 8082 ([METRICS.md](METRICS.md)) and MCP on loopback:8083, off by default ([MCP.md](MCP.md)). **Three of the four require a login; the monitoring port deliberately does not** — see §9 and [AUTH.md](AUTH.md). |
+| **Deployment** | Embedded in a JVM process is the primary shape. `graph-server` also puts up to five ports over a **root of databases**: HTTP on 8080 (browser UI, `/api/query`, whole results as JSON), a binary streaming port on loopback:8081 ([WIRE.md](WIRE.md)), **the same port over TLS on 8084 once a certificate is given**, monitoring on 8082 ([METRICS.md](METRICS.md)) and MCP on loopback:8083, off by default ([MCP.md](MCP.md)). **All but the monitoring port require a login; that one deliberately does not** — see §9 and [AUTH.md](AUTH.md). |
 | **Databases** | One directory per database under the root, each a complete independent store ([DATABASES.md](DATABASES.md)). Sizing below is **per database**. |
 | **Concurrency** | One writer process, enforced by a `LOCK` file. One writer *thread*, enforced by a lock. Readers are unlimited and scale (measured to 10x at 32 threads). |
 | **Durability** | A commit is on the device when the call returns, under the default sync mode. |
 | **Failure domain** | The store directory. There is no replication and no failover. Backup is `metaloom-graph-cli`, outside the engine — [BACKUP.md](BACKUP.md). |
-| **Biggest operational gap** | **No transport security.** Authentication exists ([AUTH.md](AUTH.md)) and a password crosses in cleartext, so put TLS in front of it. §9.1 |
+| **Biggest operational gap** | **No transport security on the HTTP and MCP ports.** The binary port encrypts itself with `--wire-tls-cert` ([WIRE.md §7.1](WIRE.md)); the other two are HTTP and need a proxy in front of them, or a password crosses in cleartext. §9.1 |
 
 ---
 
@@ -110,6 +110,11 @@ what lets the image's `CMD` carry no arguments at all.
 | `GRAPH_WIRE_ENABLED` | `--no-wire` | true |
 | `GRAPH_WIRE_PORT` | `--wire-port=` | 8081 |
 | `GRAPH_WIRE_HOST` | `--wire-host=` | 127.0.0.1 |
+| `GRAPH_WIRE_TLS_CERT` | `--wire-tls-cert=` | none; **no TLS without it** — see §9.1 |
+| `GRAPH_WIRE_TLS_KEY` | `--wire-tls-key=` | none; required by the one above |
+| `GRAPH_WIRE_TLS_PORT` | `--wire-tls-port=` | 8084 |
+| `GRAPH_WIRE_TLS_HOST` | `--wire-tls-host=` | whatever `GRAPH_WIRE_HOST` is |
+| `GRAPH_WIRE_TLS_ONLY` | `--wire-tls-only` | false — the cleartext port stays open |
 | `GRAPH_MAX_STREAMS` | `--max-streams=` | 8 |
 | `GRAPH_METRICS_ENABLED` | `--no-metrics` | true |
 | `GRAPH_METRICS_PORT` | `--metrics-port=` | 8082 |
@@ -129,7 +134,7 @@ Three behaviours that are decisions rather than accidents:
 - **A boolean typo is refused.** `Boolean.parseBoolean` maps every typo to `false`, so `GRAPH_ALLOW_WRITE=ture` would
   give a read-only server and no reason for it. `true/false`, `1/0`, `yes/no` and `on/off` are accepted; anything else
   is a start-up error naming the variable.
-- **Two fixed ports on one number are refused at parse time**, across all four listeners. Otherwise it surfaces as
+- **Two fixed ports on one number are refused at parse time**, across all five listeners. Otherwise it surfaces as
   "address already in use" from whichever bound second, which names the port but not the two settings that chose it.
   Port `0` means "any free one" and is excluded, as is a disabled front end. Note that the monitoring port defaults to
   8082, so serving HTTP on 8082 is now a start-up error rather than a race.
@@ -137,6 +142,11 @@ Three behaviours that are decisions rather than accidents:
 **`--allow-load-csv` and `--import-dir` are refused apart**, in both directions and at parse time. The flag without a
 directory would accept every load and then refuse it, which reads as a bug in the queries; a directory without the flag
 reads as enabled and is not, which is the more dangerous of the two because it is the one an operator believes.
+
+**`--wire-tls-cert` and `--wire-tls-key` are refused apart** for the same reason and a sharper one: an operator who set
+one of two variables and got a server that quietly stayed in cleartext has the worst outcome available, because they
+tried and they believe it worked. `--wire-tls-only` without a certificate is refused too, naming `--no-wire` — closing
+the binary port entirely is a thing somebody might mean, and a server with no binary listener at all is not.
 
 **`GRAPH_WIRE_HOST` deserves its own line.** The binary port binds loopback by default, which inside a pod means it is
 unreachable from outside that pod. That is the correct default and the reason the chart has to widen it deliberately:
@@ -422,26 +432,40 @@ What that does **not** cover:
   full access, and that has not changed: the identity in [AUTH.md](AUTH.md) is enforced by the servers, on the ports,
   not by the storage engine. An embedded caller holding a `GraphStore` is unaffected — the same line
   `--allow-write` has always drawn.
-- **There is no encryption**, at rest or otherwise.
+- **There is no encryption at rest.** In transit, the binary port can encrypt itself — §9.1 — and the store's own
+  files never are.
 - **A malicious store can still make you do work.** Bounds are enforced, but a store can legitimately declare a large
   blob and make you read it. Do not open untrusted stores in a process that cannot afford the time.
 - **The dictionary files are not checksummed.** A corrupt dictionary produces wrong labels, not a detected error.
 
 ### 9.1 The network, which has the same posture and a wider blast radius
 
-`graph-server` opens up to four ports over one root. Three of them require a login unless `--no-auth` was given;
-**none of them has transport security**:
+`graph-server` opens up to five ports over one root. Four of them require a login unless `--no-auth` was given; **one
+of them can encrypt itself**:
 
-| | | Authenticated |
-|---|---|---|
-| HTTP | 8080, **all interfaces** | **Yes.** Session cookie or `Authorization: Bearer`; the browser UI and `/api/query`. `/api/login`, `/api/logout`, `/api/whoami` and the static bundle are outside the filter, the last because the login page is part of it |
-| Binary | 8081, **loopback only** | **Yes.** An `AUTH` frame during the handshake ([WIRE.md](WIRE.md)). Still loopback by default: authentication is not transport security |
-| Monitoring | 8082, **all interfaces**, on by default | **No, deliberately.** `/metrics`, `/health`, `/ready` ([METRICS.md](METRICS.md)) — a kubelet probe and a Prometheus scrape carry no credential, and a probe failing over a misconfigured secret is a restart loop. **Do not publish it**: a scrape carries database names, node counts and store sizes |
-| MCP | 8083, **loopback only**, **off by default** | **Yes.** `Authorization: Bearer` on all three transports ([MCP.md](MCP.md)). Still off by default: it is a remote code path an LLM drives, and a credential is not a reason to widen that |
+| | | Authenticated | Encrypted |
+|---|---|---|---|
+| HTTP | 8080, **all interfaces** | **Yes.** Session cookie or `Authorization: Bearer`; the browser UI and `/api/query`. `/api/login`, `/api/logout`, `/api/whoami` and the static bundle are outside the filter, the last because the login page is part of it | **No.** Put an ingress or a reverse proxy in front of it |
+| Binary | 8081, **loopback only** | **Yes.** An `AUTH` frame during the handshake ([WIRE.md](WIRE.md)) | **No.** Still loopback by default: authentication is not transport security |
+| Binary over TLS | 8084, **off until a certificate is given**, then the same address as 8081 | **Yes**, the same way | **Yes.** `--wire-tls-cert` / `--wire-tls-key`, PEM. A second listener over the same server, not a mode on the first — [WIRE.md §7.1](WIRE.md) |
+| Monitoring | 8082, **all interfaces**, on by default | **No, deliberately.** `/metrics`, `/health`, `/ready` ([METRICS.md](METRICS.md)) — a kubelet probe and a Prometheus scrape carry no credential, and a probe failing over a misconfigured secret is a restart loop. **Do not publish it**: a scrape carries database names, node counts and store sizes | No |
+| MCP | 8083, **loopback only**, **off by default** | **Yes.** `Authorization: Bearer` on all three transports ([MCP.md](MCP.md)). Still off by default: it is a remote code path an LLM drives, and a credential is not a reason to widen that | **No.** Same remedy as HTTP |
 
 `GRAPH_WIRE_HOST` and `GRAPH_MCP_HOST` widen the two loopback ports, deliberately and one at a time. In a pod the
 loopback default means those ports are unreachable from outside the pod, which is still the correct starting position:
 a password on a cleartext port is only as private as the network under it.
+
+**Why only the binary port terminates TLS itself.** The other two are HTTP, and HTTP already has a TLS story — an
+ingress, a service mesh or a reverse proxy, with provisioning and renewal built into the platform. The binary port is
+the one thing that story cannot reach: it is a raw TCP protocol, and nothing in front of it can terminate a connection
+it does not understand. So the encryption lands where there was no alternative, and does not duplicate what a platform
+already does better everywhere else.
+
+**Adding a certificate does not close the cleartext port.** Both listen until `--wire-tls-only`, which is what makes
+the move a migration rather than a flag day — and while both are open the server logs a warning naming the plaintext
+one at startup. `graph_wire_connections{tls="false"}` is how you tell whether anything is still using it; until that
+rate is zero, `--wire-tls-only` breaks somebody. **Neither replaces the other**: a password on a cleartext port is
+readable by anything on the path, and an encrypted port with no login is readable by anyone who can reach it.
 
 **A grant is now the per-database boundary** that §6 of [DATABASES.md](DATABASES.md) said could not exist. A principal
 granted `MATCH ON sales` reads `sales` and is refused `default`, with a message that does not say whether `default`
@@ -513,8 +537,14 @@ Stated plainly, because an operations document that implies capabilities the sys
 
 - No incremental backup and no point-in-time recovery (§5). Online *logical* backup exists; a physical snapshot does not.
 - No repair tool for a store that fails `verify` (§6.3).
-- **No transport security on any port.** Authentication exists (§9.1, [AUTH.md](AUTH.md)) and a password crosses in
-  cleartext, which makes TLS in front of it the largest remaining gap rather than authentication itself.
+- **No transport security on the HTTP or MCP ports.** The binary port can encrypt itself (§9.1, [WIRE.md §7.1](WIRE.md));
+  the other two are HTTP and expect an ingress or a reverse proxy in front of them. Without one, a password crosses in
+  cleartext on 8080 and 8083.
+- **No certificate rotation without a restart.** The PEM is read once at bind. A renewed certificate takes effect when
+  the process does, which cert-manager's default renewal window makes a scheduled restart rather than an outage — but
+  it is a restart.
+- **No client-certificate authentication.** The TLS listener does not ask for one, and would not look at it. A
+  principal comes from the `AUTH` frame and nowhere else.
 - **No audit log.** There is a record of what ran — the slow query log — and none of who ran it.
 - **No external identity provider.** One mechanism, one password; no OIDC, no LDAP, no mTLS.
 - **No authorization below a database.** No per-label, per-property or per-row rule; that would have to be enforced on
@@ -533,5 +563,5 @@ Stated plainly, because an operations document that implies capabilities the sys
 
 ---
 
-_Git HEAD revision: `da8c93e`_
-_Last updated: 2026-08-17 (authentication and RBAC authorization)_
+_Git HEAD revision: `58cd33e`_
+_Last updated: 2026-08-18 (TLS on the binary port)_

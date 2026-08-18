@@ -81,7 +81,7 @@ CONTEXT.md (this file)
         ├─ VECTOR.md ................. vector records and the HNSW index over them
         ├─ TRANSACTIONS.md ........... ACID, snapshot isolation, page versions, CoW
         ├─ CYPHER.md ................. the openCypher subset, the server and the UI
-        ├─ WIRE.md ................... the binary streaming port, its codec and the Java client
+        ├─ WIRE.md ................... the binary streaming port, its codec, its TLS listener and the Java client
         ├─ DATABASES.md .............. several stores under one root: layout, naming, selection
         ├─ WAL.md .................... write-ahead log, recovery, checkpoints
         ├─ SSD_IO.md ................. I/O strategy, seek avoidance, alignment
@@ -116,7 +116,7 @@ CONTEXT.md (this file)
 | [VECTOR.md](VECTOR.md) | Vector data in the graph: the `VEC` record that holds a vector with its ANN links, the declared index over `(label, property key)`, the HNSW structure and its build, why no B+tree can answer a nearest-neighbour query, and the four shapes considered before HNSW was chosen | How a property value is encoded (PROPERTY_STORAGE.md) |
 | [CYPHER.md](CYPHER.md) | The openCypher subset, reads and writes: grammar, null semantics, where it differs from the engine, which transaction a query gets, why writes are off by default, the planner's costs, and the Vert.x HTTP server with its React and D3 graph browser | The public API; the binary streaming port (WIRE.md) |
 | [DATABASES.md](DATABASES.md) | Several databases under one root: the directory layout, why a name is validated by allow-list, lazy opening, create and drop, and how a database is selected from each front end | The storage format; the frame layout (WIRE.md) |
-| [WIRE.md](WIRE.md) | The binary streaming port: the frame, the value codec, the server's four bounds on a slow reader, the memory multiplication, and the Java client | The query language (CYPHER.md), the HTTP route and the browser UI |
+| [WIRE.md](WIRE.md) | The binary streaming port: the frame, the value codec, the server's four bounds on a slow reader, the memory multiplication, **the optional TLS listener (§7.1)** and the Java client | The query language (CYPHER.md), the HTTP route and the browser UI |
 | [TRANSPORT_DECISION.md](TRANSPORT_DECISION.md) | History, not specification: the measured trial that chose framed TCP over gRPC, with its criteria committed before its numbers, and what building the winner for real then changed | What the protocol *is* (WIRE.md) |
 | [TRANSACTIONS.md](TRANSACTIONS.md) | ACID guarantees, snapshot isolation, the anomaly matrix, per-page version chains, the reclamation horizon and budget, where Copy-on-Write genuinely applies. Also why `SERIALIZABLE`, `LockTable` and `xmin` are *not* built rather than unfinished | WAL record format |
 | [WAL.md](WAL.md) | WAL record format, LSN semantics, group commit, ARIES recovery, checkpointing, log retention | Isolation semantics |
@@ -371,6 +371,8 @@ Full description in [ARCHITECTURE.md](ARCHITECTURE.md).
 | `Privilege` / `Grant` / `Principal` | `io.metaloom.graph.core.api` | The fifteen names, a privilege on a database or `*`, and the one call every gate makes |
 | `User` / `Role` | `io.metaloom.graph.core.api` | The stored records. `User` carries **no hash** — that is the point of it |
 | `AuthCodec` / `PasswordHash` | `io.metaloom.graph.core.auth` | The byte format and its whole hostile-input surface; PBKDF2-HMAC-SHA512 |
+| `WireTlsOptions` | `io.metaloom.graph.server.wire` | The certificate and the second binary port, and why it is a second port rather than a mode |
+| `ClientTls` | `io.metaloom.graph.client` | What a client trusts and whether it checks the name. Verifies by default, because the library underneath does not |
 
 ---
 
@@ -397,10 +399,11 @@ deliverables and exit criteria are in [PLAN.md](PLAN.md).
 - [~] Phase 9 — Budgets, differential harness, hostile input, scaling, soak, kill -9, gates, CI, operations doc
 - [x] Phase 10 — Built as a MetaLoom index, measured against real SQL, recommended against adopting
 - [x] Authentication and RBAC authorization — users, roles and per-database grants; the HTTP, binary and MCP ports;
-      a login page; the binary client; a CLI recovery command. **No TLS**, which is now the largest gap
-      ([AUTH.md](AUTH.md))
+      a login page; the binary client; a CLI recovery command ([AUTH.md](AUTH.md))
+- [x] TLS on the binary port — an optional second listener over the same server, off by default, with the client
+      verifying unless told not to ([WIRE.md §7.1](WIRE.md)). The HTTP and MCP ports still expect a proxy in front
 
 ---
 
-_Git HEAD revision: `3edb034`_
-_Last updated: 2026-08-17 (authentication and RBAC authorization: AUTH.md, protocol version 4, a login page, and metaloom-graph-cli auth)_
+_Git HEAD revision: `58cd33e`_
+_Last updated: 2026-08-18 (TLS on the binary port)_

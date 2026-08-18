@@ -22,7 +22,7 @@ Durable, transactional, indexed, compacting, hardened, with snapshot isolation f
 | **Space reclamation** | Two halves. `reclaim()` punches all-free pages and breaks no ids. `compact()` relocates records to close holes within pages, rewrites every internal reference, and pulls the high water marks down; it is the one operation that invalidates ids. A store churned to a tenth of its slots comes back to 0.95 liveness. |
 | **Native layer** | Rust via FFM, with `cargo test` and `clippy -D warnings` inside `mvn test`. **io_uring is 12.4x** over a `pread` loop on 64 scattered reads — the one capability the JVM cannot approach. The hot-loop codecs are not: 1.38x on edges, 7.8x *slower* on CRC32C. |
 | **Hardening** | Reads-per-operation and write-amplification budgets enforced as build failures; a differential harness against an in-memory model across crashes and compaction; every format parser tested against corrupt and hostile input; a `kill -9` loop that checks acknowledged commits. |
-| **Not there** | No `OPTIONAL MATCH`, no repair tool, **no TLS on any port**, and no *physical* snapshot or point-in-time recovery. Authentication and per-database RBAC do exist — [spec/AUTH.md](spec/AUTH.md) — but a password crosses in cleartext. [spec/OPERATIONS.md](spec/OPERATIONS.md) says so plainly. |
+| **Not there** | No `OPTIONAL MATCH`, no repair tool, and no *physical* snapshot or point-in-time recovery. Authentication and per-database RBAC exist ([spec/AUTH.md](spec/AUTH.md)), and **TLS exists on the binary port only** ([spec/WIRE.md §7.1](spec/WIRE.md)) — the HTTP and MCP ports expect a proxy in front of them, or a password crosses in cleartext. [spec/OPERATIONS.md](spec/OPERATIONS.md) says so plainly. |
 | **Adjacency sizing** | A block is a run of 512 byte cells that doubles as the node fills, so degree 3 costs 512 bytes rather than a page. Fixing this took a 10M-node random graph from 61 GiB to 6.2 GiB and its load from 43 to 11 minutes. [spec/reports/SCALE.md](spec/reports/SCALE.md) has the before and after. |
 
 What is done and what is left, as one checklist: [spec/PROGRESS.md](spec/PROGRESS.md). The reason for
@@ -182,6 +182,23 @@ try (GraphClient client = GraphClient.connect("localhost", 8081, "sales");
     }
 }
 ```
+
+Give the server a certificate and it opens a **second** binary port that terminates TLS, leaving the
+first one alone so clients can move across one at a time:
+
+```bash
+graph-server --wire-tls-cert=/tls/tls.crt --wire-tls-key=/tls/tls.key /data   # 8081 and 8084
+```
+
+```java
+ClientOptions options = ClientOptions.defaults()
+    .withTls(ClientTls.system())                 // or ClientTls.trusting(pem) for a private CA
+    .withCredentials("admin", password);
+try (GraphClient client = GraphClient.connect("graph.internal", 8084, "sales", options)) { … }
+```
+
+The client verifies the certificate *and* the hostname unless told otherwise. `--wire-tls-only` closes
+the cleartext port once nothing is using it.
 
 The database is fixed for the connection: a read view belongs to one store, so a connection that could
 change store mid-flight would be one whose open views outlive their subject. Two databases at once

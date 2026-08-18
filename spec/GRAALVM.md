@@ -268,6 +268,29 @@ The escape hatch, if the provider ever proves hostile: PBKDF2 is about twenty li
 `javax.crypto.Mac` with `HmacSHA512`, which is a much smaller JCA surface — and the pre-existing
 `sun.security.provider.SHA` entry is evidence that path works. Do not hand-roll SHA-512.
 
+### 7.2 TLS, which has the same shape and a different trigger
+
+The binary port can terminate TLS ([WIRE.md §7.1](WIRE.md)), which reaches JSSE — a second reflective
+service lookup, with the same property: **a provider missing from the image fails at run time and at no
+earlier point.** GraalVM 21 and later detect JSSE usage and include the crypto backend automatically, so
+no hand-written registration is expected here. "Expected" is the operative word, and it is why the check
+is a running binary rather than a paragraph.
+
+`smoke_server` in `tools/native-image.sh` generates a throwaway certificate with `openssl`, starts the
+server binary with `--wire-tls-cert`/`--wire-tls-key`, and runs `tools/WireSmoke.java --tls` against it:
+the same handshake and the same query as the plaintext check, so a pass means TLS and nothing else
+changed. Without `openssl` on the path it says so and skips, rather than failing for a reason that is
+not about the image.
+
+**Two things this does not cover**, both worth knowing before exposing a native binary:
+
+- **The trust store.** A native image bakes in the build machine's `cacerts`. That is a *client* concern
+  and the server terminates rather than initiates, so it does not arise here — but a native client would
+  need `-Djavax.net.ssl.trustStore` at run time, or `ClientTls.trusting(pem)`, which reads a PEM and
+  consults no store at all.
+- **The certificate is read once, at bind.** In a native image exactly as on the JVM. A renewal takes
+  effect when the process restarts.
+
 ## 8. Building It
 
 ```bash
@@ -440,7 +463,8 @@ Two details are load-bearing and were both got wrong first:
 
 | File | Purpose |
 |---|---|
-| `graph-core/src/main/resources/META-INF/native-image/io.metaloom.graph/graph-core/reachability-metadata.json` | Every downcall shape the engine uses, and the map back to the code |
+| `graph-core/src/main/resources/META-INF/native-image/io.metaloom.graph/graph-core/reachability-metadata.json` | Every downcall shape the engine uses, the JCA provider (§7.1), and the map back to the code |
+| `tools/WireSmoke.java` | The binary port's handshake in one file, with `--tls` for the encrypted listener. **Outside the reactor**, so nothing compiles it: a protocol change breaks it silently, and it has been broken that way once |
 | `.../graph-core/native-image.properties` | `SharedArenaSupport`, native access |
 | `graph-server/src/main/resources/META-INF/native-image/io.metaloom.graph/graph-server/reachability-metadata.json` | Agent output: reflection, resources, netty's two downcalls |
 | `.../graph-server/native-image.properties` | logback and slf4j at build time |
@@ -455,5 +479,5 @@ Two details are load-bearing and were both got wrong first:
 
 ---
 
-_Git HEAD revision: `da8c93e`_
-_Last updated: 2026-08-17 (authentication and RBAC authorization)_
+_Git HEAD revision: `58cd33e`_
+_Last updated: 2026-08-18 (TLS on the binary port)_

@@ -24,6 +24,7 @@ import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.net.NetClient;
 import io.vertx.core.net.NetClientOptions;
+import io.vertx.core.net.PemTrustOptions;
 import io.vertx.core.net.NetSocket;
 
 /**
@@ -226,12 +227,14 @@ public final class GraphClient implements AutoCloseable {
 	private static GraphClient connect(Vertx vertx, boolean ownsVertx, String host, int port, String database,
 		ClientOptions options) {
 		long timeoutMillis = options.connectTimeout().toMillis();
-		NetClient netClient = vertx.createNetClient(new NetClientOptions()
+		NetClientOptions netOptions = new NetClientOptions()
 			.setConnectTimeout((int) Math.min(timeoutMillis, Integer.MAX_VALUE))
 			// SO_RCVBUF explicitly: autotuning would let the kernel hold megabytes past the point where the client
 			// thinks it has stopped reading, and a bound the kernel can walk past is not a bound.
 			.setReceiveBufferSize(options.socketReceiveBufferBytes())
-			.setTcpNoDelay(true));
+			.setTcpNoDelay(true);
+		applyTls(netOptions, options.tls());
+		NetClient netClient = vertx.createNetClient(netOptions);
 
 		NetSocket socket;
 		try {
@@ -243,7 +246,15 @@ public final class GraphClient implements AutoCloseable {
 			throw new GraphClientException("Interrupted while connecting to " + host + ":" + port, e);
 		} catch (ExecutionException | TimeoutException e) {
 			netClient.close();
-			throw new GraphClientException("Could not connect to " + host + ":" + port, e);
+			// A TLS failure arrives here, because the handshake happens before connect() completes. Saying so is
+			// worth the branch: "Could not connect" sends somebody to check firewalls when the real answer is that
+			// the certificate is not trusted, or that this is the plaintext port.
+			throw new GraphClientException("Could not connect to " + host + ":" + port
+				+ (options.tls() == null
+					? ". If that port expects TLS, pass ClientOptions.withTls(...)"
+					: " over TLS. Either the certificate is not trusted — see ClientTls — or that port is the"
+						+ " plaintext one, which does not speak TLS"),
+				e);
 		}
 
 		GraphClient client = new GraphClient(vertx, ownsVertx, netClient, socket, options);
@@ -261,12 +272,57 @@ public final class GraphClient implements AutoCloseable {
 				+ " within " + timeoutMillis + " ms; is it a graph server?", e);
 		} catch (ExecutionException e) {
 			client.close();
+			// A server that closed the connection without ever sending a frame is the exact signature of a plaintext
+			// client on an encrypted port: TLS speaks first, this protocol does not, and the TLS engine gives up on
+			// the HELLO. Guessed at only when the client offered no TLS and saw nothing at all, so a version mismatch
+			// or a refused login — both of which arrive as frames — keeps its own message.
+			if (!client.answered && options.tls() == null) {
+				throw new GraphClientException(host + ":" + port + " closed the connection without answering HELLO."
+					+ " If that port expects TLS, pass ClientOptions.withTls(...); otherwise it may not be a graph"
+					+ " server", e.getCause());
+			}
 			throw e.getCause() instanceof RuntimeException runtime
 				? runtime
 				: new GraphClientException("The handshake with " + host + ":" + port + " failed", e.getCause());
 		}
 		return client;
 	}
+
+	/**
+	 * Turns on TLS and, more to the point, decides what is verified.
+	 *
+	 * <p>
+	 * Vert.x defaults {@code hostnameVerificationAlgorithm} to none, so setting {@code ssl} alone produces a client
+	 * that accepts any certificate a trusted CA ever issued, for any name — encrypted, and pointed at whoever
+	 * answered. Every path out of here therefore sets the algorithm explicitly, including the one that sets it to
+	 * nothing, so that the value is always something somebody chose.
+	 * </p>
+	 */
+	private static void applyTls(NetClientOptions netOptions, ClientTls tls) {
+		if (tls == null) {
+			return;
+		}
+		netOptions.setSsl(true)
+			.setHostnameVerificationAlgorithm(tls.verifyHostname() ? "HTTPS" : "");
+		if (tls.trustAll()) {
+			netOptions.setTrustAll(true);
+		} else if (tls.trustCertificate() != null) {
+			// Replaces the JVM's anchors rather than adding to them, which is the property that makes this stronger
+			// than trustAll: everything except this certificate — and whatever it signed — is refused.
+			netOptions.setTrustOptions(new PemTrustOptions().addCertPath(tls.trustCertificate().toString()));
+		}
+		// Otherwise: the JVM trust store, which is what setSsl(true) already uses.
+	}
+
+	/**
+	 * Whether this connection has ever received a frame.
+	 *
+	 * <p>
+	 * Only ever read once, when the handshake fails, to tell "the server said no" apart from "nothing that speaks
+	 * this protocol was there". The two have completely different remedies.
+	 * </p>
+	 */
+	private volatile boolean answered;
 
 	/** Held between HELLO and AUTH, because the server only asks for them after it has seen the version. */
 	private Credentials credentials;
@@ -393,6 +449,7 @@ public final class GraphClient implements AutoCloseable {
 		if (socketContext == null) {
 			socketContext = Vertx.currentContext();
 		}
+		answered = true;
 		switch (type) {
 			case Frames.WELCOME -> {
 				WireValueCodec.Reader reader = new WireValueCodec.Reader(payload.getBytes());

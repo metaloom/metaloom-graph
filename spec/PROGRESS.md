@@ -272,8 +272,9 @@ that a steal policy cannot be made correct over a `MAP_SHARED` mapping.
       clause prefix — `forEachNode(LongPredicate)`, a push pipeline, and `LIMIT` stopping the scan — is
       the next piece and is not built
 - [x] **Authentication**, with per-database RBAC — [AUTH.md](AUTH.md)
-- [ ] **No transport security**, deliberately and documented
-      ([OPERATIONS.md §9.1](OPERATIONS.md)). The binary port binds loopback for that reason
+- [~] **Transport security on the binary port only** ([WIRE.md §7.1](WIRE.md)), off by default. The HTTP and MCP
+      ports have none and expect a proxy ([OPERATIONS.md §9.1](OPERATIONS.md)). The cleartext binary listener still
+      binds loopback for that reason
 - [ ] The trial harness was never committed, so its numbers are recorded but not reproducible from this
       repository
 
@@ -972,7 +973,11 @@ Built. [AUTH.md](AUTH.md) is the design; what follows is what moved.
 - [x] The browser UI: a login screen, a users-and-roles panel, and write affordances driven by the grant as well as
       by the flag
 - [x] Authentication **on by default** in `main`, off in the programmatic constructors; the images and the chart
-- [ ] TLS. Now the largest gap: a password crosses in cleartext on every port — `AUTH-1` in [TASKS.md](TASKS.md)
+- [x] TLS on the **binary** port — `--wire-tls-cert`, a second listener on 8084, `--wire-tls-only` to close the
+      cleartext one, and a client that verifies by default ([WIRE.md §7.1](WIRE.md))
+- [ ] TLS on the **HTTP and MCP** ports. Both are HTTP and expect an ingress or a proxy; without one a password still
+      crosses them in cleartext — `AUTH-1` in [TASKS.md](TASKS.md)
+- [ ] Certificate reload without a restart, and client certificates as an identity (`AUTH-8`)
 - [ ] An audit log — `AUTH-2`
 - [ ] An external identity provider — `AUTH-3`
 - [ ] Authorization below a database — `AUTH-4`
@@ -987,5 +992,5 @@ Built. [AUTH.md](AUTH.md) is the design; what follows is what moved.
 
 ---
 
-_Git HEAD revision: `da8c93e`_
-_Last updated: 2026-08-17 (authentication and RBAC authorization)_
+_Git HEAD revision: `58cd33e`_
+_Last updated: 2026-08-18 (TLS on the binary port)_

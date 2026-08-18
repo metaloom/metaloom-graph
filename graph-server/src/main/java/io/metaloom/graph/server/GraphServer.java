@@ -373,11 +373,28 @@ public final class GraphServer implements AutoCloseable {
 				.withHost(options.wireHost())
 				.withPort(options.wirePort())
 				.withMaxConcurrentStreams(options.maxConcurrentStreams())
-				.withQueryTimeoutMillis(options.queryTimeoutMillis()), options.allowWrite());
+				.withQueryTimeoutMillis(options.queryTimeoutMillis())
+				.withTls(options.wireTls())
+				.withPlaintext(options.wirePlaintext()), options.allowWrite());
 			// The same source object, so there is one sandbox for the process rather than one per front end.
 			wire.csvSource(server.csv);
-			int wirePort = wire.listen().toCompletionStage().toCompletableFuture().join();
-			logger.info("Binary streaming port on {}:{} — see graph-client", wire.options().host(), wirePort);
+			wire.listen().toCompletionStage().toCompletableFuture().join();
+			if (wire.port() >= 0) {
+				logger.info("Binary streaming port on {}:{} — see graph-client", wire.options().host(), wire.port());
+			}
+			if (wire.tlsPort() >= 0) {
+				logger.info("Binary streaming port over TLS on {}:{} — graph-client needs"
+					+ " ClientOptions.withTls(...)", options.wireTls().host(), wire.tlsPort());
+				if (wire.port() >= 0) {
+					// Said once, at the level an operator reads, because the reason to add a certificate is almost
+					// always to stop credentials crossing in the clear and the plaintext listener is still doing it.
+					// Single braces: SLF4J substitutes only the empty pair, so a metric name carrying a label is
+					// safe here — and doubling them, which is String.format's escape, prints them doubled.
+					logger.warn("The binary port also still accepts unencrypted connections on {}:{}. Pass"
+						+ " --wire-tls-only once every client has moved; graph_wire_connections{tls=\"false\"}"
+						+ " counts the ones that have not", wire.options().host(), wire.port());
+				}
+			}
 			// The same policy object as the HTTP front end, so one identity store backs every port and a reset is seen
 			// by all of them at once.
 			wire.authPolicy(server::authPolicy);

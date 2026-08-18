@@ -40,6 +40,10 @@ final class MetricsCatalogExercise {
 				metrics.recordSlowQuery(frontend);
 			}
 			metrics.recordMcpToolCall("graph_query", "ok");
+			// Both tag values, because a catalogue entry proved only by its happy value would leave the series that
+			// actually matters — the cleartext one — untested.
+			metrics.recordWireConnection(true);
+			metrics.recordWireConnection(false);
 			// Non-zero on every component: the write counters are only registered when the value is above zero, so a
 			// CypherStats.NONE here would leave all seven of them out of the scrape and out of the test's reach.
 			metrics.recordWriteStats(new CypherStats(1, 1, 1, 1, 1, 1, 1));

@@ -31,8 +31,9 @@ import io.metaloom.graph.server.GraphServerOptions;
  * </p>
  *
  * @param host
- *            what to bind. Loopback by default: the port has no authentication and no transport security, and a new
- *            unauthenticated port should not default to every interface
+ *            what to bind. Loopback by default: this listener is the unencrypted one, and a port that carries a
+ *            password in cleartext should not default to every interface. {@link WireTlsOptions#host()} is the
+ *            encrypted listener's own address and defaults to this
  * @param port
  *            0 for any free one
  * @param maxConcurrentStreams
@@ -58,6 +59,14 @@ import io.metaloom.graph.server.GraphServerOptions;
  *            when the store's retained bytes cross this, the oldest running stream is abandoned. 0 disables it
  * @param watchdogIntervalMillis
  *            how often retention is checked
+ * @param tls
+ *            a certificate and a port for a <b>second</b>, encrypted listener, or null for none. Off by default,
+ *            because there is no certificate a server could invent for itself that a client should trust. See
+ *            {@link WireTlsOptions}
+ * @param plaintext
+ *            whether the unencrypted listener on {@link #port} is opened at all. True by default — the binary port
+ *            has always been plaintext and adding a certificate must not silently close it under the clients already
+ *            using it. Set it false once they have moved, and the encrypted listener is the only one
  */
 public record WireServerOptions(
 	String host,
@@ -69,7 +78,9 @@ public record WireServerOptions(
 	long flushIntervalMillis,
 	long queryTimeoutMillis,
 	long retentionSoftLimitBytes,
-	long watchdogIntervalMillis) {
+	long watchdogIntervalMillis,
+	WireTlsOptions tls,
+	boolean plaintext) {
 
 	public static final String DEFAULT_HOST = "127.0.0.1";
 	public static final int DEFAULT_MAX_CONCURRENT_STREAMS = 8;
@@ -80,8 +91,8 @@ public record WireServerOptions(
 	 *
 	 * <p>
 	 * Comfortably above what a loopback or LAN round trip needs to stay full, and small enough that eight of them are
-	 * a number rather than a surprise. A high-latency link would want more; that link would also want TLS and
-	 * authentication, and this port has neither.
+	 * a number rather than a surprise. A high-latency link would want more; that link would also want
+	 * {@link WireTlsOptions} and a login, both of which this port now has and neither of which is on by default.
 	 * </p>
 	 */
 	public static final int DEFAULT_SOCKET_SEND_BUFFER_BYTES = 256 * 1024;
@@ -161,6 +172,18 @@ public record WireServerOptions(
 				+ " bytes this server would hold for clients that stopped reading, over the "
 				+ MAX_BUFFERED_BYTES + " byte ceiling. Lower any factor.");
 		}
+		// Refused rather than quietly treated as "no binary port at all", because the two readings are opposite: an
+		// operator who turned the plaintext listener off did it to close a port, not to close the service.
+		if (!plaintext && tls == null) {
+			throw new IllegalArgumentException("The plaintext binary listener was switched off and no TLS "
+				+ "certificate was given, which would leave the binary port with nothing to listen on. Pass a "
+				+ "certificate and a key, or leave the plaintext listener open");
+		}
+		// Only when both are bound: a port of 0 means "any free one" on both sides and two zeroes are not a clash.
+		if (plaintext && tls != null && tls.port() != 0 && tls.port() == port) {
+			throw new IllegalArgumentException("The binary port (" + port + ") and its TLS port (" + tls.port()
+				+ ") are the same. They are two listeners, so they need two ports — or switch the plaintext one off");
+		}
 	}
 
 	public static WireServerOptions defaults() {
@@ -170,7 +193,7 @@ public record WireServerOptions(
 			// The same budget the HTTP route uses, from the same constant. Two front ends over one store that
 			// disagreed about how long a query may run would be a confusing thing to debug.
 			GraphServerOptions.DEFAULT_QUERY_TIMEOUT_MILLIS, DEFAULT_RETENTION_SOFT_LIMIT_BYTES,
-			DEFAULT_WATCHDOG_INTERVAL_MILLIS);
+			DEFAULT_WATCHDOG_INTERVAL_MILLIS, null, true);
 	}
 
 	/**
@@ -191,43 +214,64 @@ public record WireServerOptions(
 
 	public WireServerOptions withHost(String host) {
 		return with(host, port, maxConcurrentStreams, writeQueueMaxBytes, socketSendBufferBytes, queryTimeoutMillis,
-			retentionSoftLimitBytes);
+			retentionSoftLimitBytes, tls, plaintext);
 	}
 
 	public WireServerOptions withPort(int port) {
 		return with(host, port, maxConcurrentStreams, writeQueueMaxBytes, socketSendBufferBytes, queryTimeoutMillis,
-			retentionSoftLimitBytes);
+			retentionSoftLimitBytes, tls, plaintext);
 	}
 
 	public WireServerOptions withMaxConcurrentStreams(int streams) {
 		return with(host, port, streams, writeQueueMaxBytes, socketSendBufferBytes, queryTimeoutMillis,
-			retentionSoftLimitBytes);
+			retentionSoftLimitBytes, tls, plaintext);
 	}
 
 	public WireServerOptions withWriteQueueMaxBytes(int bytes) {
 		return with(host, port, maxConcurrentStreams, bytes, socketSendBufferBytes, queryTimeoutMillis,
-			retentionSoftLimitBytes);
+			retentionSoftLimitBytes, tls, plaintext);
 	}
 
 	public WireServerOptions withSocketSendBufferBytes(int bytes) {
 		return with(host, port, maxConcurrentStreams, writeQueueMaxBytes, bytes, queryTimeoutMillis,
-			retentionSoftLimitBytes);
+			retentionSoftLimitBytes, tls, plaintext);
 	}
 
 	public WireServerOptions withQueryTimeoutMillis(long millis) {
 		return with(host, port, maxConcurrentStreams, writeQueueMaxBytes, socketSendBufferBytes, millis,
-			retentionSoftLimitBytes);
+			retentionSoftLimitBytes, tls, plaintext);
 	}
 
 	public WireServerOptions withRetentionSoftLimitBytes(long bytes) {
 		return with(host, port, maxConcurrentStreams, writeQueueMaxBytes, socketSendBufferBytes, queryTimeoutMillis,
-			bytes);
+			bytes, tls, plaintext);
+	}
+
+	/**
+	 * A copy that also opens an encrypted listener. Null removes it.
+	 *
+	 * <p>
+	 * The encrypted listener inherits this record's {@link #host} when {@code tls} carries none of its own, so
+	 * widening the binary port stays one decision rather than two that can disagree.
+	 * </p>
+	 */
+	public WireServerOptions withTls(WireTlsOptions tls) {
+		return with(host, port, maxConcurrentStreams, writeQueueMaxBytes, socketSendBufferBytes, queryTimeoutMillis,
+			retentionSoftLimitBytes, tls, plaintext);
+	}
+
+	/** A copy with the unencrypted listener switched off. Needs {@link #tls}; see the constructor. */
+	public WireServerOptions withPlaintext(boolean plaintext) {
+		return with(host, port, maxConcurrentStreams, writeQueueMaxBytes, socketSendBufferBytes, queryTimeoutMillis,
+			retentionSoftLimitBytes, tls, plaintext);
 	}
 
 	/** One place the unchanged fields are carried, so adding a component cannot silently drop one of them. */
 	private WireServerOptions with(String host, int port, int maxConcurrentStreams, int writeQueueMaxBytes,
-		int socketSendBufferBytes, long queryTimeoutMillis, long retentionSoftLimitBytes) {
+		int socketSendBufferBytes, long queryTimeoutMillis, long retentionSoftLimitBytes, WireTlsOptions tls,
+		boolean plaintext) {
 		return new WireServerOptions(host, port, maxConcurrentStreams, writeQueueMaxBytes, socketSendBufferBytes,
-			rowBatchBytes, flushIntervalMillis, queryTimeoutMillis, retentionSoftLimitBytes, watchdogIntervalMillis);
+			rowBatchBytes, flushIntervalMillis, queryTimeoutMillis, retentionSoftLimitBytes, watchdogIntervalMillis,
+			tls, plaintext);
 	}
 }

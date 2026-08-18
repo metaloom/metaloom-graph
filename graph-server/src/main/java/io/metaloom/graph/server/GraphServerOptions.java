@@ -10,6 +10,7 @@ import io.metaloom.graph.core.api.GraphDatabases;
 import io.metaloom.graph.protocol.Protocol;
 import io.metaloom.graph.server.demo.DemoData;
 import io.metaloom.graph.server.wire.WireServerOptions;
+import io.metaloom.graph.server.wire.WireTlsOptions;
 
 /**
  * The command line and the environment.
@@ -108,12 +109,21 @@ import io.metaloom.graph.server.wire.WireServerOptions;
  *            never printed by {@code --help}, by {@link #toString()} or by anything else here
  * @param sessionTimeoutMillis
  *            how long a browser session may sit idle before it has to log in again
+ * @param wireTls
+ *            a certificate, a key and a port for a <b>second</b> binary listener that terminates TLS, or null for
+ *            none. It does not replace {@link #wirePort} — both are open unless {@link #wirePlaintext} says otherwise
+ *            — and it affects the binary port only: the HTTP and MCP ports are unchanged, and are still expected to
+ *            sit behind an ingress or a reverse proxy that terminates TLS for them. {@code spec/WIRE.md} section 9
+ * @param wirePlaintext
+ *            whether the unencrypted binary listener is opened. True unless {@code --wire-tls-only} was given, so that
+ *            adding a certificate never closes a port under the clients already on it
  */
 public record GraphServerOptions(Path root, int port, boolean demo, int demoAirports, long queryTimeoutMillis,
 	long slowQueryMillis, boolean wire, int wirePort, String wireHost, int maxConcurrentStreams,
 	boolean metrics, int metricsPort, boolean mcp, int mcpPort, String mcpHost,
 	String database, boolean allowDrop, boolean allowWrite, boolean allowLoadCsv, Path importDir,
-	boolean allowBackup, boolean auth, String initialPassword, long sessionTimeoutMillis) {
+	boolean allowBackup, boolean auth, String initialPassword, long sessionTimeoutMillis,
+	WireTlsOptions wireTls, boolean wirePlaintext) {
 
 	static final int DEFAULT_PORT = 8080;
 
@@ -193,6 +203,13 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 		new EnvVar("GRAPH_WIRE_PORT", "The binary streaming port."),
 		new EnvVar("GRAPH_WIRE_HOST", "What the binary port binds. Loopback by default, so in a pod it is not "
 			+ "reachable from outside until this is set."),
+		new EnvVar("GRAPH_WIRE_TLS_CERT", "A PEM certificate. Setting it and GRAPH_WIRE_TLS_KEY opens a second, "
+			+ "encrypted binary port; the plaintext one stays open unless GRAPH_WIRE_TLS_ONLY is set."),
+		new EnvVar("GRAPH_WIRE_TLS_KEY", "The matching unencrypted PEM private key."),
+		new EnvVar("GRAPH_WIRE_TLS_PORT", "The encrypted binary port."),
+		new EnvVar("GRAPH_WIRE_TLS_HOST", "What the encrypted binary port binds. Defaults to GRAPH_WIRE_HOST."),
+		new EnvVar("GRAPH_WIRE_TLS_ONLY", "Close the unencrypted binary port and serve only the encrypted one. "
+			+ "true/false."),
 		new EnvVar("GRAPH_MAX_STREAMS", "Queries the binary port runs at once."),
 		new EnvVar("GRAPH_METRICS_ENABLED", "Open the monitoring port. true/false."),
 		new EnvVar("GRAPH_METRICS_PORT", "The monitoring port: /metrics, /health and /ready."),
@@ -238,6 +255,17 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 		if (sessionTimeoutMillis < 0) {
 			throw new IllegalArgumentException("A session timeout must not be negative, was " + sessionTimeoutMillis);
 		}
+		// The same shape as the --allow-load-csv / --import-dir pair: a combination that reads as configured and is
+		// not. Here it is worse than useless, because the reading is "the binary port is encrypted".
+		if (!wirePlaintext && wireTls == null) {
+			throw new IllegalArgumentException("--wire-tls-only needs --wire-tls-cert and --wire-tls-key: without "
+				+ "them there would be no binary port at all. Pass a certificate, or use --no-wire if closing the "
+				+ "binary port is what you meant");
+		}
+		if (!wire && wireTls != null) {
+			throw new IllegalArgumentException("A TLS certificate was given for the binary port but --no-wire "
+				+ "switched that port off, so nothing would present it. Drop one of the two");
+		}
 	}
 
 	/**
@@ -260,7 +288,8 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 			+ ", allowWrite=" + allowWrite + ", allowLoadCsv=" + allowLoadCsv + ", importDir=" + importDir
 			+ ", allowBackup=" + allowBackup + ", auth=" + auth
 			+ ", initialPassword=" + (initialPassword == null ? "<unset>" : "<set>")
-			+ ", sessionTimeoutMillis=" + sessionTimeoutMillis + "]";
+			+ ", sessionTimeoutMillis=" + sessionTimeoutMillis
+			+ ", wireTls=" + (wireTls == null ? "<none>" : wireTls) + ", wirePlaintext=" + wirePlaintext + "]";
 	}
 
 	/** Parses the command line against the real environment. */
@@ -291,6 +320,13 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 		boolean wire = true;
 		int wirePort = Protocol.DEFAULT_PORT;
 		String wireHost = WireServerOptions.DEFAULT_HOST;
+		Path wireTlsCert = null;
+		Path wireTlsKey = null;
+		int wireTlsPort = WireTlsOptions.DEFAULT_PORT;
+		// Null rather than wireHost, because "unset" and "set to the same value" have to stay distinguishable until
+		// every source has been read: the variable may be set before the flag that changes wireHost is seen.
+		String wireTlsHost = null;
+		boolean wirePlaintext = true;
 		int streams = DEFAULT_MAX_CONCURRENT_STREAMS;
 		boolean metrics = true;
 		int metricsPort = DEFAULT_METRICS_PORT;
@@ -368,6 +404,21 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 		if ((value = read(env, "GRAPH_WIRE_HOST")) != null) {
 			wireHost = value;
 		}
+		if ((value = read(env, "GRAPH_WIRE_TLS_CERT")) != null) {
+			wireTlsCert = Path.of(value);
+		}
+		if ((value = read(env, "GRAPH_WIRE_TLS_KEY")) != null) {
+			wireTlsKey = Path.of(value);
+		}
+		if ((value = read(env, "GRAPH_WIRE_TLS_PORT")) != null) {
+			wireTlsPort = parsePort(value, "GRAPH_WIRE_TLS_PORT");
+		}
+		if ((value = read(env, "GRAPH_WIRE_TLS_HOST")) != null) {
+			wireTlsHost = value;
+		}
+		if ((value = read(env, "GRAPH_WIRE_TLS_ONLY")) != null) {
+			wirePlaintext = !parseBoolean(value, "GRAPH_WIRE_TLS_ONLY");
+		}
 		if ((value = read(env, "GRAPH_MAX_STREAMS")) != null) {
 			streams = parseStreams(value, "GRAPH_MAX_STREAMS");
 		}
@@ -403,6 +454,16 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 				wirePort = parsePort(argument.substring("--wire-port=".length()), "--wire-port");
 			} else if (argument.startsWith("--wire-host=")) {
 				wireHost = argument.substring("--wire-host=".length());
+			} else if (argument.startsWith("--wire-tls-cert=")) {
+				wireTlsCert = Path.of(argument.substring("--wire-tls-cert=".length()));
+			} else if (argument.startsWith("--wire-tls-key=")) {
+				wireTlsKey = Path.of(argument.substring("--wire-tls-key=".length()));
+			} else if (argument.startsWith("--wire-tls-port=")) {
+				wireTlsPort = parsePort(argument.substring("--wire-tls-port=".length()), "--wire-tls-port");
+			} else if (argument.startsWith("--wire-tls-host=")) {
+				wireTlsHost = argument.substring("--wire-tls-host=".length());
+			} else if (argument.equals("--wire-tls-only")) {
+				wirePlaintext = false;
 			} else if (argument.startsWith("--max-streams=")) {
 				streams = parseStreams(argument.substring("--max-streams=".length()), "--max-streams");
 			} else if (argument.equals("--no-metrics")) {
@@ -456,11 +517,23 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 		if (store == null) {
 			throw new IllegalArgumentException("A root directory is required, as an argument or in GRAPH_ROOT");
 		}
-		checkPortsDiffer(port, wire ? wirePort : -1, metrics ? metricsPort : -1, mcp ? mcpPort : -1);
+		// Half a pair is refused by name. A certificate with no key is an operator who set one of two variables, and
+		// a server that quietly stayed plaintext because of it would be the worst possible outcome of trying.
+		if ((wireTlsCert == null) != (wireTlsKey == null)) {
+			throw new IllegalArgumentException("TLS on the binary port needs both a certificate and a key; only the "
+				+ (wireTlsCert == null ? "key" : "certificate") + " was given");
+		}
+		WireTlsOptions wireTls = wireTlsCert == null
+			? null
+			// The encrypted listener inherits the binary port's bind address unless it was given one of its own, so
+			// that widening the binary port stays a single decision.
+			: new WireTlsOptions(wireTlsHost == null ? wireHost : wireTlsHost, wireTlsPort, wireTlsCert, wireTlsKey);
+		checkPortsDiffer(port, wire && wirePlaintext ? wirePort : -1, metrics ? metricsPort : -1,
+			mcp ? mcpPort : -1, wire && wireTls != null ? wireTls.port() : -1);
 
 		return new GraphServerOptions(store, port, demo, airports, queryTimeout, slowQuery, wire, wirePort, wireHost,
 			streams, metrics, metricsPort, mcp, mcpPort, mcpHost, database, allowDrop, allowWrite, allowLoadCsv,
-			importDir, allowBackup, auth, initialPassword, sessionTimeout);
+			importDir, allowBackup, auth, initialPassword, sessionTimeout, wireTls, wirePlaintext);
 	}
 
 	private static String read(UnaryOperator<String> env, String name) {
@@ -483,12 +556,13 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 	 * from whichever listener happened to bind second, which names the port but not the two settings that chose it.
 	 * </p>
 	 */
-	private static void checkPortsDiffer(int http, int wire, int metrics, int mcp) {
+	private static void checkPortsDiffer(int http, int wire, int metrics, int mcp, int wireTls) {
 		Map<Integer, String> seen = new LinkedHashMap<>();
 		record Candidate(int port, String name) {
 		}
 		for (Candidate candidate : List.of(new Candidate(http, "the HTTP port"), new Candidate(wire, "the binary port"),
-			new Candidate(metrics, "the monitoring port"), new Candidate(mcp, "the MCP port"))) {
+			new Candidate(metrics, "the monitoring port"), new Candidate(mcp, "the MCP port"),
+			new Candidate(wireTls, "the encrypted binary port"))) {
 			if (candidate.port() <= 0) {
 				continue;
 			}
@@ -621,6 +695,16 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 			  --wire-port=<port>    The binary streaming port. 0 for any free one. (default: %d)
 			  --wire-host=<addr>    What the binary port binds. (default: %s)
 			  --no-wire             No binary port.
+			  --wire-tls-cert=<pem> A PEM certificate for the binary port. With --wire-tls-key it
+			                        opens a SECOND, encrypted binary port; the plaintext one stays
+			                        open until --wire-tls-only. Affects the binary port only - the
+			                        HTTP and MCP ports are unchanged.
+			  --wire-tls-key=<pem>  The matching unencrypted PEM private key.
+			  --wire-tls-port=<port>
+			                        The encrypted binary port. 0 for any free one. (default: %d)
+			  --wire-tls-host=<addr>
+			                        What the encrypted binary port binds. (default: --wire-host)
+			  --wire-tls-only       Close the plaintext binary port and serve only the encrypted one.
 			  --max-streams=<n>     Queries the binary port runs at once; the n+1th is refused rather
 			                        than queued. Multiplied by the per-stream write queue, this is the
 			                        memory the server may hold for clients that stop reading.
@@ -628,8 +712,7 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 			  --metrics-port=<port> The monitoring port: /metrics, /health and /ready. (default: %d)
 			  --no-metrics          No monitoring port.
 			  --mcp                 Open the Model Context Protocol port. Off by default: it is a
-			                        remote code path an LLM drives, against a server with no
-			                        authentication.
+			                        remote code path an LLM drives.
 			  --mcp-port=<port>     The MCP port. Implies --mcp. (default: %d)
 			  --mcp-host=<addr>     What the MCP port binds. Implies --mcp. (default: %s)
 			  -h, --help            This.
@@ -640,13 +723,19 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 			The HTTP port serves the browser UI and /api/query, which materialises a whole result as
 			JSON. The binary port streams rows as they are produced; use graph-client to read it.
 
-			The HTTP, binary and MCP ports require a login unless --no-auth is given. The monitoring
-			port never does: a kubelet probe and a Prometheus scrape carry no credential, and a probe
-			failing over a misconfigured secret would turn that into a restart loop. Do not publish it
-			anyway - a scrape carries database names, node counts and store sizes.
+			The HTTP, binary and MCP ports require a login unless --no-auth is given. Only the binary
+			port can encrypt itself, with --wire-tls-cert; put the HTTP and MCP ports behind an
+			ingress or a reverse proxy that terminates TLS for them. Encryption and authentication do
+			not replace one another: a password on a cleartext port is readable by anything on the
+			path, and an encrypted port with no authentication is readable by anyone who can reach
+			it. The monitoring port never asks for one: a kubelet probe and a Prometheus scrape carry
+			no credential, and a probe failing over a misconfigured secret would turn that into a
+			restart loop. Do not publish it anyway - a scrape carries database names, node counts and
+			store sizes.
 
-			There is no transport security on any port, so a password crosses in cleartext. Put TLS in
-			front of it, or keep it on a network you trust. The binary and MCP ports bind loopback.
+			Without --wire-tls-cert there is no transport security on any port and a password crosses
+			in cleartext. Put TLS in front of it, or keep it on a network you trust. The binary and MCP
+			ports bind loopback.
 
 			A privilege and a flag answer different questions: --allow-write and its neighbours bound
 			what this SERVER will ever do, a grant bounds what one USER may do within that, and both
@@ -657,7 +746,7 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 			spec/CYPHER.md for queries to try.
 			""".formatted(GraphDatabases.DEFAULT_NAME, DEFAULT_SESSION_TIMEOUT_MILLIS, DemoData.TINY, DemoData.SMALL, DemoData.MEDIUM,
 				DemoData.LARGE, DEFAULT_QUERY_TIMEOUT_MILLIS, DEFAULT_SLOW_QUERY_MILLIS, Protocol.DEFAULT_PORT,
-				WireServerOptions.DEFAULT_HOST, DEFAULT_MAX_CONCURRENT_STREAMS, DEFAULT_METRICS_PORT,
-				DEFAULT_MCP_PORT, DEFAULT_MCP_HOST, environment);
+				WireServerOptions.DEFAULT_HOST, WireTlsOptions.DEFAULT_PORT, DEFAULT_MAX_CONCURRENT_STREAMS,
+				DEFAULT_METRICS_PORT, DEFAULT_MCP_PORT, DEFAULT_MCP_HOST, environment);
 	}
 }

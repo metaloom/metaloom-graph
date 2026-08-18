@@ -74,6 +74,26 @@ public interface GraphMetrics {
 	void recordMcpToolCall(String tool, String outcome);
 
 	/**
+	 * One connection accepted on the binary port.
+	 *
+	 * <p>
+	 * The tag is the point of the meter. Once a deployment opens the encrypted listener alongside the plaintext one,
+	 * the only question worth asking is whether anything is still arriving in the clear — and the answer decides when
+	 * {@code --wire-tls-only} can be set. Without this it is answerable only by {@code ss} on the host, which is not
+	 * an answer a dashboard can hold.
+	 * </p>
+	 *
+	 * <p>
+	 * A counter and not a gauge of open connections: connections are long-lived here, so a level would sit flat and
+	 * say nothing about whether a client reconnected in the clear an hour ago.
+	 * </p>
+	 *
+	 * @param tls
+	 *            whether the socket terminated TLS, asked of the socket rather than assumed from configuration
+	 */
+	void recordWireConnection(boolean tls);
+
+	/**
 	 * A level, read fresh on every scrape.
 	 *
 	 * @param database

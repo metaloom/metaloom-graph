@@ -47,9 +47,9 @@ graph:
   database: default
 
   # -- Accept CREATE, SET, REMOVE and DELETE queries.
-  # NO PORT ON THIS SERVER HAS AUTHENTICATION. Turning this on hands anything that can reach the
-  # Service the ability to change and delete data — which, for a ClusterIP Service, is everything in
-  # the cluster that can resolve it. Leave it off unless something in front is doing access control.
+  # This is the DEPLOYMENT's ceiling, not a per-user rule: with auth.enabled a caller also needs the
+  # privilege, and the two must both permit, so this can only ever subtract (spec/AUTH.md section 5).
+  # With auth.enabled false it is the only thing standing between the Service and your data.
   allowWrite: false
 
   # -- Enable DELETE /api/databases/<name>, which destroys a whole database and its directory in one
@@ -58,7 +58,7 @@ graph:
 
   # -- Accept LOAD CSV. Off by default and NOT implied by allowWrite, because `LOAD CSV ... RETURN row`
   # writes nothing: without a flag of its own a read-only server would read files off its own disk for
-  # anything that can reach the Service. Requires importDir.
+  # anything holding a MATCH grant. Requires importDir.
   allowLoadCsv: false
   # -- The one directory LOAD CSV may read, and the whole of what it may read. `file:///x.csv` means
   # `<importDir>/x.csv`. Mount something here yourself — the chart does not create a volume for it,
@@ -67,8 +67,9 @@ graph:
 
   # -- Serve GET /api/databases/<name>/backup, which is what `metaloom-graph-cli database backup
   # --server=...` drives. Off by default and separate from allowWrite: a backup is a read, but it hands
-  # over every byte of a database in one request, from a Service with no authentication. The CLI is in
-  # the image, so with this on a backup is one `kubectl exec` — see spec/DEPLOYMENT.md section 2.3.
+  # over every byte of a database in one request, and BACKUP is a privilege a principal has to hold.
+  # The CLI is in the image, so with this on a backup is one `kubectl exec` — see spec/DEPLOYMENT.md
+  # section 2.3.
   # Leaving it off does not prevent backups: `--path` against a stopped pod's volume still works.
   allowBackup: false
 
@@ -94,8 +95,33 @@ wire:
   # -- Open the binary streaming port.
   enabled: true
   # -- What the binary port binds. 127.0.0.1 means the Service port exists but NOTHING outside the pod
-  # can reach it — the correct default for an unauthenticated port. Set 0.0.0.0 to actually use it.
+  # can reach it — the correct default for a port that carries a password in cleartext. Set 0.0.0.0 to
+  # actually use it, or use tls below and widen only that half.
   host: "127.0.0.1"
+
+  # -- TLS on the binary port. This opens a SECOND listener rather than encrypting the one above, so
+  # existing clients keep working while they are moved across; set `only: true` once they have.
+  #
+  # It affects the binary port and nothing else. The HTTP and MCP ports are HTTP, and an Ingress or a
+  # service mesh terminates TLS for those far better than this server could — see ingress.tls. The
+  # binary port is the one nothing in front of it can terminate, because it is a raw TCP protocol.
+  tls:
+    # -- Mount a certificate and open the encrypted listener. Requires secretName.
+    enabled: false
+    # -- The Secret holding the key material. The chart does NOT create it: a chart that generated a
+    # certificate would generate one nothing trusts, and a chart that took key material through
+    # values.yaml would put it in `helm get values`. Point this at a kubernetes.io/tls Secret from
+    # cert-manager, from your CA, or from `kubectl create secret tls`.
+    secretName: ""
+    # -- Keys inside that Secret. The defaults are what a kubernetes.io/tls Secret always uses.
+    certKey: tls.crt
+    privateKeyKey: tls.key
+    # -- What the encrypted listener binds. Empty inherits wire.host — set 0.0.0.0 here alone to expose
+    # the encrypted half while leaving the cleartext one on loopback for in-pod tooling.
+    host: ""
+    # -- Close the cleartext listener and serve only the encrypted one. Do this AFTER every client has
+    # moved: `graph_wire_connections{tls="false"}` on the monitoring port counts the ones that have not.
+    only: false
 
 metrics:
   # -- Open the monitoring port: /metrics, /health and /ready.
@@ -111,7 +137,7 @@ metrics:
 
 mcp:
   # -- Open the Model Context Protocol port. Off by default, unlike every other port here: it is a
-  # remote code path an LLM drives, against a server with no authentication.
+  # remote code path an LLM drives, and a bearer token is not a reason to widen that.
   enabled: false
   # -- What the MCP port binds. Loopback until deliberately widened, same reasoning as wire.host.
   host: "127.0.0.1"
@@ -121,8 +147,11 @@ service:
   type: ClusterIP
   # -- HTTP port: the browser UI and /api/query.
   httpPort: 8080
-  # -- Binary streaming port. Unreachable unless wire.host is widened.
+  # -- Binary streaming port, unencrypted. Unreachable unless wire.host is widened; absent from the
+  # Service entirely when wire.tls.only is set.
   wirePort: 8081
+  # -- Binary streaming port over TLS. Only present when wire.tls.enabled.
+  wireTlsPort: 8084
   # -- Monitoring port. Do not expose this outside the cluster; a scrape carries database names,
   # node counts and store sizes.
   metricsPort: 8082
@@ -209,7 +238,8 @@ serviceAccount:
   annotations: {}
 
 ingress:
-  # -- Create an Ingress for the HTTP port. Remember there is no authentication behind it.
+  # -- Create an Ingress for the HTTP port. This is also where TLS for the HTTP port belongs — the
+  # server terminates none of its own; wire.tls above is the binary port and unrelated to this.
   enabled: false
   className: ""
   annotations: {}

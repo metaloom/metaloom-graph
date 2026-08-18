@@ -25,7 +25,7 @@ the distinction to, and there is none." This is that identity.
 | **Default** | **On.** `--no-auth` / `GRAPH_AUTH_ENABLED=false` turns it off. The programmatic constructors default to off |
 | **Hashing** | PBKDF2-HMAC-SHA512, 210,000 iterations, 16-byte salt, 32-byte key. No new dependency |
 | **Scope of a grant** | `(privilege, database)`, with `*` for every database |
-| **Transport security** | **None.** Credentials cross in cleartext on every port. §9 |
+| **Transport security** | **On the binary port, optionally** — `--wire-tls-cert`, a second listener, off by default ([WIRE.md §7.1](WIRE.md)). On HTTP and MCP, **none**: credentials cross in cleartext unless a proxy terminates TLS in front of them. §9 |
 
 ---
 
@@ -306,7 +306,9 @@ Enabling authentication does not change any flag's default; they all stay off.
 `POST /api/login` takes `{user, password}` and returns an opaque token: 32 `SecureRandom` bytes as
 base64url. It is set as a cookie — `HttpOnly; SameSite=Strict; Path=/`, and `Secure` **only** when the
 request arrived over TLS or carried `X-Forwarded-Proto: https`, because this server terminates no TLS
-and an unconditional `Secure` would make the cookie unusable on localhost. The token is also in the
+**on the HTTP port** — that port expects a proxy in front of it, and an unconditional `Secure` would
+make the cookie unusable on localhost. The binary port's own TLS listener ([WIRE.md §7.1](WIRE.md)) is
+unrelated: no cookie crosses it, and no HTTP does. The token is also in the
 response body, for `Authorization: Bearer` callers.
 
 The session table is keyed by **SHA-256 of the token**, not the token, so a heap dump does not hand out
@@ -387,8 +389,13 @@ from "this server has no accounts".
 Stated plainly, because a security document that implies capabilities the system lacks is worse than
 none.
 
-- **No transport security.** Credentials cross in cleartext on every port, so a password is exposed to
-  anything on the path. Put TLS in front of it, or keep it on loopback.
+- **No transport security on the HTTP or MCP ports.** A password crosses those in cleartext, so it is
+  exposed to anything on the path. Put a proxy in front of them, or keep them on loopback. The binary
+  port can encrypt itself — [WIRE.md §7.1](WIRE.md) — and that is where the encryption landed first
+  because it is the port no ingress can terminate for you.
+- **No client-certificate authentication.** The TLS listener does not ask for one and would not look at
+  it; a principal comes from the `AUTH` frame and nowhere else. `AUTH-8`.
+- **No certificate rotation without a restart.** The PEM is read once at bind.
 - **No audit log.** There is no record of who ran what. The slow query log records queries, not
   principals.
 - **No external identity provider.** No OIDC, no LDAP, no mTLS. One mechanism, one password.
@@ -401,7 +408,7 @@ none.
   restart logs everyone out.
 - **Embedded callers are unaffected.** Anything that can open the directory still has full access.
 
-Deferred work items are in [TASKS.md](TASKS.md) as `AUTH-1` to `AUTH-6`.
+Deferred work items are in [TASKS.md](TASKS.md) as `AUTH-1` to `AUTH-8`.
 
 ---
 
@@ -465,11 +472,13 @@ Servers start in-process on port 0 and close in `@AfterEach`; there are no abstr
 - [x] MCP: bearer on all three transports, and both enforcement points extended to privileges
 - [x] The browser UI: login screen, users-and-roles panel, grant-driven affordances
 - [x] The default flipped on, and the images, chart and Playwright harness that depend on it
-- [ ] **TLS** — the largest remaining gap; a password crosses in cleartext. `AUTH-1` in [TASKS.md](TASKS.md)
+- [x] **TLS on the binary port** — an optional second listener, verified by default at the client. `AUTH-1`
+- [ ] **TLS on the HTTP and MCP ports** — still the largest gap when they are exposed without a proxy. `AUTH-1`
 - [ ] An audit log (`AUTH-2`), an external provider (`AUTH-3`), sub-database rules (`AUTH-4`), a `RESTORE`
-      privilege (`AUTH-5`), a shared session store (`AUTH-6`), login meters (`AUTH-7`)
+      privilege (`AUTH-5`), a shared session store (`AUTH-6`), login meters (`AUTH-7`), client certificates
+      (`AUTH-8`)
 
 ---
 
-_Git HEAD revision: `da8c93e`_
-_Last updated: 2026-08-17 (authentication and RBAC authorization)_
+_Git HEAD revision: `58cd33e`_
+_Last updated: 2026-08-18 (TLS on the binary port)_

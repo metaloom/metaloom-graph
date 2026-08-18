@@ -93,7 +93,9 @@ for combination in \
 	"--set persistence.existingClaim=mine" \
 	"--set ingress.enabled=true" \
 	"--set metrics.serviceMonitor.enabled=true" \
-	"--set graph.allowWrite=true --set graph.demo=true"
+	"--set graph.allowWrite=true --set graph.demo=true" \
+	"--set wire.tls.enabled=true --set wire.tls.secretName=graph-tls" \
+	"--set wire.tls.enabled=true --set wire.tls.secretName=graph-tls --set wire.tls.only=true"
 do
 	# shellcheck disable=SC2086
 	if helm template "$RELEASE" "$CHART" $combination >/dev/null 2>&1; then
@@ -115,6 +117,32 @@ rendered="$(helm template "$RELEASE" "$CHART")"
 check_contains "$rendered" "readOnlyRootFilesystem: true" "root filesystem is read-only"
 check_contains "$rendered" "mountPath: /tmp" "and /tmp is a writable mount, or the native layer would not load"
 check_contains "$rendered" "GRAPH_WIRE_HOST" "the wire host is set explicitly rather than left to the image"
+
+# TLS on the binary port. The refusal first, because a chart that mounted an empty secret name would
+# produce a pod stuck in ContainerCreating with the reason three kubectl commands away.
+tls_refusal="$(helm template "$RELEASE" "$CHART" --set wire.tls.enabled=true 2>&1 || true)"
+check_contains "$tls_refusal" "wire.tls.secretName is required" "TLS without a secret name is refused by name"
+
+tls_rendered="$(helm template "$RELEASE" "$CHART" --set wire.tls.enabled=true --set wire.tls.secretName=graph-tls)"
+check_contains "$tls_rendered" "GRAPH_WIRE_TLS_CERT" "the certificate path reaches the container"
+check_contains "$tls_rendered" "secretName: graph-tls" "from the secret the operator named"
+check_contains "$tls_rendered" "defaultMode: 0440" "and mounted 0440: not world-readable, and still readable by uid 1000 in the fsGroup"
+# The migration property, asserted as a property of the chart rather than left to the operator: adding
+# a certificate must leave the port every existing client is using open.
+if echo "$tls_rendered" | grep -qE '^\s+- name: wire$'; then
+	pass "the cleartext port stays open until wire.tls.only"
+else
+	fail "adding a certificate closed the port every existing client is using"
+fi
+
+# ...and that only closes it.
+only_rendered="$(helm template "$RELEASE" "$CHART" --set wire.tls.enabled=true --set wire.tls.secretName=graph-tls --set wire.tls.only=true)"
+check_contains "$only_rendered" "GRAPH_WIRE_TLS_ONLY" "wire.tls.only reaches the container"
+if echo "$only_rendered" | grep -qE '^\s+- name: wire$'; then
+	fail "wire.tls.only left the cleartext port in the Service"
+else
+	pass "wire.tls.only removes the cleartext port from the Service and the container"
+fi
 
 if [ "$CORE_ONLY" = "1" ]; then
 	summary

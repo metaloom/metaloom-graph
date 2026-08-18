@@ -135,13 +135,42 @@ never finish recovering.
 
 | Value | Default | Why |
 |-------|---------|-----|
-| `graph.allowWrite` | `false` | No port has authentication. On a ClusterIP Service, enabling this hands everything in the cluster that can resolve the name the ability to delete data |
+| `graph.allowWrite` | `false` | The deployment's ceiling. With `auth.enabled` a caller also needs the privilege and both must permit; with it off, this is the only thing between a ClusterIP Service and your data |
 | `wire.host` | `127.0.0.1` | The Service port exists but nothing outside the pod reaches it until this is widened. Defaulting it to `0.0.0.0` in the *image* would undo that for everyone |
+| `wire.tls.enabled` | `false` | Off because it cannot be on: a chart that generated a certificate would generate one nothing trusts, and the key has to come from a Secret the operator names. §3.4 |
 | `securityContext.readOnlyRootFilesystem` | `true` | Only correct **paired with the `/tmp` emptyDir**. Alone it silently removes the native layer |
 
 `persistence.size` defaults to 10Gi, sized from [reports/SCALE.md](reports/SCALE.md) — 10M nodes and 20M relationships
 measured at 6.1 GiB, plus the log and room to compact. **It cannot be changed by `helm upgrade`**: a StatefulSet's
 `volumeClaimTemplate` is immutable once the object exists. Size it now or plan a migration.
+
+### 3.4 TLS on the binary port
+
+```bash
+kubectl create secret tls graph-tls --cert=tls.crt --key=tls.key      # or let cert-manager write it
+helm upgrade graph ./helm/metaloom-graph \
+  --set wire.tls.enabled=true --set wire.tls.secretName=graph-tls
+```
+
+That opens **8084 as well as 8081** and mounts the Secret read-only at `/tls`. Set `wire.tls.only=true` to close 8081,
+after — not before — `graph_wire_connections{tls="false"}` has stopped rising. [WIRE.md §7.1](WIRE.md) has the design.
+
+Four things the chart decides, each of which could reasonably have gone the other way:
+
+- **It does not create the Secret.** A generated certificate is one nothing trusts, and taking key material through
+  `values.yaml` would put a private key in `helm get values` and in whatever holds the release. Point it at
+  cert-manager, at your CA, or at `kubectl create secret tls`.
+- **`kubernetes.io/tls` keys by default.** `tls.crt` and `tls.key`, which is what cert-manager and every ACME client
+  write, so the common case needs no translation. `wire.tls.certKey` and `privateKeyKey` cover the rest.
+- **Mounted `0440`, not `0400`.** A Secret volume's files are owned by root with the group set to
+  `podSecurityContext.fsGroup` — 0 here — while the process runs as uid 1000. Owner-only would leave the key
+  unreadable by the process that needs it, and the symptom is a pod that starts and then cannot bind.
+- **It affects the binary port only.** TLS for the HTTP port belongs on the Ingress (`ingress.tls`), which is where a
+  platform already provisions and renews certificates. The binary port is the one an Ingress cannot terminate, because
+  it is a raw TCP protocol.
+
+**The certificate is read once, at bind.** A renewal takes effect when the pod restarts — with cert-manager's default
+renewal window that is a scheduled restart rather than an outage, but it is a restart, and nothing here reloads.
 
 ---
 
@@ -173,15 +202,18 @@ Nine phases; **35 assertions, all passing** as of this writing. Three of them ar
 
 ## 5. What is not here
 
-- **Authentication is on in the image and configurable in the chart**, and there is a Secret now — see the section above. What is still missing is TLS, so a password crosses in cleartext. See
+- **Authentication is on in the image and configurable in the chart**, and there is a Secret now — see the section
+  above. **TLS is available on the binary port** (§3.4) and not on the HTTP or MCP ports, which expect an Ingress or a
+  mesh in front of them; without one a password crosses those in cleartext. See
   [OPERATIONS.md §9.1](OPERATIONS.md#91-the-network-which-has-the-same-posture-and-a-wider-blast-radius).
+- **No certificate reload.** A renewed Secret is not picked up until the pod restarts (§3.4).
 - **No backup in the chart.** The tool is in the image (§2.3) and `kubectl exec <pod> -- metaloom-graph-cli
   database backup default --server=http://localhost:8080 --out=- > g.dump` works today, given
   `graph.allowBackup`. What is not here is a `CronJob`, a retention policy or anywhere to put the dump —
   scheduling is not something this chart should decide, and a chart that half-decided it would be worse than
   one that says so.
-- **No NetworkPolicy.** It would be the right place to bound an unauthenticated Service, and what it should allow
-  depends entirely on the cluster.
+- **No NetworkPolicy.** It would be the right place to bound which workloads may reach the Service at all, and what it
+  should allow depends entirely on the cluster.
 - **No horizontal scaling, and there will not be.** One writer process is a property of the storage engine.
 
 ---
@@ -221,7 +253,9 @@ Two consequences of the session table being per process, both stated in `NOTES.t
   recognised by another. The chart's `replicas: 1` default was already the right shape for a
   single-writer engine and is now load-bearing for a second reason.
 
-`helm/test/run.sh` deploys the chart on k3d and runs a real pipeline; a phase that logs in and runs an
-authenticated query is the obvious next addition to it and has not been written.
+`helm/test/run.sh` deploys the chart on k3d and runs a real pipeline. Its offline phase now renders the chart with TLS
+on, with TLS-only, and with `wire.tls.enabled` and no secret name — asserting the refusal, the mount mode, and that
+adding a certificate leaves the cleartext port open. A cluster phase that logs in and runs an authenticated query is
+still the obvious next addition and has not been written.
 
-_Last updated: 2026-08-17 (authentication and RBAC authorization)_
+_Last updated: 2026-08-18 (TLS on the binary port)_

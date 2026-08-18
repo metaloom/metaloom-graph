@@ -1,8 +1,11 @@
 {{- if .Values.ingress.enabled -}}
 {{/*
-  There is no authentication behind this. An Ingress makes the browser UI and /api/query reachable
-  from outside the cluster, and with graph.allowWrite on it makes the delete path reachable too. Put
-  something in front of it.
+  This is also where TLS for the HTTP port belongs -- the server terminates none of its own, and
+  ingress.tls is the value that fixes it. wire.tls is the BINARY port and does nothing for this one.
+
+  With auth.enabled false there is no authentication behind this at all: an Ingress makes the browser
+  UI and /api/query reachable from outside the cluster, and with graph.allowWrite on it makes the
+  delete path reachable too.
 
   Only the HTTP port is ever exposed here. The monitoring port carries database names and store sizes,
   and the MCP port is a remote code path an LLM drives; neither belongs behind a public hostname.

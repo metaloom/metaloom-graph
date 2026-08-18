@@ -24,10 +24,10 @@ to the framing; it also names the one thing the losing arm did better, which sha
 | | |
 |---|---|
 | **Modules** | `graph-protocol` (frames, codec, error codes), `graph-client` (the Java client), `io.metaloom.graph.server.wire` (the server) |
-| **Default port** | 8081, bound to **127.0.0.1**. HTTP stays on 8080 |
+| **Default port** | 8081, bound to **127.0.0.1**, unencrypted. **8084 for the TLS listener**, off until a certificate is given; §7.1. HTTP stays on 8080 |
 | **Surface** | Cypher, reads and writes. **Writes off unless the server has `--allow-write`**; §4.1. No schema call |
-| **Security** | **Authentication, yes; transport security, no.** An `AUTH` frame during the handshake; the password crosses in cleartext. §7 and [AUTH.md](AUTH.md) |
-| **Protocol version** | 4. Negotiated on connect; a mismatch is an error, not a hang, and it happens *before* any credential is asked for |
+| **Security** | **Authentication, yes. Transport security, optional and off by default.** An `AUTH` frame during the handshake ([AUTH.md](AUTH.md)); on port 8081 the password crosses in cleartext, on the TLS listener it does not. §7 and §7.1 |
+| **Protocol version** | 4. Negotiated on connect; a mismatch is an error, not a hang, and it happens *before* any credential is asked for. **TLS did not change it** — the frames are identical on both listeners |
 | **Database** | Chosen per connection at `HELLO` — see [DATABASES.md](DATABASES.md) |
 | **Client dependencies** | `graph-protocol` and vertx-core. **Not** graph-core, **not** graph-cypher, no FFM, no native library — asserted by `ClientDependencyTest` |
 
@@ -397,24 +397,25 @@ engine in it.
 
 ## 7. Security posture
 
-**Authentication, yes. Transport security, no.** A connection presents a credential during the
-handshake and is refused without one ([AUTH.md](AUTH.md)), and that credential crosses the socket **in
-cleartext**. There is no rate limit on queries beyond `maxConcurrentStreams`; logging in has its own,
-because verifying a password costs the server ~100 ms of CPU that an unauthenticated caller can ask
-for.
+**Authentication, yes. Transport security, optional.** A connection presents a credential during the
+handshake and is refused without one ([AUTH.md](AUTH.md)). On the default port that credential crosses
+the socket **in cleartext**; §7.1 is the second listener that does not. There is no rate limit on
+queries beyond `maxConcurrentStreams`; logging in has its own, because verifying a password costs the
+server ~100 ms of CPU that an unauthenticated caller can ask for.
 
-The port still binds **loopback** by default, and authentication is not a reason to change that. The two
-answer different questions: a credential says who the peer is, and only the network under it says who
-could have read the credential on its way past. `GRAPH_WIRE_HOST` widens it, deliberately and with TLS
-in front of it or a network you trust behind it.
+The plaintext port still binds **loopback** by default, and neither authentication nor the existence of
+an encrypted sibling is a reason to change that. The three answer different questions: a credential says
+who the peer is, TLS says who the *server* is and keeps the conversation private, and only the network
+under it says who could have read a cleartext credential on its way past. `GRAPH_WIRE_HOST` widens it,
+deliberately.
 
-What the surface actually is: **Cypher over an authenticated but unencrypted socket.** A principal can
-read every byte of every database it holds a grant on, and — if the server was started with
-`--allow-write` *and* that principal was granted the clause — change it. Both have to permit: without
-the flag a write is refused with `READ_ONLY`, and without the grant with `UNAUTHORIZED`, and the two
-are distinguishable because their remedies are held by different people. `UNAUTHENTICATED` ends the
-connection, like every other handshake failure; `UNAUTHORIZED` is per stream and the connection
-survives, because the next query on it may well be one this principal may run.
+What the surface actually is: **Cypher over an authenticated socket.** A principal can read every byte
+of every database it holds a grant on, and — if the server was started with `--allow-write` *and* that
+principal was granted the clause — change it. Both have to permit: without the flag a write is refused
+with `READ_ONLY`, and without the grant with `UNAUTHORIZED`, and the two are distinguishable because
+their remedies are held by different people. `UNAUTHENTICATED` ends the connection, like every other
+handshake failure; `UNAUTHORIZED` is per stream and the connection survives, because the next query on
+it may well be one this principal may run.
 
 A refusal never says which part of a credential was wrong, and a database a principal may not use
 answers `UNAUTHORIZED` with a message that does not reveal whether it exists — the same rule
@@ -422,6 +423,68 @@ answers `UNAUTHORIZED` with a message that does not reveal whether it exists —
 
 The frame decoder is the part an attacker reaches first, and it is the part with a non-differential
 oracle rather than only a round-trip test — see §8.
+
+### 7.1 TLS: a second listener, not a mode
+
+```
+--wire-tls-cert=/tls/tls.crt --wire-tls-key=/tls/tls.key    # opens 8084 as well as 8081
+--wire-tls-port=8084  --wire-tls-host=<addr>                # where; host defaults to --wire-host
+--wire-tls-only                                             # ...and closes 8081
+```
+
+`GRAPH_WIRE_TLS_CERT`, `_KEY`, `_PORT`, `_HOST`, `_ONLY` are the same five. Both files are **PEM**,
+the key unencrypted — `tls.crt` and `tls.key` in a Kubernetes `kubernetes.io/tls` secret, which is what
+cert-manager and every ACME client write. A certificate with no key, or `--wire-tls-only` with no
+certificate, is refused at parse time rather than producing a server that quietly stayed in the clear.
+
+**This is the binary port only.** The HTTP port serving the browser UI and `/api/*` is unchanged and
+still expects an ingress or a reverse proxy in front of it; so is the MCP port. That is not an
+oversight — it is where the two differ. A browser already has a TLS story with certificate provisioning
+and renewal built into the platform in front of it, and the binary port is the one thing that story does
+not reach: a `GraphClient` in another datacentre speaks a raw TCP protocol no ingress can terminate
+without understanding it.
+
+**One `WireServer`, two `NetServer`s.** The stream permits, the worker pool, the write gates and the
+watchdog are shared, so §5's multiplication still describes the whole server rather than one of two
+halves. `WireServerOptions.maxBufferedBytes()` does not double when the second listener opens.
+
+**Why two ports rather than one negotiated one:**
+
+1. **The protocol does not change.** No `STARTTLS`, no capability bit, no version bump — a negotiated
+   upgrade would have to be refusable by the server and demandable by the client, which is two failure
+   modes and a downgrade attack to reason about, in exchange for one port number.
+2. **Migration has a middle.** Open 8084, move clients over one at a time while 8081 still works, then
+   set `--wire-tls-only`. A single switchable port makes that a flag day.
+3. **A wrong guess fails fast.** TLS speaks first and this server does not, so a plaintext client on
+   8084 gets a handshake failure rather than parking on a socket waiting for a `WELCOME`. The client
+   turns "closed without answering HELLO" into a message naming `withTls`, because from the client's
+   side the mistake is otherwise invisible.
+
+**Adding a certificate never closes a port.** `--wire-tls-only` is separate and explicit, and while both
+are open the server logs a warning naming the plaintext one. `graph_wire_connections{tls="false"}`
+([METRICS.md](METRICS.md)) is how you know when nobody needs it any more.
+
+**What the client verifies, and the default that matters.** `ClientOptions.withTls(...)` takes a
+`ClientTls`, and there is deliberately no no-argument form: encrypting is not the decision, *what to
+trust* is.
+
+| | Trusts | Checks the name |
+|---|---|---|
+| `ClientTls.system()` | the JVM trust store | yes |
+| `ClientTls.trusting(pem)` | that certificate, or the CA that signed it, **and nothing else** | yes |
+| `ClientTls.insecure()` | anything | no |
+
+`verifyHostname` defaults to **on**, and that is load-bearing rather than tidy: Vert.x's own
+`NetClientOptions` leaves hostname verification off, so a client that merely sets `setSsl(true)`
+accepts a valid certificate issued for any name at all — encrypted, and pointed at whoever answered.
+`ClientTls.trusting` is strictly stronger than `insecure`, refuses everything it was not told about,
+and is barely more work.
+
+**What TLS here does not do.** It does not authenticate the client: a client certificate is not asked
+for and would not be looked at if offered, and a principal comes from the `AUTH` frame and nowhere
+else. Mapping a certificate subject onto a user is a second authentication *mechanism*, not a TLS
+setting — `AUTH-8` in [TASKS.md](TASKS.md). It does not make `--no-auth` safe, and a login does not
+make cleartext safe; neither substitutes for the other.
 
 ---
 
@@ -438,6 +501,8 @@ oracle rather than only a round-trip test — see §8.
 | `QuerySummaryTest` | The `COMPLETE` payload: round trip, every truncation offset refused, trailing bytes ignored |
 | `WireServerOptionsTest` | The multiplication in §5, enforced |
 | `WireServerTest` (databases) | Two connections to two databases from one process seeing different data; an unknown database and a name that is not a name both refused at the handshake |
+| `WireTlsTest` | §7.1 end to end against a certificate generated per test: a query over the encrypted listener, both listeners serving one store at once, a login crossing the encrypted one, `close()` stopping both acceptors, and `--wire-tls-only` opening no plaintext listener. Weighted towards **refusal** — an untrusted certificate, a certificate for the wrong name, a plaintext client on the encrypted port and the reverse — because those are the paths where a mistake produces something that looks like it is working. Same class-level `@Timeout` and event-loop count as `WireServerTest`, for the same two reasons |
+| `ClientTlsTest` | What the client verifies, and that a copy method does not drop the transport. Cheap assertions that earn their place because the value they pin down — hostname verification on — is one Vert.x defaults the other way |
 | `ClientDependencyTest` | Fails if graph-core or graph-cypher ever reaches the client's classpath. Checked by **loading**, not by reading a pom, because a transitive arrival would pass a pom check |
 
 **Why a fuzz oracle and not only a differential test.** [TESTING.md](TESTING.md) §0 records the finding:
@@ -463,11 +528,13 @@ decoder on corrupt input.
 | `graph-protocol/…/QuerySummary.java` | The `COMPLETE` payload: how the query went and what it changed |
 | `graph-client/…/GraphClient.java`, `RowStream.java`, `Row.java` | Connect, stream, read |
 | `graph-client/…/ClientOptions.java`, `QueryOptions.java` | The client's two memory bounds; the per-query deadline |
+| `graph-client/…/ClientTls.java` | What a client trusts, and whether it checks the name |
 | `graph-server/…/wire/WireServer.java` | Dispatch, the producer, the four bounds, the watchdog |
 | `graph-server/…/wire/WireServerOptions.java` | §5, enforced |
+| `graph-server/…/wire/WireTlsOptions.java` | §7.1: the certificate, the second port, and why it is a second port |
 | `graph-server/…/wire/CypherWireValues.java` | The conversion at the server's edge, and why it exists |
 
 ---
 
-_Git HEAD revision: `da8c93e`_
-_Last updated: 2026-08-17 (authentication and RBAC authorization)_
+_Git HEAD revision: `58cd33e`_
+_Last updated: 2026-08-18 (TLS on the binary port)_

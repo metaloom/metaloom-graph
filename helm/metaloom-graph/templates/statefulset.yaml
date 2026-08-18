@@ -57,9 +57,14 @@ spec:
             - name: http
               containerPort: {{ .Values.service.httpPort }}
               protocol: TCP
-            {{- if .Values.wire.enabled }}
+            {{- if and .Values.wire.enabled (not .Values.wire.tls.only) }}
             - name: wire
               containerPort: {{ .Values.service.wirePort }}
+              protocol: TCP
+            {{- end }}
+            {{- if and .Values.wire.enabled .Values.wire.tls.enabled }}
+            - name: wire-tls
+              containerPort: {{ .Values.service.wireTlsPort }}
               protocol: TCP
             {{- end }}
             {{- if .Values.metrics.enabled }}
@@ -108,10 +113,26 @@ spec:
             {{- if .Values.wire.enabled }}
             - name: GRAPH_WIRE_PORT
               value: {{ .Values.service.wirePort | quote }}
-            # Loopback unless deliberately widened: the port has no authentication, so the Service
-            # port existing is not the same as it being reachable, and that is on purpose.
+            # Loopback unless deliberately widened: the cleartext port carries a password in the clear, so the
+            # Service port existing is not the same as it being reachable, and that is on purpose.
             - name: GRAPH_WIRE_HOST
               value: {{ .Values.wire.host | quote }}
+            {{- if .Values.wire.tls.enabled }}
+            # A SECOND listener over the same server, not a mode on the first. The plaintext one above stays open
+            # until wire.tls.only, so moving clients across is a migration rather than a flag day.
+            - name: GRAPH_WIRE_TLS_CERT
+              value: /tls/{{ .Values.wire.tls.certKey }}
+            - name: GRAPH_WIRE_TLS_KEY
+              value: /tls/{{ .Values.wire.tls.privateKeyKey }}
+            - name: GRAPH_WIRE_TLS_PORT
+              value: {{ .Values.service.wireTlsPort | quote }}
+            - name: GRAPH_WIRE_TLS_HOST
+              value: {{ .Values.wire.tls.host | default .Values.wire.host | quote }}
+            {{- if .Values.wire.tls.only }}
+            - name: GRAPH_WIRE_TLS_ONLY
+              value: "true"
+            {{- end }}
+            {{- end }}
             {{- end }}
             - name: GRAPH_METRICS_ENABLED
               value: {{ .Values.metrics.enabled | quote }}
@@ -207,9 +228,27 @@ spec:
             # /api/stats and falling back to pure Java.
             - name: tmp
               mountPath: /tmp
+            {{- if and .Values.wire.enabled .Values.wire.tls.enabled }}
+            # Read-only, and mounted rather than templated: the key never passes through values.yaml, a rendered
+            # manifest or `helm get values`. A kubernetes.io/tls Secret holds tls.crt and tls.key, which is what
+            # cert-manager and every ACME client write, so this mounts whatever issued it without translation.
+            - name: wire-tls
+              mountPath: /tls
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if and .Values.wire.enabled .Values.wire.tls.enabled }}
+        - name: wire-tls
+          secret:
+            secretName: {{ required "wire.tls.secretName is required when wire.tls.enabled is on: the chart does not issue certificates, it mounts one you already have" .Values.wire.tls.secretName }}
+            # 0440 and not the 0644 a Secret volume defaults to. Not 0400 either, and the difference is the whole
+            # reason this line has a comment: a Secret volume's files are owned by root with the group set to
+            # podSecurityContext.fsGroup, which is 0 here, while the process runs as uid 1000. Owner-only would make
+            # the key unreadable by the very process that needs it — a pod that starts and then cannot bind.
+            defaultMode: 0440
+        {{- end }}
         {{- if and .Values.persistence.enabled .Values.persistence.existingClaim }}
         - name: data
           persistentVolumeClaim:

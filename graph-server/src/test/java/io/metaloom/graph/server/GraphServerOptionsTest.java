@@ -239,8 +239,141 @@ public class GraphServerOptionsTest {
 		}
 		// And the reverse direction, spelled out: the count is asserted so that adding a variable to the parser
 		// without adding it to VARIABLES fails here rather than being noticed by an operator.
-		assertEquals(24, GraphServerOptions.VARIABLES.size(),
+		assertEquals(29, GraphServerOptions.VARIABLES.size(),
 			"a variable was added or removed; update this count and check --help still prints all of them");
+	}
+
+	// ---------------------------------------------------------------- TLS on the binary port
+
+	/**
+	 * TLS is off unless a certificate is supplied, and supplying one does not close the plaintext port.
+	 *
+	 * <p>
+	 * The second half is the part worth asserting. Closing the existing port on the operator who just added a
+	 * certificate would break every client at once, at the moment they were trying to make things safer, which is the
+	 * worst possible time.
+	 * </p>
+	 */
+	@Test
+	public void testTlsIsOffByDefaultAndAddingItLeavesThePlaintextPortOpen() throws Exception {
+		GraphServerOptions defaults = parse("/data");
+		assertNull(defaults.wireTls());
+		assertTrue(defaults.wirePlaintext());
+
+		Certificate certificate = Certificate.write();
+		GraphServerOptions encrypted = parse("/data", "--wire-tls-cert=" + certificate.crt,
+			"--wire-tls-key=" + certificate.key);
+		assertEquals(8084, encrypted.wireTls().port());
+		assertEquals(certificate.crt, encrypted.wireTls().certificate());
+		assertTrue(encrypted.wirePlaintext(), "adding a certificate must not close the plaintext port");
+		assertTrue(encrypted.wire());
+	}
+
+	/** The encrypted listener inherits the binary port's address, and can be given one of its own. */
+	@Test
+	public void testTheEncryptedListenerInheritsTheBindAddress() throws Exception {
+		Certificate certificate = Certificate.write();
+		GraphServerOptions inherited = parse("/data", "--wire-host=0.0.0.0",
+			"--wire-tls-cert=" + certificate.crt, "--wire-tls-key=" + certificate.key);
+		assertEquals("0.0.0.0", inherited.wireTls().host());
+
+		GraphServerOptions split = parse("/data", "--wire-host=127.0.0.1", "--wire-tls-host=0.0.0.0",
+			"--wire-tls-cert=" + certificate.crt, "--wire-tls-key=" + certificate.key);
+		assertEquals("0.0.0.0", split.wireTls().host());
+		assertEquals("127.0.0.1", split.wireHost());
+	}
+
+	/**
+	 * Half a pair is refused by name.
+	 *
+	 * <p>
+	 * An operator who set one of two variables and got a server that quietly stayed in cleartext would have the worst
+	 * outcome available: they tried, and they believe it worked.
+	 * </p>
+	 */
+	@Test
+	public void testACertificateWithoutAKeyIsRefused() throws Exception {
+		Certificate certificate = Certificate.write();
+		IllegalArgumentException noKey = assertThrows(IllegalArgumentException.class,
+			() -> parse("/data", "--wire-tls-cert=" + certificate.crt));
+		assertTrue(noKey.getMessage().contains("only the certificate"), noKey.getMessage());
+
+		IllegalArgumentException noCert = assertThrows(IllegalArgumentException.class,
+			() -> parse("/data", "--wire-tls-key=" + certificate.key));
+		assertTrue(noCert.getMessage().contains("only the key"), noCert.getMessage());
+	}
+
+	@Test
+	public void testTlsOnlyWithoutACertificateIsRefused() {
+		IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+			() -> parse("/data", "--wire-tls-only"));
+		assertTrue(refused.getMessage().contains("--no-wire"), refused.getMessage());
+	}
+
+	@Test
+	public void testTlsOnlyClosesThePlaintextListener() throws Exception {
+		Certificate certificate = Certificate.write();
+		GraphServerOptions options = parse("/data", "--wire-tls-cert=" + certificate.crt,
+			"--wire-tls-key=" + certificate.key, "--wire-tls-only");
+		assertFalse(options.wirePlaintext());
+		assertTrue(options.wire(), "the binary port is still open, over TLS");
+	}
+
+	@Test
+	public void testACertificateOnADisabledBinaryPortIsRefused() throws Exception {
+		Certificate certificate = Certificate.write();
+		IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+			() -> parse("/data", "--no-wire", "--wire-tls-cert=" + certificate.crt,
+				"--wire-tls-key=" + certificate.key));
+		assertTrue(refused.getMessage().contains("--no-wire"), refused.getMessage());
+	}
+
+	/** The fifth port joins the collision check rather than being discovered as "address already in use". */
+	@Test
+	public void testTheEncryptedPortMayNotCollideWithAnother() throws Exception {
+		Certificate certificate = Certificate.write();
+		IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+			() -> parse("/data", "--wire-tls-cert=" + certificate.crt, "--wire-tls-key=" + certificate.key,
+				"--wire-tls-port=8082"));
+		assertTrue(refused.getMessage().contains("the encrypted binary port"), refused.getMessage());
+	}
+
+	/** The environment reaches the same place the flags do. */
+	@Test
+	public void testTheEnvironmentConfiguresTls() throws Exception {
+		Certificate certificate = Certificate.write();
+		GraphServerOptions options = GraphServerOptions.parse(new String[] { "/data" }, Map.of(
+			"GRAPH_WIRE_TLS_CERT", certificate.crt.toString(),
+			"GRAPH_WIRE_TLS_KEY", certificate.key.toString(),
+			"GRAPH_WIRE_TLS_PORT", "9084",
+			"GRAPH_WIRE_TLS_HOST", "0.0.0.0",
+			"GRAPH_WIRE_TLS_ONLY", "true")::get);
+		assertEquals(9084, options.wireTls().port());
+		assertEquals("0.0.0.0", options.wireTls().host());
+		assertFalse(options.wirePlaintext());
+	}
+
+	/**
+	 * A pair of files that exist, which is all the option layer checks.
+	 *
+	 * <p>
+	 * Deliberately not real key material: whether the PEM parses is the TLS stack's question and
+	 * {@code WireTlsTest} asks it against a real certificate. What is being tested here is the parsing of paths, and
+	 * a test that had to generate a keypair to assert that {@code --wire-tls-port} is read would be measuring the
+	 * wrong thing.
+	 * </p>
+	 */
+	private record Certificate(Path crt, Path key) {
+
+		static Certificate write() throws Exception {
+			Path directory = java.nio.file.Files.createTempDirectory("graph-tls-options");
+			directory.toFile().deleteOnExit();
+			Path crt = java.nio.file.Files.writeString(directory.resolve("tls.crt"), "not a certificate");
+			Path key = java.nio.file.Files.writeString(directory.resolve("tls.key"), "not a key");
+			crt.toFile().deleteOnExit();
+			key.toFile().deleteOnExit();
+			return new Certificate(crt, key);
+		}
 	}
 
 	/**
@@ -359,7 +492,9 @@ public class GraphServerOptionsTest {
 		assertTrue(usage.contains("--wire-port"), "and the binary port, which is on by default");
 		assertTrue(usage.contains("--max-streams"), "and the factor an operator has to multiply");
 		assertTrue(usage.contains("authentication"),
-			"a server with two unauthenticated ports should say so where somebody will read it");
+			"which ports require a login belongs where somebody will read it");
+		assertTrue(usage.contains("--wire-tls-cert"), "and the flag that encrypts the binary port");
+		assertTrue(usage.contains("--wire-tls-only"), "and the one that closes the cleartext half of it");
 		assertTrue(usage.contains("--database"), "and the flag that picks which database a request gets");
 		assertTrue(usage.contains("--allow-drop"), "and the one that turns on the only route that deletes data");
 		assertTrue(usage.contains("--allow-write"), "and the one that lets a query change a store at all");
