@@ -1,0 +1,31 @@
+<!--
+    Test-time logging.
+
+    A module with no logback configuration on its test classpath does not run quiet: logback falls back to
+    BasicConfigurator, which is root=DEBUG to the console. That is how a suite ends up printing a stack trace for
+    every retried transaction — GraphStoreImpl.inTransaction logs one per lost optimistic attempt at DEBUG, and
+    SnapshotIsolationTest deliberately puts four threads on the same eight bytes, so the retries are the subject of
+    the test rather than a symptom. Correct level, wrong default threshold.
+
+    Third-party WARN, io.metaloom INFO: the engine's INFO lines are recovery, checkpoint and bind, which are worth
+    reading when a test fails, while netty and vertx narrate transport setup on every request.
+
+    Duplicated per module because test resources are not inherited, and a shared file wired through
+    logback.configurationFile would need an absolute path this build has no reliable way to spell (there is no .mvn
+    directory, so ${maven.multiModuleProjectDirectory} is whichever directory maven happened to start in).
+-->
+<configuration>
+    <appender name="console" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level %logger{28} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <logger name="io.netty" level="WARN" />
+    <logger name="io.vertx" level="WARN" />
+    <logger name="io.metaloom" level="INFO" />
+
+    <root level="WARN">
+        <appender-ref ref="console" />
+    </root>
+</configuration>

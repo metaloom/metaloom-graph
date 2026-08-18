@@ -520,6 +520,14 @@ diagnostic artefact and deleting it on failure is the most frustrating thing a t
   happened: twenty-five leaked Vert.x instances turned a five-second class into a build that hung for
   twenty-five minutes, passed in isolation, and reproduced only under load. `WireServerTest` now
   counts live event loops after every test, which is the only kind of assertion that catches this.
+- **Every module carries a `logback-test.xml`, and the one that does not runs at DEBUG.** Unconfigured
+  logback does not fall back to silence, it falls back to `BasicConfigurator`: root DEBUG, straight to
+  the console. `graph-core` had no test configuration for a long time and nobody read the output, which
+  is how `SnapshotIsolationTest` came to print an eleven-line stack trace for every retried
+  transaction — `inTransaction` logs one per lost optimistic attempt at DEBUG, and that test puts four
+  threads on the same eight bytes on purpose, so the retries are the subject rather than a symptom. The
+  level was right; the missing file was the bug. Test resources are not inherited, so a new module
+  needs its own copy.
 
 ---
 
