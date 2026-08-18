@@ -583,9 +583,19 @@ What exists now, beyond the atomicity, durability and rollback that were already
       **exclusively** and runs once more (`GraphStoreImpl.writeExclusively`): with no other writer in
       flight there is no window to lose, so progress is guaranteed instead of hoped for. It reuses the
       gate downgrade compaction already relies on, so it adds no lock ordering.
-      `autoCommitEscalations()` counts it, and the test asserts the count moved — a run that never
-      escalated did not reproduce the contention and its pass would prove nothing. **10 failures in 10
-      before, 0 in 12 after.**
+      `autoCommitEscalations()` counts it. **10 failures in 10 before, 0 in 12 after.**
+      <br>**And the assertion that came with the fix was itself flaky**, found the same way the defect
+      was — by a run on another machine. `testAutoCommitAbsorbsIndexLeafContention` asserted that the
+      run had escalated, on the argument that a run which never did had not reproduced the contention.
+      The argument holds; the assertion did not, because an escalation is sixty-four losses *in a row*
+      and whether six threads produce that is a fact about the host's scheduler. It failed with a count
+      of zero on a run where every conflict had been absorbed exactly as promised, which is the design
+      working. Split in two: the load test now asserts `autoCommitRetries()` moved — a lost conflict is
+      what contention is, and there are hundreds of them in every run — and the fallback has its own
+      test, `testAutoCommitEscalatesWhenEveryOptimisticAttemptLoses`, which **schedules** the
+      starvation by having a helper thread commit over the statement's record once per attempt. Every
+      optimistic attempt loses by construction, the escalation is reached on every machine, and taking
+      `runExclusively` back out fails it in under a second instead of one run in ten.
       <br>**And then the same defect once more, one module along.** With `graph-core` green the run
       reached `graph-cypher` for the first time and `CypherConcurrencyTest` failed the same way:
       `Cypher.write` had its own copy of the optimistic loop, so it had its own copy of the defect.
@@ -1034,5 +1044,5 @@ Built. [AUTH.md](AUTH.md) is the design; what follows is what moved.
 
 ---
 
-_Git HEAD revision: `58cd33e`_
-_Last updated: 2026-08-18 (TLS on the binary port)_
+_Git HEAD revision: `9a607c9`_
+_Last updated: 2026-08-18 (the auto-commit escalation assertion)_

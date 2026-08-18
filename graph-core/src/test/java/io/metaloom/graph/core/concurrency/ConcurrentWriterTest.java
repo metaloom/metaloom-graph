@@ -1,6 +1,7 @@
 package io.metaloom.graph.core.concurrency;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -9,6 +10,8 @@ import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
@@ -26,6 +29,7 @@ import io.metaloom.graph.core.api.TransactionConflictException;
 import io.metaloom.graph.core.api.VerifyLevel;
 import io.metaloom.graph.core.fixture.TempStore;
 import io.metaloom.graph.core.id.ElementId;
+import io.metaloom.graph.core.store.GraphStoreImpl;
 
 /**
  * Writers overlap, and what happens when they meet.
@@ -360,6 +364,19 @@ public class ConcurrentWriterTest {
 	 * writers deep enough to keep the leaf rewritten for as long as one loser keeps retrying, and it appears as a rate
 	 * rather than a certainty.
 	 * </p>
+	 *
+	 * <p>
+	 * <b>What it does not assert.</b> It used to require that the run also reached the exclusive fallback, on the
+	 * argument that a run which never escalated had not reproduced the contention. The argument is right and the
+	 * assertion was wrong: escalation is starvation past sixty-four attempts <em>in a row</em>, which is emergent and
+	 * decided by how the machine interleaved six threads, so the assertion made a correctness test's outcome a
+	 * property of the host. It passes twelve times in twelve on an idle box here and has been seen failing with a
+	 * count of zero elsewhere — on a run where nothing was wrong, every conflict having been absorbed exactly as
+	 * promised. The evidence that writers really collided is a lost conflict, not a lost run of sixty-four of them, so
+	 * that is what is asserted; the fallback itself is proven by
+	 * {@link #testAutoCommitEscalatesWhenEveryOptimisticAttemptLoses()}, which schedules the starvation rather than
+	 * waiting for it.
+	 * </p>
 	 */
 	@Test
 	public void testAutoCommitAbsorbsIndexLeafContention() throws Exception {
@@ -409,13 +426,108 @@ public class ConcurrentWriterTest {
 				assertTrue(refused.isEmpty(), "an auto-commit write was refused rather than retried: "
 					+ (refused.isEmpty() ? "" : refused.get(0).toString()));
 
-				// The optimistic loop alone does not survive this, so a run that never escalated did not reproduce the
-				// contention the test is about and its pass says nothing. Asserting the escalation happened is what
-				// keeps this a test of the last resort rather than of the machine's timing.
-				long escalations = ((io.metaloom.graph.core.store.GraphStoreImpl) store).autoCommitEscalations();
-				assertTrue(escalations > 0, "no auto-commit write ever exhausted its optimistic attempts, so the "
-					+ "exclusive fallback was never exercised and this run proves nothing");
+				// A run in which the writers never actually met absorbed nothing and proves nothing, so the
+				// contention is asserted rather than assumed. A lost conflict is the evidence — hundreds of them on
+				// any machine — and not an escalation, which is sixty-four losses in a row and therefore a fact about
+				// the host's scheduler. See testAutoCommitEscalatesWhenEveryOptimisticAttemptLoses for the fallback.
+				GraphStoreImpl impl = (GraphStoreImpl) store;
+				assertTrue(impl.autoCommitRetries() > 0, "no auto-commit write ever lost a conflict, so six writers "
+					+ "on one index leaf did not in fact contend and this run absorbed nothing");
 
+				store.verify(VerifyLevel.FULL);
+			}
+		});
+	}
+
+	/**
+	 * Every optimistic attempt is made to lose, so the exclusive fallback is reached on purpose rather than by luck.
+	 *
+	 * <p>
+	 * This is the other half of {@link #testAutoCommitAbsorbsIndexLeafContention()} and the reason that test no longer
+	 * asserts an escalation count. Escalation is the last resort of a statement — sixty-four lost conflicts in a row —
+	 * and under a load test whether any writer loses that many in a row is a property of the host's scheduler, not of
+	 * the engine. Here it is scheduled: a helper thread commits over the statement's own record between the
+	 * statement's snapshot and its commit, once per attempt, so <em>every</em> optimistic attempt loses and the
+	 * engine has to reach the fallback to make any progress at all.
+	 * </p>
+	 *
+	 * <p>
+	 * The helper stands down exactly when {@code autoCommitEscalations()} moves, which is the engine announcing —
+	 * before it runs the attempt — that this one is taken under the write gate exclusively. It has to: a competing
+	 * {@code begin()} blocks on that gate, so a helper that kept going would block there waiting for the statement
+	 * that is waiting for it, and the test would deadlock rather than fail. That the last attempt then commits with no competitor in flight is the
+	 * guarantee section 6.3 makes, and the rest of the assertions are its consequences — one escalation, not several,
+	 * and no conflict raised at a caller who had one statement and nothing to reconsider.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>Seen to fail.</b> Deleting the {@code runExclusively} call and letting {@code asStatement} rethrow leaves the
+	 * work refused with a {@code TransactionConflictException} after the bound, which is the defect the fallback was
+	 * added for and is here reproduced on demand instead of one run in ten.
+	 * </p>
+	 */
+	@Test
+	public void testAutoCommitEscalatesWhenEveryOptimisticAttemptLoses() throws Exception {
+		assertTimeoutPreemptively(Duration.ofMinutes(2), () -> {
+			try (GraphStore store = stores.open()) {
+				warmSharedStructures(store);
+				GraphStoreImpl impl = (GraphStoreImpl) store;
+				long contested = store.createNode("Contested", Properties.of().set("mark", 0L));
+
+				// Handing the helper a round and waiting for it to commit is what puts its commit strictly between
+				// this statement's snapshot and its validation, which is the only window a conflict is decided in.
+				BlockingQueue<Long> rounds = new ArrayBlockingQueue<>(1);
+				BlockingQueue<Object> committed = new ArrayBlockingQueue<>(1);
+				AtomicReference<Throwable> helperFailed = new AtomicReference<>();
+				Object done = new Object();
+				Thread helper = Thread.ofPlatform().name("helper").start(() -> {
+					try {
+						long mark;
+						while ((mark = rounds.take()) >= 0) {
+							// An explicit transaction, so that the helper is never itself a statement and can never
+							// contribute to the escalation count this test is about to read.
+							try (Transaction txn = store.begin()) {
+								store.setNodeProperties(contested, Properties.of().set("mark", mark));
+								txn.commit();
+							}
+							committed.put(done);
+						}
+					} catch (Throwable e) {
+						helperFailed.compareAndSet(null, e);
+						committed.offer(done);
+					}
+				});
+
+				AtomicInteger attempts = new AtomicInteger();
+				long finalMark = store.inStatement(() -> {
+					int attempt = attempts.incrementAndGet();
+					store.setNodeProperties(contested, Properties.of().set("mark", (long) -attempt));
+					if (impl.autoCommitEscalations() == 0) {
+						// Still optimistic, so lose this attempt. Once the count moves, this attempt is the exclusive
+						// one and the helper cannot run inside it: its begin() would block on the write gate this
+						// statement holds.
+						try {
+							rounds.put((long) attempt);
+							assertNotNull(committed.poll(30, TimeUnit.SECONDS), "the helper never committed");
+						} catch (InterruptedException e) {
+							Thread.currentThread().interrupt();
+							throw new IllegalStateException(e);
+						}
+					}
+					return (long) -attempt;
+				});
+				rounds.put(-1L);
+				helper.join();
+
+				assertNull(helperFailed.get(), "the helper failed rather than committing: " + helperFailed.get());
+				assertEquals(1, impl.autoCommitEscalations(),
+					"a statement that lost every optimistic attempt must escalate exactly once");
+				assertEquals(GraphStoreImpl.autoCommitAttempts() + 1, attempts.get(),
+					"the work must run once per optimistic attempt and once more under the write gate");
+				assertEquals(GraphStoreImpl.autoCommitAttempts(), impl.autoCommitRetries(),
+					"every optimistic attempt was made to lose, so every one of them must be counted as a retry");
+				assertEquals(finalMark, store.nodeProperty(contested, "mark"),
+					"the exclusive attempt is the one that stands, and nothing may have committed over it");
 				store.verify(VerifyLevel.FULL);
 			}
 		});
@@ -440,7 +552,7 @@ public class ConcurrentWriterTest {
 	}
 
 	private int recordsPerNodePage(GraphStore store) {
-		return ((io.metaloom.graph.core.store.GraphStoreImpl) store).segmentSets()
+		return ((GraphStoreImpl) store).segmentSets()
 			.get(io.metaloom.graph.core.id.Kind.NODE).slotsPerPage();
 	}
 }

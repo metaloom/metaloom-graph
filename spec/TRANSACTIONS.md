@@ -445,8 +445,8 @@ the loser's snapshot is stale every time it reaches the front. Measured, it took
 runs failing to all of them.
 
 So an auto-commit write that exhausts its optimistic attempts **takes the write gate exclusively and
-runs once more** (`writeExclusively`). With no other writer in flight there is no window for a
-conflict to be decided in, so the attempt cannot lose one, and progress is guaranteed rather than
+runs once more** (`GraphStoreImpl.runExclusively`). With no other writer in flight there is no window
+for a conflict to be decided in, so the attempt cannot lose one, and progress is guaranteed rather than
 hoped for. The gate is then re-taken shared by the `begin()` inside it — the downgrade
 `ReentrantReadWriteLock` is there for and the same sequence compaction runs — so no new lock ordering
 is introduced. It is deliberately the exception: excluding every other writer for one statement is the
@@ -455,6 +455,23 @@ alternative for a caller who wrote one statement is not a slower write but a fai
 `GraphStoreImpl.autoCommitEscalations()` counts how often it happens, which is the number that
 separates "the retry loop absorbed contention" from "the engine serialised writers to finish a
 statement".
+
+**Two counters, because they answer different questions**, and conflating them cost a flaky test.
+`autoCommitRetries()` counts every attempt that lost a conflict and was re-run; `autoCommitEscalations()`
+counts only the statements that lost `AUTO_COMMIT_ATTEMPTS` of them *in a row*. A retry is what
+contention looks like and a busy leaf produces hundreds of them; an escalation is starvation, which is
+rare by design and **emergent** — whether any writer meets it in a given run is decided by how the host
+happened to interleave its threads. So an escalation count is the right thing for an operator to alert
+on and the wrong thing for a test to require. `ConcurrentWriterTest.testAutoCommitAbsorbsIndexLeafContention`
+required it and failed with a count of zero on a machine where nothing was wrong: every conflict had
+been absorbed, which is the promise being kept. It now asserts `autoCommitRetries() > 0` — that the
+writers did in fact collide, which is what stops the pass being vacuous — and the fallback itself is
+proven separately by `testAutoCommitEscalatesWhenEveryOptimisticAttemptLoses`, which **schedules** the
+starvation: a helper thread commits over the statement's record once per attempt, so every optimistic
+attempt loses and the escalation is reached by construction rather than by luck. The helper stands
+down when `autoCommitEscalations()` moves, because the engine increments it before taking the gate and
+a helper that kept going would block on that gate waiting for the statement waiting for it. Removing
+the fallback fails that test in under a second, where it used to reproduce one run in ten.
 
 **One mechanism, both statement paths.** A Cypher write query had its own copy of the optimistic loop
 in `Cypher.write`, and the copy carried the defect with it — the same bounded attempts, the same
@@ -726,5 +743,5 @@ replaced by a shared/exclusive write gate plus a commit lock; and `OverlayHolder
 
 ---
 
-_Git HEAD revision: `da8c93e`_
-_Last updated: 2026-08-17 (concurrent writers)_
+_Git HEAD revision: `9a607c9`_
+_Last updated: 2026-08-18 (auto-commit retry vs escalation counters)_

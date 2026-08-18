@@ -264,8 +264,11 @@ project unbuildable for a contributor who only touches Java.
 
 That path is also reachable deliberately: `mvn test -Dnative.skip=true` turns the native layer off
 even where cargo *is* present, which is how the fallback is actually checked rather than assumed.
-Measured: **359 tests pass, with 23 skipped rather than 3** — the extra 20 are the native-specific
-tests declining to run, which is the correct behaviour and is visible in the count.
+Measured, running both CI matrix legs back to back: `graph-core` reports **522 tests passing with 27
+skipped rather than 3** — the extra 24 are the native-specific tests declining to run, which is the
+correct behaviour and is visible in the count. That the difference is *only* visible in the count is
+the reason `-Dmetaloom.graph.native.required=true` exists: a skipped test and a passing one exit the
+same way.
 
 The flag also stops the tests **loading** a library an earlier build left behind, which it did not
 always do. `NativeCapabilities` searches paths relative to the working directory before it searches

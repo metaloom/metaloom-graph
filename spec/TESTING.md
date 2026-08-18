@@ -131,9 +131,11 @@ src/test/java/io/metaloom/graph/core/
                  ConcurrentWriterTest — the four statements concurrent writers actually make, each
                  written so it could only pass with them and would have deadlocked against the single
                  writer lock; plus testAutoCommitAbsorbsIndexLeafContention, six writers on one index
-                 leaf asserting that a single-statement write is never refused. That one also asserts
-                 the exclusive fallback was reached, because a run that never escalated did not
-                 reproduce the contention and its pass would prove nothing
+                 leaf asserting that a single-statement write is never refused, and that they really
+                 collided (autoCommitRetries moved) so the pass is not vacuous. The exclusive fallback
+                 is a separate test, testAutoCommitEscalatesWhenEveryOptimisticAttemptLoses, which
+                 schedules the starvation with a helper thread instead of asserting that a load test
+                 happened to produce one — see TRANSACTIONS.md section 6.3
 
 graph-cypher/src/test/java/io/metaloom/graph/cypher/
                  parser, null semantics, execution, the versus-API differential, variable-length paths
@@ -661,5 +663,5 @@ diagnostic artefact and deleting it on failure is the most frustrating thing a t
 
 ---
 
-_Git HEAD revision: `58cd33e`_
-_Last updated: 2026-08-18 (TLS on the binary port)_
+_Git HEAD revision: `9a607c9`_
+_Last updated: 2026-08-18 (the escalation assertion moved to its own test)_

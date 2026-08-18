@@ -172,6 +172,20 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	private final LongAdder autoCommitEscalations = new LongAdder();
 
 	/**
+	 * How often an auto-commit write lost a conflict and re-ran itself optimistically.
+	 *
+	 * <p>
+	 * The companion to {@link #autoCommitEscalations}, and the number that says whether a workload met any contention
+	 * at all. Escalation is starvation past {@link #AUTO_COMMIT_ATTEMPTS} attempts in a row, which is rare by design
+	 * and emergent rather than scheduled: whether a given run reaches it depends on how the machine happened to
+	 * interleave its writers, so it is the wrong thing to read — or to assert — as evidence that writers collided. A
+	 * lost conflict is the direct evidence, it is counted here, and six writers over one hot index leaf produce
+	 * hundreds of them on any machine.
+	 * </p>
+	 */
+	private final LongAdder autoCommitRetries = new LongAdder();
+
+	/**
 	 * Held for writing only while a commit copies its pages into the mapping, so a reader never observes half of a
 	 * commit.
 	 * <p>
@@ -1022,6 +1036,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				return result;
 			} catch (TransactionConflictException e) {
 				conflict = e;
+				autoCommitRetries.increment();
 				backOff(attempt);
 			}
 		}
@@ -3015,6 +3030,23 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	/** How many auto-commit writes have had to take the write gate exclusively to finish. See {@link #runExclusively}. */
 	public long autoCommitEscalations() {
 		return autoCommitEscalations.sum();
+	}
+
+	/** How many auto-commit attempts have lost a conflict and been re-run. See {@link #asStatement}. */
+	public long autoCommitRetries() {
+		return autoCommitRetries.sum();
+	}
+
+	/**
+	 * How many optimistic attempts a statement makes before it takes the write gate exclusively.
+	 *
+	 * <p>
+	 * Exposed so that a test can schedule the escalation instead of waiting for a machine to produce it, and so an
+	 * operator reading {@link #autoCommitEscalations()} can see what a single escalation cost in lost attempts.
+	 * </p>
+	 */
+	public static int autoCommitAttempts() {
+		return AUTO_COMMIT_ATTEMPTS;
 	}
 
 	@Override
