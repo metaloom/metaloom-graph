@@ -56,6 +56,11 @@ public class SoakTest {
 	 */
 	private static final int STEADY_EDGES = 20_000;
 
+	/** The band the live node count is held inside, well within the bound the run asserts at the end. */
+	private static final int NODE_CEILING = STEADY_STATE + STEADY_STATE / 10;
+
+	private static final int NODE_FLOOR = STEADY_STATE - STEADY_STATE / 10;
+
 	@RegisterExtension
 	TempStore stores = new TempStore();
 
@@ -152,10 +157,18 @@ public class SoakTest {
 		}
 	}
 
-	/** One churn step: the mix is weighted so that both halves of the live set stay near their steady state. */
+	/**
+	 * One churn step: the mix is weighted so that both halves of the live set stay near their steady state.
+	 * <p>
+	 * The node count needs a restoring force in <b>both</b> directions, and getting that wrong is not obvious from
+	 * reading the mix. Creates and deletes are each 25 percent, so above the target they cancel exactly and the live
+	 * set performs an unbiased random walk with nothing pulling it back: the 12-hour run started at 4,000 nodes and
+	 * wandered to 20,549, which would have failed the closing bound on a store that was behaving perfectly. Hence the
+	 * band — above it no node is created, below it none is deleted, and inside it the original mix is untouched.
+	 */
 	private int churn(GraphStore store, List<Long> live, Random random) throws java.io.IOException {
 		int roll = random.nextInt(100);
-		if (live.size() < STEADY_STATE || roll < 25) {
+		if (live.size() < STEADY_STATE || (roll < 25 && live.size() < NODE_CEILING)) {
 			live.add(store.createNode("N", Properties.of().set("i", random.nextInt(100_000))));
 			return 1;
 		}
@@ -178,7 +191,7 @@ public class SoakTest {
 		} else if (roll < 75) {
 			store.nodeProperties(id);
 			store.neighbours(id, Direction.BOTH);
-		} else if (live.size() > STEADY_STATE) {
+		} else if (live.size() > NODE_FLOOR) {
 			long doomed = live.remove(random.nextInt(live.size()));
 			edges -= incidentEdges(store, doomed);
 			store.deleteNode(doomed);
@@ -245,6 +258,10 @@ public class SoakTest {
 	private Sample sample(GraphStore store, List<Long> live, String label) {
 		long truth = countEdges(store, live);
 		assertEquals(truth, edges, "the workload's edge tally drifted from the graph it built");
+		// Checked here rather than only at the end: a workload that has drifted out of its band stopped measuring
+		// what it claims hours before it says so, and the run is long enough that the difference matters.
+		assertTrue(live.size() >= STEADY_STATE / 2 && live.size() <= STEADY_STATE * 2,
+			"the workload drifted out of its steady state at " + label + ": " + live.size() + " live nodes");
 		System.gc();
 		StoreStats stats = store.stats();
 		Runtime runtime = Runtime.getRuntime();

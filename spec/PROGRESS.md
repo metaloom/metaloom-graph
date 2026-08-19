@@ -31,7 +31,7 @@ not**, in one place.
 | 6 — Native layer | **Done** except a second build target; `miri` and `fuzz` now installed and run | `NativeCodecTest`, `UringIoEngineTest`, `DirectWalTest`, `BlobCompressionTest`, `StatxTest`, `NativeBindingsTest` |
 | 7 — Indexes | **Done** for the label, property, composite and unique B+trees | `IndexTest`, `CompositeIndexTest`, `UniqueConstraintTest` |
 | 8 — Compaction and reclamation | **Done** except the p99 latency budget | `CompactionTest`, `CompactionCrashTest` |
-| 9 — Hardening | **Partial** — see §4.9; crash matrix **built**, no JMH, long runs not run | `CrashMatrixTest`, `WalFaultTest`; §6 of PHASE_STATUS |
+| 9 — Hardening | **Partial** — see §4.9; crash matrix **built**, the soak and the `kill -9` loop **run**, no JMH, no nightly cadence, power-loss test still manual | `CrashMatrixTest`, `WalFaultTest`, `SoakTest`; §6 of PHASE_STATUS |
 | 10 — MetaLoom integration | **Done** — built, measured, recommended against adopting | §6 below |
 | 11 — Query language | **Done** for an openCypher subset in its own module, reads and writes, with a single-jar Vert.x server and a React and D3 graph browser. `FOREACH` and `OPTIONAL MATCH` refused by name | [CYPHER.md](CYPHER.md); `CypherVersusApiTest`, `CypherWriteVersusApiTest`, `NullSemanticsTest`, `e2e/graph-browser.spec.ts` |
 | 12 — GraalVM native image | **Done** — the server builds to a 38 MB standalone binary, FFM and all, behind `-Pgraalvm` | [GRAALVM.md](GRAALVM.md); `ForeignDowncallMetadataTest`, `tools/native-image.sh` |
@@ -881,18 +881,35 @@ trusting anything that depends on it, and skips when it does not. On ext4 or xfs
       shorter prefix rather than becoming unreadable — which is what the CRC plus self-identifying LSN
       was designed to guarantee and had never been shown to do. The default is 12 transactions so
       `-Pcrash` stays about a minute; `-Dgraph.crash.transactions=24` reproduces the run above.
-- [~] **The long runs, partly executed.** On 2026-08-18, against the concurrent-writer write path:
+- [~] **The long runs, executed.** On 2026-08-18 and 2026-08-19, against the concurrent-writer write
+      path. What is left of this item is a *week* of nightlies rather than a single long run of each:
       - **`kill -9` loop: 200 iterations, all clean** (20 minutes). Each iteration killed a writing store
         without warning, reopened it and checked its acknowledged-commit ledger. The last one held
         176,678 acknowledged commits with 176,879 present — the 201 extra committed but never
         acknowledged, which is the allowed window. **Not one acknowledged commit was lost.** That is up
         from the 8 iterations this had ever run, but it is still not a week of nightlies.
-      - **Soak: 6h05m of 12, stopped deliberately.** It found a defect *in the workload* — an edge tally
-        built on `degreeOut + degreeIn`, which over-counts a self-loop — that made its own leak metric
-        meaningless (see [TESTING.md §1](TESTING.md)), so the run was stopped and the harness fixed rather
-        than left to produce a number nobody could trust. The engine itself was healthy throughout: storage
-        flat at ~4.6 MB, 5 segment files, heap ~9 MB, and `verify(FULL)` clean every 20 rounds for 962,000
-        rounds. **The 12-hour run still has to be performed on the fixed harness.**
+      - **Soak: run, and it is the first real one.** 10h04m, **1,635,100 rounds and about 818 million
+        operations**, stopped by hand rather than by the clock once it had run long enough to answer the
+        question. Zero exceptions, zero `verify(FULL)` violations across roughly 81,000 verifications —
+        one every 20 rounds, each preceded by `reclaim`, `compact` and `checkpoint`. **Nothing leaked**:
+        storage stayed inside 1.5 to 7.2 MB, segment files never exceeded 5, heap sat at about 9.7 MB, and
+        bytes per live element *fell* from 321 at settling to 266 at the end. The only log warnings were
+        four lines of JDK FFM boilerplate at startup.
+      - **Both defects the soak found were in the soak**, which is the honest headline: a 12-hour test
+        nobody had ever run for 12 hours had never had its own arithmetic checked.
+        - An edge tally built on `degreeOut + degreeIn`, which double-counts a self-loop. It crossed zero
+          at round 280,220 and reached -7,335, and since bytes-per-element divides by `nodes + edges` the
+          leak metric's denominator went with it. Fixed by subtracting the true incident count, and the
+          tally is now asserted against a real edge count at every sample.
+        - No restoring force on the node count. Creates and deletes are each 25 percent of the mix, so
+          above the target they cancel exactly and the live set performs an unbiased random walk: it
+          wandered from 4,000 to 20,549 and would have failed the closing bound on a healthy store. Fixed
+          with a band, and the bound is now checked at every sample instead of only at the end.
+        - Also corrected while in there: the explicit `deleteEdge` slice. The mix equilibrates near 0.4
+          edges per node, so a removal branch gated on the 20,000-edge ceiling never ran once in ten hours.
+      - **What the soak did not do is find an engine defect**, over 818 million operations against the
+        concurrent-writer write path. Two hours of the twelve remain unrun and are not worth the machine
+        time: the metric was flat for the last nine.
 - [~] **The manual power-loss test is written and untested.**
       [OPERATIONS.md §8](OPERATIONS.md#8-the-manual-power-loss-test) is a full procedure, down to
       checking whether the device's write cache is honest. Until it is performed, the assumption
@@ -923,25 +940,29 @@ trusting anything that depends on it, and skips when it does not. On ext4 or xfs
 
 ## 5. The Backlog, In The Order That Buys The Most
 
-1. **Run the long runs** (§4.9). Two commands, no new code, and they either confirm the leak and
-   fragmentation bounds or find something. Still the largest remaining gap, because it is the only one
-   that could still be hiding a correctness bug.
-2. **Verify page checksums on read** (§4.4). The field is already written; this is a read-path check
+1. **Verify page checksums on read** (§4.4). The field is already written; this is a read-path check
    and a test. Note that the cost lands on the hottest path in the engine — a node read by id is 21 ns
    — so it needs the same measure-then-default treatment the traversal prefetch got.
-3. **The manual power-loss test** (§4.9). `WalFaultTest` establishes that a device which lies about
+2. **The manual power-loss test** (§4.9). `WalFaultTest` establishes that a device which lies about
    writing defeats the log and that nothing in the format can tell. That is not a defect to fix; it is
    the reason the manual procedure exists, and it is still unperformed.
-4. **Collapse redundant retained versions** (§4.5). Measured: a view held across 60,000 commits
+3. **Collapse redundant retained versions** (§4.5). Measured: a view held across 60,000 commits
    retains 200.6 MiB in 990,899 entries, of which the reader needs 192 KiB. A page every commit
    touches collects one entry per commit when only the oldest can ever be needed. Worth doing, and
    deliberately not done in a hurry — the dedup rule has to be exactly right or a reader gets a
    silently wrong page, and the retention budget already bounds the damage.
-5. **Concurrent writers** (§4.5), if and only if they become a requirement. The largest piece of work
-   left in the plan, and the one that gates the group-commit throughput miss. It is a rewrite of the
-   write path, not an addition: page overlays resolve two writers on one page by last-writer-wins.
+4. **A nightly cadence** (§4.9). Both long runs have now been performed once — the soak for ten hours
+   and the `kill -9` loop for 200 iterations, neither finding an engine defect. What they have never
+   had is repetition on varied hardware, which is the same argument as attaching a CI runner and is
+   gated on the same missing thing.
 
 **Done and off this list**, each of which held the top slot in turn:
+
+- **The long runs** (§4.9) — held the top slot until 2026-08-19. Ten hours and 818 million operations
+  found nothing in the engine and two accounting defects in the harness itself.
+- **Concurrent writers** (§4.5) — described here for a long time as the largest piece of work left and
+  a rewrite of the write path. It was a rewrite of the write path, and it is built: see §4.5 and
+  [TRANSACTIONS.md](TRANSACTIONS.md).
 
 - **The crash matrix** (§4.9) — 2,394 fault cases, every property held, one engine defect found.
 - **The middle adjacency tier**. A block is now a run of 512 byte cells that doubles as the node
