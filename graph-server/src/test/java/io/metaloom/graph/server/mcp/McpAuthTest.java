@@ -190,6 +190,42 @@ public class McpAuthTest {
 		assertTrue(opened.get(10, TimeUnit.SECONDS).contains("graph_query"), "an authenticated websocket works");
 	}
 
+	/**
+	 * A websocket outlives many requests, so its session is re-checked at every message rather than at the upgrade.
+	 *
+	 * <p>
+	 * Otherwise a user disabled while their agent is connected keeps driving the port for as long as the socket stays
+	 * up, where on HTTP the very next request would have been refused.
+	 * </p>
+	 */
+	@Test
+	public void testADisabledUsersWebSocketStopsWorking() throws Exception {
+		java.util.concurrent.LinkedBlockingQueue<String> events = new java.util.concurrent.LinkedBlockingQueue<>();
+		java.util.concurrent.CompletableFuture<io.vertx.core.http.WebSocket> opened =
+			new java.util.concurrent.CompletableFuture<>();
+		vertx.createWebSocketClient()
+			.connect(new io.vertx.core.http.WebSocketConnectOptions()
+				.setHost("127.0.0.1").setPort(server.port()).setURI(McpConstants.WEBSOCKET_PATH)
+				.addHeader("Authorization", "Bearer " + tokenFor("reader", "reader-pw")))
+			.onSuccess(socket -> {
+				socket.textMessageHandler(events::add);
+				socket.closeHandler(ignored -> events.add("closed:" + socket.closeStatusCode()));
+				opened.complete(socket);
+			})
+			.onFailure(opened::completeExceptionally);
+		io.vertx.core.http.WebSocket socket = opened.get(10, TimeUnit.SECONDS);
+		String list = new JsonObject().put("jsonrpc", "2.0").put("id", 1).put("method", "tools/list").encode();
+
+		socket.writeTextMessage(list);
+		assertTrue(events.poll(10, TimeUnit.SECONDS).contains("graph_query"));
+
+		identities.setEnabled("reader", false);
+		socket.writeTextMessage(list);
+		String after = events.poll(10, TimeUnit.SECONDS);
+		assertFalse(after == null || after.contains("graph_query"),
+			"a disabled user's websocket still answered: " + after);
+	}
+
 	// ---------------------------------------------------------------- both enforcement points
 
 	/**
@@ -256,6 +292,54 @@ public class McpAuthTest {
 		JsonObject result = call(tokenFor("admin", "admin-pw"), "graph_query",
 			new JsonObject().put("query", "LOAD CSV FROM 'file:///x.csv' AS row RETURN row"));
 		assertTrue(result.getJsonObject("result").getBoolean("isError", false), result.encode());
+	}
+
+	// ---------------------------------------------------------------- the database a call names
+
+	/**
+	 * A tool is checked against the database it is about to touch, not the server's default.
+	 *
+	 * <p>
+	 * Every store tool takes a {@code database} argument. A check against the default would let a grant scoped to
+	 * {@code default} drop an index anywhere.
+	 * </p>
+	 */
+	@Test
+	public void testAToolCallIsCheckedAgainstTheDatabaseItNames() throws Exception {
+		databases.create("sales").createIndex("Person", "email");
+		identities.createRole("indexer");
+		identities.grantToRole("indexer", new Grant(Privilege.DROP_INDEX, GraphDatabases.DEFAULT_NAME));
+		identities.grantToRole("indexer", new Grant(Privilege.INTROSPECT, GraphDatabases.DEFAULT_NAME));
+		identities.createUser("indexer", "indexer-pw".toCharArray(), List.of("indexer"));
+		String indexer = tokenFor("indexer", "indexer-pw");
+
+		JsonObject drop = call(indexer, "graph_drop_index",
+			new JsonObject().put("label", "Person").put("key", "email").put("database", "sales"));
+		assertTrue(drop.getJsonObject("result").getBoolean("isError", false), drop.encode());
+		assertTrue(databases.database("sales").hasIndex("Person", "email"), "the index on 'sales' was dropped");
+
+		JsonObject schema = call(indexer, "graph_schema", new JsonObject().put("database", "sales"));
+		assertTrue(schema.getJsonObject("result").getBoolean("isError", false), schema.encode());
+
+		// And the grant still works where it was given.
+		JsonObject own = call(indexer, "graph_schema", new JsonObject());
+		assertFalse(own.getJsonObject("result").getBoolean("isError", false), own.encode());
+	}
+
+	/** {@code graph_list_databases} names only what the caller holds something on, as the HTTP route does. */
+	@Test
+	public void testListDatabasesOmitsWhatThePrincipalHoldsNothingOn() throws Exception {
+		databases.create("sales");
+		identities.createRole("local");
+		identities.grantToRole("local", new Grant(Privilege.MATCH, GraphDatabases.DEFAULT_NAME));
+		identities.createUser("local", "local-pw".toCharArray(), List.of("local"));
+
+		String listed = call(tokenFor("local", "local-pw"), "graph_list_databases", new JsonObject()).encode();
+		assertTrue(listed.contains(GraphDatabases.DEFAULT_NAME), listed);
+		assertFalse(listed.contains("sales"), "a database the caller holds nothing on was listed: " + listed);
+
+		String forAdmin = call(tokenFor("admin", "admin-pw"), "graph_list_databases", new JsonObject()).encode();
+		assertTrue(forAdmin.contains("sales"), forAdmin);
 	}
 
 	// ---------------------------------------------------------------- plumbing

@@ -167,7 +167,7 @@ public final class Compactor {
 				// way through calls flushChecksums(), which clears the dirty-page marks that writer has set,
 				// leaving its pages with stale checksums. Both were reproduced as an intermittent failure.
 				int[] punched = new int[1];
-				runner.runExclusive(() -> punched[0] = set.reclaim());
+				runner.runUnlogged(() -> punched[0] = set.reclaim());
 				result.pagesPunched += punched[0];
 			}
 		}
@@ -368,7 +368,7 @@ public final class Compactor {
 					}
 				}
 				remapVectorOwners(map);
-				remapPropertyPayloads(map);
+				remapPropertyPayloads(map, true);
 			}
 			case REL -> {
 				for (long blockId : adjacency.blockIds()) {
@@ -381,7 +381,7 @@ public final class Compactor {
 					properties.owner(rels.propBlockId(newId), newId);
 				}
 				remapVectorOwners(map);
-				remapPropertyPayloads(map);
+				remapPropertyPayloads(map, true);
 			}
 			case PROP -> {
 				for (long nodeId : sets.get(Kind.NODE).liveIds()) {
@@ -424,6 +424,17 @@ public final class Compactor {
 						adjacency.nextBlock(blockId, mapped);
 					}
 				}
+				// The walk above reaches a destination only through its predecessor, and skips sources: when two
+				// consecutive blocks of one chain moved in this batch, the first one's copy is never visited and would
+				// keep naming the second one's source, which the batch is about to free. Every destination is fixed
+				// here directly; one the walk already fixed maps to itself.
+				for (long destination : map.entries().values()) {
+					long next = adjacency.nextBlock(destination);
+					long mapped = map.mapId(next);
+					if (mapped != next) {
+						adjacency.nextBlock(destination, mapped);
+					}
+				}
 			}
 			case BLOB -> {
 				for (long extentId : sets.get(Kind.BLOB).liveIds()) {
@@ -436,16 +447,17 @@ public final class Compactor {
 						blobs.nextExtent(extentId, mapped);
 					}
 				}
-				remapPropertyPayloads(map);
+				remapPropertyPayloads(map, false);
 			}
 			case VEC -> {
-				// A vector record is reached from exactly one place, the payload of its owner's property block, so the
-				// payload sweep is the whole of it. The record's own back-pointer does not move — the owner did not.
+				// A vector record is reached from its owner's property block, from the ANN links of its neighbours and,
+				// for one record per index, from the catalog as the entry point. The record's own back-pointer does not
+				// move — the owner did not.
 				//
-				// The ANN links inside these records are deliberately NOT remapped here. Rewriting them would be a
-				// random write per link per moved record, and the structure they form is rebuildable by construction:
-				// the same argument that makes the B+trees a resetTrees() rather than a page-by-page fix-up.
-				remapPropertyPayloads(map);
+				// The links used to be left alone as "rebuildable", but nothing rebuilt them and a moved record keeps
+				// its linked flag, so every link to it named a freed slot and a moved entry point emptied the index.
+				remapPropertyPayloads(map, false);
+				remapVectorLinks(map);
 			}
 			default -> throw new IllegalArgumentException("Compaction does not relocate " + moved);
 		}
@@ -470,11 +482,75 @@ public final class Compactor {
 		}
 	}
 
-	/** Rewrites the ids embedded in every live property payload: blob escapes, vector records and element references. */
-	private void remapPropertyPayloads(ForwardingMap map) {
+	/**
+	 * Repoints every ANN link and entry point that names a vector record this batch moved.
+	 * <p>
+	 * One pass over the live records, as the other sweeps here are; a layer is written back only if one of its links
+	 * changed, so an index none of whose members moved costs reads only.
+	 */
+	private void remapVectorLinks(ForwardingMap map) {
+		if (vectors == null || !indexes.isInitialised()) {
+			return;
+		}
+		List<io.metaloom.graph.core.api.VectorIndexDefinition> declared = indexes.vectorIndexes();
+		if (declared.isEmpty()) {
+			return;
+		}
+		for (long vectorId : sets.get(Kind.VEC).liveIds()) {
+			if (map.isSource(vectorId)) {
+				continue;
+			}
+			int ord = vectors.indexOrdinal(vectorId);
+			if (ord < 0 || ord >= declared.size() || declared.get(ord) == null) {
+				continue;
+			}
+			int m = declared.get(ord).m();
+			int top = Math.min(vectors.topLevel(vectorId), vectors.maxLevel(m));
+			for (int level = 0; level <= top; level++) {
+				long[] links = vectors.links(vectorId, level, m);
+				boolean changed = false;
+				for (int i = 0; i < links.length; i++) {
+					long mapped = map.mapId(links[i]);
+					if (mapped != links[i]) {
+						links[i] = mapped;
+						changed = true;
+					}
+				}
+				if (changed) {
+					vectors.links(vectorId, level, m, links);
+				}
+			}
+		}
+		for (int ord = 0; ord < declared.size(); ord++) {
+			if (declared.get(ord) == null) {
+				continue;
+			}
+			long entry = indexes.vectorEntryPoint(ord);
+			long mapped = map.mapId(entry);
+			if (mapped != entry) {
+				indexes.vectorEntryPoint(ord, mapped, indexes.vectorMaxLevel(ord));
+			}
+		}
+	}
+
+	/**
+	 * Rewrites the ids embedded in every live property payload: blob escapes, vector records and element references.
+	 *
+	 * @param elementsMoved
+	 *            whether this batch moved nodes or relationships, which an element reference can name. Such a
+	 *            rewrite changes the property's <em>value</em>, and the property index is keyed on the value's hash,
+	 *            so an unmoved holder's entry has to be re-keyed. A moved holder is re-keyed by {@link #reindex}.
+	 */
+	private void remapPropertyPayloads(ForwardingMap map, boolean elementsMoved) throws IOException {
+		boolean reindexHolders = elementsMoved && indexes.isInitialised();
+		Set<Long> destinations = reindexHolders ? new HashSet<>(map.entries().values()) : Set.of();
 		for (long nodeId : sets.get(Kind.NODE).liveIds()) {
 			if (!map.isSource(nodeId)) {
-				properties.remapReferences(nodes.propBlockId(nodeId), map::mapId);
+				boolean changed = properties.remapReferences(nodes.propBlockId(nodeId), map::mapId);
+				if (changed && reindexHolders && !destinations.contains(nodeId)) {
+					Map<Integer, Object> after = properties.read(nodes.propBlockId(nodeId));
+					indexes.onPropertiesChanged(nodeId, nodes.labels(nodeId), unmapReferences(after, map), after);
+				}
 			}
 		}
 		for (long relId : sets.get(Kind.REL).liveIds()) {
@@ -482,6 +558,34 @@ public final class Compactor {
 				properties.remapReferences(rels.propBlockId(relId), map::mapId);
 			}
 		}
+	}
+
+	/**
+	 * The properties as they read before this batch's reference sweep: every element reference to a destination put
+	 * back to the source it was copied from. A destination slot was free before the batch, so no reference could
+	 * already have named it.
+	 */
+	private static Map<Integer, Object> unmapReferences(Map<Integer, Object> after, ForwardingMap map) {
+		Map<Long, Long> inverse = null;
+		Map<Integer, Object> before = after;
+		for (Map.Entry<Integer, Object> entry : after.entrySet()) {
+			if (entry.getValue() instanceof io.metaloom.graph.core.store.prop.ValueCodec.ElementRef ref) {
+				if (inverse == null) {
+					inverse = new java.util.HashMap<>();
+					for (Map.Entry<Long, Long> move : map.entries().entrySet()) {
+						inverse.put(move.getValue(), move.getKey());
+					}
+				}
+				Long source = inverse.get(ref.id());
+				if (source != null) {
+					if (before == after) {
+						before = new java.util.HashMap<>(after);
+					}
+					before.put(entry.getKey(), new io.metaloom.graph.core.store.prop.ValueCodec.ElementRef(source));
+				}
+			}
+		}
+		return before;
 	}
 
 	private void remapInlineEdges(long nodeId, ForwardingMap map, boolean materialised) {
@@ -560,7 +664,9 @@ public final class Compactor {
 			long newId = entry.getValue();
 			int[] labelIds = nodes.labels(newId);
 			Map<Integer, Object> props = properties.read(nodes.propBlockId(newId));
-			indexes.onNodeDeleted(entry.getKey(), labelIds, props);
+			// Removed under the values it was indexed with: the reference sweep has already rewritten any element
+			// reference this node holds, and removing by the new value would leave the old entry behind.
+			indexes.onNodeDeleted(entry.getKey(), labelIds, unmapReferences(props, map));
 			indexes.onNodeCreated(newId, labelIds, props);
 		}
 	}
@@ -620,7 +726,9 @@ public final class Compactor {
 			if (pages <= 0) {
 				return;
 			}
-			long entries = indexes.labelIndexSize() + indexes.propertyIndexSize();
+			// Composite trees live in the same pages, so their entries count too; leaving them out made a store with a
+			// declared composite look sparse and set off full rebuilds it did not need.
+			long entries = indexes.labelIndexSize() + indexes.propertyIndexSize() + indexes.compositeIndexSize();
 			fill[0] = (double) entries / (pages * indexes.tree().fanout());
 		});
 		return fill[0];

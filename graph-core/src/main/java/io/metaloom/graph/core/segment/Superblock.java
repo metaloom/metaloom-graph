@@ -288,11 +288,19 @@ public final class Superblock {
 	 *
 	 * <p>
 	 * They are Java fields rather than bytes in the mapping until a flush, so nothing else would undo the fold: the
-	 * overlay goes with the rollback, and these would stay moved. Order is live, free, flags, lastLsn, highWater.
+	 * overlay goes with the rollback, and these would stay moved. Order is live, free, flags, lastLsn.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>The high water mark is deliberately not part of it.</b> The fold never moves it; the bump allocator does,
+	 * under the allocation lock rather than the commit lock, so another writer can advance it while this commit is in
+	 * its fsync. Putting a captured value back would lower the mark beneath that writer's slot, and a scan bounded by
+	 * the mark would then miss its committed record. Rollback lowers it on its own terms, through
+	 * {@code SegmentSet.lowerHighWater}.
 	 * </p>
 	 */
 	public long[] captureCounters() {
-		return new long[] { liveCount, freeCount, flags, lastLsn, highWaterSlot };
+		return new long[] { liveCount, freeCount, flags, lastLsn };
 	}
 
 	public void restoreCounters(long[] captured) {
@@ -300,7 +308,6 @@ public final class Superblock {
 		this.freeCount = captured[1];
 		this.flags = captured[2];
 		this.lastLsn = captured[3];
-		this.highWaterSlot = captured[4];
 	}
 
 	/** Marks the header as owing a rewrite. The commit's journal fold uses it after folding a transaction's deltas. */

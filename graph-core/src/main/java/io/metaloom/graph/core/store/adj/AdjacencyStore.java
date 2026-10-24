@@ -51,14 +51,18 @@ public final class AdjacencyStore {
 	public static final int MIN_CELLS = 1;
 
 	/**
-	 * Upper bound on the length of any chain: every live block in the store.
+	 * Upper bound on the length of any chain: every block slot below the high water marks.
 	 * <p>
 	 * A chain is a linked list read out of pages, so a single corrupt {@code next} pointer can make it a ring. Every
 	 * walk is bounded, because "follow pointers until null" against untrusted data is a process that never returns.
 	 * The bound is computed once per walk rather than per hop, since it costs a scan of the segment headers.
+	 * <p>
+	 * Not the live count: a snapshot view walks a chain whose blocks a later commit may have freed, so the current
+	 * live count can be smaller than the chain the view is entitled to see. The high water mark never drops while a
+	 * view is open.
 	 */
 	long chainLimit() {
-		return segments.liveCount() + 1;
+		return segments.highWaterTotal() + 1;
 	}
 
 	long step(long nodeId, long blockId, long hops, long limit) {
@@ -240,13 +244,13 @@ public final class AdjacencyStore {
 	 * What the skip saves is the decode, counted as {@link io.metaloom.graph.core.api.IoStats#adjacencyBlocksSkipped}.
 	 * <p>
 	 * <b>This materialises the whole chain</b>, which is right for a caller that wants all of it and wrong for one
-	 * that may stop early. It is written as a drain of {@link #cursor(long, java.util.Set)} so that the walk and its
+	 * that may stop early. It is written as a drain of {@link #cursor(long, TypeFilter)} so that the walk and its
 	 * filters exist in one place.
 	 *
 	 * @param typeIds
 	 *            relationship type ids to admit, or null for every entry
 	 */
-	public long[] edges(long nodeId, java.util.Set<Integer> typeIds) {
+	public long[] edges(long nodeId, TypeFilter typeIds) {
 		EdgeCursor cursor = cursor(nodeId, typeIds);
 		long[] result = new long[16];
 		int written = 0;
@@ -263,7 +267,7 @@ public final class AdjacencyStore {
 	 * The same walk, streamed: entries arrive one at a time and a block is decoded only when the previous one has been
 	 * consumed.
 	 * <p>
-	 * {@link #edges(long, java.util.Set)} is a drain of this, which is the point — the chain walk and its two filter
+	 * {@link #edges(long, TypeFilter)} is a drain of this, which is the point — the chain walk and its two filter
 	 * levels exist once. Use this when the caller may stop early and the array form when it will not.
 	 * <p>
 	 * <b>The cursor does not hold a read view.</b> It reads pages lazily, across as many calls as the caller makes, so
@@ -273,7 +277,7 @@ public final class AdjacencyStore {
 	 * @param typeIds
 	 *            relationship type ids to admit, or null for every entry
 	 */
-	public EdgeCursor cursor(long nodeId, java.util.Set<Integer> typeIds) {
+	public EdgeCursor cursor(long nodeId, TypeFilter typeIds) {
 		int inline = nodes.inlineEdgeCount(nodeId);
 		long[] head = new long[inline];
 		for (int i = 0; i < inline; i++) {

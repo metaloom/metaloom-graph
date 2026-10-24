@@ -76,6 +76,7 @@ import io.metaloom.graph.core.segment.SegmentSet;
 import io.metaloom.graph.core.segment.Superblock;
 import io.metaloom.graph.core.store.adj.AdjacencyStore;
 import io.metaloom.graph.core.store.adj.PackedEdge;
+import io.metaloom.graph.core.store.adj.TypeFilter;
 import io.metaloom.graph.core.store.blob.BlobStore;
 import io.metaloom.graph.core.store.node.NodeStore;
 import io.metaloom.graph.core.store.prop.PropertyStore;
@@ -144,6 +145,19 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	private final ReentrantReadWriteLock writeGate = new ReentrantReadWriteLock();
 
 	/**
+	 * Takes {@link #writeGate} exclusively, refusing instead when this thread's own open transaction holds it shared.
+	 * A read hold cannot be upgraded, so the acquisition would wait for the caller forever — holding back every
+	 * {@code begin()} queued behind it.
+	 */
+	private void lockGateExclusively(String operation) {
+		if (writeGate.getReadHoldCount() > 0 && !writeGate.isWriteLockedByCurrentThread()) {
+			throw new GraphStoreException(operation + " cannot run inside a write transaction on the same thread;"
+				+ " commit or roll it back first");
+		}
+		writeGate.writeLock().lock();
+	}
+
+	/**
 	 * The commit point, and the only thing about a write transaction that is still serialised.
 	 *
 	 * <p>
@@ -209,6 +223,13 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	private final ThreadLocal<TransactionImpl> currentTransaction = new ThreadLocal<>();
 
 	/**
+	 * How many {@link ReadLease}s the calling thread holds. A commit waits for the apply latch exclusively and the
+	 * latch is not reentrant, so a commit on a thread that still holds a lease — a write inside a scan callback, a
+	 * commit with a cursor open — would wait for itself while holding the commit lock, and every writer behind it.
+	 */
+	private final ThreadLocal<int[]> heldLeases = ThreadLocal.withInitial(() -> new int[1]);
+
+	/**
 	 * The LSN of the newest commit whose pages are in the mapping, which is what a new read view is fixed at.
 	 * <p>
 	 * Written under the apply lock and read without it, so it is volatile. It is deliberately not {@code durableLsn}:
@@ -256,6 +277,9 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		this.adjacency = new AdjacencyStore(segmentSets.get(Kind.ADJ), nodes);
 		this.indexes = new IndexCatalog(segmentSets.get(Kind.INDEX), catalog);
 		this.hnsw = vectors == null ? null : new HnswIndex(vectors, indexes);
+		if (hnsw != null) {
+			properties.onVectorRelease(this::releaseVectorMember);
+		}
 
 		for (SegmentSet set : segmentSets.values()) {
 			set.writeContexts(contexts);
@@ -490,6 +514,12 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		WriteContext context = txn.context();
 		boolean committed = false;
 		try {
+			if (heldLeases.get()[0] > 0) {
+				// Inside the try, so the transaction is still ended — rolled back — and its gate hold released.
+				throw new GraphStoreException("Cannot commit while this thread holds an open cursor or is inside a scan"
+					+ " callback: the commit would wait for the thread's own read latch. Close the cursor, or collect"
+					+ " the ids and write after the scan. The transaction has been rolled back.");
+			}
 			commitLock.lock();
 			try {
 				// The data pages first, and validation before anything else is touched. Folding first and validating
@@ -516,6 +546,12 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 						if (batch.commitLsn() > appliedLsn) {
 							appliedLsn = batch.commitLsn();
 						}
+					} catch (RuntimeException | Error e) {
+						// Durable in the log, rolled back in memory below: the two now disagree, and a later commit
+						// reusing this transaction's slots would be replayed on top of it. No further commits until a
+						// reopen lets recovery settle it. A failure inside logCommit has already done the same.
+						wal.poison(e);
+						throw e;
 					} finally {
 						applyLock.unlockWrite(stamp);
 					}
@@ -1145,7 +1181,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			try {
 				T result = op.get();
 				if (applyLock.validate(stamp)) {
-					return result;
+					return stillAlive(snapshot, result);
 				}
 			} catch (Snapshot.NeedsExclusionException e) {
 				// A page has to be rebuilt for this view, and rebuilding reads the mapping and the version chains
@@ -1163,13 +1199,27 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			if (snapshot != null) {
 				snapshot.exclusionHeld(true);
 			}
-			return op.get();
+			return stillAlive(snapshot, op.get());
 		} finally {
 			if (snapshot != null) {
 				snapshot.exclusionHeld(false);
 			}
 			applyLock.unlockRead(readStamp);
 		}
+	}
+
+	/**
+	 * The result, provided the view it was read through is still alive. Checking once before the operation is not
+	 * enough: the retention budget can abandon a view mid-operation, and vacuum then deletes chains it needed without
+	 * taking the apply latch, so the optimistic validation does not notice and the pages read after that came from the
+	 * mapping — newer than the view. Vacuum raises the horizon before it removes anything, and the horizon only rises,
+	 * so a check afterwards catches every such read.
+	 */
+	private static <T> T stillAlive(Snapshot snapshot, T result) {
+		if (snapshot != null) {
+			snapshot.checkAlive();
+		}
+		return result;
 	}
 
 	@FunctionalInterface
@@ -1220,9 +1270,28 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 	@Override
 	public void runExclusive(MaintenanceRunner.Unit unit) throws IOException {
-		writeGate.writeLock().lock();
+		lockGateExclusively("A maintenance unit");
 		try {
+			// Every unit, not once per run: beginRead() does not take the gate, so a view can open between two batches,
+			// and the next one would relocate, free or unmap something that view is reading.
+			refuseWhileViewsAreOpen("compact()");
 			write(() -> {
+				unit.run();
+				return null;
+			});
+		} finally {
+			writeGate.writeLock().unlock();
+		}
+	}
+
+	@Override
+	public void runUnlogged(MaintenanceRunner.Unit unit) throws IOException {
+		lockGateExclusively("A maintenance unit");
+		try {
+			// Under the gate, and per unit rather than once per compaction: beginRead() does not take the gate, so a
+			// view can open at any point of a long run.
+			refuseWhileViewsAreOpen("compact()");
+			uninterruptible(() -> {
 				unit.run();
 				return null;
 			});
@@ -1273,6 +1342,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				this.snapshot = open.snapshot();
 				this.stamp = applyLock.readLock();
 				this.held = true;
+				heldLeases.get()[0]++;
 				this.snapshot.exclusionHeld(true);
 				return;
 			}
@@ -1283,6 +1353,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			this.snapshot = current;
 			this.stamp = applyLock.readLock();
 			this.held = true;
+			heldLeases.get()[0]++;
 			if (snapshot != null) {
 				snapshot.exclusionHeld(true);
 			}
@@ -1296,6 +1367,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			// Cleared first: a cursor may be closed twice, and unlocking a stamp twice corrupts the lock rather than
 			// throwing.
 			held = false;
+			heldLeases.get()[0]--;
 			if (snapshot != null) {
 				snapshot.exclusionHeld(false);
 			}
@@ -1500,22 +1572,55 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	}
 
 	/**
+	 * Runs a declaration — an index or constraint created or dropped — with every other writer excluded.
+	 *
+	 * <p>
+	 * A declaration and an ordinary write meet nowhere on disk. The declaring scan reads its own snapshot, which cannot
+	 * hold a concurrent writer's uncommitted node; that writer's maintenance hook reads the declaration lists as of
+	 * <em>its</em> snapshot, which cannot hold the declaration. The two write disjoint bytes, so conflict detection has
+	 * nothing to find and both commit: an index that permanently misses a node, or a unique constraint declared over a
+	 * duplicate. Holding the write gate exclusively waits out every open write transaction before the scan and keeps new
+	 * ones out until the declaration has committed, so each writer is wholly before it or wholly after. Declarations
+	 * are rare, and a vector index's build — the long part — runs after the gate is released.
+	 * </p>
+	 *
+	 * <p>
+	 * <b>Inside the caller's own transaction it cannot do that</b>: the caller already holds the gate shared, and a
+	 * read-write lock does not upgrade. It joins that transaction, as every other mutation does, and is isolated only
+	 * as well as the transaction is — which against concurrent writers is not at all. Declare outside a transaction
+	 * when other writers are running.
+	 * </p>
+	 */
+	private <T> T declare(WriteOp<T> op) throws IOException {
+		checkOpen();
+		if (currentTransaction.get() != null) {
+			return write(op);
+		}
+		writeGate.writeLock().lock();
+		try {
+			return write(op);
+		} finally {
+			writeGate.writeLock().unlock();
+		}
+	}
+
+	/**
 	 * Declares a property key unique across live nodes.
 	 * <p>
 	 * Checks the existing data first and refuses rather than declaring something that is already false.
 	 */
 	@Override
 	public void createUniqueConstraint(String key) throws IOException {
-		write(() -> {
+		declare(() -> {
 			int keyId = catalog.internKey(key);
-			Map<Object, Long> seen = new java.util.HashMap<>();
+			// Keyed the way the index compares, or a vector — a fresh array on every read — never meets its twin.
+			Map<IndexCatalog.ValueKey, Long> seen = new java.util.HashMap<>();
 			for (long nodeId : segmentSets.get(Kind.NODE).liveIds()) {
 				Object value = properties.read(nodes.propBlockId(nodeId), keyId);
 				if (value == null) {
 					continue;
 				}
-				Object normalised = value instanceof byte[] bytes ? java.util.Arrays.toString(bytes) : value;
-				Long previous = seen.put(normalised, nodeId);
+				Long previous = seen.put(new IndexCatalog.ValueKey(value), nodeId);
 				if (previous != null) {
 					throw new ConstraintViolationException(key, value, previous);
 				}
@@ -1541,7 +1646,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 	@Override
 	public void createIndex(String label, String key) throws IOException {
-		write(() -> {
+		declare(() -> {
 			int labelId = catalog.internLabel(label);
 			int keyId = catalog.internKey(key);
 			if (indexes.addCompositeIndex(labelId, keyId, false)) {
@@ -1559,10 +1664,11 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	 */
 	@Override
 	public void createUniqueConstraint(String label, String key) throws IOException {
-		write(() -> {
+		declare(() -> {
 			int labelId = catalog.internLabel(label);
 			int keyId = catalog.internKey(key);
-			Map<Object, Long> seen = new java.util.HashMap<>();
+			// Keyed the way the index compares, or a vector — a fresh array on every read — never meets its twin.
+			Map<IndexCatalog.ValueKey, Long> seen = new java.util.HashMap<>();
 			for (long nodeId : segmentSets.get(Kind.NODE).liveIds()) {
 				if (!nodes.hasLabel(nodeId, labelId)) {
 					continue;
@@ -1571,8 +1677,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				if (value == null) {
 					continue;
 				}
-				Object normalised = value instanceof byte[] bytes ? java.util.Arrays.toString(bytes) : value;
-				Long previous = seen.put(normalised, nodeId);
+				Long previous = seen.put(new IndexCatalog.ValueKey(value), nodeId);
 				if (previous != null) {
 					throw new ConstraintViolationException(label, key, value, previous);
 				}
@@ -1617,7 +1722,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	 */
 	@Override
 	public void dropIndex(String label, String key) throws IOException {
-		write(() -> {
+		declare(() -> {
 			int labelId = catalog.lookupLabel(label);
 			int keyId = catalog.lookupKey(key);
 			if (labelId == 0 || keyId == 0 || !indexes.hasComposite(labelId, keyId)) {
@@ -1792,7 +1897,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			throw new IllegalArgumentException("This store holds vectors of " + vectors.dimensions()
 				+ " dimensions, so an index over " + definition.dimensions() + " cannot be built on it");
 		}
-		write(() -> {
+		declare(() -> {
 			int labelId = catalog.internLabel(definition.label());
 			int keyId = catalog.internKey(definition.key());
 			int modelId = definition.model().isEmpty() ? 0 : catalog.internKey("vector.model:" + definition.model());
@@ -2035,9 +2140,25 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		}
 	}
 
+	/**
+	 * Takes a vector record out of its index as its slot is freed. Only the entry point needs repair — stale links from
+	 * neighbours fail the liveness check a search already makes — but a freed entry point leaves nowhere to start.
+	 */
+	private void releaseVectorMember(long vectorId) {
+		int held = vectors.indexOrdinal(vectorId);
+		if (held < 0) {
+			return;
+		}
+		List<VectorIndexDefinition> declared = indexes.vectorIndexes();
+		VectorIndexDefinition leaving = held < declared.size() ? declared.get(held) : null;
+		if (leaving != null) {
+			hnsw.remove(held, leaving, vectorId);
+		}
+	}
+
 	@Override
 	public void dropVectorIndex(String label, String key) throws IOException {
-		write(() -> {
+		declare(() -> {
 			int ord = indexes.vectorIndexOrdinal(label, key);
 			if (ord < 0) {
 				throw new IllegalArgumentException("No vector index on :" + label + "." + key);
@@ -2190,7 +2311,9 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				if (PackedEdge.isMaterialised(edge)) {
 					long relId = liveRelationshipId(PackedEdge.relationshipId(edge));
 					if (!ElementId.isNull(relId)) {
-						deleteRelationshipInternal(relId);
+						// Only the far end's entry: this node's chain is freed wholesale below, and removing its entries
+						// one by one re-encoded its block once per relationship.
+						deleteRelationshipInternal(relId, nodeId);
 					}
 				} else {
 					long neighbour = liveNodeId(PackedEdge.neighbourId(edge));
@@ -2234,6 +2357,12 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			requireNode(fromId);
 			requireNode(toId);
 			int typeId = catalog.internEdgeType(type);
+			if (!Catalog.packable(typeId)) {
+				// A type id beyond the 14 bit field cannot be a lightweight entry, so the edge escalates to a
+				// materialised relationship, whose entry simply does not cache the type (RELATIONSHIP_STORAGE.md §3).
+				createRelationshipInternal(fromId, typeId, toId, null);
+				return null;
+			}
 			// Both endpoints are always updated. Linking only one side is what made the proof of concept incapable of
 			// traversing backwards.
 			adjacency.add(fromId, PackedEdge.ofNeighbour(PackedEdge.DIR_OUT, typeId, toId));
@@ -2251,6 +2380,9 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			if (typeId == 0) {
 				return false;
 			}
+			if (!Catalog.packable(typeId)) {
+				return deleteEscalatedEdge(fromId, typeId, toId);
+			}
 			if (!adjacency.remove(fromId, PackedEdge.ofNeighbour(PackedEdge.DIR_OUT, typeId, toId))) {
 				return false;
 			}
@@ -2266,30 +2398,52 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		return createRelationship(fromId, type, toId, null);
 	}
 
+	/**
+	 * Removes one edge that {@link #createEdge} had to escalate: a relationship of this type from {@code fromId} to
+	 * {@code toId}. Any one of them satisfies the request, exactly as with two identical lightweight entries.
+	 */
+	private boolean deleteEscalatedEdge(long fromId, int typeId, long toId) throws IOException {
+		for (long edge : adjacency.edges(fromId)) {
+			if (!PackedEdge.isMaterialised(edge)) {
+				continue;
+			}
+			long relId = liveRelationshipId(PackedEdge.relationshipId(edge));
+			if (!ElementId.isNull(relId) && rels.typeId(relId) == typeId && rels.fromId(relId) == fromId
+				&& rels.toId(relId) == toId) {
+				deleteRelationshipInternal(relId);
+				return true;
+			}
+		}
+		return false;
+	}
+
 	@Override
 	public long createRelationship(long fromId, String type, long toId, Properties props) throws IOException {
 		return write(() -> {
 			requireNode(fromId);
 			requireNode(toId);
-			int typeId = catalog.internEdgeType(type);
-			long relId = rels.create(fromId, typeId, toId, ElementId.NULL);
-			if (props != null && !props.isEmpty()) {
-				rels.propBlockId(relId, properties.store(toKeyIds(props), relId));
-			}
-			// The entry caches the type, which is what lets a type-filtered traversal skip it without the random read
-			// its record costs. Direction is not cacheable — see PackedEdge.
-			long entry = PackedEdge.ofRelationship(relId, typeId);
-			adjacency.add(fromId, entry);
-			if (toId != fromId) {
-				// A materialised entry carries no direction of its own — it is resolved from the relationship's
-				// endpoints — so the two copies of a self-loop would be byte-identical and both would read as
-				// outgoing. A self-loop therefore gets one entry, and the traversal expands it into both directions.
-				adjacency.add(toId, entry);
-			}
-			nodes.degreeDelta(fromId, 1, 0);
-			nodes.degreeDelta(toId, 0, 1);
-			return relId;
+			return createRelationshipInternal(fromId, catalog.internEdgeType(type), toId, props);
 		});
+	}
+
+	private long createRelationshipInternal(long fromId, int typeId, long toId, Properties props) throws IOException {
+		long relId = rels.create(fromId, typeId, toId, ElementId.NULL);
+		if (props != null && !props.isEmpty()) {
+			rels.propBlockId(relId, properties.store(toKeyIds(props), relId));
+		}
+		// The entry caches the type, which is what lets a type-filtered traversal skip it without the random read
+		// its record costs. Direction is not cacheable — see PackedEdge. A type beyond 14 bits is not cached at all.
+		long entry = PackedEdge.ofRelationship(relId, typeId);
+		adjacency.add(fromId, entry);
+		if (toId != fromId) {
+			// A materialised entry carries no direction of its own — it is resolved from the relationship's
+			// endpoints — so the two copies of a self-loop would be byte-identical and both would read as
+			// outgoing. A self-loop therefore gets one entry, and the traversal expands it into both directions.
+			adjacency.add(toId, entry);
+		}
+		nodes.degreeDelta(fromId, 1, 0);
+		nodes.degreeDelta(toId, 0, 1);
+		return relId;
 	}
 
 	@Override
@@ -2336,16 +2490,25 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	}
 
 	private void deleteRelationshipInternal(long relationshipId) throws IOException {
+		deleteRelationshipInternal(relationshipId, ElementId.NULL);
+	}
+
+	/**
+	 * @param dyingNodeId
+	 *            an endpoint that is itself being deleted, whose adjacency and degrees are therefore left alone, or
+	 *            {@link ElementId#NULL}
+	 */
+	private void deleteRelationshipInternal(long relationshipId, long dyingNodeId) throws IOException {
 		long fromId = rels.fromId(relationshipId);
 		long toId = rels.toId(relationshipId);
 		// Matched by the relationship it names rather than by its whole packed value: the type field of a materialised
 		// entry is a cache, and a store written before the cache existed holds zero there where a fresh one holds the
 		// type. Matching on the exact bits would leave those entries behind as dangling adjacency.
-		if (nodes.exists(fromId)) {
+		if (fromId != dyingNodeId && nodes.exists(fromId)) {
 			adjacency.removeMaterialised(fromId, relationshipId);
 			nodes.degreeDelta(fromId, -1, 0);
 		}
-		if (nodes.exists(toId)) {
+		if (toId != dyingNodeId && nodes.exists(toId)) {
 			if (toId != fromId) {
 				adjacency.removeMaterialised(toId, relationshipId);
 			}
@@ -2418,7 +2581,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 		private final long nodeId;
 		private final Direction direction;
-		private final Set<Integer> typeIds;
+		private final TypeFilter typeIds;
 		private final ReadLease lease;
 		private final io.metaloom.graph.core.store.adj.EdgeCursor entries;
 		private final List<Edge> pending = new ArrayList<>(2);
@@ -2426,7 +2589,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		private int index;
 		private Edge current;
 
-		NeighbourWalk(long nodeId, Direction direction, Set<Integer> typeIds, ReadLease lease) {
+		NeighbourWalk(long nodeId, Direction direction, TypeFilter typeIds, ReadLease lease) {
 			this.nodeId = nodeId;
 			this.direction = direction;
 			this.typeIds = typeIds;
@@ -2502,12 +2665,16 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	public List<Edge> traverse(long startNodeId, Direction direction, Set<String> types, int maxDepth) {
 		return read(() -> {
 			requireNode(startNodeId);
-			Set<Integer> typeIds = resolveTypes(types);
+			TypeFilter typeIds = resolveTypes(types);
 			List<Edge> result = new ArrayList<>();
 			Set<Long> visited = new HashSet<>();
 			visited.add(startNodeId);
 			Deque<long[]> queue = new ArrayDeque<>();
-			queue.add(new long[] { startNodeId, 0 });
+			// Entries are {id, depth, sequence}: the sequence is the order of enqueueing, which is what lets the
+			// prefetch below advise each id once instead of re-advising the whole window on every step.
+			queue.add(new long[] { startNodeId, 0, 0 });
+			long enqueued = 1;
+			long advisedBelow = 1;
 			// The frontier is the one thing a breadth-first walk knows in advance, so it is the one place a mapped data
 			// path can get more than one read in flight: naming the pages of the nodes queued behind this one lets the
 			// kernel fetch them while this level is still being decoded.
@@ -2527,12 +2694,18 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 					continue;
 				}
 				if (frontier != null) {
+					// Only the ids newly inside the window. Re-advising all of it on every step cost one madvise per
+					// queued id per visited node — about sixty-three of every sixty-four of them already advised.
+					long windowEnd = current[2] + 1 + frontier.length;
 					int ahead = 0;
 					for (long[] queued : queue) {
-						if (ahead == frontier.length) {
+						if (queued[2] >= windowEnd) {
 							break;
 						}
-						frontier[ahead++] = queued[0];
+						if (queued[2] >= advisedBelow) {
+							frontier[ahead++] = queued[0];
+							advisedBelow = queued[2] + 1;
+						}
 					}
 					if (ahead > 0) {
 						nodes.segments().prefetch(frontier, ahead);
@@ -2544,7 +2717,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 					for (int i = before; i < result.size(); i++) {
 						long neighbour = result.get(i).neighbourId();
 						if (visited.add(neighbour)) {
-							queue.add(new long[] { neighbour, depth + 1 });
+							queue.add(new long[] { neighbour, depth + 1, enqueued++ });
 						}
 					}
 				}
@@ -2675,7 +2848,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	 * <em>surviving candidate</em> rather than per entry. An entry that caches no type still falls through to the
 	 * record, which is what every entry of an older store does.
 	 */
-	private void materialise(long fromNodeId, long packed, Direction direction, Set<Integer> typeIds,
+	private void materialise(long fromNodeId, long packed, Direction direction, TypeFilter typeIds,
 		List<Edge> out) {
 		if (PackedEdge.excludedByType(packed, typeIds)) {
 			return;
@@ -2686,13 +2859,14 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				return;
 			}
 			// Still checked against the record: an entry that cached no type has not been filtered yet, and one that
-			// did is being confirmed against the authority its cache stands in for.
-			int typeId = rels.typeId(relId);
-			if (typeIds != null && !typeIds.contains(typeId)) {
+			// did is being confirmed against the authority its cache stands in for. One resolve for all three fields.
+			java.lang.foreign.MemorySegment rel = rels.view(relId);
+			int typeId = RelStore.typeId(rel);
+			if (typeIds != null && !typeIds.admits(typeId)) {
 				return;
 			}
-			long relFrom = rels.fromId(relId);
-			long relTo = rels.toId(relId);
+			long relFrom = RelStore.fromId(rel);
+			long relTo = RelStore.toId(rel);
 			if (relFrom == relTo) {
 				// One stored entry, two edges: the node is both endpoints, so it has an outgoing and an incoming
 				// edge and the direction filter has to be applied to each of them separately.
@@ -2739,18 +2913,19 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		return gen == 0 ? ElementId.NULL : ElementId.withGen(idWithoutGen, gen);
 	}
 
-	private Set<Integer> resolveTypes(Set<String> types) {
+	/** Resolved once per query into a bitset, so the per-entry test boxes and hashes nothing. */
+	private TypeFilter resolveTypes(Set<String> types) {
 		if (types == null || types.isEmpty()) {
 			return null;
 		}
-		Set<Integer> ids = new HashSet<>();
+		List<Integer> ids = new ArrayList<>(types.size());
 		for (String type : types) {
 			int id = catalog.lookupLabel(type);
 			if (id != 0) {
 				ids.add(id);
 			}
 		}
-		return ids;
+		return TypeFilter.of(ids);
 	}
 
 	private void requireNode(long nodeId) {
@@ -2789,7 +2964,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		checkOpen();
 		// Exclusive: a checkpoint forces every data file and trims the log, and a commit landing in the middle of that
 		// would be durable in the mapping and gone from the log at once.
-		writeGate.writeLock().lock();
+		lockGateExclusively("checkpoint()");
 		long started = System.nanoTime();
 		try {
 			// Same reason as commit(): an interrupt reaching the channel closes it for everybody.
@@ -2843,7 +3018,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	@Override
 	public int reclaim() throws IOException {
 		checkOpen();
-		writeGate.writeLock().lock();
+		lockGateExclusively("reclaim()");
 		try {
 			// Under the gate rather than before it: with concurrent writers, checking first and taking the lock second
 			// leaves a window in which a view opens in between, which is exactly the case the refusal exists for.
@@ -2941,7 +3116,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	@Override
 	public void verify(VerifyLevel level, VerifyOptions options) {
 		checkOpen();
-		writeGate.writeLock().lock();
+		lockGateExclusively("verify()");
 		try {
 			// Reentrant: a caller verifying from inside its own maintenance scope still holds it, and must not have it
 			// released underneath by the throttling pacer.
@@ -2953,6 +3128,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				}
 				if (level == VerifyLevel.FULL) {
 					List<String> violations = new InvariantChecker(nodes, rels, adjacency, properties, blobs, vectors, segmentSets)
+						.withIndexes(indexes)
 						.check(options, pacer(options, stamp, ownsWriterLock));
 					if (!violations.isEmpty()) {
 						throw new GraphStoreException("Structural invariants violated (" + violations.size()
@@ -3163,9 +3339,15 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		}
 		// The writer lock, so close can never run beside a transaction that is half applied. A commit copies its pages
 		// into the mapping under the apply lock and then reclaims; unmapping a segment part way through that is not a
-		// recoverable state, it is a segfault. Taking the lock waits for the in-flight write instead — and because the
-		// lock is reentrant, a caller closing from inside its own transaction is not deadlocked by this, it simply
-		// closes a store whose transaction is about to be rolled back by the overlay being discarded.
+		// recoverable state, it is a segfault. Taking the lock waits for the in-flight write instead.
+		//
+		// A caller closing from inside its own transaction holds the gate shared, and a read hold does not upgrade:
+		// the acquisition used to wait for the caller forever. That transaction cannot commit after the store is gone,
+		// so it is rolled back first, which releases the hold.
+		TransactionImpl open = currentTransaction.get();
+		if (open != null) {
+			open.rollback();
+		}
 		writeGate.writeLock().lock();
 		try {
 			// A store being closed on an interrupted thread — the shutdownNow() case — must still be able to write its
@@ -3192,6 +3374,9 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			catalog.force();
 			long lsn = wal.checkpoint();
 			manifest.checkpoint(lsn, lsn, nextTxnId.get());
+			// Durable before the trim, as in checkpoint(): a kill between the two would otherwise leave a manifest
+			// naming a checkpoint whose log segment had already been deleted.
+			manifest.force();
 			wal.trim(lsn);
 		} catch (IOException e) {
 			first = e;

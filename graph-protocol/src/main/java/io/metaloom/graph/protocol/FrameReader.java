@@ -1,6 +1,7 @@
 package io.metaloom.graph.protocol;
 
 import java.util.function.Consumer;
+import java.util.function.IntSupplier;
 
 import io.vertx.core.Handler;
 import io.vertx.core.buffer.Buffer;
@@ -47,6 +48,19 @@ public final class FrameReader {
 	 *            it differently.
 	 */
 	public static void attach(ReadStream<Buffer> stream, FrameHandler handler, Consumer<WireFormatException> onMalformed) {
+		attach(stream, handler, onMalformed, () -> Frames.MAX_FRAME_BYTES);
+	}
+
+	/**
+	 * As {@link #attach(ReadStream, FrameHandler, Consumer)}, with a ceiling the caller may lower per frame.
+	 *
+	 * @param maxLength
+	 *            consulted at every header, so it can follow the connection's state. The server holds it far below
+	 *            {@link Frames#MAX_FRAME_BYTES} until the handshake is done, so a peer that has presented nothing cannot
+	 *            make it buffer sixteen megabytes. Never above {@link Frames#MAX_FRAME_BYTES}, which is checked first
+	 */
+	public static void attach(ReadStream<Buffer> stream, FrameHandler handler, Consumer<WireFormatException> onMalformed,
+		IntSupplier maxLength) {
 		RecordParser parser = RecordParser.newFixed(Frames.HEADER_BYTES);
 		parser.handler(new Handler<>() {
 
@@ -85,6 +99,11 @@ public final class FrameReader {
 				// Before fixedSizeMode, not after. Telling the parser to wait for a length nobody has checked is the
 				// whole of the unvalidated-length-field defect, wearing a framework's name.
 				Frames.checkLength(length);
+				int ceiling = maxLength.getAsInt();
+				if (length > ceiling) {
+					throw new WireFormatException("A frame of " + length + " bytes is over the " + ceiling
+						+ "-byte limit this connection allows now");
+				}
 				if (length == 0) {
 					handler.frame(type, streamId, Buffer.buffer(0));
 					return;

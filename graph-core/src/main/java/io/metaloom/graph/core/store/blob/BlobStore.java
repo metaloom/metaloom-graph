@@ -136,8 +136,9 @@ public final class BlobStore {
 		// The length is read out of a page and is therefore untrusted. Bounding it by Integer.MAX_VALUE is not
 		// enough: a flipped byte would then have the reader allocate two gigabytes before discovering the chain is
 		// four pages long, which is a way to be told how much heap the process has. The real bound is how much the
-		// store's live blob extents could possibly hold.
-		long ceiling = (long) payloadPerExtent * Math.max(1, segments.liveCount());
+		// store's blob extents could possibly hold — counted by high water mark, not by live count: a snapshot view
+		// still reads extents a later commit freed, and the high water mark is what never drops under an open view.
+		long ceiling = (long) payloadPerExtent * Math.max(1, segments.highWaterTotal());
 		if (totalLength < 0 || totalLength > Math.min(Integer.MAX_VALUE, ceiling)) {
 			throw new PageCorruptException("Blob " + ElementId.toString(blobId) + " reports length " + totalLength
 				+ ", which is beyond the " + ceiling + " bytes its store could hold");
@@ -191,7 +192,7 @@ public final class BlobStore {
 						+ " claims lz4 compression but holds only " + stored.length + " bytes");
 				}
 				long originalLength = MemorySegment.ofArray(stored).get(Layouts.LONG, 0);
-				long ceiling = (long) payloadPerExtent * Math.max(1, segments.liveCount()) * 255L;
+				long ceiling = (long) payloadPerExtent * Math.max(1, segments.highWaterTotal()) * 255L;
 				if (originalLength < 0 || originalLength > Math.min(Integer.MAX_VALUE, ceiling)) {
 					throw new PageCorruptException("Blob " + ElementId.toString(blobId)
 						+ " declares an uncompressed length of " + originalLength + ", which is not plausible");

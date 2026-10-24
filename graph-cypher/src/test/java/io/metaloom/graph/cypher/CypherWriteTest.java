@@ -441,6 +441,75 @@ public class CypherWriteTest {
 		verify();
 	}
 
+	/**
+	 * The second row names a relationship the first row's cascade already removed. Deleting it again would free an id
+	 * twice, which the store does not catch and {@code verify(FULL)} does.
+	 */
+	@Test
+	public void testDetachDeleteOfARelationshipTheCascadeAlreadyTook() throws Exception {
+		try (Transaction txn = store.begin()) {
+			long a = store.createNode("A");
+			store.createRelationship(a, "R", store.createNode("B"), Properties.of());
+			store.createRelationship(a, "R", store.createNode("B"), Properties.of());
+			txn.commit();
+		}
+
+		CypherResult result = run("MATCH (a:A)-[r]->() DETACH DELETE a, r");
+
+		assertEquals(1, result.stats().nodesDeleted());
+		assertEquals(2, result.stats().relationshipsDeleted(), "each relationship once, whichever path removed it");
+		assertEquals(2, store.nodesByLabel("B").size());
+		verify();
+	}
+
+	@Test
+	public void testDetachDeleteCountsASelfRelationshipOnce() throws Exception {
+		run("CREATE (n:Loop)-[:SELF]->(n)");
+
+		CypherResult result = run("MATCH (n:Loop) DETACH DELETE n");
+
+		assertEquals(1, result.stats().nodesDeleted());
+		assertEquals(1, result.stats().relationshipsDeleted(), "it is one relationship, seen from both of its ends");
+		verify();
+	}
+
+	/** Each row reads what the rows before it wrote, or three increments of one counter would leave it at one. */
+	@Test
+	public void testSetReadsWhatEarlierRowsOfTheSameClauseWrote() throws Exception {
+		run("CREATE (p:Page {views: 0}) WITH p UNWIND range(1, 3) AS i CREATE (:User)-[:VIEWED]->(p)");
+
+		CypherResult result = run("MATCH (:User)-[:VIEWED]->(p:Page) SET p.views = p.views + 1 "
+			+ "RETURN DISTINCT p.views AS views");
+
+		assertEquals(List.of(3L), result.column("views"));
+		assertEquals(3L, store.nodeProperty(store.nodesByLabel("Page").get(0), "views"));
+		verify();
+	}
+
+	@Test
+	public void testPlusEqualsANullRemovesTheKey() throws Exception {
+		CypherResult result = run("MATCH (n:Person {name: 'Alice'}) SET n += {age: null, city: 'Bonn'}");
+
+		assertEquals(2, result.stats().propertiesSet(), "one removed, one added");
+		assertNull(store.nodeProperty(alice, "age"), "a null in += removes the key, as SET n.age = null does");
+		assertEquals("Bonn", store.nodeProperty(alice, "city"));
+		verify();
+	}
+
+	/** A JSON body decodes small numbers as Integer, and a caller's Map.of does the same. */
+	@Test
+	public void testIntegerAndFloatParametersAreWritable() throws Exception {
+		run("CREATE (n:Typed {age: $age, weight: $weight, scores: $scores, nested: $nested.inner})",
+			Map.of("age", 30, "weight", 1.5f, "scores", List.of(1, (short) 2), "nested", Map.of("inner", (byte) 7)));
+
+		long id = store.nodesByLabel("Typed").get(0);
+		assertEquals(30L, store.nodeProperty(id, "age"));
+		assertEquals(1.5d, store.nodeProperty(id, "weight"));
+		assertEquals(List.of(1L, 2L), store.nodeProperty(id, "scores"));
+		assertEquals(7L, store.nodeProperty(id, "nested"));
+		verify();
+	}
+
 	// ---------------------------------------------------------------- reads still work
 
 	@Test

@@ -185,6 +185,19 @@ public final class AuthStore implements AutoCloseable {
 	}
 
 	/**
+	 * Everything a user holds, directly or through a role, <b>whether or not they are enabled</b>.
+	 *
+	 * <p>
+	 * For an administrator deciding whether an edit to that user would hand the caller more than they hold. Unlike
+	 * {@link #principal} it does not hide a disabled user: a disabled administrator is one re-enable away from being
+	 * an administrator again. Empty for a user that does not exist.
+	 * </p>
+	 */
+	public List<Grant> effectiveGrants(String name) {
+		return image.effectiveGrants(name);
+	}
+
+	/**
 	 * Verifies a password.
 	 *
 	 * <p>

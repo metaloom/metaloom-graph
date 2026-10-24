@@ -49,7 +49,17 @@ public final class FaultInjectingIoEngine implements IoEngine {
 		/** The write succeeds, and the fsync that was supposed to make it durable does not. */
 		FAIL_FSYNC,
 		/** The device is full. */
-		ENOSPC
+		ENOSPC,
+		/**
+		 * Only the one write at {@code failFrom} fails; the device is honest before and after. The shape of a transient
+		 * error, which is what tempts a writer into carrying on.
+		 */
+		FAIL_WRITE_ONCE,
+		/**
+		 * Only the one fsync at {@code failFrom} fails. On Linux a failed writeback is reported once and then cleared,
+		 * so the next fsync succeeding is the realistic case rather than the lucky one.
+		 */
+		FAIL_FSYNC_ONCE
 	}
 
 	private final IoEngine delegate;
@@ -132,6 +142,12 @@ public final class FaultInjectingIoEngine implements IoEngine {
 			return switch (fault) {
 				case FAIL_WRITE -> throw new IOException("injected write failure at operation " + index);
 				case ENOSPC -> throw new IOException("injected ENOSPC at operation " + index);
+				case FAIL_WRITE_ONCE -> {
+					if (index == failFrom) {
+						throw new IOException("injected write failure at operation " + index);
+					}
+					yield handle.write(buffer, length, offset);
+				}
 				// Reports the full length while writing nothing, which is what a lying cache does.
 				case LOSE_WRITE -> length;
 				case TEAR_WRITE -> {
@@ -154,7 +170,7 @@ public final class FaultInjectingIoEngine implements IoEngine {
 		@Override
 		public void force() throws IOException {
 			int index = forces.getAndIncrement();
-			if (index >= failFrom && fault == Fault.FAIL_FSYNC) {
+			if (index >= failFrom && fault == Fault.FAIL_FSYNC || index == failFrom && fault == Fault.FAIL_FSYNC_ONCE) {
 				throw new IOException("injected fsync failure at force " + index);
 			}
 			handle.force();

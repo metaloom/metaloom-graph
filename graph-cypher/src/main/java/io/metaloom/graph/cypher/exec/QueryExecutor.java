@@ -3,7 +3,6 @@ package io.metaloom.graph.cypher.exec;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -366,7 +365,7 @@ public final class QueryExecutor {
 		RowConsumer next = downstream -> push(clauses, index + 1, downstream, stages, out);
 
 		return switch (clauses.get(index)) {
-			case Ast.Match match -> matcher.match(match.pattern(), row,
+			case Ast.Match match -> matcher.match(match.pattern(), match.where(), row,
 				matched -> !keeps(matched, match.where()) || next.accept(matched));
 			case Ast.Unwind unwind -> {
 				Object value = evaluator.evaluate(unwind.expression(), row);
@@ -512,13 +511,12 @@ public final class QueryExecutor {
 			return false;
 		}
 
+		// The projected items and nothing else: what a WITH leaves out is out of scope after it, which is what the
+		// list path does too. Only ORDER BY may see underneath a projection, and ORDER BY never streams.
 		Row projected = new Row();
 		for (Ast.ProjectionItem item : projection.items()) {
 			projected = projected.with(item.alias(), evaluator.evaluate(item.expression(), row));
 		}
-		// The source row stays underneath, exactly as the list path does it, so a later clause can still see what an
-		// earlier one bound.
-		projected = row.merge(projected);
 
 		// Before the counters: a row the WHERE drops was never one of the rows SKIP and LIMIT are counting.
 		if (!keeps(projected, where)) {
@@ -568,7 +566,7 @@ public final class QueryExecutor {
 				case Ast.Match match -> {
 					List<Row> next = new ArrayList<>();
 					for (Row row : rows) {
-						next.addAll(matcher.match(match.pattern(), row));
+						next.addAll(matcher.match(match.pattern(), match.where(), row));
 					}
 					rows = filter(next, match.where());
 				}
@@ -603,9 +601,12 @@ public final class QueryExecutor {
 				}
 				case Ast.With with -> {
 					Projected projected = project(rows, with.projection());
-					rows = filter(projected.rows(), with.where());
+					// The WHERE sees only what the WITH projects, and so does every clause after it. ORDER BY may
+					// still read underneath, as openCypher allows, so the source rows are dropped only after it.
+					rows = filter(projected.rows(), with.where(), projected.columns());
 					rows = order(rows, with.projection(), projected.columns());
 					rows = slice(rows, with.projection());
+					rows = only(rows, projected.columns());
 					columns = projected.columns();
 				}
 				case Ast.Return returnClause -> {
@@ -658,6 +659,28 @@ public final class QueryExecutor {
 			}
 		}
 		return kept;
+	}
+
+	/** The WHERE of a WITH, evaluated against the projection alone. */
+	private List<Row> filter(List<Row> rows, Ast.Expr where, List<String> scope) {
+		if (where == null) {
+			return rows;
+		}
+		List<Row> kept = new ArrayList<>();
+		for (Row row : rows) {
+			if (Values.isTrue(evaluator.evaluate(where, row.only(scope)))) {
+				kept.add(row);
+			}
+		}
+		return kept;
+	}
+
+	private static List<Row> only(List<Row> rows, List<String> columns) {
+		List<Row> out = new ArrayList<>(rows.size());
+		for (Row row : rows) {
+			out.add(row.only(columns));
+		}
+		return out;
 	}
 
 	private record Projected(List<String> columns, List<Row> rows) {
@@ -737,13 +760,18 @@ public final class QueryExecutor {
 			case Ast.Property property -> containsAggregate(property.target());
 			case Ast.Index index -> containsAggregate(index.target()) || containsAggregate(index.index());
 			case Ast.ListLiteral list -> list.elements().stream().anyMatch(QueryExecutor::containsAggregate);
+			case Ast.MapLiteral map -> map.entries().values().stream().anyMatch(QueryExecutor::containsAggregate);
+			case Ast.IsNull isNull -> containsAggregate(isNull.operand());
+			case Ast.LabelPredicate predicate -> containsAggregate(predicate.target());
 			// `sum(CASE WHEN x THEN 1 ELSE 0 END)` is caught by the FunctionCall arm above; this is the other way
 			// round — an aggregate inside a branch, as in `CASE WHEN $wanted THEN count(*) ELSE 0 END`.
 			case Ast.Case branch -> containsAggregate(branch.subject())
 				|| branch.whens().stream().anyMatch(QueryExecutor::containsAggregate)
 				|| branch.thens().stream().anyMatch(QueryExecutor::containsAggregate)
 				|| containsAggregate(branch.otherwise());
-			default -> false;
+			case Ast.Literal ignored -> false;
+			case Ast.Variable ignored -> false;
+			case Ast.Parameter ignored -> false;
 		};
 	}
 
@@ -763,25 +791,32 @@ public final class QueryExecutor {
 			(containsAggregate(item.expression()) ? aggregates : keys).add(item);
 		}
 
-		Map<List<Object>, List<Row>> groups = new LinkedHashMap<>();
+		// Keyed on Cypher equivalence rather than Java equality, so 1 and 1.0 are one group, as DISTINCT says they are.
+		// The first row's values are what the group projects.
+		Map<Object, List<Object>> keyValues = new LinkedHashMap<>();
+		Map<Object, List<Row>> groups = new LinkedHashMap<>();
 		for (Row row : rows) {
-			List<Object> key = new ArrayList<>(keys.size());
+			List<Object> values = new ArrayList<>(keys.size());
 			for (Ast.ProjectionItem item : keys) {
-				key.add(evaluator.evaluate(item.expression(), row));
+				values.add(evaluator.evaluate(item.expression(), row));
 			}
+			Object key = Values.groupingKey(values);
+			keyValues.putIfAbsent(key, values);
 			groups.computeIfAbsent(key, k -> new ArrayList<>()).add(row);
 		}
 		// An aggregate with no grouping key over no rows still produces one row: `count(*)` of nothing is 0, not
 		// no answer at all.
 		if (groups.isEmpty() && keys.isEmpty()) {
 			groups.put(List.of(), List.of());
+			keyValues.put(List.of(), List.of());
 		}
 
 		List<Row> out = new ArrayList<>(groups.size());
-		for (Map.Entry<List<Object>, List<Row>> group : groups.entrySet()) {
+		for (Map.Entry<Object, List<Row>> group : groups.entrySet()) {
+			List<Object> values = keyValues.get(group.getKey());
 			Row projected = new Row();
 			for (int i = 0; i < keys.size(); i++) {
-				projected = projected.with(keys.get(i).alias(), group.getKey().get(i));
+				projected = projected.with(keys.get(i).alias(), values.get(i));
 			}
 			for (Ast.ProjectionItem item : aggregates) {
 				projected = projected.with(item.alias(), foldAggregate(item.expression(), group.getValue()));
@@ -791,55 +826,23 @@ public final class QueryExecutor {
 		return out;
 	}
 
-	/** Evaluates an expression in which aggregating calls are folded over the group and the rest is ordinary. */
+	/**
+	 * Evaluates an expression in which aggregating calls are folded over the group and the rest is ordinary.
+	 *
+	 * <p>
+	 * Whatever surrounds the calls is evaluated against the first row of the group, which is sound because anything
+	 * there that is not an aggregate is constant across the group: it is one of the grouping keys. Each call is folded
+	 * when the evaluation reaches it and not before, so {@code CASE WHEN $wanted THEN count(*) ELSE 0 END} folds only
+	 * the branch it takes.
+	 * </p>
+	 */
 	private Object foldAggregate(Ast.Expr expression, List<Row> group) {
-		if (expression instanceof Ast.FunctionCall call && Functions.isAggregate(call.name())) {
-			return Aggregates.fold(evaluator, call, group);
-		}
-		if (expression instanceof Ast.Binary binary) {
-			Object left = foldAggregate(binary.left(), group);
-			Object right = foldAggregate(binary.right(), group);
-			return switch (binary.op()) {
-				case ADD -> Values.add(left, right);
-				case SUBTRACT -> Values.subtract(left, right);
-				case MULTIPLY -> Values.multiply(left, right);
-				case DIVIDE -> Values.divide(left, right);
-				case MODULO -> Values.modulo(left, right);
-				case POWER -> Values.power(left, right);
-				case AND -> Values.and(left, right);
-				case OR -> Values.or(left, right);
-				case XOR -> Values.xor(left, right);
-				default -> throw new CypherTypeException("Unsupported operator " + binary.op()
-					+ " over an aggregate");
-			};
-		}
-		if (expression instanceof Ast.Unary unary) {
-			Object operand = foldAggregate(unary.operand(), group);
-			return unary.op() == Ast.Op.NOT ? Values.not(operand) : Values.negate(operand);
-		}
-		// `CASE WHEN $wanted THEN count(*) ELSE 0 END` — the aggregate is inside a branch rather than around the CASE,
-		// which is the other way round from the common `sum(CASE … END)`. The branch is chosen against the first row,
-		// on the same reasoning as the fallback below, and only the branch taken is then folded.
-		if (expression instanceof Ast.Case branch && containsAggregate(branch)) {
-			if (group.isEmpty()) {
-				return null;
-			}
-			Row first = group.get(0);
-			Object subject = branch.subject() == null ? null : evaluator.evaluate(branch.subject(), first);
-			for (int i = 0; i < branch.whens().size(); i++) {
-				Object when = evaluator.evaluate(branch.whens().get(i), first);
-				boolean taken = branch.subject() == null
-					? Values.isTrue(when)
-					: subject != null && when != null && Values.equalKnown(subject, when);
-				if (taken) {
-					return foldAggregate(branch.thens().get(i), group);
-				}
-			}
-			return branch.otherwise() == null ? null : foldAggregate(branch.otherwise(), group);
-		}
-		// A plain expression inside an aggregating projection is evaluated against the first row of the group; it is
-		// constant across the group by construction, because it is one of the grouping keys.
-		return group.isEmpty() ? null : evaluator.evaluate(expression, group.get(0));
+		Map<Ast.FunctionCall, Object> folded = new java.util.IdentityHashMap<>();
+		Evaluator folding = evaluator.folding(call -> folded.computeIfAbsent(call,
+			ignored -> Aggregates.fold(evaluator, call, group)));
+		// Only the no-key group can be empty, and then there is nothing for a non-aggregate to read: `count(*)` of
+		// nothing is 0, and `size(collect(x))` of nothing is 0 too.
+		return folding.evaluate(expression, group.isEmpty() ? new Row() : group.get(0));
 	}
 
 	// ---------------------------------------------------------------- ordering and paging
@@ -848,18 +851,39 @@ public final class QueryExecutor {
 		if (projection.order().isEmpty()) {
 			return rows;
 		}
-		List<Row> sorted = new ArrayList<>(rows);
-		Comparator<Row> comparator = null;
-		for (Ast.SortItem item : projection.order()) {
-			Comparator<Row> next = Comparator.comparing(
-				row -> sortKey(item.expression(), row), Values::orderForSort);
-			if (!item.ascending()) {
-				next = next.reversed();
-			}
-			comparator = comparator == null ? next : comparator.thenComparing(next);
+		// Keys once per row, not once per comparison: a key can read the store or score a vector, and a sort makes
+		// O(n log n) comparisons. The column name each item would resolve to is rendered once per item for the same
+		// reason.
+		List<Ast.SortItem> items = projection.order();
+		List<String> names = new ArrayList<>(items.size());
+		for (Ast.SortItem item : items) {
+			names.add(io.metaloom.graph.cypher.ast.Rendering.text(item.expression()));
 		}
-		sorted.sort(comparator);
+		List<Keyed> keyed = new ArrayList<>(rows.size());
+		for (Row row : rows) {
+			Object[] keys = new Object[items.size()];
+			for (int i = 0; i < keys.length; i++) {
+				keys[i] = sortKey(items.get(i).expression(), names.get(i), row);
+			}
+			keyed.add(new Keyed(row, keys));
+		}
+		keyed.sort((left, right) -> {
+			for (int i = 0; i < items.size(); i++) {
+				int order = Values.orderForSort(left.keys()[i], right.keys()[i]);
+				if (order != 0) {
+					return items.get(i).ascending() ? order : -Integer.signum(order);
+				}
+			}
+			return 0;
+		});
+		List<Row> sorted = new ArrayList<>(keyed.size());
+		for (Keyed entry : keyed) {
+			sorted.add(entry.row());
+		}
 		return sorted;
+	}
+
+	private record Keyed(Row row, Object[] keys) {
 	}
 
 	/**
@@ -871,8 +895,7 @@ public final class QueryExecutor {
 	 * a column called {@code n.city}, which is what the user meant and what Cypher orders by.
 	 * </p>
 	 */
-	private Object sortKey(Ast.Expr expression, Row row) {
-		String name = io.metaloom.graph.cypher.ast.Rendering.text(expression);
+	private Object sortKey(Ast.Expr expression, String name, Row row) {
 		if (row.has(name)) {
 			return row.get(name);
 		}
@@ -886,7 +909,8 @@ public final class QueryExecutor {
 		}
 		int to = rows.size();
 		if (projection.limit() != null) {
-			to = (int) Math.min(rows.size(), from + positive(projection.limit(), "LIMIT"));
+			// Clamped before the addition, or SKIP 1 LIMIT 9223372036854775807 overflows into a negative bound.
+			to = (int) Math.min(rows.size(), from + Math.min(rows.size(), positive(projection.limit(), "LIMIT")));
 		}
 		return from == 0 && to == rows.size() ? rows : new ArrayList<>(rows.subList(from, to));
 	}
@@ -902,16 +926,25 @@ public final class QueryExecutor {
 
 	// ---------------------------------------------------------------- distinct
 
+	/**
+	 * DISTINCT, under Cypher equivalence rather than {@code Object.equals}.
+	 *
+	 * <p>
+	 * A plain hash set over the values would be wrong — {@code 1} and {@code 1.0} are the same Cypher value with
+	 * different hash codes, and two nodes are equal by id rather than by contents — so it is a hash set over
+	 * {@link Values#groupingKey}, which is the same rule aggregation groups by. Two nulls are the same value here,
+	 * which is the one place null equals null in Cypher.
+	 * </p>
+	 */
 	private List<Row> distinctBy(List<Row> rows, List<String> columns) {
 		List<Row> kept = new ArrayList<>();
-		List<List<Object>> seen = new ArrayList<>();
+		Set<Object> seen = new java.util.HashSet<>();
 		for (Row row : rows) {
 			List<Object> key = new ArrayList<>(columns.size());
 			for (String column : columns) {
 				key.add(row.get(column));
 			}
-			if (!containsRow(seen, key)) {
-				seen.add(key);
+			if (seen.add(Values.groupingKey(key))) {
 				kept.add(row);
 			}
 		}
@@ -920,48 +953,12 @@ public final class QueryExecutor {
 
 	private static List<List<Object>> distinctRows(List<List<Object>> rows) {
 		List<List<Object>> kept = new ArrayList<>();
+		Set<Object> seen = new java.util.HashSet<>();
 		for (List<Object> row : rows) {
-			if (!containsRow(kept, row)) {
+			if (seen.add(Values.groupingKey(row))) {
 				kept.add(row);
 			}
 		}
 		return kept;
-	}
-
-	/**
-	 * Row membership under Cypher equality rather than {@code Object.equals}.
-	 * <p>
-	 * A hash set would be faster and wrong: {@code 1} and {@code 1.0} are the same Cypher value with different hash
-	 * codes, and two nodes are equal by id rather than by contents. The cost is quadratic in the number of distinct
-	 * rows, which is noted in spec/CYPHER.md.
-	 */
-	private static boolean containsRow(List<List<Object>> rows, List<Object> candidate) {
-		for (List<Object> row : rows) {
-			if (sameRow(row, candidate)) {
-				return true;
-			}
-		}
-		return false;
-	}
-
-	private static boolean sameRow(List<Object> left, List<Object> right) {
-		if (left.size() != right.size()) {
-			return false;
-		}
-		for (int i = 0; i < left.size(); i++) {
-			Object a = left.get(i);
-			Object b = right.get(i);
-			if (a == null || b == null) {
-				// DISTINCT treats two nulls as the same value, which is the one place null equals null in Cypher.
-				if (a != b) {
-					return false;
-				}
-				continue;
-			}
-			if (!Values.equalKnown(a, b)) {
-				return false;
-			}
-		}
-		return true;
 	}
 }

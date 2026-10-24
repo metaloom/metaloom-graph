@@ -327,6 +327,15 @@ index, returned by nothing. `HnswIndex.apply` therefore refuses any plan whose a
 entry point" no longer holds, and the build re-plans that member under the lock. It is the expensive
 path and it fires, in a build, essentially once.
 
+**What a hop costs, measured again.** A visited record used to cost a boxed `Long` and a hash-map node in the
+visited set, a `Candidate` whether or not it was admitted, and — under cosine — a pass over the query to recompute
+its norm, as expensive as the dot product it divides. The query norm is now computed once per walk, the visited set
+is a flat `long` array, and a candidate is allocated only once admitted. `IndexPathBenchmark`, 10,000 members at 128
+dimensions, two alternating runs each on a quiet machine: a cosine build went from 503–512 to 608–611 inserts/s and
+cosine `nearest` (k = 10) from 3,533–3,740 to 4,761–4,960 queries/s; euclidean from 752–762 to 842–847 and from
+5,621–5,866 to 6,257–6,431. What is left per
+hop is in `VectorStore`: `links()` allocates its array, and euclidean materialises the stored vector.
+
 **What is still under the lock**: the back-links. `linkBack` reads a neighbour's own list and re-runs
 the diversity heuristic over it, which is bounded by `M` and cheap per link but is not free at 32
 links a layer — it is most of the 251 ms. Planning it as well is possible and is not obviously
@@ -385,9 +394,11 @@ indexes:
   interesting one: adding `:Person` to a node that already carries an embedding must index it.
 - **Snapshot isolation.** Free, and for the same reason as the B+trees: index pages are read through
   `SegmentFile.readSlice`, so a view sees them as of its own LSN ([TRANSACTIONS.md §5](TRANSACTIONS.md)).
-- **Compaction.** Node ids move, so anything storing them must be rebuilt. `resetTrees()` is the
-  precedent and the right pattern — an ANN structure is rebuilt, not patched up, and rebuilding is
-  what an HNSW wants periodically anyway.
+- **Compaction.** Record ids move. **As built, the links are patched, not rebuilt**: each `VEC`
+  relocation batch remaps every live record's ANN links and each index's entry point through the
+  batch's forwarding map (`Compactor.remapVectorLinks`). An earlier version left them alone as
+  "rebuildable", but nothing rebuilt them and a moved record kept `FLAG_LINKED`, so every link to it
+  named a freed slot and a moved entry point emptied the index. `VectorCompactionTest` is the guard.
 - **Blob interaction.** If a `VEC` kind holds the vectors, the property block should hold a `VEC` id
   rather than a blob id for indexed vectors — otherwise every vector is stored twice. That is a
   property-block format decision and belongs in [PROPERTY_STORAGE.md](PROPERTY_STORAGE.md) before any
@@ -466,17 +477,29 @@ writing 4 unconditionally would have refused every store on disk to describe a f
 a function of the content — 3 when `vec_stride` is zero, 4 when it is not — and both are accepted, with the pair
 required to agree. A store with no vectors is bit-identical to what it was.
 
-**Three things the tests found that the design did not.**
+**Five things the tests found that the design did not.**
 
 - **Two dimensions can share a stride.** A stride is a power of two rounded up, so 4 and 8 both land on 512, and a
   check on the stride alone would have let a store created for one be opened as the other — reading every vector at
   the wrong length. The manifest compares both numbers.
 - **Dropping an index left `FLAG_LINKED` set**, so the *next* index's build skipped every member as "already linked",
   ended with no entry point, and answered every query with nothing. A record that leaves an index is now unlinked.
+- **Unlinking a record does not take it out of the graph.** Leaving an index clears the record's own links and
+  repairs the entry point, but its old neighbours' links to it stay, exactly like links to a deleted record. The
+  walk tested only that a link was still allocated, so it reached the departed record and returned it — and if
+  the record had since joined a second index, its own links led into that graph, and a `:Doc` query answered
+  with `:Other` members. Every hop now follows a link only to a record whose `index_ord` is the index being
+  walked (`HnswIndex.member`), in the search, the insert's plan and apply, the back-links and entry-point
+  repair. `FLAG_TOMBSTONE` is still never set; the ordinal is what decides membership.
 - **Nearest-M pruning strands outliers.** Inserting one point outside a tight cluster gave it no in-links at all: every
   neighbour was full of its own cluster, and proximity pruning drops the outsider first. It was in the index, correct
   on disk, and returned by nothing. Both selection paths now use the paper's diversity heuristic — keep a candidate
   only if it is nearer to the anchor than to anything already kept.
+- **Freeing the entry point disconnected the index.** The entry point was repaired only when a record's index
+  ordinal changed, but deleting a node or overwriting its vector frees the record without changing anything first —
+  the next search started from a dead id and returned nothing, and the next insert took the empty-graph branch and
+  linked to nobody. `PropertyStore.free` now calls a release hook for every vector record before its slot goes, and
+  `GraphStoreImpl` hands the entry point over there (`VectorIndexTest.testDeletingTheEntryPointKeepsTheIndexReachable`).
 
 **Stage 1 is the ground truth and had to come first.** Every measured surprise this project has had —
 [reports/SCALE.md](reports/SCALE.md)'s 59-of-61 GiB, the codec that turned out 7.8x slower than the
@@ -515,9 +538,11 @@ The repository's existing culture applies directly, and one test class matters m
   that must not return the stale answer. This is where the four hooks earn their place, and where
   [IDX-1](INDEX_TASKS.md#3-closed)'s dangling
   entry came from.
-- **`verify(FULL)`** over a store with a declared vector index, since `NoDanglingRefs` is what catches
-  an index entry pointing at a freed slot.
-- **Compaction**: ids move, the index still answers — the case `resetTrees` exists for.
+- **`verify(FULL)`** over a store with a declared vector index. `NoDanglingRefs` covers record references
+  only and never looked at an index; `InvariantChecker.checkIndexes` now checks that each declared index's
+  entry point, when set, is a live member of that index, and that an index with linked members has one
+  ([INDEX.md §10](INDEX.md)).
+- **Compaction**: ids move, the index still answers — `VectorCompactionTest`.
 - **Crash**: an index update and its data update land together or not at all, in the existing fault
   matrix.
 
@@ -554,6 +579,7 @@ The repository's existing culture applies directly, and one test class matters m
 
 ---
 
-_Git HEAD revision: `0970e6b`_
-_Last updated: 2026-08-16 (IDX-7 closed, so §1.3's declaration machinery now cites INDEX.md; new §4.4.1: the bulk build's cost measured, the search moved out of
+_Git HEAD revision: `4f21a62`_
+_Last updated: 2026-10-24 (the walk follows only its own index's members; a hop's bookkeeping measured and cut;
+the vector declaration excludes concurrent writers — [INDEX.md §3.3](INDEX.md). Before that 2026-08-16: IDX-7 closed, so §1.3's declaration machinery now cites INDEX.md; new §4.4.1: the bulk build's cost measured, the search moved out of
 the writer lock, and why one-member-per-commit — the obvious reading of the plan — was 2.5x slower)_

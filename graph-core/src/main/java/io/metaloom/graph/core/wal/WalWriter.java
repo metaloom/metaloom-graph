@@ -10,6 +10,9 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 import org.slf4j.Logger;
@@ -44,13 +47,23 @@ public final class WalWriter implements AutoCloseable {
 	private FileChannel channel;
 	private long channelBaseLsn = -1;
 
-	private long nextLsn;
-	private long durableLsn;
+	// Volatile for the metrics gauge, which reads them without the writer's lock.
+	private volatile long nextLsn;
+	private volatile long durableLsn;
 	private boolean dirty;
+	/** The first failure, after which the log is read-only. See {@link #poison(Throwable)}. */
+	private volatile Throwable failure;
+	private boolean closed;
 
 	private IoCounters counters = new IoCounters();
 
 	private final DirectLog direct;
+
+	/**
+	 * Forces an idle log under {@code GROUP_COMMIT}, or null. The interval used to be checked only inside
+	 * {@link #sync()}, so the last commits before a quiet period stayed unforced for as long as the quiet lasted.
+	 */
+	private final ScheduledExecutorService flusher;
 
 	public WalWriter(Path storePath, long segmentBytes, long startLsn, WalSyncMode syncMode, long syncIntervalMillis)
 		throws IOException {
@@ -85,6 +98,38 @@ public final class WalWriter implements AutoCloseable {
 		this.direct = supplied != null || resolve(engine) ? new DirectLog(supplied) : null;
 		if (direct != null) {
 			logger.debug("The log is on the direct engine, block size {}", DirectLog.BLOCK);
+		}
+		if (syncMode == WalSyncMode.GROUP_COMMIT && syncIntervalMillis > 0) {
+			// A thread of its own that nobody interrupts: an interrupt reaching a FileChannel closes it for everyone.
+			flusher = Executors.newSingleThreadScheduledExecutor(r -> {
+				Thread thread = new Thread(r, "graph-wal-flusher " + dir);
+				thread.setDaemon(true);
+				return thread;
+			});
+			flusher.scheduleWithFixedDelay(this::forceIfIdle, syncIntervalMillis, syncIntervalMillis,
+				TimeUnit.MILLISECONDS);
+		} else {
+			flusher = null;
+		}
+	}
+
+	/** The background half of {@code GROUP_COMMIT}: forces what the last commits left unforced. */
+	private synchronized void forceIfIdle() {
+		if (failure != null || closed || !dirty) {
+			return;
+		}
+		long now = System.nanoTime();
+		if (now - lastSyncNanos < syncIntervalNanos) {
+			return;
+		}
+		lastSyncNanos = now;
+		try {
+			forceNow();
+		} catch (IOException e) {
+			// forceNow() has poisoned the log; the next commit reports it.
+		} catch (RuntimeException e) {
+			// Escaping would cancel the schedule silently. Same outcome as an I/O failure instead.
+			poison(e);
 		}
 	}
 
@@ -154,27 +199,51 @@ public final class WalWriter implements AutoCloseable {
 	 * Appends one record and returns its LSN. A record never straddles a segment boundary: if it would, the remainder
 	 * of the segment is skipped.
 	 */
-	public long append(long prevLsn, long txnId, int type, byte[] payload) throws IOException {
-		int length = WalRecord.HEADER_BYTES + payload.length;
+	public synchronized long append(long prevLsn, long txnId, int type, byte[] payload) throws IOException {
+		long lsn = place(WalRecord.HEADER_BYTES + payload.length);
+		return write(lsn, WalRecord.encode(lsn, prevLsn, txnId, type, payload));
+	}
+
+	/**
+	 * Appends one {@link WalRecord#TYPE_PAGE_IMAGE} record of {@code length} bytes taken straight from {@code source}.
+	 * The same record {@link #append} would write for {@link WalRecord#encodePageImage}, built without the copies.
+	 */
+	public synchronized long appendPageImage(long prevLsn, long txnId, int kindCode, int segmentNumber, int pageIndex,
+		int offsetInPage, MemorySegment source, long sourceOffset, int length) throws IOException {
+		long lsn = place(WalRecord.pageImageRecordLength(length));
+		return write(lsn, WalRecord.encodePageImageRecord(lsn, prevLsn, txnId, kindCode, segmentNumber, pageIndex,
+			offsetInPage, source, sourceOffset, length));
+	}
+
+	/** The LSN a record of this length goes to: the next one, or the next segment's base if it would straddle. */
+	private long place(int length) throws IOException {
 		if (length > segmentBytes) {
 			throw new IllegalArgumentException("WAL record of " + length + " bytes exceeds the segment size");
 		}
+		checkHealthy();
 		long lsn = nextLsn;
-		long offsetInSegment = lsn % segmentBytes;
-		if (offsetInSegment + length > segmentBytes) {
+		if (lsn % segmentBytes + length > segmentBytes) {
 			lsn = baseLsnOf(lsn) + segmentBytes;
-			offsetInSegment = 0;
 		}
-		byte[] record = WalRecord.encode(lsn, prevLsn, txnId, type, payload);
-		if (direct != null) {
-			direct.append(lsn, record);
-		} else {
-			FileChannel target = channelFor(lsn);
-			target.position(offsetInSegment);
-			ByteBuffer buffer = ByteBuffer.wrap(record);
-			while (buffer.hasRemaining()) {
-				target.write(buffer);
+		return lsn;
+	}
+
+	private long write(long lsn, byte[] record) throws IOException {
+		long offsetInSegment = lsn % segmentBytes;
+		int length = record.length;
+		try {
+			if (direct != null) {
+				direct.append(lsn, record);
+			} else {
+				FileChannel target = channelFor(lsn);
+				target.position(offsetInSegment);
+				ByteBuffer buffer = ByteBuffer.wrap(record);
+				while (buffer.hasRemaining()) {
+					target.write(buffer);
+				}
 			}
+		} catch (IOException e) {
+			throw failed(e);
 		}
 		nextLsn = lsn + length;
 		dirty = true;
@@ -184,8 +253,15 @@ public final class WalWriter implements AutoCloseable {
 
 	/**
 	 * Makes everything appended so far durable, subject to the configured sync mode. This is the commit point.
+	 *
+	 * <p>
+	 * Only a force moves {@link #durableLsn()}. Under {@code GROUP_COMMIT} and {@code ASYNC} a sync that skips the
+	 * fsync still hands the records to the kernel — the buffered writer already has, the direct one writes its staged
+	 * blocks here — so a process crash loses nothing that returned, and only a power cut can take the unforced tail.
+	 * </p>
 	 */
-	public void sync() throws IOException {
+	public synchronized void sync() throws IOException {
+		checkHealthy();
 		switch (syncMode) {
 			case FSYNC_ON_COMMIT -> forceNow();
 			case GROUP_COMMIT -> {
@@ -193,29 +269,46 @@ public final class WalWriter implements AutoCloseable {
 				if (now - lastSyncNanos >= syncIntervalNanos) {
 					lastSyncNanos = now;
 					forceNow();
+				} else {
+					writeThrough();
 				}
 			}
-			case ASYNC -> {
-				// Ordering still holds; only the fsync is skipped.
-			}
+			// Ordering still holds; only the fsync is skipped.
+			case ASYNC -> writeThrough();
 		}
-		durableLsn = nextLsn;
+	}
+
+	/** Hands staged direct-IO records to the device without forcing. A no-op for the buffered writer. */
+	private void writeThrough() throws IOException {
+		if (direct == null || !dirty) {
+			return;
+		}
+		try {
+			direct.writeStaged();
+		} catch (IOException e) {
+			throw failed(e);
+		}
 	}
 
 	/** Forces regardless of the sync mode. Used by checkpoint and close. */
-	public void forceNow() throws IOException {
-		if (direct != null) {
-			if (dirty) {
-				// Padding moves the stream on, so the next record starts in a block that has never been written.
-				nextLsn = direct.flushAndPad(nextLsn);
-				direct.force();
+	public synchronized void forceNow() throws IOException {
+		checkHealthy();
+		try {
+			if (direct != null) {
+				if (dirty) {
+					// Padding moves the stream on, so the next record starts in a block that has never been written.
+					nextLsn = direct.flushAndPad(nextLsn);
+					direct.force();
+					dirty = false;
+					counters.walSynced();
+				}
+			} else if (dirty && channel != null) {
+				channel.force(true);
 				dirty = false;
 				counters.walSynced();
 			}
-		} else if (dirty && channel != null) {
-			channel.force(true);
-			dirty = false;
-			counters.walSynced();
+		} catch (IOException e) {
+			throw failed(e);
 		}
 		// Everything appended is on the device now, whatever the sync mode. Leaving durableLsn behind made the lag
 		// gauge report a permanent backlog after every checkpoint, which is the one moment it should read zero.
@@ -223,10 +316,52 @@ public final class WalWriter implements AutoCloseable {
 	}
 
 	/**
+	 * Marks the log failed: from now on every append, sync and force is refused until the store is reopened.
+	 *
+	 * <p>
+	 * <b>Why a failure is permanent.</b> Once any part of a commit has been handed to the log, the log and memory can
+	 * disagree about it. A failed fsync may still leave the commit record in the file, where the next successful
+	 * fsync would make durable a transaction the caller was told had failed and the store had rolled back — and whose
+	 * slots a later transaction then reused, so recovery would replay both over the same records. A failed direct
+	 * write leaves its padding staged without the stream having moved past it, so every later record would sit at the
+	 * wrong offset for its LSN. And on Linux a failed writeback is reported once and then forgotten, so retrying the
+	 * fsync proves nothing. This is the rule PostgreSQL adopted in 2018: stop writing, and let recovery decide from the
+	 * log what was committed.
+	 * </p>
+	 *
+	 * <p>
+	 * Called from here on any I/O failure, and by the store when a commit fails after its records were logged.
+	 * </p>
+	 */
+	public void poison(Throwable cause) {
+		if (failure == null) {
+			failure = cause;
+			logger.error("The write-ahead log failed and accepts no further writes until the store is reopened", cause);
+		}
+	}
+
+	/** True once {@link #poison} has been called. */
+	public boolean isPoisoned() {
+		return failure != null;
+	}
+
+	private IOException failed(IOException e) {
+		poison(e);
+		return e;
+	}
+
+	private void checkHealthy() throws IOException {
+		if (failure != null) {
+			throw new IOException("The write-ahead log failed earlier (" + failure + ") and accepts nothing more."
+				+ " Reopen the store: recovery decides from the log which commits are durable.", failure);
+		}
+	}
+
+	/**
 	 * The log written through {@code O_DIRECT}, in whole aligned blocks.
 	 *
 	 * <p>
-	 * <b>The rule that shapes everything here: a partly filled block is never rewritten in place.</b> Once a block has
+	 * <b>The rule that shapes everything here: a forced block is never rewritten in place.</b> Once a block has
 	 * been written and fsynced it is immutable. Appending more records into the free space at its end would mean
 	 * re-issuing a write over bytes that a commit has already been acknowledged on, and a torn write of that block
 	 * during a crash would destroy a transaction the caller was told was durable. So a flush rounds up: the tail of
@@ -319,6 +454,22 @@ public final class WalWriter implements AutoCloseable {
 		}
 
 		/**
+		 * Writes what is staged without padding and without moving the stream on: the whole blocks once, and the
+		 * partial tail block as it stands, zero-filled.
+		 * <p>
+		 * The tail block is written again, with more records, by the next call or by the padded flush of the next force.
+		 * That does not break the rule above, which is about blocks that have been <em>forced</em>: nothing in this one
+		 * has been promised durable, so a torn rewrite can only take commits a power cut was already allowed to take.
+		 */
+		void writeStaged() throws IOException {
+			flushWholeBlocks();
+			if (fill > 0) {
+				buffer.asSlice(fill, BLOCK - fill).fill((byte) 0);
+				handle.write(buffer, BLOCK, bufferOffset);
+			}
+		}
+
+		/**
 		 * Writes everything staged, padding the last block out, and returns the LSN the stream continues at.
 		 * <p>
 		 * After this the current block is immutable, so the caller's next record must start in the following one.
@@ -349,6 +500,24 @@ public final class WalWriter implements AutoCloseable {
 			return continuation;
 		}
 
+		/**
+		 * Writes everything staged for the segment being left, rounded up to a whole block with zeros.
+		 * <p>
+		 * Not padded with a record: the stream continues at the next segment's base, and a padding record could not
+		 * even fit when the gap is shorter than a header. Zeros are the same tail the buffered writer leaves, and the
+		 * reader treats a tail that does not validate as the hop to the next segment.
+		 */
+		private void flushTail() throws IOException {
+			if (fill == 0) {
+				return;
+			}
+			int rounded = (fill + BLOCK - 1) / BLOCK * BLOCK;
+			buffer.asSlice(fill, rounded - fill).fill((byte) 0);
+			handle.write(buffer, rounded, bufferOffset);
+			bufferOffset += rounded;
+			fill = 0;
+		}
+
 		void force() throws IOException {
 			if (handle != null) {
 				handle.force();
@@ -372,6 +541,9 @@ public final class WalWriter implements AutoCloseable {
 				return;
 			}
 			if (handle != null) {
+				// What is staged belongs to the segment being left, and must reach it before the handle goes: the sync
+				// that follows forces only the new file. Dropping it here lost every record since the last flush.
+				flushTail();
 				handle.force();
 				handle.close();
 			}
@@ -431,14 +603,45 @@ public final class WalWriter implements AutoCloseable {
 
 	@Override
 	public void close() throws IOException {
-		if (direct != null) {
-			forceNow();
-			direct.close();
+		if (flusher != null) {
+			// Outside the lock: a flush in flight holds it, and waiting for that flush while holding it would deadlock.
+			// shutdown(), not shutdownNow(): interrupting a thread inside FileChannel.force closes the channel.
+			flusher.shutdown();
+			try {
+				flusher.awaitTermination(1, TimeUnit.MINUTES);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
 		}
-		if (channel != null) {
-			channel.force(true);
-			channel.close();
-			channel = null;
+		synchronized (this) {
+			if (closed) {
+				return;
+			}
+			closed = true;
+			closeUnderLock();
+		}
+	}
+
+	private void closeUnderLock() throws IOException {
+		try {
+			// A failed log writes nothing more, not even its staged tail; see poison().
+			if (direct != null && failure == null) {
+				forceNow();
+			}
+		} finally {
+			if (direct != null) {
+				direct.close();
+			}
+			if (channel != null) {
+				try {
+					if (failure == null) {
+						channel.force(true);
+					}
+				} finally {
+					channel.close();
+					channel = null;
+				}
+			}
 		}
 	}
 }

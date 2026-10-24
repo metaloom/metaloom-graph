@@ -746,8 +746,10 @@ Still missing:
 - [x] **Prefetch wired into the traversal frontier**, and **off by default on a measurement**.
       `SegmentSet.prefetch` advises the pages of the nodes queued behind the current one, which is
       the only point at which a mapped data path can have more than one fetch in flight. Warm, it is
-      **2.8x slower** — 1,967 ns per edge against 701 — because advising costs a syscall per node and
-      there is no fault for it to overlap. It can only pay on genuinely cold pages, and this
+      **2.8x slower** as first measured — 1,967 ns per edge against 701 — most of which turned out to be
+      a defect: every step re-advised the whole 64-id window. Advising each id once
+      (`BulkBenchmark#benchTraverseRandomGraph`, 2026-10-24) took it from 2,184 to 387 ns per edge
+      against 210 off, **1.8x**, still a syscall per node with no fault for it to overlap. It can only pay on genuinely cold pages, and this
       filesystem cannot produce those: `posix_fadvise` evicts nothing here, so the cost is measurable
       and the benefit is not. Enable with `-Dmetaloom.graph.prefetch.traversal=true`
 

@@ -160,7 +160,7 @@ defaulting it to `0.0.0.0` in the image would silently undo a security decision 
 
 | Signal | Healthy | Investigate when |
 |--------|---------|------------------|
-| `walLagBytes` | 0 under `FSYNC_ON_COMMIT` | Nonzero under `FSYNC_ON_COMMIT` — that would mean a commit returned without an fsync |
+| `walLagBytes` | 0 under `FSYNC_ON_COMMIT`; up to an interval's worth of log under `GROUP_COMMIT`; grows until the next checkpoint under `ASYNC` | Nonzero under `FSYNC_ON_COMMIT` — that would mean a commit returned without an fsync. Under the other modes it is what a power cut would lose ([WAL.md §4](WAL.md#4-group-commit)) |
 | `walBytesSinceCheckpoint` | Below a few hundred MB | Growing without bound: nothing is checkpointing, and recovery time grows with it |
 | `unflushedPages` | Small and oscillating | Monotonically rising: writes are outrunning the flush |
 | `averageCheckpointMillis` | Tens of milliseconds | Seconds: the store has grown past what a checkpoint can force quickly |
@@ -250,7 +250,9 @@ locked and is refused. [DEPLOYMENT.md §2.3](DEPLOYMENT.md) has both directions 
 **`--force` is about data, not existence.** A restore replaces a database whole, so it refuses one that holds
 anything unless told twice — but a target that is merely *there* and empty is replaced without a flag. That matters
 because opening a root that does not exist creates an empty `default` inside it, which is exactly the state a machine
-is in when a dump is being put onto it.
+is in when a dump is being put onto it. The replacement is built beside the target and swapped in only after the dump
+has been read to its end and verified, so a truncated or corrupt dump leaves the original untouched even with
+`--force`. Against a server with authentication on, `--server` needs `GRAPH_TOKEN` (a token from `POST /api/login`).
 
 **What it costs while it runs.** Writers wait one batch at a time rather than for the whole walk; `reclaim()` and
 `compact()` are refused for the duration, because the backup holds a read view; and retention grows with write volume ×
@@ -304,6 +306,7 @@ Recovery time is proportional to `walBytesSinceCheckpoint`. If it is slow, check
 | `Segment X-N has <field> A but this store expects B` | Geometry mismatch: the store was created with different options | Open it with the options it was created with. Page size and segment capacity are not changeable |
 | `Segment format version N, expected M` | Written by a different version of the engine | Use that version. There is no in-place upgrade |
 | `Recovery references X segment N, which does not exist` | The log names a segment file that is gone | The store directory is incomplete. Restore it whole |
+| `WAL segment .../wal-....log is missing: recovery starts at checkpoint LSN ...` | A log segment between the checkpoint and the newest segment is gone — a partial copy, or a manifest older than the trim that removed it | Restore the missing segment, or the store from a backup. Opening anyway would recover to a wrong point |
 
 ### 6.3 The store opens but `verify` fails
 
@@ -324,7 +327,12 @@ There is **no repair tool**. Orphans are harmless and can be left; anything else
 ### 6.4 Running out of space
 
 `ENOSPC` during a commit surfaces as an `IOException` from `commit()`. The transaction does not apply — the log write
-fails before any data file is touched — so the store stays consistent. Free space and retry.
+fails before any data file is touched — so the store stays consistent. **Any** failure of the log (a failed write, a
+failed fsync, `ENOSPC`, `EIO`) also stops the store taking commits: every later commit and `checkpoint()` fails with
+`The write-ahead log failed earlier ...` until the store is closed and reopened. Free space, close the store (the close
+reports the failure too), and reopen it; recovery decides from the log whether the failed transaction is there. A
+failed fsync cannot be retried safely, because Linux reports a failed writeback once and then forgets it
+([WAL.md §5.1](WAL.md#51-a-log-failure-is-permanent-until-reopen)).
 
 To give space back, in increasing order of cost:
 
@@ -563,5 +571,5 @@ Stated plainly, because an operations document that implies capabilities the sys
 
 ---
 
-_Git HEAD revision: `58cd33e`_
-_Last updated: 2026-08-18 (TLS on the binary port)_
+_Git HEAD revision: `4f21a62`_
+_Last updated: 2026-10-24 (WAL failures stop commits until reopen; missing log segment refuses the open)_

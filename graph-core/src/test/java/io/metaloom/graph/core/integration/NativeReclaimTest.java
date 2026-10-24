@@ -106,6 +106,68 @@ public class NativeReclaimTest {
 	}
 
 	/**
+	 * A page punched once is not punched again. Its checksum is then the CRC of a zero page, not zero, so a skip that
+	 * only recognised zero sent every reclaim back over every earlier hole — a file open, an fallocate and an 8 KiB CRC
+	 * per page, and a punched-page count that grew with every call.
+	 */
+	@Test
+	public void testASecondReclaimPunchesNothing() throws Exception {
+		assumeTrue(NativeLib.isAvailable(), "without the native layer nothing is punched and there is nothing to test");
+		try (GraphStore store = stores.open()) {
+			List<Long> ids = new ArrayList<>();
+			try (Transaction txn = store.begin()) {
+				for (int i = 0; i < 4000; i++) {
+					ids.add(store.createNode("N", Properties.of().set("i", i)));
+				}
+				txn.commit();
+			}
+			try (Transaction txn = store.begin()) {
+				for (long id : ids) {
+					store.deleteNode(id);
+				}
+				txn.commit();
+			}
+			assertTrue(store.reclaim() > 0, "the first reclaim has emptied pages to give back");
+			assertEquals(0, store.reclaim(), "a second reclaim with nothing newly emptied must punch nothing");
+			store.verify(io.metaloom.graph.core.api.VerifyLevel.FULL);
+		}
+	}
+
+	/**
+	 * A page punched with its checksum update lost — a crash between the two — is an empty page, not a corrupt one.
+	 * Simulated by punching directly through the native layer, which is what the crash leaves on disk.
+	 */
+	@Test
+	public void testAPunchedPageWithAStaleChecksumStillVerifies() throws Exception {
+		assumeTrue(NativeLib.isAvailable(), "without the native layer nothing is punched and there is nothing to test");
+		try (GraphStore store = stores.open()) {
+			List<Long> ids = new ArrayList<>();
+			try (Transaction txn = store.begin()) {
+				for (int i = 0; i < 1000; i++) {
+					ids.add(store.createNode("N", Properties.of().set("i", i)));
+				}
+				txn.commit();
+			}
+			try (Transaction txn = store.begin()) {
+				// The first page's records only: 128 nodes per 8 KiB page.
+				for (int i = 0; i < 128; i++) {
+					store.deleteNode(ids.get(i));
+				}
+				txn.commit();
+			}
+			store.checkpoint();
+			io.metaloom.graph.core.segment.SegmentFile segment = ((io.metaloom.graph.core.store.GraphStoreImpl) store)
+				.segments(io.metaloom.graph.core.id.Kind.NODE).segments().get(0);
+			io.metaloom.graph.core.segment.Geometry geometry = ((io.metaloom.graph.core.store.GraphStoreImpl) store)
+				.geometry();
+			assertTrue(NativeLib.punchHole(segment.path(), geometry.dataStart(io.metaloom.graph.core.id.Kind.NODE),
+				geometry.pageSize()), "the punch itself must succeed");
+			store.verify(io.metaloom.graph.core.api.VerifyLevel.FULL);
+			assertEquals(1000 - 128, store.stats().nodeCount());
+		}
+	}
+
+	/**
 	 * A punched page must not restart its generation counters.
 	 *
 	 * <p>

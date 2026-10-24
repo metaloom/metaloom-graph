@@ -172,6 +172,11 @@ public class CompactionCrashTest {
 			fallible(unit, delegate::runExclusive);
 		}
 
+		@Override
+		public void runUnlogged(Unit unit) throws IOException {
+			fallible(unit, delegate::runUnlogged);
+		}
+
 		private void fallible(Unit unit, Fallible run) throws IOException {
 			if (++writes < failAt) {
 				run.accept(unit);

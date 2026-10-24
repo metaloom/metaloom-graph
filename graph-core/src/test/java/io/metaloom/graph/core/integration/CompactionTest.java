@@ -286,6 +286,103 @@ public class CompactionTest {
 		}
 	}
 
+	/**
+	 * Several consecutive blocks of one chain relocated in the same batch.
+	 *
+	 * <p>
+	 * The reference rewrite reached blocks by walking chains from the node heads, and skipped every source. A
+	 * destination is reached only through its predecessor, so when the predecessor moved too its copy was never visited
+	 * and its next pointer still named the next block's source — which the batch then frees. The defragmentation test
+	 * above cannot see it: it empties the hub first, so its chain is down to a block or two before anything moves.
+	 * </p>
+	 */
+	@Test
+	public void testConsecutiveChainBlocksRelocatedTogetherStayLinked() throws Exception {
+		try (GraphStore store = stores.open()) {
+			GraphStoreImpl impl = (GraphStoreImpl) store;
+			List<Long> fillers = new ArrayList<>();
+			try (Transaction txn = store.begin()) {
+				long sink = store.createNode("Sink");
+				for (int i = 0; i < 256; i++) {
+					long filler = store.createNode("Filler");
+					for (int j = 0; j < 48; j++) {
+						store.createEdge(filler, "F", sink);
+					}
+					fillers.add(filler);
+				}
+				txn.commit();
+			}
+			long hub;
+			try (Transaction txn = store.begin()) {
+				hub = store.createNode("Hub");
+				for (int i = 0; i < 30000; i++) {
+					store.createEdge(hub, "E", store.createNode("Spoke"));
+				}
+				txn.commit();
+			}
+			int blocks = impl.adjacencyStore().blockCount(hub);
+			assertTrue(blocks >= 4, "the hub needs a long chain for this test, had " + blocks);
+
+			// Frees the low adjacency cells, so the hub's blocks are what compaction moves down into them.
+			try (Transaction txn = store.begin()) {
+				for (long filler : fillers) {
+					store.deleteNode(filler);
+				}
+				txn.commit();
+			}
+
+			CompactionReport report = store.compact(CompactionOptions.always());
+			assertTrue(report.relocated().getOrDefault(Kind.ADJ, 0L) > 0, "adjacency must have moved: " + report);
+			store.verify(VerifyLevel.FULL);
+			long survivingHub = store.nodesByLabel("Hub").get(0);
+			assertEquals(30000, store.neighbours(survivingHub, Direction.OUT).size(),
+				"every edge must still be reachable through the relocated chain");
+		}
+	}
+
+	/**
+	 * A property that names another element is rewritten when that element moves, and the property index has to follow
+	 * it: the index is keyed on the value's hash, and the value just changed under it. The reference sweep rewrote the
+	 * payload and left the entry keyed on the old id, so the lookup by the new value missed the holder and the old entry
+	 * dangled for good.
+	 */
+	@Test
+	public void testAnIndexedReferenceFollowsTheNodeItNames() throws Exception {
+		try (GraphStore store = stores.open()) {
+			long holder = store.createNode("Holder");
+			List<Long> fillers = new ArrayList<>();
+			try (Transaction txn = store.begin()) {
+				for (int i = 0; i < 2000; i++) {
+					fillers.add(store.createNode("Filler"));
+				}
+				txn.commit();
+			}
+			long target = store.createNode("Target");
+			store.setNodeProperties(holder,
+				Properties.of().set("friend", new io.metaloom.graph.core.store.prop.ValueCodec.ElementRef(target)));
+			try (Transaction txn = store.begin()) {
+				for (long filler : fillers) {
+					store.deleteNode(filler);
+				}
+				txn.commit();
+			}
+
+			// No index rebuild: a rebuild from the records would repair the entry and hide the defect.
+			store.compact(CompactionOptions.builder().livenessThreshold(1.0).indexFillThreshold(0.0).build());
+			store.verify(VerifyLevel.FULL);
+
+			long movedHolder = store.nodesByLabel("Holder").get(0);
+			long movedTarget = store.nodesByLabel("Target").get(0);
+			assertNotEquals(target, movedTarget, "the target must have moved for this test to mean anything");
+			assertEquals(List.of(movedHolder), store.nodesByProperty("friend",
+				new io.metaloom.graph.core.store.prop.ValueCodec.ElementRef(movedTarget)),
+				"the holder must be found by the reference as it now reads");
+			assertTrue(store.nodesByProperty("friend",
+				new io.metaloom.graph.core.store.prop.ValueCodec.ElementRef(target)).isEmpty(),
+				"and not by the id the target no longer has");
+		}
+	}
+
 	@Test
 	public void testEmptiedSegmentsAreRetired() throws Exception {
 		try (GraphStore store = stores.open()) {

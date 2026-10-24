@@ -102,11 +102,16 @@ public final class Lz4 {
 				throw new IllegalArgumentException("Match of " + matchLength + " bytes overruns a "
 					+ dst.length + " byte output at " + out);
 			}
-			// Byte at a time, deliberately: a match may overlap its own output, which is how LZ4 encodes runs, and
-			// arraycopy would read ahead of what has been written.
+			// A match may overlap its own output, which is how LZ4 encodes runs, and arraycopy would then read ahead of
+			// what has been written — so only a match that ends before its own start is copied in one go.
 			int from = out - offset;
-			for (int i = 0; i < matchLength; i++) {
-				dst[out++] = dst[from++];
+			if (offset >= matchLength) {
+				System.arraycopy(dst, from, dst, out, matchLength);
+				out += matchLength;
+			} else {
+				for (int i = 0; i < matchLength; i++) {
+					dst[out++] = dst[from++];
+				}
 			}
 		}
 

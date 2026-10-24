@@ -113,6 +113,50 @@ public class UniqueConstraintTest {
 	}
 
 	/**
+	 * Declaring over duplicate vectors is refused, in both scopes.
+	 * <p>
+	 * The declaration scan compares values in a map of its own rather than through the index, and a {@code float[]}
+	 * key hashes by identity there — every vector read back is a fresh array, so two identical ones never met, and the
+	 * constraint was declared over data that already broke it. The same holds one level down, for a list of vectors.
+	 */
+	@Test
+	public void testDeclaringAConstraintOverDuplicateVectorsIsRefused() throws Exception {
+		try (GraphStore store = stores.open()) {
+			store.createNode("Face", Properties.of().set("embedding", new float[] { 1f, 2f, 3f })
+				.set("embeddings", List.of(new float[] { 1f, 2f }, new float[] { 3f, 4f })));
+			store.createNode("Face", Properties.of().set("embedding", new float[] { 1f, 2f, 3f })
+				.set("embeddings", List.of(new float[] { 1f, 2f }, new float[] { 3f, 4f })));
+
+			assertThrows(ConstraintViolationException.class, () -> store.createUniqueConstraint("embedding"));
+			assertThrows(ConstraintViolationException.class, () -> store.createUniqueConstraint("embeddings"));
+			assertThrows(ConstraintViolationException.class, () -> store.createUniqueConstraint("Face", "embedding"));
+			assertThrows(ConstraintViolationException.class,
+				() -> store.createUniqueConstraint("Face", "embeddings"));
+			assertTrue(store.uniqueConstraints().isEmpty(), "a refused declaration must not be recorded");
+			assertFalse(store.hasIndex("Face", "embedding"), "a refused declaration must not be recorded");
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	/**
+	 * Values the index treats as one are one for the declaration scan too: a {@code byte[]} by content, and an
+	 * integer by its number whatever width it was written at.
+	 */
+	@Test
+	public void testDeclaringAConstraintOverDuplicateBytesIsRefused() throws Exception {
+		try (GraphStore store = stores.open()) {
+			store.createNode("File", Properties.of().set("digest", new byte[] { 1, 2, 3 }));
+			store.createNode("File", Properties.of().set("digest", new byte[] { 1, 2, 3 }));
+			assertThrows(ConstraintViolationException.class, () -> store.createUniqueConstraint("digest"));
+
+			store.createNode("File", Properties.of().set("other", new byte[] { 1, 2, 3 }));
+			store.createNode("File", Properties.of().set("other", new byte[] { 1, 2, 4 }));
+			store.createUniqueConstraint("other");
+			assertEquals(List.of("other"), store.uniqueConstraints());
+		}
+	}
+
+	/**
 	 * A constraint on a vector property fires, which it could not while the value hashed to an identity.
 	 * <p>
 	 * {@code conflicts()} probes with the same key the maintenance hooks write, so an unreproducible key made the

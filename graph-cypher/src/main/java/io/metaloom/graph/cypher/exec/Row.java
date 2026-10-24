@@ -46,6 +46,17 @@ public final class Row {
 		return new Row(copy);
 	}
 
+	/** A copy holding only these names, which is what a projection leaves in scope. */
+	public Row only(java.util.Collection<String> names) {
+		Map<String, Object> copy = new LinkedHashMap<>();
+		for (String name : names) {
+			if (values.containsKey(name)) {
+				copy.put(name, values.get(name));
+			}
+		}
+		return new Row(copy);
+	}
+
 	public Map<String, Object> asMap() {
 		return values;
 	}

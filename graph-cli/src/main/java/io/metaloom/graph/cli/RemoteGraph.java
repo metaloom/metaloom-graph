@@ -57,10 +57,22 @@ final class RemoteGraph {
 		return HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
 	}
 
-	static GraphBackup.Summary backup(String server, String database, OutputStream out,
+	/** A GET carrying the token when there is one. Authentication is on by default, so without it every call is a 401. */
+	private static HttpRequest get(URI uri, String token) {
+		HttpRequest.Builder request = HttpRequest.newBuilder(uri).GET();
+		if (token != null) {
+			request.header("Authorization", "Bearer " + token);
+		}
+		return request.build();
+	}
+
+	private static final String NEEDS_TOKEN = "The server requires a login. Log in with POST /api/login and pass "
+		+ "the \"token\" it returns in GRAPH_TOKEN.";
+
+	static GraphBackup.Summary backup(String server, String token, String database, OutputStream out,
 		GraphBackup.Progress progress) throws IOException {
 		URI uri = URI.create(trim(server) + "/api/databases/" + encode(database) + "/backup");
-		HttpRequest request = HttpRequest.newBuilder(uri).GET().build();
+		HttpRequest request = get(uri, token);
 		HttpResponse<InputStream> response;
 		try {
 			response = client().send(request, HttpResponse.BodyHandlers.ofInputStream());
@@ -137,15 +149,17 @@ final class RemoteGraph {
 		}
 	}
 
-	static List<String> databases(String server) throws IOException {
+	static List<String> databases(String server, String token) throws IOException {
 		URI uri = URI.create(trim(server) + "/api/databases");
 		HttpResponse<String> response;
 		try {
-			response = client().send(HttpRequest.newBuilder(uri).GET().build(),
-				HttpResponse.BodyHandlers.ofString());
+			response = client().send(get(uri, token), HttpResponse.BodyHandlers.ofString());
 		} catch (InterruptedException e) {
 			Thread.currentThread().interrupt();
 			throw new IOException("Interrupted while listing databases", e);
+		}
+		if (response.statusCode() == 401) {
+			throw new IOException(NEEDS_TOKEN);
 		}
 		if (response.statusCode() != 200) {
 			throw new IOException("The server answered " + response.statusCode() + " listing databases");
@@ -173,9 +187,11 @@ final class RemoteGraph {
 			// The status is the useful part; a body that cannot be read does not change what to do.
 		}
 		return switch (response.statusCode()) {
+			case 401 -> NEEDS_TOKEN + " " + body;
+			// Either refusal: the flag, or a login that does not hold BACKUP on this database. The body says which.
 			case 403 -> "The server refuses to serve a backup. It has to be started with --allow-backup, which is a "
-				+ "separate flag from --allow-write because a backup reads every byte of a database in one request "
-				+ "and this port has no authentication. " + body;
+				+ "separate flag from --allow-write because a backup reads every byte of a database in one request, "
+				+ "and the login has to hold BACKUP on it. " + body;
 			case 404 -> "The server has no database '" + database + "'. " + body;
 			default -> "The server answered " + response.statusCode() + " backing up '" + database + "'. " + body;
 		};

@@ -152,7 +152,7 @@ public class CliOptionsTest {
 			assertTrue(CliOptions.usage().contains(variable.name()),
 				variable.name() + " is declared but the help text does not print it");
 		}
-		assertEquals(4, CliOptions.VARIABLES.size(),
+		assertEquals(5, CliOptions.VARIABLES.size(),
 			"a variable was added or removed; update this count and check the help text still prints them all");
 	}
 

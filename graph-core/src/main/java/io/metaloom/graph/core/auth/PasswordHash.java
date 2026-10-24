@@ -121,6 +121,11 @@ public final class PasswordHash {
 
 	/** Derives at an explicit cost. Tests use this; nothing else should. */
 	public static PasswordHash of(char[] password, int iterations) {
+		if (password == null || password.length == 0) {
+			// The one place every new password passes through: AuthStore, the bootstrap and the CLI all land here, so
+			// none of them can set a login that needs no secret.
+			throw new IllegalArgumentException("A password may not be empty");
+		}
 		byte[] salt = new byte[SALT_BYTES];
 		RANDOM.nextBytes(salt);
 		return new PasswordHash(PBKDF2_SHA512, iterations, salt, derive(password, salt, iterations, HASH_BYTES));
@@ -155,7 +160,10 @@ public final class PasswordHash {
 	public boolean verify(char[] password) {
 		byte[] candidate = derive(password, salt, iterations, hash.length);
 		try {
-			return MessageDigest.isEqual(hash, candidate);
+			// Derived first and refused after, so an empty attempt costs what any wrong one costs. Refused even
+			// against a hash an older build made from "", because nothing should log in without a secret.
+			boolean empty = password == null || password.length == 0;
+			return !empty && MessageDigest.isEqual(hash, candidate);
 		} finally {
 			Arrays.fill(candidate, (byte) 0);
 		}
@@ -220,8 +228,8 @@ public final class PasswordHash {
 	}
 
 	private static byte[] derive(char[] password, byte[] salt, int iterations, int length) {
-		// An empty password would make PBEKeySpec throw, and "you cannot log in with an empty password" is a rule that
-		// belongs here rather than as an IllegalArgumentException escaping from inside the JCA.
+		// An empty password would make PBEKeySpec throw. of() refuses one and verify() answers false for one; this only
+		// keeps the derivation itself running, so that refusal costs the same as a wrong password.
 		char[] material = password == null || password.length == 0 ? new char[] { '\0' } : password;
 		PBEKeySpec spec = new PBEKeySpec(material, salt, iterations, length * 8);
 		try {

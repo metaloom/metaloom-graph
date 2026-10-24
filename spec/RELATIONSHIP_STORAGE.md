@@ -336,7 +336,10 @@ thing producing rows can be told to stop.
 **There is one walk, not two.** `edges(nodeId, typeIds)` is written as a drain of `cursor(nodeId,
 typeIds)`, and `neighbours(...)` as a drain of the same cursor with `materialise` on top. Both filter
 levels stay where §5.3 and §3.1 put them — `AdjacencyBlock.admitsAnyType` per block,
-`PackedEdge.excludedByType` per entry — and neither rule is re-derived in the streaming path. A
+`PackedEdge.excludedByType` per entry — and neither rule is re-derived in the streaming path. The
+filter they take is a `TypeFilter`, resolved once per query: a bitset over the type ids plus the OR
+of their type-bitmap bits, so the per-entry test boxes and hashes nothing (it was a
+`Set<Integer>.contains` per entry) and the per-block test is one AND. A
 second implementation of "type 0 means the cache is absent, not that the type is zero" is a second
 place to get it wrong, and getting it wrong drops edges silently.
 
@@ -400,10 +403,13 @@ block skip that a value match gets from `type_bitmap` is given up for those remo
 location` still applies, and it is the selective one for a delete that already knows its target.
 
 Deleting a node deletes all of its edges, which requires visiting each neighbour's adjacency to
-remove the mirror entry. For a dense node this is expensive and is therefore performed **lazily**:
-the node's slot is freed immediately, and mirror entries are removed by the vacuum worker, with
-traversal skipping entries whose neighbour fails the generation/live check. This is a deliberate
-trade — see §8.
+remove the mirror entry. This is done **eagerly**, inside the deleting transaction — the lazy,
+vacuum-driven variant once planned here was never built. Only the **far** end of each edge is edited:
+the dying node's own chain is freed whole by `freeChain`, so `deleteRelationshipInternal` is told
+which endpoint is dying and leaves its entries and degrees alone. Removing them one by one had
+re-encoded the node's own block once per relationship — quadratic in its degree, and measured at
+~6x the cost for a 2,000-relationship hub (`BulkBenchmark.benchDeleteNodeWithMaterialisedEdges`).
+Deleting a supernode still costs one edit per neighbour — see §8.
 
 ### 6.3 Traverse
 
@@ -502,6 +508,17 @@ The numbers are estimates, but the orders of magnitude are structural, not tunin
 - **`min/max_location` bound entry locations, which are not all neighbour locations.** A materialised
   entry's 48 bits are a relationship location. Only a block flagged `NO_MATERIALISED` may be pruned
   on the range by a search for a neighbour.
+- **A chain walk is bounded by the high water marks, not the live count.** Every walk is capped so
+  a corrupt `next` pointer cannot loop forever, and the cap was `liveCount + 1`. A snapshot view walks
+  a chain that a later commit may have freed, so the current live count can be smaller than the
+  chain the view is entitled to see — and the view was told its adjacency "contains a cycle". The
+  high water mark never drops while a view is open (compaction and rollback lowering both refuse
+  then), so `AdjacencyStore.chainLimit` and `BlobStore.read`'s length ceiling use it
+  (`VisibilityTest.testAnAdjacencyChainFreedAfterTheViewBeganIsStillWalkable`).
+- **A type id beyond 14 bits is legal.** Labels and types share one id space, so a store with 16,383
+  distinct names has used up the packed field. `createEdge` then escalates to a relationship record
+  whose entry caches no type, and `deleteEdge` finds it by endpoints and type; before, both
+  `createEdge` and `createRelationship` threw once the id passed 16,383.
 - **Deleting a supernode is slow.** That is the accepted trade for making the common case free. If a
   workload deletes supernodes frequently, that is a signal to build the Phase 7 B+tree adjacency.
 

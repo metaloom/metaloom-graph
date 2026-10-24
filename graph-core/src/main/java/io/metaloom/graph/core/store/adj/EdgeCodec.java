@@ -1,6 +1,7 @@
 package io.metaloom.graph.core.store.adj;
 
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.util.Arrays;
 
 import io.metaloom.graph.core.util.VarInt;
@@ -192,42 +193,34 @@ public final class EdgeCodec {
 	}
 
 	/**
-	 * Decodes straight out of a mapped page, with no intermediate byte array.
+	 * Per-thread copy target for {@link #decode(MemorySegment, long, long, long[])}. Grown on demand and never shrunk;
+	 * a block is at most one page, so this stays at a page per thread that has ever read one.
+	 */
+	private static final ThreadLocal<byte[]> SCRATCH = ThreadLocal.withInitial(() -> new byte[0]);
+
+	/**
+	 * Decodes out of a mapped page.
 	 *
 	 * <p>
-	 * This is the path a traversal takes. Copying the compressed region out of the page first cost an allocation of up
-	 * to a page on every block read, which a walk does once per node it opens. The bytes are already mapped; there is
-	 * no reason to hold a second copy of them.
+	 * This is the path a traversal takes. The region is bulk-copied into a per-thread scratch array and decoded from
+	 * there. Reading the varints a byte at a time out of the segment pays a bounds and liveness check per byte, and
+	 * {@code CodecProfileBenchmark#profileSegmentAgainstArrayDecode} measured that at <b>5.6x</b> the copy-and-decode
+	 * on blocks of 400 to 8,000 entries. The scratch array is reused, so a block read still allocates nothing.
 	 * </p>
 	 */
 	public static int decode(MemorySegment src, long offset, long limit, long[] dst) {
-		long[] out = new long[1];
-		long pos = VarInt.read(src, offset, limit, out);
-		int groups = (int) out[0];
-		int written = 0;
-		for (int g = 0; g < groups; g++) {
-			pos = VarInt.read(src, pos, limit, out);
-			int key = (int) out[0];
-			pos = VarInt.read(src, pos, limit, out);
-			int count = (int) out[0];
-			if (count <= 0 || written + count > dst.length) {
-				// Zero is rejected along with the negatives. The encoder never writes an empty group, and the first
-				// entry below is emitted before the loop that counts — so a zero count still produced one entry, and
-				// on a full destination that was an ArrayIndexOutOfBoundsException rather than a typed failure. Found
-				// by fuzzing the Rust decoder, which had it too.
-				throw new IllegalArgumentException(
-					"Encoded adjacency declares " + count + " entries, which does not fit the destination");
-			}
-			pos = VarInt.read(src, pos, limit, out);
-			long location = out[0];
-			dst[written++] = rebuild(key, location);
-			for (int j = 1; j < count; j++) {
-				pos = VarInt.read(src, pos, limit, out);
-				location = advance(location, out[0]);
-				dst[written++] = rebuild(key, location);
-			}
+		long length = limit - offset;
+		if (length < 0 || length > Integer.MAX_VALUE) {
+			throw new IllegalArgumentException("Encoded adjacency region of " + length + " bytes");
 		}
-		return written;
+		int size = (int) length;
+		byte[] scratch = SCRATCH.get();
+		if (scratch.length < size) {
+			scratch = new byte[size];
+			SCRATCH.set(scratch);
+		}
+		MemorySegment.copy(src, ValueLayout.JAVA_BYTE, offset, scratch, 0, size);
+		return decode(scratch, 0, size, dst);
 	}
 
 	private static long rebuild(int groupKey, long location) {

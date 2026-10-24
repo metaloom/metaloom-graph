@@ -144,6 +144,39 @@ public class CypherParserTest {
 			.pattern().get(0).relationships().get(0).range(), "no star means no range");
 	}
 
+	/** A bound past an int is "unbounded", not whatever its low 32 bits happen to be. */
+	@Test
+	public void testAHugeRangeBoundIsClampedNotTruncated() {
+		assertEquals(new Ast.Range(1, Integer.MAX_VALUE), range("MATCH (a)-[*1..4294967297]->(b) RETURN a"));
+		assertEquals(new Ast.Range(Integer.MAX_VALUE, Integer.MAX_VALUE),
+			range("MATCH (a)-[*4294967297]->(b) RETURN a"));
+	}
+
+	/** Every malformed number is a syntax error with a caret, never a NumberFormatException. */
+	@Test
+	public void testAnUnrepresentableNumberIsASyntaxError() {
+		for (String query : List.of("RETURN 9223372036854775808", "RETURN 0x", "RETURN 0xFFFFFFFFFFFFFFFFF",
+			"RETURN '\\uZZZZ'", "MATCH (a)-[*99999999999999999999]->(b) RETURN a")) {
+			assertThrows(CypherSyntaxException.class, () -> CypherParser.parse(query), query);
+		}
+		assertEquals(new Ast.Literal(Long.MIN_VALUE), projected("RETURN -9223372036854775808"),
+			"the smallest integer is writable, because its minus sign is part of the literal");
+	}
+
+	/** Nesting deep enough to overflow the stack is refused by the parser, before any recursion can. */
+	@Test
+	public void testPathologicalNestingIsASyntaxError() {
+		int depth = 100_000;
+		for (String query : List.of("RETURN " + "(".repeat(depth) + "1" + ")".repeat(depth),
+			"RETURN " + "-".repeat(depth) + "1", "RETURN " + "NOT ".repeat(depth) + "true",
+			"RETURN 1" + " + 1".repeat(depth), "RETURN " + "[".repeat(depth) + "]".repeat(depth))) {
+			CypherSyntaxException e = assertThrows(CypherSyntaxException.class, () -> CypherParser.parse(query));
+			assertTrue(e.getMessage().contains("nested"), e.getMessage());
+		}
+		// A generated query with a long, flat OR chain is legitimate and must still parse.
+		CypherParser.parse("MATCH (n) WHERE n.id = 0" + " OR n.id = 1".repeat(500) + " RETURN n");
+	}
+
 	private static Ast.Range range(String query) {
 		return ((Ast.Match) CypherParser.parse(query).parts().get(0).clauses().get(0))
 			.pattern().get(0).relationships().get(0).range();
@@ -210,6 +243,24 @@ public class CypherParserTest {
 		assertTrue(assertThrows(CypherSyntaxException.class,
 			() -> CypherParser.parse("MATCH (n) WHERE ALL(x IN n.xs WHERE x > 0) RETURN n")).getMessage()
 				.contains("ALL predicates are not supported"));
+		// The other three are not keywords, so they reach the parser as function names; they must still be named.
+		for (String predicate : List.of("ANY", "none", "Single")) {
+			assertTrue(assertThrows(CypherSyntaxException.class,
+				() -> CypherParser.parse("MATCH (n) WHERE " + predicate + "(x IN n.xs WHERE x > 0) RETURN n"))
+				.getMessage().contains(predicate.toUpperCase(java.util.Locale.ROOT) + " predicates are not supported"),
+				predicate);
+		}
+	}
+
+	/** {@code a < b < c} is a chain, as in openCypher: {@code a < b AND b < c}, not a boolean compared to c. */
+	@Test
+	public void testComparisonsChain() throws Exception {
+		Ast.Binary chained = (Ast.Binary) projected("RETURN 1 < 2 < 3");
+		assertEquals(Ast.Op.AND, chained.op());
+		assertEquals(new Ast.Comparison(Ast.Op.LESS, new Ast.Literal(2L), new Ast.Literal(3L)), chained.right());
+		Ast.Binary three = (Ast.Binary) projected("RETURN 1 <= 2 = 2 > 0");
+		assertEquals(Ast.Op.AND, three.op());
+		assertEquals(Ast.Op.GREATER, ((Ast.Comparison) three.right()).op());
 	}
 
 	/**

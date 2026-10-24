@@ -150,12 +150,101 @@ public class CompositeIndexPlanTest {
 		assertFalse(calls.made("nodesByLabelAndProperty"));
 	}
 
+	/** The declared tree is keyed on the stored type too, so an integral float must probe both spellings. */
+	@Test
+	public void testAnIntegralFloatProbesTheDeclaredIndexForTheInteger() throws Exception {
+		try (Transaction txn = store.begin()) {
+			store.createNode("Person", Properties.of().set("rank", 7L));
+			txn.commit();
+		}
+		store.createIndex("Person", "rank");
+
+		Calls calls = new Calls();
+		assertEquals(1, run(calls, "MATCH (n:Person {rank: 7.0}) RETURN n").rows().size());
+		assertTrue(calls.made("nodesByLabelAndProperty"));
+	}
+
+	// ---------------------------------------------------------------- WHERE equality
+
+	/** {@code WHERE n.key = <constant>} is the same predicate as an inline map, and seeds the same probe. */
+	@Test
+	public void testAWhereEqualitySeedsThePropertyProbe() {
+		Calls calls = new Calls();
+		QueryExecutor.Result result = run(calls, "MATCH (n:Person) WHERE n.email = 'user0@example.com' RETURN n.email");
+
+		assertEquals(1, result.rows().size());
+		assertTrue(calls.made("nodesByProperty"), "the equality drives the seed");
+		assertFalse(calls.made("nodesByLabel"), "rather than a scan of every :Person");
+		assertEquals(1, calls.count("nodeLabels"), "one candidate read, not ten");
+	}
+
+	@Test
+	public void testAWhereEqualityUsesADeclaredIndexWithEitherOperandOrderAndAParameter() throws Exception {
+		store.createIndex("Person", "email");
+
+		Calls calls = new Calls();
+		QueryExecutor.Result result = run(calls,
+			"MATCH (n:Person) WHERE n.active AND $e = n.email RETURN n.email", Map.of("e", "user5@example.com"));
+
+		assertEquals(1, result.rows().size());
+		assertTrue(calls.made("nodesByLabelAndProperty"));
+		assertFalse(calls.made("nodesByLabel"));
+	}
+
+	/** Only a conjunct narrows the candidates; under OR the row could qualify through the other side. */
+	@Test
+	public void testAnEqualityUnderOrIsNotASeed() {
+		Calls calls = new Calls();
+		QueryExecutor.Result result = run(calls,
+			"MATCH (n:Person) WHERE n.email = 'user0@example.com' OR n.email = 'user5@example.com' RETURN n.email");
+
+		assertEquals(2, result.rows().size());
+		assertTrue(calls.made("nodesByLabel"));
+		assertFalse(calls.made("nodesByProperty"));
+	}
+
+	@Test
+	public void testAnEqualityThatReadsTheRowIsNotASeed() throws Exception {
+		Calls calls = new Calls();
+		QueryExecutor.Result result = run(calls,
+			"MATCH (n:Person) WHERE n.email = n.email RETURN n.email");
+		assertEquals(10, result.rows().size(), "a right side that reads the row cannot be probed before the row exists");
+		assertTrue(calls.made("nodesByLabel"));
+	}
+
+	// ---------------------------------------------------------------- ORDER BY
+
+	/** A sort key is evaluated once per row, not once per comparison, so a key that reads the store reads it n times. */
+	@Test
+	public void testAnOrderByKeyIsEvaluatedOncePerRow() throws Exception {
+		try (Transaction txn = store.begin()) {
+			long company = store.createNode("Employer");
+			for (long id : store.nodesByLabel("Person")) {
+				store.createRelationship(id, "WORKS_AT", company, Properties.of());
+			}
+			txn.commit();
+		}
+
+		Calls calls = new Calls();
+		QueryExecutor.Result result = run(calls,
+			"MATCH (p:Person)-[r:WORKS_AT]->(c) RETURN p.email ORDER BY startNode(r).email DESC");
+
+		assertEquals(10, result.rows().size());
+		assertEquals("user5@example.com", result.rows().get(0).get(0));
+		// Ten seeds, ten far ends, and one startNode(r) per row.
+		assertEquals(30, calls.count("nodeLabels"));
+	}
+
 	// ---------------------------------------------------------------- the recorder
 
 	private QueryExecutor.Result run(Calls calls, String query) {
+		return run(calls, query, Map.of());
+	}
+
+	private QueryExecutor.Result run(Calls calls, String query, Map<String, Object> parameters) {
 		Ast.Query parsed = Cypher.parse(query);
 		try (var view = store.beginRead()) {
-			return new QueryExecutor(new GraphAccess(calls.wrap(store)), Map.of()).run(parsed);
+			return new QueryExecutor(new GraphAccess(calls.wrap(store)), parameters).run(parsed);
 		}
 	}
 
@@ -190,6 +279,10 @@ public class CompositeIndexPlanTest {
 
 		boolean made(String method) {
 			return names.contains(method);
+		}
+
+		long count(String method) {
+			return names.stream().filter(method::equals).count();
 		}
 	}
 }

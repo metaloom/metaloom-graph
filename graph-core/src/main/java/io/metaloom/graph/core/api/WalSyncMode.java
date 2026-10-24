@@ -15,14 +15,16 @@ public enum WalSyncMode {
 	FSYNC_ON_COMMIT,
 
 	/**
-	 * At most one fsync per interval. A power loss may discard commits from the last interval, but never corrupts the
-	 * store. See {@link GraphStoreOptions#walSyncIntervalMillis()}.
+	 * At most one fsync per interval; an idle log is forced within the interval by a background flusher. A process
+	 * crash loses nothing the kernel was handed. A <b>power loss</b> may discard commits from the last interval, and
+	 * because a commit is applied to the mapped data files before its log is forced, it can also leave a transaction
+	 * torn across pages — spec/WAL.md section 4. See {@link GraphStoreOptions#walSyncIntervalMillis()}.
 	 */
 	GROUP_COMMIT,
 
 	/**
-	 * Never fsync explicitly; rely on the operating system. Bulk import and tests only. The store still recovers to a
-	 * consistent point, it is simply an older one.
+	 * Never fsync explicitly; rely on the operating system. Bulk import and tests only. Survives a process crash; after a
+	 * power loss it has the same torn-transaction exposure as {@link #GROUP_COMMIT}, over an unbounded window.
 	 */
 	ASYNC
 }

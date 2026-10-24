@@ -331,7 +331,7 @@ reasons that are measurements rather than caution.
 
 | Capability | Default | Measured |
 |---|---|---|
-| **Traversal prefetch** (`madvise` on the BFS frontier) | **off** | **2.8x slower** warm: 1,967 ns per edge against 701 |
+| **Traversal prefetch** (`madvise` on the BFS frontier) | **off** | **1.8x slower** warm: 387 ns per edge against 210 (`BulkBenchmark#benchTraverseRandomGraph`). First measured at 2.8x (1,967 against 701), most of it a defect that re-advised the whole window on every step |
 | **WAL on the direct engine** (`O_DIRECT`) | **off** (`AUTO` = buffered) | up to 4,095 wasted bytes per commit under `FSYNC_ON_COMMIT` |
 | **lz4 for blobs** | **on** where the crate loaded | a 50,000 byte run stores as 207 bytes |
 

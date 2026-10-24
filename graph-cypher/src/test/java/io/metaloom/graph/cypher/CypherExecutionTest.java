@@ -184,6 +184,11 @@ public class CypherExecutionTest {
 		CypherResult result = run("MATCH (a:Person {name:'Alice'})-[:KNOWS*0..1]->(b) RETURN b.name ORDER BY b.name");
 		assertEquals(List.of("Alice", "Bob"), result.column("b.name"),
 			"a zero-length match reaches the start node itself");
+
+		CypherResult paths = run("MATCH p = (a:Person {name:'Alice'})-[:KNOWS*0..1]->(b) "
+			+ "RETURN length(p) AS hops, size(nodes(p)) AS nodes ORDER BY hops");
+		assertEquals(List.of(0L, 1L), paths.column("hops"));
+		assertEquals(List.of(1L, 2L), paths.column("nodes"), "a path of no hops holds its start node once");
 		store.close();
 	}
 
@@ -347,6 +352,160 @@ public class CypherExecutionTest {
 		CypherTypeException e = assertThrows(CypherTypeException.class,
 			() -> run("MATCH (n) WHERE count(*) > 1 RETURN n"));
 		assertTrue(e.getMessage().contains("aggregating"), e.getMessage());
+		store.close();
+	}
+
+	@Test
+	public void testAnAggregateInsideAnyExpression() throws Exception {
+		CypherResult result = run("MATCH (n:Person) RETURN size(collect(n.name)) AS s, count(*) > 0 AS some, "
+			+ "collect(n.name)[0] IS NOT NULL AS first, {c: count(*)} AS m, toString(count(*)) AS text");
+		assertEquals(3L, result.row(0).get("s"));
+		assertEquals(Boolean.TRUE, result.row(0).get("some"));
+		assertEquals(Boolean.TRUE, result.row(0).get("first"));
+		assertEquals(Map.of("c", 3L), result.row(0).get("m"));
+		assertEquals("3", result.row(0).get("text"));
+
+		CypherResult grouped = run("MATCH (n:Person) RETURN n.city AS city, size(collect(n.name)) AS s ORDER BY city");
+		assertEquals(List.of("Berlin", "Bonn"), grouped.column("city"));
+		assertEquals(List.of(1L, 2L), grouped.column("s"));
+		store.close();
+	}
+
+	// ---------------------------------------------------------------- scoping and uniqueness
+
+	/** WITH is a projection, so what it leaves out is out of scope afterwards, on both execution paths. */
+	@Test
+	public void testWithDropsWhatItDoesNotProject() throws Exception {
+		String query = "MATCH (a:Person {name:'Alice'})-->(b) WITH a MATCH (a)-->(b) RETURN b.name";
+		assertEquals(4, run(query).size(), "b is a fresh variable in the second MATCH, not a join on the first");
+		assertEquals(4, run(query + " ORDER BY b.name").size(), "and the materialised path agrees");
+		assertEquals(4L, run("MATCH (a:Person {name:'Alice'})-->(b) WITH a MATCH (a)-->(b) RETURN count(*) AS c")
+			.row(0).get("c"));
+
+		CypherTypeException e = assertThrows(CypherTypeException.class,
+			() -> run("MATCH (a:Person {name:'Alice'})-->(b) WITH a RETURN b"));
+		assertTrue(e.getMessage().contains("not defined"), e.getMessage());
+		assertThrows(CypherTypeException.class,
+			() -> run("MATCH (a:Person {name:'Alice'})-->(b) WITH a RETURN b ORDER BY a.name"));
+		assertEquals(List.of("Alice", "Alice"),
+			run("MATCH (a:Person {name:'Alice'})-->(b) WITH a ORDER BY b.name RETURN a.name").column("a.name"),
+			"ORDER BY in a WITH may still read what the WITH is about to drop");
+		store.close();
+	}
+
+	/** Relationship uniqueness spans the whole MATCH, not one comma-separated part of it. */
+	@Test
+	public void testOneRelationshipIsNotMatchedTwiceAcrossPatternParts() throws Exception {
+		assertEquals(2L, run("MATCH (a)-[r1:KNOWS]->(b), (c)-[r2:KNOWS]->(d) RETURN count(*) AS c").row(0).get("c"),
+			"two KNOWS edges make two ordered pairs of distinct edges, not four");
+		assertEquals(2L, run("MATCH ()-[:KNOWS]->(), ()-[:KNOWS]->() RETURN count(*) AS c").row(0).get("c"),
+			"and anonymous relationships count too");
+		store.close();
+	}
+
+	@Test
+	public void testABoundRelationshipVariableIsAJoin() throws Exception {
+		CypherResult result = run("MATCH ()-[r:KNOWS]->() WITH r MATCH (a)-[r]->(b) RETURN a.name, b.name "
+			+ "ORDER BY a.name");
+		assertEquals(List.of("Alice", "Bob"), result.column("a.name"));
+		assertEquals(List.of("Bob", "Carol"), result.column("b.name"));
+		store.close();
+	}
+
+	@Test
+	public void testStartNodeAndEndNodeAreNodes() throws Exception {
+		CypherResult result = run("MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b) "
+			+ "RETURN startNode(r) = a AS same, endNode(r).name AS far");
+		assertEquals(Boolean.TRUE, result.row(0).get("same"));
+		assertEquals("Bob", result.row(0).get("far"));
+		assertEquals(List.of("Carol"),
+			run("MATCH (:Person {name:'Bob'})-[r:KNOWS]->() RETURN endNode(r).name AS far").column("far"),
+			"a lightweight edge has endpoints even though it has no id");
+		store.close();
+	}
+
+	// ---------------------------------------------------------------- numbers
+
+	/** The index is keyed on the stored type, and Cypher equality is not, so 34 and 34.0 must find the same node. */
+	@Test
+	public void testAnIntegralFloatFindsAnIntegerAndBack() throws Exception {
+		try (Transaction txn = store.begin()) {
+			store.createNode(List.of("Weighed"), Properties.of().set("kg", 30.0d));
+			txn.commit();
+		}
+		assertEquals(List.of("Alice"), run("MATCH (n:Person {age: 34.0}) RETURN n.name").column("n.name"));
+		assertEquals(List.of("Alice"), run("MATCH (n {age: 34.0}) RETURN n.name").column("n.name"));
+		assertEquals(1, run("MATCH (n {kg: 30}) RETURN n").size());
+		assertEquals(1, run("MATCH (n {kg: $kg}) RETURN n", Map.of("kg", 30L)).size());
+		assertEquals(0, run("MATCH (n {age: 34.5}) RETURN n").size());
+		store.close();
+	}
+
+	@Test
+	public void testIntegerOverflowIsAnErrorNotAWrap() throws Exception {
+		for (String expression : List.of("9223372036854775807 + 1", "-9223372036854775807 - 2",
+			"9223372036854775807 * 2", "-(-9223372036854775807 - 1)", "(-9223372036854775807 - 1) / -1",
+			"abs(-9223372036854775807 - 1)")) {
+			assertThrows(CypherTypeException.class, () -> run("RETURN " + expression + " AS v"), expression);
+		}
+		assertThrows(CypherTypeException.class,
+			() -> run("UNWIND [9223372036854775807, 1] AS x RETURN sum(x) AS s"));
+		store.close();
+	}
+
+	@Test
+	public void testHugeBoundsAreClampedRatherThanTruncated() throws Exception {
+		assertEquals(List.of(2L, 3L),
+			run("UNWIND [3, 1, 2] AS x RETURN x ORDER BY x SKIP 1 LIMIT 9223372036854775807").column("x"));
+		assertEquals("bc", run("RETURN substring('abc', 1, 2147483647) AS v").row(0).get("v"));
+		assertEquals("abc", run("RETURN substring('abc', 0, 4294967296) AS v").row(0).get("v"));
+		assertThrows(CypherTypeException.class, () -> run("RETURN substring('abc', 4294967297) AS v"));
+		store.close();
+	}
+
+	@Test
+	public void testRangeAtTheEdgeOfTheIntegers() throws Exception {
+		assertEquals(List.of(9223372036854775806L, 9223372036854775807L),
+			run("RETURN range(9223372036854775806, 9223372036854775807) AS v").row(0).get("v"));
+		assertEquals(List.of(-9223372036854775807L - 1),
+			run("RETURN range(-9223372036854775807 - 1, -9223372036854775807 - 1, -5) AS v").row(0).get("v"));
+		store.close();
+	}
+
+	/** The parser's depth limit is set so that whatever it accepts, the evaluator can walk. */
+	@Test
+	public void testTheDeepestAcceptedExpressionEvaluates() throws Exception {
+		assertEquals(900L, run("RETURN 1" + " + 1".repeat(899) + " AS v").row(0).get("v"));
+		assertEquals(1L, run("RETURN " + "(".repeat(190) + "1" + ")".repeat(190) + " AS v").row(0).get("v"));
+		store.close();
+	}
+
+	@Test
+	public void testAnEnormousRangeIsRefusedRatherThanBuilt() throws Exception {
+		CypherTypeException e = assertThrows(CypherTypeException.class,
+			() -> run("UNWIND range(1, 2000000000) AS x RETURN count(*) AS c"));
+		assertTrue(e.getMessage().contains("range()"), e.getMessage());
+		store.close();
+	}
+
+	// ---------------------------------------------------------------- equality and ordering
+
+	@Test
+	public void testGroupingUsesCypherEquality() throws Exception {
+		CypherResult result = run("UNWIND [1, 1.0, 2] AS x RETURN x, count(*) AS c");
+		assertEquals(2, result.size(), "1 and 1.0 are one group, as DISTINCT already says");
+		assertEquals(List.of(2L, 1L), result.column("c"));
+		assertEquals(2, run("UNWIND [1, 1.0, 2] AS x RETURN DISTINCT x").size());
+		store.close();
+	}
+
+	@Test
+	public void testFloatComparisonsAreIeeeNotATotalOrder() throws Exception {
+		assertEquals(Boolean.FALSE, run("RETURN -0.0 < 0.0 AS v").row(0).get("v"));
+		assertEquals(Boolean.TRUE, run("RETURN -0.0 <= 0.0 AS v").row(0).get("v"));
+		assertEquals(Boolean.FALSE, run("RETURN 0.0 / 0.0 > 1 AS v").row(0).get("v"));
+		assertEquals(Boolean.FALSE, run("RETURN 0.0 / 0.0 < 1 AS v").row(0).get("v"));
+		assertEquals(Boolean.FALSE, run("RETURN 0.0 / 0.0 >= 0.0 / 0.0 AS v").row(0).get("v"));
 		store.close();
 	}
 }

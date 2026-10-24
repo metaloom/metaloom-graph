@@ -143,6 +143,14 @@ used to explain why there was deliberately no such field: "this server has no au
 identities; inventing a permission field that is always empty would suggest a check that does not happen". The
 reasoning was right, and the field arrived when the check did; the comment is kept rather than deleted.
 
+**`tools/call` checks `requiredPrivileges` against the database the call names** — the `database`
+argument every store tool takes, through `GraphMcpTool.database(arguments)` — and only falls back to
+the server's default when there is none. It used to check the default whatever the call named, so a
+role holding `DROP_INDEX ON default` could drop an index on any database. `tools/list` still filters
+against the default, because a listing names no database. `graph_list_databases` is filtered exactly
+as `GET /api/databases` is, to the databases the caller holds any privilege on
+(`GraphServer.visibleTo`, shared rather than copied).
+
 A refusal comes back as a **tool result with `isError`**, not as a JSON-RPC error, and its text names the flag and
 says *do not retry*. The distinction matters: a JSON-RPC error is a transport failure the model may reasonably retry,
 where this is a decision it should report to the user.
@@ -154,7 +162,9 @@ model to argue about it.
 
 ## 6. Metrics
 
-`graph_mcp_tool_calls{tool,outcome}` — `ok`, `refused` or `error` — and `graph_mcp_sessions` as a gauge. Queries run
+`graph_mcp_tool_calls{tool,outcome}` — `ok`, `refused` or `error` — and `graph_mcp_sessions` as a gauge.
+A call naming a tool that does not exist is recorded as `tool="unknown"`: the name is the client's, and
+used as a label it would be one new series per string anybody cared to send. Queries run
 through `graph_query` are recorded as `graph_queries{frontend="mcp"}`, so one dashboard covers all three front ends.
 See [METRICS.md](METRICS.md).
 

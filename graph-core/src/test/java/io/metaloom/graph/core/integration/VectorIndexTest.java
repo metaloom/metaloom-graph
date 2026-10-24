@@ -247,6 +247,73 @@ public class VectorIndexTest {
 	}
 
 	/**
+	 * A record that leaves an index is not returned by it, even though its old neighbours still link to it.
+	 *
+	 * <p>
+	 * Leaving unlinks the record's own lists and repairs the entry point, but the neighbours' links to it are left in
+	 * place — rewriting them would be a random write per link. So the walk still reaches it, and the only thing that can
+	 * keep it out of an answer is the search asking whether the record still belongs to this index. With one member the
+	 * entry-point repair hid that; with three the departed one is found through a neighbour.
+	 * </p>
+	 */
+	@Test
+	public void testARecordThatLeftTheIndexIsNotReturned() throws Exception {
+		try (GraphStore store = stores.open(withVectors(3))) {
+			long a;
+			long b;
+			long c;
+			try (Transaction txn = store.begin()) {
+				a = doc(store, "a", 1f, 0f, 0f);
+				b = doc(store, "b", 0.9f, 0.1f, 0f);
+				c = doc(store, "c", 0f, 1f, 0f);
+				txn.commit();
+			}
+			store.createVectorIndex(definition());
+			store.removeNodeLabel(b, "Doc");
+
+			List<Long> found = ids(store.nearest("Doc", "embedding", new float[] { 0.9f, 0.1f, 0f }, 5, null));
+			assertEquals(List.of(a, c), found, "b is no longer a :Doc and must not be answered for one");
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	/**
+	 * A record relabelled into a second index must not become a bridge between the two graphs.
+	 *
+	 * <p>
+	 * The stale link from a {@code :Doc} member reaches it, and its own links now belong to the {@code :Other} graph. A
+	 * walk that followed them would answer a {@code :Doc} query with {@code :Other} members.
+	 * </p>
+	 */
+	@Test
+	public void testARelabelledRecordDoesNotBridgeTwoIndexes() throws Exception {
+		try (GraphStore store = stores.open(withVectors(3))) {
+			List<Long> docs = new ArrayList<>();
+			long bridge;
+			try (Transaction txn = store.begin()) {
+				for (int i = 0; i < 6; i++) {
+					docs.add(doc(store, "d" + i, 1f, i * 0.05f, 0f));
+				}
+				bridge = doc(store, "bridge", 0f, 1f, 0f);
+				for (int i = 0; i < 6; i++) {
+					store.createNode(List.of("Other"),
+						Properties.of().set("embedding", new float[] { -0.1f * i, 1f, 0.05f * i }));
+				}
+				txn.commit();
+			}
+			store.createVectorIndex(definition());
+			store.createVectorIndex(VectorIndexDefinition.of("Other", "embedding", 3, VectorMetric.COSINE));
+			store.removeNodeLabel(bridge, "Doc");
+			store.addNodeLabel(bridge, "Other");
+
+			List<Long> found = ids(store.nearest("Doc", "embedding", new float[] { 0f, 1f, 0f }, 20, null));
+			assertEquals(docs.size(), found.size(), "every :Doc member and nothing else: " + found);
+			assertTrue(docs.containsAll(found), "a :Doc query answered with a non-member: " + found);
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	/**
 	 * The build resumes rather than restarting, and calling it again on a finished index is a no-op.
 	 * <p>
 	 * The resume marker is per record — a flag in the record itself — rather than a position in a list. Ids are not
@@ -310,5 +377,56 @@ public class VectorIndexTest {
 			}
 			store.verify(VerifyLevel.FULL);
 		}
+	}
+
+	/**
+	 * Every member's vector record is freed in turn, the entry point's included, and the index must still reach every
+	 * survivor. Freeing the entry point without handing it over leaves a search with nowhere to start, and the next
+	 * insert then takes the empty-graph branch and links to nothing.
+	 */
+	@Test
+	public void testOverwritingEveryVectorKeepsTheIndexReachable() throws Exception {
+		try (GraphStore store = stores.open(withVectors(3))) {
+			store.createVectorIndex(definition());
+			List<Long> nodes = new ArrayList<>();
+			try (Transaction txn = store.begin()) {
+				for (int i = 0; i < 30; i++) {
+					nodes.add(doc(store, "d" + i, spread(i)));
+				}
+				txn.commit();
+			}
+			for (int i = 0; i < nodes.size(); i++) {
+				store.setNodeProperties(nodes.get(i), Properties.of().set("name", "d" + i).set("embedding", spread(i + 7)));
+			}
+			assertEquals(30, store.nearest("Doc", "embedding", new float[] { 1f, 0f, 0f }, 30, null).size(),
+				"overwriting every vector, the entry point's included, must leave every member reachable");
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	@Test
+	public void testDeletingTheEntryPointKeepsTheIndexReachable() throws Exception {
+		try (GraphStore store = stores.open(withVectors(3))) {
+			store.createVectorIndex(definition());
+			List<Long> nodes = new ArrayList<>();
+			try (Transaction txn = store.begin()) {
+				for (int i = 0; i < 30; i++) {
+					nodes.add(doc(store, "d" + i, spread(i)));
+				}
+				txn.commit();
+			}
+			for (int i = 0; i < nodes.size(); i++) {
+				store.deleteNode(nodes.get(i));
+				int left = nodes.size() - i - 1;
+				assertEquals(left, store.nearest("Doc", "embedding", new float[] { 1f, 0f, 0f }, 30, null).size(),
+					"after deleting " + (i + 1) + " members every survivor must still be found");
+			}
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	private static float[] spread(int i) {
+		double angle = i * 0.2;
+		return new float[] { (float) Math.cos(angle), (float) Math.sin(angle), 0.05f * (i % 5) };
 	}
 }

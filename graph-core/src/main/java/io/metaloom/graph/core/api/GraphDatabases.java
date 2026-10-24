@@ -283,6 +283,89 @@ public final class GraphDatabases implements AutoCloseable {
 	}
 
 	/**
+	 * Opens an empty store <b>beside</b> a database, for building its replacement without touching it.
+	 *
+	 * <p>
+	 * For a restore that may fail late. A dump's checksum is in its trailer, so it is only known to be whole once all
+	 * of it has been replayed; {@link #replace} would by then have deleted the original. The staged store lives in a
+	 * dot-directory under the root, which {@link #validate} can never accept as a name, so {@link #names} never lists
+	 * it and no request can address it. A leftover from an earlier, interrupted attempt is cleared first.
+	 * </p>
+	 *
+	 * <p>
+	 * The store returned is the caller's to close. Then either {@link #install} puts it in place or
+	 * {@link #discardStaged} throws it away.
+	 * </p>
+	 */
+	public GraphStore stage(String name, GraphStoreOptions storeOptions) throws IOException {
+		validate(name);
+		synchronized (this) {
+			checkOpen();
+			Path staging = stagingPathOf(name);
+			if (Files.exists(staging)) {
+				deleteRecursively(staging);
+			}
+			Files.createDirectories(staging);
+			return GraphStore.open(staging, storeOptions == null ? options : storeOptions);
+		}
+	}
+
+	/**
+	 * Swaps a store built by {@link #stage}, and since closed, in for the database of that name.
+	 *
+	 * <p>
+	 * Two renames within the root rather than a copy: the original is moved aside, the staged directory moved in, and
+	 * only then is the original deleted. Like {@link #replace} it does not refuse to replace the last database.
+	 * </p>
+	 */
+	public GraphStore install(String name, GraphStoreOptions storeOptions) throws IOException {
+		validate(name);
+		synchronized (this) {
+			checkOpen();
+			Path staging = stagingPathOf(name);
+			if (!isStoreDirectory(staging)) {
+				throw new GraphStoreException("Nothing has been staged for '" + name + "'");
+			}
+			GraphStore existing = open.remove(name);
+			if (existing != null) {
+				// Closed before the directory moves, for the reason replace() gives.
+				existing.close();
+			}
+			Path path = root.resolve(name);
+			Path aside = root.resolve(".replaced-" + name);
+			if (Files.exists(aside)) {
+				deleteRecursively(aside);
+			}
+			if (Files.exists(path)) {
+				Files.move(path, aside, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+			}
+			Files.move(staging, path, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+			if (Files.exists(aside)) {
+				deleteRecursively(aside);
+			}
+			GraphStore store = GraphStore.open(path, storeOptions == null ? options : storeOptions);
+			open.put(name, store);
+			return store;
+		}
+	}
+
+	/** Deletes what {@link #stage} made, once its store is closed. No error if there is nothing. */
+	public void discardStaged(String name) throws IOException {
+		validate(name);
+		synchronized (this) {
+			Path staging = stagingPathOf(name);
+			if (Files.exists(staging)) {
+				deleteRecursively(staging);
+			}
+		}
+	}
+
+	/** A dot-name, so never a valid database name and never listed. */
+	private Path stagingPathOf(String name) {
+		return root.resolve(".staging-" + name);
+	}
+
+	/**
 	 * Closes a database and deletes its directory.
 	 *
 	 * @return false if there was no such database, so that dropping twice is not an error

@@ -49,6 +49,8 @@ public final class PropertyStore {
 	private final VectorStore vectors;
 	private final int cellBytes;
 	private final int maxPayloadBytes;
+	private java.util.function.LongConsumer vectorRelease = vectorId -> {
+	};
 
 	public PropertyStore(SegmentSet segments, BlobStore blobs) {
 		this(segments, blobs, null);
@@ -325,6 +327,17 @@ public final class PropertyStore {
 	}
 
 	/**
+	 * Called with every vector record a {@link #free} is about to release, before its slot goes.
+	 * <p>
+	 * Every free of a block runs through here — a deleted node, an overwritten property, a deleted relationship — so
+	 * this is the one place an ANN index can be told a member is leaving. Left to the callers, the path that forgot
+	 * freed the entry point and the index answered every later query with nothing.
+	 */
+	public void onVectorRelease(java.util.function.LongConsumer release) {
+		this.vectorRelease = release;
+	}
+
+	/**
 	 * Frees a block and everything it owns. This cascade is what the proof of concept never had: deleting an element
 	 * there left its property records behind forever.
 	 * <p>
@@ -349,6 +362,7 @@ public final class PropertyStore {
 		for (long ownedId : ownedIds) {
 			if (ElementId.kind(ownedId) == Kind.VEC) {
 				if (vectors != null) {
+					vectorRelease.accept(ownedId);
 					vectors.free(ownedId);
 				}
 			} else {

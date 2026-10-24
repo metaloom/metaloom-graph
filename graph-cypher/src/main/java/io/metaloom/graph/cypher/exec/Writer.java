@@ -261,8 +261,15 @@ final class Writer {
 
 	List<Row> set(Ast.SetClause clause, List<Row> rows) {
 		Touched touched = new Touched();
-		for (Row row : rows) {
+		// What this clause has written so far, re-read. A row is rebound against it before its items are evaluated,
+		// or `SET p.views = p.views + 1` over three rows holding one node reads the same stale 0 three times.
+		Map<Long, CypherNode> freshNodes = new HashMap<>();
+		Map<Long, CypherRelationship> freshRelationships = new HashMap<>();
+		for (Row source : rows) {
+			Row row = freshNodes.isEmpty() && freshRelationships.isEmpty() ? source
+				: rebindRow(source, freshNodes, freshRelationships);
 			Pending pending = new Pending();
+			Touched written = new Touched();
 			for (Ast.SetItem item : clause.items()) {
 				switch (item) {
 					case Ast.SetProperty property -> {
@@ -273,11 +280,17 @@ final class Writer {
 						Object target = binding(row, replace.variable());
 						Map<String, Object> map = asPropertyMap(evaluator.evaluate(replace.map(), row), "SET");
 						pending.of(target).clear();
-						pending.of(target).putAll(map);
+						map.forEach((key, value) -> {
+							if (value != null) {
+								pending.of(target).put(key, value);
+							}
+						});
 					}
 					case Ast.SetPropertiesMerge merge -> {
 						Object target = binding(row, merge.variable());
-						pending.of(target).putAll(asPropertyMap(evaluator.evaluate(merge.map(), row), "SET"));
+						// A null in += removes the key, exactly as SET n.key = null does.
+						asPropertyMap(evaluator.evaluate(merge.map(), row), "SET")
+							.forEach((key, value) -> assign(pending, target, key, value));
 					}
 					case Ast.SetLabels labels -> {
 						CypherNode node = node(binding(row, labels.variable()), "SET");
@@ -287,11 +300,19 @@ final class Writer {
 								labelsAdded++;
 							}
 						}
-						touched.nodes.add(node.id());
+						written.nodes.add(node.id());
 					}
 				}
 			}
-			pending.flush(touched);
+			pending.flush(written);
+			for (long id : written.nodes) {
+				freshNodes.put(id, graph.node(id));
+			}
+			for (long id : written.relationships) {
+				freshRelationships.put(id, graph.relationship(id));
+			}
+			touched.nodes.addAll(written.nodes);
+			touched.relationships.addAll(written.relationships);
 		}
 		return refresh(rows, touched);
 	}
@@ -503,7 +524,20 @@ final class Writer {
 		} else {
 			// Counted before the delete, and after any earlier delete in the same clause, so a relationship whose
 			// other end has already gone is not counted twice.
-			relationshipsDeleted += graph.expand(node.id(), Direction.BOTH, null).size();
+			List<GraphAccess.Expansion> attached = new ArrayList<>(graph.expand(node.id(), Direction.OUT, null));
+			for (GraphAccess.Expansion incoming : graph.expand(node.id(), Direction.IN, null)) {
+				// A self-relationship is listed in both directions, and was already taken from the outgoing side.
+				if (incoming.neighbourId() != node.id()) {
+					attached.add(incoming);
+				}
+			}
+			for (GraphAccess.Expansion expansion : attached) {
+				relationshipsDeleted++;
+				// Recorded, so that a later row naming one of these deletes nothing rather than freeing its id again.
+				if (expansion.relationship().isMaterialised()) {
+					deletedRelationships.add(expansion.relationship().id());
+				}
+			}
 		}
 		graph.deleteNode(node.id());
 		deletedNodes.add(node.id());
@@ -540,10 +574,9 @@ final class Writer {
 			case null -> Map.of();
 			case Map<?, ?> map -> {
 				Map<String, Object> out = new LinkedHashMap<>();
+				// Nulls are kept: += reads one as "remove this key", and = drops it.
 				for (Map.Entry<?, ?> entry : map.entrySet()) {
-					if (entry.getValue() != null) {
-						out.put(String.valueOf(entry.getKey()), entry.getValue());
-					}
+					out.put(String.valueOf(entry.getKey()), entry.getValue());
 				}
 				yield out;
 			}
@@ -583,17 +616,21 @@ final class Writer {
 		}
 		List<Row> out = new ArrayList<>(rows.size());
 		for (Row row : rows) {
-			Row current = row;
-			for (String name : row.names()) {
-				Object value = row.get(name);
-				Object rebound = rebind(value, nodes, relationships);
-				if (rebound != value) {
-					current = current.with(name, rebound);
-				}
-			}
-			out.add(current);
+			out.add(rebindRow(row, nodes, relationships));
 		}
 		return out;
+	}
+
+	private static Row rebindRow(Row row, Map<Long, CypherNode> nodes, Map<Long, CypherRelationship> relationships) {
+		Row current = row;
+		for (String name : row.names()) {
+			Object value = row.get(name);
+			Object rebound = rebind(value, nodes, relationships);
+			if (rebound != value) {
+				current = current.with(name, rebound);
+			}
+		}
+		return current;
 	}
 
 	private static Object rebind(Object value, Map<Long, CypherNode> nodes,

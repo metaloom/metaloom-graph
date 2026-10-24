@@ -202,8 +202,14 @@ asserting something the design explicitly does not promise.
    first would be checked against a half-loaded graph.
 5. **`verify(FULL)`** — the engine's own oracle, entirely outside this code.
 
-A restore refuses a database that already exists unless `--force`, which drops and recreates it.
+A restore refuses a database that already exists and holds data unless `--force`, which replaces it.
 Restoring into a non-empty store would merge two graphs, which is not what the word means.
+
+The replacement is built **beside** the target — `GraphDatabases.stage`, a `.staging-<name>` directory
+that no database name can address — and swapped in by `GraphDatabases.install` only after the dump has
+been read to its trailer and passed `verify(FULL)`. The checksum is at the end, so a target replaced
+first would be lost to a truncated or corrupt dump, `--force` or not; a failed restore now discards the
+staging directory and leaves the original exactly as it was.
 
 **`createUniqueConstraint` refuses a declaration the data already violates.** A faithful dump from a
 store that held the constraint cannot do that, so a failure there means the dump is damaged or the target
@@ -297,6 +303,12 @@ Two things about that pair are worth knowing before they are discovered:
   names `--server`.
 - **The restore has no `--path` and no `--force`.** `GRAPH_ROOT` supplies the first. The second is not
   needed because the target is empty: see §7.2.
+- **`--server` needs `GRAPH_TOKEN` when authentication is on**, which is the default. It is sent as
+  `Authorization: Bearer`; the value is the `token` that `POST /api/login` returns, for a login holding
+  `BACKUP` on the database (or `MATCH`/anything for `database list`). Without it every `--server`
+  command was a 401 with no way to send a credential. A variable rather than a flag, for the reason
+  `GRAPH_ADMIN_PASSWORD` is: a flag is in shell history and in `ps`.
+  `docker exec -e GRAPH_TOKEN=… g metaloom-graph-cli database backup …`.
 
 ### 7.2 Restoring over the last database
 
@@ -309,7 +321,10 @@ Two changes, both narrow:
 
 - **`GraphDatabases.replace(name, options)`**, which closes, deletes and recreates in one step while
   holding the lock. The root is never observed empty, so this is not "drop without the check" — the
-  check is about a state that no longer occurs. `drop` is unchanged and still refuses.
+  check is about a state that no longer occurs. `drop` is unchanged and still refuses. The CLI's restore
+  has since moved to `stage` + `install` (§5), which keep the same property — `install` renames the
+  original aside, renames the staged store in, then deletes the original — and also survive a dump that
+  turns out to be damaged; `replace` remains for callers with nothing to lose.
 - **`--force` is about data, not existence.** A target that exists but holds no nodes is replaced
   without it. Being asked to confirm the loss of an empty database that the tool itself had just
   created was a question with only one answer.
@@ -325,7 +340,7 @@ Two changes, both narrow:
 | `BackupUnderLoadTest` | A backup taken while a writer commits: every edge joins one generation and every generation is present whole, so the dump is one instant — **and** the writer made progress, so it was online |
 | `DumpHostileInputTest` | §3.4: every truncation, every single-byte corruption, 200 random inputs, a huge length, deep nesting, a non-terminating varint |
 | `CliOptionsTest` | The command line, both directions, and that every dispatched command is documented |
-| `GraphCliTest` | The commands as somebody runs them, through `run()` and its exit status. §7.2 lived here: neither of the two above goes through the CLI, so neither could see that a restore into a fresh root was impossible |
+| `GraphCliTest` | The commands as somebody runs them, through `run()` and its exit status. §7.2 lived here: neither of the two above goes through the CLI, so neither could see that a restore into a fresh root was impossible. Also that a truncated or corrupt dump restored with `--force` leaves the original untouched and no staging directory listed |
 | `GraphDatabasesTest` (graph-core) | That the last database can be `replace`d though it cannot be `drop`ped, and that the root is never observed empty |
 | `GraphServerOptionsTest` | That `--allow-backup` is off by default and independent of `--allow-write` and `--allow-drop` |
 | `tools/native-image.sh`, `cli` | Not a unit test: the GraalVM binary doing the whole round against a real store. `-H:+SharedArenaSupport` fails on *close*, so only a round trip catches its absence — [GRAALVM.md §10.2](GRAALVM.md#102-its-smoke-test) |

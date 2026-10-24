@@ -111,23 +111,53 @@ public final class SegmentFile implements AutoCloseable {
 
 		FileChannel channel = FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ,
 			StandardOpenOption.WRITE);
+		Arena arena = null;
 		try {
 			if (channel.size() < size) {
-				// Extends sparsely: no blocks are allocated until a page is actually written.
-				channel.truncate(0);
-				channel.position(size - 1);
-				channel.write(java.nio.ByteBuffer.wrap(new byte[1]));
+				// Extends sparsely: no blocks are allocated until a page is actually written. Never truncated first:
+				// an existing file that is merely short — a partial copy, an interrupted restore — keeps its bytes, so
+				// whatever is wrong with it is found by validation rather than erased before it.
+				channel.write(java.nio.ByteBuffer.wrap(new byte[1]), size - 1);
 			}
-			Arena arena = Arena.ofShared();
+			arena = Arena.ofShared();
 			MemorySegment mapped = channel.map(MapMode.READ_WRITE, 0, size, arena);
+			if (!fresh && neverWritten(mapped, geometry, kind)) {
+				// The file was created and the process died before its header was forced, which addSegment does at
+				// once. Nothing can have been allocated in it, so it is a fresh segment, not a corrupt one; refusing
+				// it would leave the whole store unopenable over a file that never held anything.
+				logger.warn("{} segment {} at {} has no header and no allocations; initialising it", kind,
+					segmentNumber, path);
+				fresh = true;
+			}
 			if (fresh) {
 				logger.debug("Created {} segment {} at {} ({} bytes nominal)", kind, segmentNumber, path, size);
 			}
 			return new SegmentFile(path, kind, segmentNumber, geometry, channel, arena, mapped, fresh);
 		} catch (RuntimeException | IOException e) {
+			// The mapping too, not only the descriptor: a store retried over a damaged segment would otherwise leak a
+			// segment-sized mapping per attempt until the process exits.
+			if (arena != null) {
+				arena.close();
+			}
 			channel.close();
 			throw e;
 		}
+	}
+
+	/** Both superblock copies and the whole free-slot bitmap still zero: the file never got past being created. */
+	private static boolean neverWritten(MemorySegment mapped, Geometry geometry, Kind kind) {
+		MemorySegment zeros = MemorySegment.ofArray(new byte[Geometry.HEADER_BYTES]);
+		if (mapped.asSlice(0, Geometry.HEADER_BYTES).mismatch(zeros) != -1) {
+			return false;
+		}
+		long start = geometry.fsbStart(kind);
+		long end = start + geometry.fsbBytes(kind);
+		for (long at = start; at < end; at += 8) {
+			if (mapped.get(io.metaloom.graph.core.util.Layouts.LONG, at) != 0) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	// ---------------------------------------------------------------- overlay routing
@@ -394,6 +424,14 @@ public final class SegmentFile implements AutoCloseable {
 		dirtyPages.clear();
 	}
 
+	private static final java.util.concurrent.ConcurrentHashMap<Integer, Integer> ZERO_PAGE_CHECKSUMS =
+		new java.util.concurrent.ConcurrentHashMap<>();
+
+	/** The checksum a page of zeros carries, which is what a punched page reads as. One per page size. */
+	private int zeroPageChecksum() {
+		return ZERO_PAGE_CHECKSUMS.computeIfAbsent(pageSize, size -> Crc.crc32c(new byte[size]));
+	}
+
 	/** Verifies every page that has at least one live record. Used by {@code store.verify()}. */
 	public void verifyChecksums() {
 		int pages = geometry.pagesPerSegment(kind);
@@ -402,7 +440,10 @@ public final class SegmentFile implements AutoCloseable {
 				continue;
 			}
 			int actual = Crc.crc32c(mapped, dataStart + (long) page * pageSize, pageSize);
-			if (actual != pageMeta.checksum(page)) {
+			if (actual != pageMeta.checksum(page)
+				&& !(actual == zeroPageChecksum() && pageMeta.liveCount(page) == 0)) {
+				// The exception is a page with no live record that reads as zeros, which is a valid empty page whatever
+				// its checksum says: it is what a crash between punching a hole and recording the punch leaves behind.
 				throw new PageCorruptException("Checksum mismatch in " + path + " page " + page
 					+ " (slots " + (long) page * geometry.recordsPerPage(kind) + ".."
 					+ ((long) (page + 1) * geometry.recordsPerPage(kind) - 1) + ")");
@@ -430,16 +471,31 @@ public final class SegmentFile implements AutoCloseable {
 			return 0;
 		}
 		force();
-		int punched = 0;
 		int pages = geometry.pagesPerSegment(kind);
 		long highWaterPage = superblock.highWaterSlot() / geometry.recordsPerPage(kind);
+		int zeroPage = zeroPageChecksum();
+		java.util.BitSet candidates = new java.util.BitSet();
 		for (int page = 0; page < pages && page <= highWaterPage; page++) {
-			if (pageMeta.liveCount(page) != 0 || pageMeta.checksum(page) == 0) {
+			int checksum = pageMeta.checksum(page);
+			// Zero is a page never written; the zero-page CRC is one already punched. Neither has anything to give
+			// back, and testing only the first made every reclaim punch every earlier hole again.
+			if (pageMeta.liveCount(page) != 0 || checksum == 0 || checksum == zeroPage) {
 				continue;
 			}
 			// Read before punching, obviously, but also before the punch is attempted: a floor raised for a page that
 			// then failed to punch costs one wasted generation and nothing else, while the reverse loses the history.
 			pageMeta.raiseGenFloor(page, highestGenOnPage(page));
+			candidates.set(page);
+		}
+		if (candidates.isEmpty()) {
+			return 0;
+		}
+		// Every floor is durable before any page loses the records it was read from. A punch takes effect at once;
+		// a crash between it and a later force would otherwise leave a zeroed page whose slots restart at generation
+		// 1, so that an id from before the delete resolves to whatever is allocated there next.
+		force();
+		int punched = 0;
+		for (int page = candidates.nextSetBit(0); page >= 0; page = candidates.nextSetBit(page + 1)) {
 			if (NativeLib.punchHole(path, dataStart + (long) page * pageSize, pageSize)) {
 				// The page now reads as zeros, so its checksum has to follow or verify() would fail.
 				pageMeta.checksum(page, Crc.crc32c(mapped, dataStart + (long) page * pageSize, pageSize));

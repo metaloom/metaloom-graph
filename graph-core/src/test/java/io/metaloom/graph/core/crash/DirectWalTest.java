@@ -26,6 +26,7 @@ import io.metaloom.graph.core.nativelib.NativeLib;
 import io.metaloom.graph.core.store.GraphStoreImpl;
 import io.metaloom.graph.core.wal.WalReader;
 import io.metaloom.graph.core.wal.WalRecord;
+import io.metaloom.graph.core.wal.WalWriter;
 
 /**
  * The write-ahead log on the direct engine — capability N2 applied to the one file it was meant for.
@@ -183,5 +184,141 @@ public class DirectWalTest {
 				assertEquals((long) i, recovered.nodeProperty(committed.get(i), "i"));
 			}
 		}
+	}
+
+	/**
+	 * Records staged for one segment must reach it when the stream rolls into the next.
+	 *
+	 * <p>
+	 * The writer stages records and only writes when a buffer fills or a sync pads it out. Rolling over to a new
+	 * segment used to drop whatever was staged for the old one, and the sync that followed then forced only the new
+	 * file. Read before {@code close()}, because close flushes the current segment and would hide nothing — the loss
+	 * is in the old one.
+	 * </p>
+	 */
+	@Test
+	public void testRecordsStagedBeforeASegmentRolloverReachTheDisk() throws Exception {
+		assumeTrue(DirectIoEngine.isSupported(), "direct IO is unavailable");
+
+		long segment = 64 * 1024;
+		int records = 100;
+		try (WalWriter writer = new WalWriter(dir, segment, 0, WalSyncMode.FSYNC_ON_COMMIT, 0, IoEngineKind.DIRECT)) {
+			for (int i = 0; i < records; i++) {
+				// About 1 KiB each, so the stream crosses into the second segment around record 61.
+				writer.append(0, 7, WalRecord.TYPE_PAGE_IMAGE, new byte[1024]);
+			}
+			writer.append(0, 7, WalRecord.TYPE_TXN_COMMIT, new byte[0]);
+			writer.sync();
+
+			int found = 0;
+			try (WalReader reader = new WalReader(dir, segment, 0)) {
+				byte[] record;
+				while ((record = reader.next()) != null) {
+					if (WalRecord.type(record, 0) != WalRecord.TYPE_PADDING) {
+						found++;
+					}
+				}
+			}
+			assertEquals(records + 1, found, "every record acknowledged by sync() must be on disk, in either segment");
+		}
+	}
+
+	/**
+	 * Under {@code GROUP_COMMIT} a commit that returned is in the kernel's hands, even when its fsync is deferred.
+	 *
+	 * <p>
+	 * The buffered writer gets this for free: every append is a {@code write()}, so a {@code kill -9} loses nothing
+	 * that returned and only a power cut can take the unforced tail. The direct writer staged records in its own
+	 * buffer until a force, so a process crash took every commit of the interval with it — while the data pages those
+	 * commits had already been copied into, being a shared mapping, survived. A torn or unlogged transaction from a
+	 * plain process kill. Read here without closing the writer, because close would flush the buffer.
+	 * </p>
+	 */
+	@Test
+	public void testGroupCommitHandsEveryCommitToTheDevice() throws Exception {
+		assumeTrue(DirectIoEngine.isSupported(), "direct IO is unavailable");
+
+		long segment = 1L << 20;
+		try (WalWriter writer = new WalWriter(dir, segment, 0, WalSyncMode.GROUP_COMMIT, 3_600_000,
+			IoEngineKind.DIRECT)) {
+			for (int i = 0; i < 10; i++) {
+				writer.append(0, i, WalRecord.TYPE_TXN_COMMIT, new byte[100]);
+				writer.sync();
+			}
+			int found = 0;
+			try (WalReader reader = new WalReader(dir, segment, 0)) {
+				byte[] record;
+				while ((record = reader.next()) != null) {
+					if (WalRecord.type(record, 0) != WalRecord.TYPE_PADDING) {
+						found++;
+					}
+				}
+			}
+			assertEquals(10, found, "every commit that returned must have been written, if not yet forced");
+			assertTrue(writer.durableLsn() < writer.nextLsn(), "and none of it may be called durable");
+		}
+	}
+
+	/**
+	 * One transaction whose records span a segment boundary is recovered whole.
+	 *
+	 * <p>
+	 * The data files are rolled back to a snapshot taken before the transaction, so only the log can bring it back. A
+	 * log missing the part staged in the first segment replays the second half alone: the transaction comes back
+	 * torn, which is worse than not at all.
+	 * </p>
+	 */
+	@Test
+	public void testATransactionAcrossASegmentBoundaryIsRecoveredWhole() throws Exception {
+		assumeTrue(DirectIoEngine.isSupported(), "direct IO is unavailable");
+
+		GraphStoreOptions options = GraphStoreOptions.builder()
+			.walSyncMode(WalSyncMode.FSYNC_ON_COMMIT)
+			.ioEngine(IoEngineKind.DIRECT)
+			.walSegmentBytes(64 * 1024)
+			.segmentCapacity(io.metaloom.graph.core.fixture.TempStore.TEST_SEGMENT_CAPACITY)
+			.build();
+		Path snapshot = dir.resolve("snapshot");
+		Path storeDir = dir.resolve("store");
+		try (GraphStore store = GraphStore.open(storeDir, options)) {
+			store.createNode("Seed");
+		}
+		copyDataFiles(storeDir, snapshot);
+
+		List<Long> ids = new ArrayList<>();
+		GraphStoreImpl store = (GraphStoreImpl) GraphStore.open(storeDir, options);
+		try (Transaction txn = store.begin()) {
+			for (int i = 0; i < 500; i++) {
+				ids.add(store.createNode("Person", Properties.of().set("i", i).set("name", "person-" + i)));
+			}
+			txn.commit();
+		}
+		assertTrue(store.wal().nextLsn() > 64 * 1024, "the transaction must have crossed a segment boundary");
+		store.abandon();
+		copyDataFiles(snapshot, storeDir);
+
+		try (GraphStore recovered = GraphStore.open(storeDir, options)) {
+			assertEquals(ids.size() + 1, recovered.stats().nodeCount(), "the transaction must come back whole");
+			for (int i = 0; i < ids.size(); i++) {
+				assertEquals((long) i, recovered.nodeProperty(ids.get(i), "i"), "node " + i + " was torn");
+			}
+			recovered.verify();
+		}
+	}
+
+	/** Copies the data segments and the manifest, leaving the log alone, as RecoveryTest does. */
+	private static void copyDataFiles(Path from, Path to) throws java.io.IOException {
+		Path source = from.resolve("seg");
+		try (java.util.stream.Stream<Path> walk = Files.walk(source)) {
+			for (Path entry : walk.toList()) {
+				Path destination = to.resolve("seg").resolve(source.relativize(entry).toString());
+				if (Files.isDirectory(entry)) {
+					Files.createDirectories(destination);
+				} else {
+					Files.copy(entry, destination, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+				}
+			}
+		}
+		Files.copy(from.resolve("MANIFEST"), to.resolve("MANIFEST"), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
 	}
 }

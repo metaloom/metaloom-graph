@@ -321,6 +321,32 @@ public class AuthenticationTest {
 		assertEquals(401, get("/api/stats", token).statusCode());
 	}
 
+	/**
+	 * And so does a disable made by another process — the CLI, editing {@code .auth} while the server runs.
+	 *
+	 * <p>
+	 * The server re-reads the file when it changes. Doing that only on login would let an existing session outlive
+	 * the edit until its idle timeout; the check is rate-limited, so this allows a moment rather than demanding the
+	 * very next request.
+	 * </p>
+	 */
+	@Test
+	public void testADisableMadeByAnotherProcessEndsTheLiveSession() throws Exception {
+		String token = tokenFor("reader", "reader-password");
+		assertEquals(200, get("/api/stats", token).statusCode());
+
+		try (AuthStore elsewhere = AuthStore.open(stores.path().resolve("root"))) {
+			elsewhere.setEnabled("reader", false);
+		}
+
+		int status = 200;
+		for (int attempt = 0; attempt < 40 && status != 401; attempt++) {
+			Thread.sleep(100);
+			status = get("/api/stats", token).statusCode();
+		}
+		assertEquals(401, status, "a user disabled on disk kept their session");
+	}
+
 	/** And a revoked grant takes effect just as immediately. */
 	@Test
 	public void testARevokedGrantTakesEffectOnTheNextRequest() throws Exception {

@@ -221,4 +221,31 @@ public class McpProtocolTest {
 				"the descriptor's write flag must not be serialised");
 		}
 	}
+
+	/**
+	 * An unknown tool name is recorded as {@code tool="unknown"}, never as itself.
+	 *
+	 * <p>
+	 * The name comes from the client. Used as a label it is one new time series per string a caller cares to send,
+	 * which is unbounded memory in the registry and on every scrape.
+	 * </p>
+	 */
+	@Test
+	public void testAnUnknownToolNameIsNotUsedAsAMetricLabel() {
+		io.micrometer.prometheusmetrics.PrometheusMeterRegistry registry =
+			new io.micrometer.prometheusmetrics.PrometheusMeterRegistry(
+				io.micrometer.prometheusmetrics.PrometheusConfig.DEFAULT);
+		McpJsonRpcHandler handler = new McpJsonRpcHandler(
+			GraphMcpTools.all(vertx, databases, GraphDatabases.DEFAULT_NAME, false, 5_000), false,
+			new io.metaloom.graph.server.metrics.MicrometerGraphMetrics(registry));
+
+		for (int i = 0; i < 3; i++) {
+			JsonObject response = callTool(handler, "made_up_" + i, new JsonObject());
+			assertNotNull(response.getJsonObject("error"), response.encode());
+		}
+
+		String scrape = registry.scrape();
+		assertFalse(scrape.contains("made_up_"), "a client-chosen name became a label: " + scrape);
+		assertTrue(scrape.contains("tool=\"unknown\""), scrape);
+	}
 }

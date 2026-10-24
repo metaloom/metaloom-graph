@@ -61,10 +61,22 @@ Range        := [Int] ['..' [Int]]
 
 Expression precedence, loosest first: `OR` · `XOR` · `AND` · `NOT` · comparison
 (`= <> < <= > >=`, `IN`, `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `IS [NOT] NULL`) · `+ -` · `* / %` ·
-`^` (right associative) · unary `-` · property access, indexing, `:Label` predicate.
+`^` (right associative) · unary `-` · property access, indexing, `:Label` predicate. Comparisons
+chain as in openCypher: `a < b <= c` is `a < b AND b <= c`.
 
 **Parameters** are `$name`. **Comments** are `//` and `/* */`. **Backticks** quote a name containing
 spaces. Keywords are case-insensitive; identifiers are not; `:Order` and `.end` are ordinary names.
+
+**Parameters are normalised once per query**: `Integer`, `Short` and `Byte` become `Long`, `Float` becomes
+`Double`, through lists and maps. A JSON body decodes `30` as an `Integer`, and without this it compared
+correctly and then failed the first write. A `float[]` is left alone — it is how a query vector arrives.
+
+**Hostile input is refused, not survived.** An expression nested more than 200 levels deep in the
+parser's recursion (parentheses, lists, prefix operators), or whose tree is deeper than 1,000 (a flat
+`a OR b OR …` chain of 999 is fine), is a `CypherSyntaxException` rather than a `StackOverflowError`. A
+number that does not fit in 64 bits — `9223372036854775808`, `0xFFFFFFFFFFFFFFFFF`, `0x` — and a bad
+`\u` escape are syntax errors with a caret; `-9223372036854775808` is the one literal that only exists
+negated and is accepted. A range bound past `2^31` means "unbounded" rather than its low 32 bits.
 
 ### 1.1 Functions
 
@@ -76,6 +88,21 @@ spaces. Keywords are case-insensitive; identifiers are not; `:Order` and `.end` 
 | String | `toString`, `toUpper`, `toLower`, `trim`, `ltrim`, `rtrim`, `substring`, `replace`, `split` |
 | Numeric | `toInteger`, `toFloat`, `toBoolean`, `abs`, `ceil`, `floor`, `round`, `sqrt`, `sign` |
 | Vector | `vector.cosine`, `vector.dot`, `vector.l2` — [VECTOR.md](VECTOR.md) |
+
+An aggregate may sit anywhere inside a projection item — `size(collect(x))`, `count(*) > 0`,
+`collect(x)[0]`, `{c: count(*)}` — and is folded when evaluation reaches it, so a `CASE` folds only the
+branch it takes.
+
+`startNode(r)` and `endNode(r)` return the **node**, so `startNode(r) = a` and `startNode(r).name` work.
+`range()` builds at most **10,000,000** elements and refuses more: the list is materialised and boxed,
+and `range(1, 2000000000)` was an `OutOfMemoryError` for every query in the process rather than a slow
+answer. Its length is counted up front, so `range(9223372036854775806, 9223372036854775807)` is two
+elements rather than a loop that wraps.
+
+**Integer arithmetic does not wrap.** `+ - * /`, unary minus, `abs` and `sum` over integers that leave
+64 bits raise a `CypherTypeException` naming the operator; a silently negative sum is a wrong answer that
+throws nothing. `SKIP`/`LIMIT` and `substring` arguments past an `int` are clamped as longs, not
+truncated.
 
 **One procedure**, and it exists because the planner cannot infer an access path it has no cost model
 for:
@@ -118,12 +145,11 @@ query vector written for a different model than the stored one.
 which is a different value from the `float[]` the Java API writes and will not match it. Populating a
 vector property is a Java API operation today.
 
-**The spelling that matters for a top-k.** `ORDER BY` is sort-then-truncate and `Comparator.comparing`
-recomputes its key on every comparison, so ordering directly on a call evaluates the distance
-`O(n log n)` times:
+**A top-k.** `ORDER BY` is sort-then-truncate, and its keys are computed **once per row** before the
+sort, so ordering directly on `vector.cosine(...)` scores each row once. Projecting the score first is
+still the clearer spelling:
 
 ```cypher
-// once per row
 MATCH (d:Doc) WITH d, vector.cosine(d.embedding, $q) AS score
 ORDER BY score DESC LIMIT 10 RETURN d.name, score
 ```
@@ -149,6 +175,10 @@ for, or drops rows it did.
 | `3 IN [1, null]` | `null` | the null might have been a 3 |
 | `1 IN [1, null]` | `true` | a match is a match |
 | `null IN []` | `false` | nothing is in an empty list |
+| `[1, null] = [1, 2]` | `null` | a nested null is just as unknown |
+| `[1, null] = [2, null]` | `false` | unless a known element already differs |
+| `{a: 1} = {a: 1.0}` | `true` | map values compare as Cypher values |
+| `-0.0 < 0.0`, `0.0/0.0 > 1` | `false` | `< <= > >=` on floats are IEEE, not `Double.compare`'s sort order |
 | `WHERE <null>` | row dropped | the one place the third value collapses |
 
 **The classic surprise**: `WHERE NOT n.age > 20` does not return the nodes with no age. `n.age > 20`
@@ -158,8 +188,10 @@ Aggregates **skip nulls**; `count(*)` counts **rows**. Over five people of whom 
 `count(*)` is 5, `count(p.age)` is 3, and `avg(p.age)` divides by 3. `sum` of nothing is `0`;
 `avg` of nothing is `null`.
 
-DISTINCT and ORDER BY need a total order, so they are the one place two nulls are treated as equal.
-Nulls sort **last** ascending.
+DISTINCT, grouping and ORDER BY need two-valued answers, so they are the one place two nulls are
+treated as equal. DISTINCT and grouping use openCypher's *equivalence* — null ≡ null, NaN ≡ NaN, `1` ≡
+`1.0` — through one key function (`Values.groupingKey`), so `UNWIND [1, 1.0] AS x RETURN x, count(*)`
+is one group, as `RETURN DISTINCT x` is one row. Nulls sort **last** ascending.
 
 ---
 
@@ -192,13 +224,19 @@ The engine has a breadth-first walk. It was not reused, and the difference is no
 
 | | `GraphStore.traverse` | Cypher `-[*1..3]->` |
 |---|---|---|
-| Uniqueness | per **node** | per **relationship**, within each path |
+| Uniqueness | per **node** | per **relationship**, across the whole `MATCH` (every comma-separated part) |
 | Result | flat list of edges | one row per distinct **path** |
 | Question | what can I reach | how can I get there |
 
 On a diamond — two routes from A to D — `traverse` reports D once, Cypher returns two rows.
 `VarLengthPathTest` builds that graph and asserts both, so the claim is measured rather than argued.
-Relationship uniqueness is also what makes `-[*]-` terminate on a cycle.
+Relationship uniqueness is also what makes `-[*]-` terminate on a cycle. A relationship variable
+already bound by an earlier clause is a **join**, as a node variable is: `WITH r MATCH (a)-[r]->(b)`
+finds `r`'s own endpoints rather than rebinding `r` to every edge.
+
+**`WITH` is a projection.** What it leaves out is out of scope afterwards, in its own `WHERE` and in
+every later clause, on both execution paths — `MATCH (a)-->(b) WITH a MATCH (a)-->(b)` binds a fresh
+`b`. Its `ORDER BY` may still read underneath, as openCypher allows.
 
 ---
 
@@ -325,7 +363,17 @@ pipeline must therefore never carry a write clause**; see [PROGRESS.md](PROGRESS
 **Bindings are refreshed after a clause writes.** A `CypherNode` is an immutable snapshot taken when the
 variable was bound, so without this `MATCH (n) SET n.age = 30 RETURN n` would return the age from
 before — a wrong answer that throws nothing. Each write clause re-reads what it touched and rewrites the
-bindings in every row, including inside lists and paths.
+bindings in every row, including inside lists and paths. **Within a `SET`, each row also sees what the
+rows before it wrote**: it is rebound against the elements already written before its items are
+evaluated, or `MATCH (:User)-[:VIEWED]->(p) SET p.views = p.views + 1` over three users would read the
+same stale value three times and lose two updates.
+
+**`SET n += {k: null}` removes `k`**, exactly as `SET n.k = null` does; in `SET n = {…}` a null entry is
+simply not stored.
+
+**`DETACH DELETE` remembers what its cascade took.** `MATCH (a)-[r]->() DETACH DELETE a, r` reaches the
+second row with `r` already gone with `a`; deleting it again would free its id twice, which the store
+does not catch. A self-relationship is counted once, though both of its ends list it.
 
 **Several assignments to one element are one store write.** `setNodeProperties` decodes the whole
 property block, re-encodes the map, allocates a new block, frees the old and diffs both against the
@@ -583,6 +631,17 @@ composite index** over one of the pattern's labels and one of its literal proper
 property equality → a label scan → a full node scan. So
 `MATCH (a:Person {email:$e})-[:KNOWS]->(b)` is one index probe and one expansion.
 
+**A `WHERE` equality seeds the same probe.** `MATCH (n:Person) WHERE n.email = $e` is the inline map
+spelled differently and now costs the same: a top-level `AND`-ed `var.key = <literal | $param |
+other.key>` on the leading node is a candidate for the probe, after the inline map. Only a conjunct (under
+`OR` or `NOT` the row could pass without it), only a scalar value, and the `WHERE` still runs over every
+row — so a hint can narrow the candidates and never decide the answer.
+
+**An integral number is probed in both spellings.** The index is keyed on the stored value's own type,
+so `30` and `30.0` hash apart there while `30 = 30.0` is true in Cypher, and an empty probe is an answer
+with no scan behind it. `MATCH (n {age: 30.0})` found nothing and `MERGE` duplicated the node; both
+spellings are now probed and the results joined (exact below 2^53).
+
 **The composite step is taken only when the pair has been declared** through
 `GraphStore.createIndex(label, key)` ([INDEX.md §3.3](INDEX.md)); an undeclared pair falls through to
 the property probe, which is what the planner did before. There is no Cypher DDL for a declaration —
@@ -600,9 +659,9 @@ the query language uses an index it cannot create.
   `RETURN *` needs it to know its own columns; and a write materialises so that it can commit before
   delivering a row. [WIRE.md §0](WIRE.md) states the same distinction from the transport's side, where
   it is easiest to overclaim.
-- **DISTINCT is quadratic** in the number of distinct rows. It cannot use a hash set: `1` and `1.0`
-  are the same Cypher value with different hash codes, and two nodes are equal by id rather than by
-  contents.
+- **DISTINCT is a hash set over `Values.groupingKey`**, not over the values: `1` and `1.0` are the same
+  Cypher value with different hash codes, and two nodes are equal by id rather than by contents, so the
+  key normalises both. It was quadratic before the key existed.
 - **Only the first label of a pattern drives the scan**; the rest are verified per candidate. The
   rarest would be the better choice, and the store does not expose per-label counts. A declared
   composite index is the way to say which pair matters, because without statistics the planner cannot
@@ -852,14 +911,14 @@ together: both have to permit, and the flag can only subtract.
 
 | Class | Cases | |
 |---|---|---|
-| `CypherParserTest` | 26 | Tokens, precedence, ranges, every refusal naming itself with a caret, and that a label or property key named after a keyword keeps its spelling |
+| `CypherParserTest` | 30 | Tokens, precedence, ranges, every refusal naming itself with a caret, and that a label or property key named after a keyword keeps its spelling |
 | `io/CsvRowReaderTest` | 15 | RFC 4180: quoted newlines, the `""` escape, BOM, `\r\n`, a custom terminator, and a record straddling the buffer |
 | `LoadCsvTest` | 27 | §5.6 end to end: both row shapes, both execution paths, the reader closed on every exit including an early `LIMIT`, `DENY` by default, and periodic commit's partial-failure semantics |
-| `NullSemanticsTest` | 16 | §2, on its own |
-| `CypherExecutionTest` | 31 | Every clause, end to end |
+| `NullSemanticsTest` | 17 | §2, on its own |
+| `CypherExecutionTest` | 44 | Every clause, end to end |
 | `CypherVersusApiTest` | 12 | **The load-bearing one** — see below |
 | `CypherWriteVersusApiTest` | 7 | Its inverse, and the load-bearing one for writes: run a write in Cypher, verify with the Java API, then `verify(FULL)` |
-| `CypherWriteTest` | 31 | Every write clause end to end, each finishing with `verify(FULL)` |
+| `CypherWriteTest` | 37 | Every write clause end to end, each finishing with `verify(FULL)` |
 | `CypherWriteTransactionTest` | 8 | §4.1: the transaction joined, the read view refused, a failed query leaving the segment files byte-identical, and a concurrent reader's snapshot unmoved |
 | `LazyExecutionTest` | 14 | §7.1: what stops the scan early — counted at the store rather than timed — what correctly does not, and the two paths agreeing cell by cell |
 | `integration/CypherCorpusTest` | 4 | The `test-data/` corpus: four openCypher dumps and 29 queries whose counts were derived elsewhere and proven against Neo4j. See §9.2 |
@@ -956,5 +1015,5 @@ previous bundle. Every assertion in the first run failed against markup that no 
 
 ---
 
-_Git HEAD revision: `58cd33e`_
-_Last updated: 2026-08-18 (TLS on the binary port)_
+_Git HEAD revision: `4f21a62`_
+_Last updated: 2026-10-24 (review fixes: WITH scope, SET read-your-writes, numeric equality in probes, overflow, depth limits)_

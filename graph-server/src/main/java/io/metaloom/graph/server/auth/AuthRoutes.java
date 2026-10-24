@@ -3,7 +3,6 @@ package io.metaloom.graph.server.auth;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.Semaphore;
 import java.util.function.Supplier;
 
 import org.slf4j.Logger;
@@ -53,17 +52,6 @@ public final class AuthRoutes {
 	public static final String COOKIE = "graph_session";
 
 	private static final String BEARER = "Bearer ";
-
-	/**
-	 * How many passwords may be verified at once.
-	 *
-	 * <p>
-	 * One derivation is around a hundred milliseconds of CPU, so a hundred concurrent logins is fifteen CPU-seconds.
-	 * Bounding it turns a flood into a queue and then into a 503, rather than into a server that stops answering
-	 * queries because it is busy hashing.
-	 * </p>
-	 */
-	private final Semaphore verifications = new Semaphore(Runtime.getRuntime().availableProcessors());
 
 	/**
 	 * The policy, read per request rather than captured.
@@ -181,15 +169,18 @@ public final class AuthRoutes {
 			return;
 		}
 
-		if (!verifications.tryAcquire()) {
+		// Bounded across every front end at once — see AuthPolicy.tryBeginVerification. Held as one policy, so the
+		// release goes back to the semaphore the permit came from even if the policy is swapped meanwhile.
+		AuthPolicy policy = auth();
+		if (!policy.tryBeginVerification()) {
 			fail(context, 503, "busy", "This server is verifying as many passwords as it can at once. Retry.");
 			return;
 		}
 
 		char[] characters = password.toCharArray();
-		vertx.<Optional<Principal>>executeBlocking(() -> auth().authenticate(user, characters), false)
+		vertx.<Optional<Principal>>executeBlocking(() -> policy.authenticate(user, characters), false)
 			.onComplete(outcome -> {
-				verifications.release();
+				policy.endVerification();
 				java.util.Arrays.fill(characters, '\0');
 				if (outcome.failed()) {
 					logger.error("Verifying a password failed", outcome.cause());
@@ -321,6 +312,11 @@ public final class AuthRoutes {
 		for (int i = 0; i < requested.size(); i++) {
 			roles.add(requested.getString(i));
 		}
+		// Putting a user in a role hands them its grants, which is MANAGE_ROLES's business. Without this a helpdesk
+		// account creates a second user in the admin role and logs in as it (spec/AUTH.md section 1.1).
+		if (!roles.isEmpty() && !permit(context, Privilege.MANAGE_ROLES)) {
+			return;
+		}
 		char[] characters = password.toCharArray();
 		mutate(context, () -> auth().store().createUser(name, characters, roles), () -> {
 			java.util.Arrays.fill(characters, '\0');
@@ -358,6 +354,15 @@ public final class AuthRoutes {
 		}
 		if (!self && !permit(context, Privilege.MANAGE_USERS)) {
 			return;
+		}
+		if (!self) {
+			// A reset is a login as that user. Resetting a reader's password is the helpdesk's job; resetting the
+			// password of somebody who may manage roles would be becoming them.
+			Privilege beyond = administrativeBeyond(principal, name);
+			if (beyond != null) {
+				forbidden(context, beyond, Grant.ALL_DATABASES);
+				return;
+			}
 		}
 		JsonObject body = body(context);
 		if (body == null) {
@@ -498,6 +503,24 @@ public final class AuthRoutes {
 		}
 		forbidden(context, privilege, Grant.ALL_DATABASES);
 		return false;
+	}
+
+	/**
+	 * An administrative privilege {@code target} holds and {@code caller} does not, or null.
+	 *
+	 * <p>
+	 * Administrative only, the global-only ones: a helpdesk resetting a reader's password does take on that reader's
+	 * access for a moment, and that is the job {@code MANAGE_USERS} exists for. What it must not reach is an account
+	 * that could grant anything. Disabled users count, because re-enabling one is another {@code MANAGE_USERS} call.
+	 * </p>
+	 */
+	private Privilege administrativeBeyond(Principal caller, String target) {
+		for (Grant grant : auth().store().effectiveGrants(target)) {
+			if (grant.privilege().isGlobalOnly() && !caller.may(grant.privilege())) {
+				return grant.privilege();
+			}
+		}
+		return null;
 	}
 
 	private interface Edit {

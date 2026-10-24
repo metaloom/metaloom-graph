@@ -66,14 +66,24 @@ final class Aggregates {
 		boolean integral = true;
 		double asDouble = 0;
 		long asLong = 0;
+		// Net wraps past either end. The true sum is asLong + wraps * 2^64, so it fits exactly when this is zero — and
+		// only matters at all if the result stays an integer.
+		long wraps = 0;
 		for (Object value : values) {
 			Number number = Values.number(value, "sum");
 			if (Values.isIntegral(number)) {
-				asLong += number.longValue();
+				long next = asLong + number.longValue();
+				if (((asLong ^ next) & (number.longValue() ^ next)) < 0) {
+					wraps += number.longValue() > 0 ? 1 : -1;
+				}
+				asLong = next;
 			} else {
 				integral = false;
 			}
 			asDouble += number.doubleValue();
+		}
+		if (integral && wraps != 0) {
+			throw new CypherTypeException("Integer overflow in sum(): the result does not fit in 64 bits");
 		}
 		return integral ? (Object) asLong : (Object) asDouble;
 	}
@@ -105,18 +115,12 @@ final class Aggregates {
 		return best;
 	}
 
-	/** Distinct under Cypher equality, so that 1 and 1.0 collapse and two reads of one node collapse. */
+	/** Distinct under Cypher equivalence, so that 1 and 1.0 collapse and two reads of one node collapse. */
 	private static List<Object> distinct(List<Object> values) {
 		List<Object> kept = new ArrayList<>();
+		java.util.Set<Object> seen = new java.util.HashSet<>();
 		for (Object value : values) {
-			boolean seen = false;
-			for (Object existing : kept) {
-				if (Values.equalKnown(existing, value)) {
-					seen = true;
-					break;
-				}
-			}
-			if (!seen) {
+			if (seen.add(Values.groupingKey(value))) {
 				kept.add(value);
 			}
 		}

@@ -386,6 +386,17 @@ format.
 - **A read view is thread-confined**, and using one from another thread is refused rather than
   tolerated. Open one per thread.
 - **A writer never reads through a view**, even one open on its own thread.
+- **A write transaction is thread-confined too.** `commit()` or `rollback()` from a thread other than
+  the one that called `begin()` is refused, and the transaction stays usable by its owner. It used to
+  release a lock the calling thread did not hold and leave checkpoint and close hung forever.
+- **Do not commit with a cursor open, or write from inside a scan callback.** A `neighbourCursor` or a
+  `forEachNode` callback holds the apply latch on its thread, and a commit has to wait for every holder —
+  itself included. The commit is refused with a `GraphStoreException` and the transaction is rolled
+  back; it used to deadlock the whole store. Collect the ids, finish the scan, then write.
+- **`checkpoint()`, `reclaim()`, `verify()` and `compact()` refuse to run inside the caller's own
+  write transaction**, which they would otherwise wait on forever. **`close()` inside one rolls it
+  back and closes.** `compact()` also refuses a read view opened while it runs, at the next batch
+  rather than only at the start.
 - **Batch reads reorder.** `tx.nodes(ids)` does not guarantee cursor order matches the input array;
   use `c.id()`. An ordered variant costs a sort of the results.
 

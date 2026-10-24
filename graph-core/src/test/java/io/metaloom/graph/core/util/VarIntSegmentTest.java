@@ -104,7 +104,35 @@ public class VarIntSegmentTest {
 		java.util.Arrays.fill(buffer, (byte) 0x80);
 		long[] out = new long[1];
 		assertThrows(IllegalArgumentException.class, () -> VarInt.read(buffer, 0, buffer.length, out));
+		try (Arena arena = Arena.ofConfined()) {
+			MemorySegment segment = arena.allocate(buffer.length);
+			MemorySegment.copy(MemorySegment.ofArray(buffer), 0, segment, 0, buffer.length);
+			assertThrows(IllegalArgumentException.class, () -> VarInt.read(segment, 0, buffer.length, out));
+		}
+	}
+
+	/**
+	 * The tenth byte carries bit 63 alone, so anything above 1 there names bits a long does not have. Accepting it
+	 * silently dropped them, decoding a corrupt varint as a plausible value.
+	 */
+	@Test
+	public void testATenthByteAboveOneIsRefusedOnEitherPath() {
+		byte[] buffer = new byte[10];
+		java.util.Arrays.fill(buffer, 0, 9, (byte) 0xFF);
+		long[] out = new long[1];
+		buffer[9] = 0x01;
+		assertEquals(10, VarInt.read(buffer, 0, buffer.length, out));
+		assertEquals(-1L, out[0], "0x01 in the tenth byte is bit 63, the largest legal encoding");
+		buffer[9] = 0x02;
 		assertThrows(IllegalArgumentException.class, () -> VarInt.read(buffer, 0, buffer.length, out));
+		try (Arena arena = Arena.ofConfined()) {
+			MemorySegment segment = arena.allocate(buffer.length);
+			MemorySegment.copy(MemorySegment.ofArray(buffer), 0, segment, 0, buffer.length);
+			assertThrows(IllegalArgumentException.class, () -> VarInt.read(segment, 0, buffer.length, out));
+			segment.set(java.lang.foreign.ValueLayout.JAVA_BYTE, 9, (byte) 0x01);
+			assertEquals(10, VarInt.read(segment, 0, buffer.length, out));
+			assertEquals(-1L, out[0]);
+		}
 	}
 
 	/** The two {@link EdgeCodec} decode entry points must produce the same edges as each other, on real blocks. */

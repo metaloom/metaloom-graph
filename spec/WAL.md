@@ -65,9 +65,25 @@ its CRC matches **and** its `lsn` equals its own file offset. That second check 
 partially-overwritten preallocated file unambiguous: stale bytes from a previous life of the file
 carry the wrong LSN and are rejected without needing an explicit end-of-log marker.
 
-Records are written into a shared, page-aligned ring buffer and flushed in 4 KiB blocks with
-`O_DIRECT`. A partial trailing block is rewritten on the next flush (the same 4 KiB block is written
-again with more data), which an SSD handles as a single-page overwrite.
+**Implemented.** Two writers produce the same format, and either can reopen the other's log:
+
+- **Buffered** (the default, and what `AUTO` resolves to): every record is a positioned `write()`
+  into the preallocated segment, and a force is `fdatasync`. A process crash therefore loses nothing
+  that was appended; only a power cut can take what was not yet forced.
+- **Direct** (`IoEngineKind.DIRECT`, `WalWriter.DirectLog`): records are staged in an aligned buffer
+  and written in whole 4 KiB blocks with `O_DIRECT`. **A block that has been forced is never written
+  again**: a force pads the tail of its last block with a `PADDING` record (type 6, skipped by redo)
+  and the stream continues in the next block. A sync that does not force (`GROUP_COMMIT` between
+  forces, `ASYNC`) still writes the staged blocks, the partial tail block zero-filled, so a process
+  crash loses no more than with the buffered writer; that tail block is written again, with more
+  records, until a force pads it. When the stream rolls into a new segment, whatever is staged for the
+  old one is written to it first (rounded up to a block with zeros, not padded: the reader treats a
+  tail that does not validate as the hop to the next segment) and the old file is forced and closed.
+
+Records are encoded in one array per record; a page image is built straight from the transaction's
+page copy (`WalRecord.encodePageImageRecord`). The reader scans with a sliding 64 KiB window that is
+refilled only when the next record is not wholly inside it, and grows for a record longer than the
+window — a whole-page image on a 64 KiB page store is one.
 
 ---
 
@@ -136,11 +152,23 @@ transaction whose commit LSN is at or below `durable_lsn` is committed.
 | Mode | Guarantee | Use |
 |------|-----------|-----|
 | `fsync_on_commit` | No committed transaction is ever lost | Default |
-| `group_commit(ms)` | Commits may lose up to *ms* of work on power loss; never corrupt | Throughput-oriented |
-| `async` | Durability off | Tests and bulk import only; the store refuses to open a production flag with it |
+| `group_commit(ms)` | A process crash loses nothing that returned. A power cut may lose up to *ms* of commits — and see below | Throughput-oriented |
+| `async` | A process crash loses nothing that returned. A power cut may lose everything since the last checkpoint — and see below | Tests and bulk import only |
 
-Even in `async` mode the **ordering** rules are preserved, so the store is always recoverable to
-*some* consistent point — it never becomes corrupt, only stale.
+**What is implemented** (the diagram above is the target): `GROUP_COMMIT` is time-based, not queued.
+A commit forces only when `walSyncIntervalMillis` has passed since the last force, and a background
+thread (`graph-wal-flusher`) forces an idle log within the same interval, so the window is bounded by
+time rather than by the arrival of the next commit. `durableLsn` moves **only** on a force, so
+`StoreMetrics.walLagBytes` is the honest size of the unforced tail: zero under `fsync_on_commit`,
+up to an interval's worth under `group_commit`, and growing until the next checkpoint under `async`.
+
+**Not "never corrupt" on power loss.** The engine applies a commit to the `MAP_SHARED` data files as
+soon as `sync()` returns, and the kernel may write those pages back at any moment. Under
+`fsync_on_commit` that is safe because the log was forced first. Under `group_commit` and `async` it
+is not: a power cut can leave data pages carrying a transaction whose log records never reached the
+device, and redo-only recovery has nothing to put them back with — the transaction can come back
+torn. A process crash (`kill -9`) does not have this problem, because every record that was appended
+is already in the kernel. If a power cut must leave a consistent store, use `fsync_on_commit`.
 
 ---
 
@@ -170,6 +198,23 @@ Additional sequencing:
   the write itself is the flush and only the WAL is fsynced.
 - **Never rely on `FileChannel.force` to flush a `MAP_SHARED` mapping.** The PoC's commented-out
   `fc.force(false)` calls would not have provided durability even if they were enabled.
+
+### 5.1 A log failure is permanent until reopen
+
+Any I/O failure in the log writer — a failed write, a failed fsync, a failed segment rollover — and
+any failure of a commit **after** `logCommit` returned (version retention, the apply) poisons the
+writer (`WalWriter.poison`). From then on every append, sync and force throws, so the store takes no
+further commit and no checkpoint until it is closed and reopened, and recovery decides from the log
+which commits are durable. `close()` still releases everything, and reports the failure.
+
+Why not carry on: the failed transaction's commit record may already be in the file. It is rolled
+back in memory and its slots go back to the free rings; the next successful fsync would make it
+durable after its caller was told it failed, and recovery would then replay it and the later
+transaction that reused its slots over the same records. A failed direct write also leaves its
+padding staged without the stream having moved past it, so every later record would sit at the wrong
+offset for its LSN. And on Linux a failed writeback is reported once and then cleared, so retrying an
+fsync proves nothing. This is PostgreSQL's 2018 fsync rule. The outcome of the transaction whose
+commit failed is whatever the log holds — present or absent after the reopen, never half.
 
 ---
 
@@ -209,7 +254,13 @@ nothing.
 - A record whose `lsn` field does not equal its own offset: end of log (stale preallocated bytes).
 - A record whose `length` would run past the segment: end of log.
 - A missing WAL segment file between `wal_min_lsn` and the end: **fatal**, the store refuses to open
-  rather than silently recovering to a wrong point.
+  rather than silently recovering to a wrong point. Implemented in `WalManager.recover` as a
+  contiguity check before the scan: segment files are created on the first append into them and
+  deleted only below a durable checkpoint, so from the checkpoint's segment onwards they must be
+  consecutive. A gap, or a missing first segment with later ones present, raises
+  `PageCorruptException` naming the missing file. Without it the reader met the hole as a clean end
+  of log, and the writer resumed at the old LSN with stale, self-identifying records still on disk
+  past the hole.
 
 ### 6.2 Page-level corruption
 
@@ -233,6 +284,12 @@ Fuzzy checkpoints; nothing stalls.
 
 Triggered by `checkpoint.interval.sec` or `checkpoint.wal.bytes`, whichever comes first, and by a
 clean `close()`.
+
+**Implemented:** `store.checkpoint()` and `close()` both run the same order — force the data files,
+append and force the checkpoint records, write **and force** the manifest, and only then delete
+segments below the new checkpoint. `close()` used to delete first and force the manifest last, so a
+kill between the two left a manifest naming a checkpoint whose segment was gone (now refused at open,
+§6.1).
 
 **WAL retention.** `wal_min_lsn` is the minimum of: the checkpoint's `min_recovery_lsn`, the oldest
 active transaction's begin LSN, and (if configured) a replication or backup retention floor. A log
@@ -281,6 +338,15 @@ segment is deleted only when it is entirely below that.
 - **Real power-loss test** (manual, documented in [TESTING.md §6](TESTING.md#6-crash-and-fault-injection)):
   a physical or VM-level power cut under load, with a post-condition checker.
 
+**What exists** (the list above is the target): `WalWriterTest` (`durableLsn` only moves on a force,
+the idle group-commit flush, the one-array page image), `WalReaderTest` (records larger than the read
+window, many small records across segments), `ChangedRunsTest` (the run search against the
+chunk-by-chunk loop it replaced), `DirectWalTest` (padding, preallocation, a transaction across a
+segment boundary, group commit handing every commit to the device), `RecoveryTest` (redo after losing
+the data files, idempotence, torn tail, a missing start segment refuses the open), `WalFaultTest`
+(crash-tagged: failing write and fsync, one-shot faults poison the writer and the store), and
+`CrashMatrixTest` / `SyncModeDurabilityTest` (crash-tagged).
+
 ---
 
 ## 10. Progress Assessment
@@ -294,7 +360,10 @@ segment is deleted only when it is entirely below that.
 - [x] End-of-log detection by CRC and self-LSN mismatch
 - [x] Tests: redo after losing the data files, uncommitted work discarded, rollback, recovery idempotence,
       torn log tail, checkpoint makes replay unnecessary
-- [ ] `O_DIRECT` aligned writes (Phase 6)
+- [x] `O_DIRECT` aligned writes, opt-in via `IoEngineKind.DIRECT` (`DirectLog`, §2), including segment rollover
+- [x] A failed log write or fsync poisons the writer until reopen (§5.1)
+- [x] A missing segment from the checkpoint onwards refuses the open (§6.1)
+- [x] `durableLsn` moves only on a force; a background flusher bounds the `GROUP_COMMIT` window when idle (§4)
 - [ ] Group commit with parking and a batch fsync thread (the current implementation is time-based, not queued)
 - [ ] Undo handlers and CLRs — not needed under no-steal; required if the policy changes
 - [ ] Fuzzy checkpointing (the current checkpoint flushes everything)
@@ -316,5 +385,5 @@ segment is deleted only when it is entirely below that.
 
 ---
 
-_Git HEAD revision: `c016a41`_
-_Last updated: 2026-08-13 (synced with the Phase 0 to 3 implementation)_
+_Git HEAD revision: `4f21a62`_
+_Last updated: 2026-10-24 (WAL review: direct rollover, failure poisoning, close ordering, honest durableLsn, reader window)_

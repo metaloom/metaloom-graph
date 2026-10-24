@@ -202,6 +202,32 @@ public final class IndexCatalog {
 		segments.touched(catalogPage());
 	}
 
+	/**
+	 * Inserts into one of the trees and records its root only if the insert moved it.
+	 *
+	 * <p>
+	 * A root moves only when the root itself splits, which is once per level over the life of a tree. Writing the
+	 * unchanged id back on every insert cost each writing transaction a copy of the whole catalog page into its overlay
+	 * and a diff of it at commit, for bytes that came out identical — and made the one page every indexed write shares
+	 * a page every indexed write had dirtied.
+	 * </p>
+	 */
+	private void putLabel(int labelId, long nodeId) throws IOException {
+		long root = labelRoot();
+		long moved = tree.put(root, labelId, nodeId, nodeId);
+		if (moved != root) {
+			labelRoot(moved);
+		}
+	}
+
+	private void putProperty(int keyId, Object value, long nodeId) throws IOException {
+		long root = propRoot();
+		long moved = tree.put(root, propertyKey(keyId, value), nodeId, nodeId);
+		if (moved != root) {
+			propRoot(moved);
+		}
+	}
+
 	private long propRoot() {
 		return segments.resolve(catalogPage()).get(Layouts.LONG, OFF_PROP_ROOT);
 	}
@@ -264,17 +290,36 @@ public final class IndexCatalog {
 		return false;
 	}
 
-	/** Candidate ids already carrying this key and value, excluding one element. Empty when the key is not unique. */
+	/**
+	 * Candidate ids already carrying this key and value, excluding one element — and a claim on the leaves the value
+	 * would be inserted into. Write transactions only.
+	 *
+	 * <p>
+	 * The claim is what makes the check hold between concurrent writers; {@link BTree#claimPrefix} has the case it
+	 * closes. It is skipped when the excluded element is itself a candidate: that element already holds an entry
+	 * under this value, so the write calling this inserts nothing here and has nothing to race for.
+	 * </p>
+	 */
 	public List<Long> conflicts(int keyId, Object value, long excluding) {
 		if (!initialised() || value == null) {
 			return List.of();
 		}
-		List<Long> candidates = tree.scanPrefix(propRoot(), propertyKey(keyId, value));
+		long key = propertyKey(keyId, value);
+		return claimed(propRoot(), key, tree.scanPrefix(propRoot(), key), excluding);
+	}
+
+	private List<Long> claimed(long rootId, long key, List<Long> candidates, long excluding) {
 		List<Long> conflicting = new java.util.ArrayList<>(1);
+		boolean held = false;
 		for (long id : candidates) {
 			if (id != excluding) {
 				conflicting.add(id);
+			} else {
+				held = true;
 			}
+		}
+		if (!held) {
+			tree.claimPrefix(rootId, key);
 		}
 		return conflicting;
 	}
@@ -496,15 +541,13 @@ public final class IndexCatalog {
 		return nodesByLabelAndProperty(labelId, keyId, value);
 	}
 
-	/** Candidates for a label-scoped unique check, excluding one element. */
+	/** Candidates for a label-scoped unique check, excluding one element, with the claim {@link #conflicts} makes. */
 	public List<Long> compositeConflicts(int labelId, int keyId, Object value, long excluding) {
-		List<Long> conflicting = new java.util.ArrayList<>(1);
-		for (long id : nodesByLabelAndProperty(labelId, keyId, value)) {
-			if (id != excluding) {
-				conflicting.add(id);
-			}
+		if (!initialised() || value == null || ElementId.isNull(compositeRoot())) {
+			return List.of();
 		}
-		return conflicting;
+		long key = compositeKey(labelId, keyId, value);
+		return claimed(compositeRoot(), key, tree.scanPrefix(compositeRoot(), key), excluding);
 	}
 
 	/**
@@ -519,7 +562,11 @@ public final class IndexCatalog {
 	}
 
 	private void compositePut(long nodeId, int labelId, int keyId, Object value) throws IOException {
-		compositeRoot(tree.put(compositeRoot(), compositeKey(labelId, keyId, value), nodeId, nodeId));
+		long root = compositeRoot();
+		long moved = tree.put(root, compositeKey(labelId, keyId, value), nodeId, nodeId);
+		if (moved != root) {
+			compositeRoot(moved);
+		}
 	}
 
 	private void compositeRemove(long nodeId, int labelId, int keyId, Object value) {
@@ -699,8 +746,21 @@ public final class IndexCatalog {
 		segments.touched(catalogPage());
 	}
 
+	/**
+	 * Refuses an ordinal with no declaration behind it.
+	 * <p>
+	 * Reads the count and the one state byte rather than {@link #vectorIndexes()}, which decodes every declaration and
+	 * looks its names up in the dictionary — and this guards every entry-point read, which a search makes twice and a
+	 * build twice per member.
+	 */
 	private void requireDeclared(int ord) {
-		if (!initialised() || ord < 0 || ord >= vectorIndexes().size() || vectorIndexes().get(ord) == null) {
+		if (!initialised() || ord < 0) {
+			throw new IllegalArgumentException("No vector index with ordinal " + ord);
+		}
+		MemorySegment page = segments.resolve(catalogPage());
+		int count = page.get(Layouts.INT, OFF_VECTOR_COUNT);
+		if (ord >= Math.min(count, MAX_VECTOR_INDEXES)
+			|| page.get(Layouts.BYTE, OFF_VECTOR_ENTRIES + (long) ord * VECTOR_ENTRY_BYTES + VI_STATE) == 0) {
 			throw new IllegalArgumentException("No vector index with ordinal " + ord);
 		}
 	}
@@ -718,13 +778,13 @@ public final class IndexCatalog {
 		if (labelIds != null) {
 			for (int labelId : labelIds) {
 				if (labelId != 0) {
-					labelRoot(tree.put(labelRoot(), labelId, nodeId, nodeId));
+					putLabel(labelId, nodeId);
 				}
 			}
 		}
 		if (properties != null) {
 			for (Map.Entry<Integer, Object> entry : properties.entrySet()) {
-				propRoot(tree.put(propRoot(), propertyKey(entry.getKey(), entry.getValue()), nodeId, nodeId));
+				putProperty(entry.getKey(), entry.getValue(), nodeId);
 			}
 		}
 		for (Composite declared : composites()) {
@@ -796,7 +856,7 @@ public final class IndexCatalog {
 		}
 		for (int labelId : after) {
 			if (labelId != 0 && !holds(before, labelId)) {
-				labelRoot(tree.put(labelRoot(), labelId, nodeId, nodeId));
+				putLabel(labelId, nodeId);
 			}
 		}
 		List<Composite> declared = composites();
@@ -846,7 +906,7 @@ public final class IndexCatalog {
 		for (Map.Entry<Integer, Object> entry : after.entrySet()) {
 			Object was = before.get(entry.getKey());
 			if (!valueEquals(was, entry.getValue())) {
-				propRoot(tree.put(propRoot(), propertyKey(entry.getKey(), entry.getValue()), nodeId, nodeId));
+				putProperty(entry.getKey(), entry.getValue(), nodeId);
 			}
 		}
 		for (Composite composite : composites()) {
@@ -945,6 +1005,46 @@ public final class IndexCatalog {
 
 	public BTree tree() {
 		return tree;
+	}
+
+	// ---------------------------------------------------------------- verification
+
+	/** The label tree's entries as {@code k1, k2, value} triples, or none when there is no index yet. */
+	public long[] labelEntries() {
+		return initialised() ? tree.entries(labelRoot()) : new long[0];
+	}
+
+	/** The property tree's entries, in the same shape. */
+	public long[] propertyEntries() {
+		return initialised() ? tree.entries(propRoot()) : new long[0];
+	}
+
+	/** The composite tree's entries, in the same shape; none when nothing is declared. */
+	public long[] compositeEntries() {
+		return initialised() && !ElementId.isNull(compositeRoot()) ? tree.entries(compositeRoot()) : new long[0];
+	}
+
+	public boolean hasLabelEntry(long nodeId, int labelId) {
+		return initialised() && tree.get(labelRoot(), labelId, nodeId) != null;
+	}
+
+	public boolean hasPropertyEntry(long nodeId, int keyId, Object value) {
+		return initialised() && tree.get(propRoot(), propertyKey(keyId, value), nodeId) != null;
+	}
+
+	public boolean hasCompositeEntry(long nodeId, int labelId, int keyId, Object value) {
+		return initialised() && !ElementId.isNull(compositeRoot())
+			&& tree.get(compositeRoot(), compositeKey(labelId, keyId, value), nodeId) != null;
+	}
+
+	/** Whether a property-tree key is the one this value would be indexed under. */
+	public static boolean isPropertyKey(long k1, int keyId, Object value) {
+		return propertyKey(keyId, value) == k1;
+	}
+
+	/** Whether a composite-tree key is the one this triple would be indexed under. */
+	public static boolean isCompositeKey(long k1, int labelId, int keyId, Object value) {
+		return compositeKey(labelId, keyId, value) == k1;
 	}
 
 	/** The property tree root. Exposed for the read-budget test, which asserts against the tree's actual depth. */
@@ -1065,6 +1165,30 @@ public final class IndexCatalog {
 			return true;
 		}
 		return java.util.Objects.deepEquals(widen(a), widen(b));
+	}
+
+	/**
+	 * A value as a map key, with the index's notion of equality rather than the value's own.
+	 *
+	 * <p>
+	 * For a scan that has to find duplicates without the tree — the one a unique-constraint declaration runs. Keying a
+	 * map on the raw value hashes a {@code float[]} by identity, and every vector read back is a fresh array, so two
+	 * identical embeddings never met and a constraint was declared over data that already broke it. This is
+	 * {@link #valueHash} and {@link #valueEquals} put where a {@code HashMap} will use them, so a declaration's idea of
+	 * "the same value" is the one enforcement uses afterwards.
+	 * </p>
+	 */
+	public record ValueKey(Object value) {
+
+		@Override
+		public boolean equals(Object other) {
+			return other instanceof ValueKey key && valueEquals(value, key.value);
+		}
+
+		@Override
+		public int hashCode() {
+			return valueHash(value);
+		}
 	}
 
 	private static Object widen(Object value) {

@@ -167,6 +167,36 @@ public final class WireServer implements AutoCloseable {
 	/** How long an abandoned query is given to unwind before the store is closed regardless. */
 	private static final long ABORT_UNWIND_MILLIS = 2_000;
 
+	/**
+	 * The ceiling on one frame until WELCOME.
+	 *
+	 * <p>
+	 * HELLO and AUTH are a few hundred bytes, a long password included, and nothing else may be sent before the
+	 * handshake. {@link Frames#MAX_FRAME_BYTES} applies from then on; before it, a peer that has presented nothing could
+	 * have the server buffer sixteen megabytes per connection.
+	 * </p>
+	 */
+	static final int HANDSHAKE_MAX_FRAME_BYTES = 16 * 1024;
+
+	/**
+	 * How long a peer has to send its HELLO and, when asked, its AUTH.
+	 *
+	 * <p>
+	 * Counted only while the server is waiting on the <em>peer</em> — not while it verifies a password or opens a store,
+	 * which is the server's own time. A connection that never speaks otherwise holds a socket and its buffers forever.
+	 * There is deliberately no idle timeout after the handshake: the protocol has no keep-alive, and a pooled client
+	 * idle between queries is normal.
+	 * </p>
+	 */
+	public static final long DEFAULT_HANDSHAKE_TIMEOUT_MILLIS = 10_000;
+
+	private volatile long handshakeTimeoutMillis = DEFAULT_HANDSHAKE_TIMEOUT_MILLIS;
+
+	/** For a test that cannot wait ten seconds. Applies to connections accepted afterwards; zero disables it. */
+	void handshakeTimeoutMillis(long millis) {
+		this.handshakeTimeoutMillis = millis;
+	}
+
 	private final Vertx vertx;
 	private final boolean ownsVertx;
 	private final GraphDatabases databases;
@@ -633,16 +663,27 @@ public final class WireServer implements AutoCloseable {
 		 * is a window in which a client could pipeline a QUERY. Refusing everything in that window is what stops a
 		 * query racing an unfinished credential check.
 		 * </p>
+		 *
+		 * <p>
+		 * {@link State#OPENING} is the same window for the database: it is opened on a worker, because a first open
+		 * maps a whole store, and nothing may run against a store that is not there yet.
+		 * </p>
 		 */
 		private enum State {
-			NEW, GREETED, AUTHENTICATING, READY
+			NEW, GREETED, AUTHENTICATING, OPENING, READY
 		}
 
 		private State state = State.NEW;
 
-		/** Resolved at AUTH, or {@link Principal#ANONYMOUS} when this server does not ask. Fixed for the connection. */
+		/**
+		 * Resolved at AUTH, or {@link Principal#ANONYMOUS} when this server does not ask. The <em>name</em> is fixed for
+		 * the connection; the grants are re-read at every query.
+		 */
 		private Principal principal = Principal.ANONYMOUS;
-		/** Resolved once, at HELLO, and fixed for the life of the connection. See {@link Protocol}. */
+		/**
+		 * Opened once, just before WELCOME, and fixed for the life of the connection. See {@link Protocol}. After AUTH
+		 * when the server asks for one, so a peer that has presented nothing cannot learn which names exist.
+		 */
 		private GraphStore store;
 		private String database;
 
@@ -651,7 +692,22 @@ public final class WireServer implements AutoCloseable {
 		}
 
 		void attach() {
-			socket.closeHandler(v -> open = false);
+			long deadline = handshakeTimeoutMillis;
+			long timer = deadline <= 0 ? -1 : vertx.setTimer(deadline, id -> {
+				// Only while waiting on the peer: AUTHENTICATING and OPENING are the server's own time.
+				if (open && (state == State.NEW || state == State.GREETED)) {
+					fail(Frames.CONNECTION_STREAM, WireError.PROTOCOL,
+						"The handshake was not completed within " + deadline + " ms", 0, 0);
+					open = false;
+					socket.close();
+				}
+			});
+			socket.closeHandler(v -> {
+				open = false;
+				if (timer >= 0) {
+					vertx.cancelTimer(timer);
+				}
+			});
 			socket.exceptionHandler(t -> {
 				open = false;
 				socket.close();
@@ -662,7 +718,7 @@ public final class WireServer implements AutoCloseable {
 				fail(Frames.CONNECTION_STREAM, WireError.PROTOCOL, malformed.getMessage(), 0, 0);
 				open = false;
 				socket.close();
-			});
+			}, () -> state == State.READY ? Frames.MAX_FRAME_BYTES : HANDSHAKE_MAX_FRAME_BYTES);
 		}
 
 		private void frame(int type, int streamId, Buffer payload) {
@@ -683,6 +739,14 @@ public final class WireServer implements AutoCloseable {
 						// race a password check still running on a worker.
 						fail(Frames.CONNECTION_STREAM, WireError.UNAUTHENTICATED,
 							"This connection is still being authenticated", 0, 0);
+						open = false;
+						socket.close();
+						return;
+					}
+					case OPENING -> {
+						// Pipelined behind the handshake: the database it would run against is still being opened.
+						fail(Frames.CONNECTION_STREAM, WireError.PROTOCOL,
+							"A frame arrived before WELCOME; wait for it", 0, 0);
 						open = false;
 						socket.close();
 						return;
@@ -722,26 +786,10 @@ public final class WireServer implements AutoCloseable {
 			}
 			String requested = WireValueCodec.expect(WireValueCodec.decode(reader), String.class,
 				"the database name");
-			String resolved = requested.isEmpty() ? defaultDatabase : requested;
-			try {
-				// Resolved here, on the event loop, and held. It is a map lookup after the first time; the first time
-				// opens a store, which is why the whole connection pays for it once rather than every query doing so.
-				store = databases.database(resolved);
-			} catch (IllegalArgumentException | GraphStoreException e) {
-				// A name that is not a name and a name that is not a database are the same thing to a client: it
-				// asked for something that is not there, and listing the databases is the next step either way.
-				fail(Frames.CONNECTION_STREAM, WireError.NO_SUCH_DATABASE, e.getMessage(), 0, 0);
-				open = false;
-				socket.close();
-				return;
-			} catch (java.io.IOException e) {
-				fail(Frames.CONNECTION_STREAM, WireError.STORE, "Could not open '" + resolved + "': " + e.getMessage(),
-					0, 0);
-				open = false;
-				socket.close();
-				return;
-			}
-			database = resolved;
+			// Only remembered here. Opening it now would answer NO_SUCH_DATABASE to a peer that has presented nothing,
+			// which lists the databases for anybody who can reach the port; it is opened once the credential is
+			// checked, or straight away when the server asks for none.
+			database = requested.isEmpty() ? defaultDatabase : requested;
 			if (auth.get().isEnabled()) {
 				// The credential is asked for rather than assumed, which is what lets a client with one talk to a
 				// server without one and never send it.
@@ -752,8 +800,45 @@ public final class WireServer implements AutoCloseable {
 				socket.write(Frames.frame(Frames.AUTH_REQUIRED, Frames.CONNECTION_STREAM, required));
 				return;
 			}
-			state = State.READY;
-			welcome();
+			openThenWelcome();
+		}
+
+		/**
+		 * Opens the connection's database on a worker, then ends the handshake.
+		 *
+		 * <p>
+		 * A map lookup after the first time; the first time maps a whole store and holds the {@code GraphDatabases}
+		 * monitor while it does, which on an event loop would stall every other connection sharing it. The default
+		 * worker pool rather than the query pool, so a handshake never waits behind running queries.
+		 * </p>
+		 */
+		private void openThenWelcome() {
+			state = State.OPENING;
+			String name = database;
+			vertx.<GraphStore>executeBlocking(() -> databases.database(name), false).onComplete(outcome -> {
+				if (!open) {
+					return;
+				}
+				if (outcome.succeeded()) {
+					store = outcome.result();
+					state = State.READY;
+					welcome();
+					return;
+				}
+				Throwable e = outcome.cause();
+				if (e instanceof IllegalArgumentException || e instanceof GraphStoreException) {
+					// A name that is not a name and a name that is not a database are the same thing to a client: it
+					// asked for something that is not there, and listing the databases is the next step either way.
+					fail(Frames.CONNECTION_STREAM, WireError.NO_SUCH_DATABASE, e.getMessage(), 0, 0);
+				} else if (e instanceof java.io.IOException) {
+					fail(Frames.CONNECTION_STREAM, WireError.STORE, "Could not open '" + name + "': " + e.getMessage(),
+						0, 0);
+				} else {
+					fail(Frames.CONNECTION_STREAM, WireError.INTERNAL, "Could not open '" + name + "'", 0, 0);
+				}
+				open = false;
+				socket.close();
+			});
 		}
 
 		/** The frame that ends the handshake, whichever way it got here. */
@@ -802,10 +887,22 @@ public final class WireServer implements AutoCloseable {
 				return;
 			}
 
+			// The same bound HTTP's login uses, and the same semaphore: the CPU being rationed is the process's.
+			// Refused rather than queued — and on the default worker pool, not the query pool, so a burst of
+			// handshakes cannot make running queries wait behind PBKDF2 (spec/AUTH.md section 4.1).
+			AuthPolicy policy = auth.get();
+			if (!policy.tryBeginVerification()) {
+				fail(Frames.CONNECTION_STREAM, WireError.OVERLOADED,
+					"This server is verifying as many passwords as it can at once. Retry.", 0, 0);
+				open = false;
+				socket.close();
+				return;
+			}
 			state = State.AUTHENTICATING;
 			char[] characters = secret.toCharArray();
-			workers.executeBlocking(() -> auth.get().authenticate(user, characters), false)
+			vertx.executeBlocking(() -> policy.authenticate(user, characters), false)
 				.onComplete(outcome -> {
+					policy.endVerification();
 					java.util.Arrays.fill(characters, '\0');
 					if (outcome.failed()) {
 						logger.error("Verifying a password failed", outcome.cause());
@@ -826,8 +923,7 @@ public final class WireServer implements AutoCloseable {
 					}
 					auth.get().throttle().recordSuccess(user);
 					principal = outcome.result().get();
-					state = State.READY;
-					welcome();
+					openThenWelcome();
 				});
 		}
 
@@ -871,6 +967,20 @@ public final class WireServer implements AutoCloseable {
 			// worker thread and no writer lock.
 			// What the query needs, before what the server permits. Grant first so a principal who simply lacks MERGE
 			// is told that, rather than being advised to restart a server they cannot restart.
+			if (principal.authenticated()) {
+				// Re-resolved per query rather than frozen at AUTH, as HTTP does per request: a revoke or a disable
+				// must reach a pooled connection that stays open for days (spec/AUTH.md section 6.1).
+				java.util.Optional<Principal> current = auth.get().principalFor(principal.name());
+				if (current.isEmpty()) {
+					metrics.recordQueryRejected("wire", "unauthenticated");
+					fail(Frames.CONNECTION_STREAM, WireError.UNAUTHENTICATED,
+						"'" + principal.name() + "' is no longer an enabled user here", 0, 0);
+					open = false;
+					socket.close();
+					return;
+				}
+				principal = current.get();
+			}
 			for (Privilege privilege : parsed.requiredPrivileges()) {
 				if (!principal.may(privilege, database)) {
 					metrics.recordQueryRejected("wire", "forbidden");

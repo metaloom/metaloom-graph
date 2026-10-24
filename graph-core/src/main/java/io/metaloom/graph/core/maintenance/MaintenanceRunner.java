@@ -36,6 +36,20 @@ public interface MaintenanceRunner {
 	 */
 	void runExclusive(Unit unit) throws IOException;
 
+	/**
+	 * Runs the unit with every other writer excluded and <b>outside any transaction</b>, refusing while a read view is
+	 * open.
+	 *
+	 * <p>
+	 * For work whose effect on the file is immediate and cannot be staged: punching a hole. Inside a transaction the
+	 * generation floors and checksums describing the punch went to the journal and were only durable at its commit,
+	 * while the hole was already in the file, so a crash in between lost the floors that keep stale ids stale. Here they
+	 * are written to the mapping and forced in the order the unit chooses. A view is refused because a punched page is
+	 * the base its reconstruction would start from.
+	 * </p>
+	 */
+	void runUnlogged(Unit unit) throws IOException;
+
 	/** Runs the unit under a read latch, so it never observes half of a commit. */
 	void runRead(Unit unit) throws IOException;
 

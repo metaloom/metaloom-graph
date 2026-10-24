@@ -234,6 +234,37 @@ public class WireAuthTest {
 		}
 	}
 
+	/**
+	 * A revoke or a disable reaches a connection that is already open.
+	 *
+	 * <p>
+	 * Grants are resolved per query, as HTTP resolves them per request ({@code spec/AUTH.md} section 6.1). Freezing
+	 * them at AUTH would let a revoked user keep a long-lived connection — exactly what a pooled client is — for as
+	 * long as it stays up.
+	 * </p>
+	 */
+	@Test
+	public void testARevokeAndADisableReachAnOpenConnection() throws Exception {
+		listen(true, false);
+		try (GraphClient client = GraphClient.login("127.0.0.1", port, "", "reader", "reader-pw")) {
+			assertEquals(1, drain(client, "MATCH (n:Person) RETURN n.name"));
+
+			identities.revokeFromRole("reader", Grant.on(Privilege.MATCH));
+			QueryFailedException revoked = assertThrows(QueryFailedException.class,
+				() -> drain(client, "MATCH (n:Person) RETURN n.name"));
+			assertEquals(WireError.UNAUTHORIZED, revoked.error());
+
+			identities.grantToRole("reader", Grant.on(Privilege.MATCH));
+			assertEquals(1, drain(client, "MATCH (n:Person) RETURN n.name"), "and a grant reaches it too");
+
+			identities.setEnabled("reader", false);
+			GraphClientException disabled = assertThrows(GraphClientException.class,
+				() -> drain(client, "MATCH (n:Person) RETURN n.name"));
+			assertFalse(disabled instanceof QueryFailedException q && q.error() == WireError.UNAUTHORIZED,
+				"a disabled user is not merely unauthorized: " + disabled.getMessage());
+		}
+	}
+
 	/** A per-database grant is per database on this port too. */
 	@Test
 	public void testAGrantOnOneDatabaseDoesNotReachAnother() throws Exception {
@@ -266,6 +297,120 @@ public class WireAuthTest {
 				() -> drain(client, "CREATE (n:Person)"));
 			assertEquals(WireError.READ_ONLY, refused.error(),
 				"the flag refused, not the grant: the administrator holds CREATE ON *");
+		}
+	}
+
+	/**
+	 * Before AUTH, a missing database and a present one are answered alike.
+	 *
+	 * <p>
+	 * HELLO names the database, and resolving it there answered {@code NO_SUCH_DATABASE} to a peer that had presented
+	 * nothing — a list of the databases for anybody who can reach the port, and a store opened on its behalf. With
+	 * authentication on the name is resolved only once the credential has been checked.
+	 * </p>
+	 */
+	@Test
+	public void testHelloDoesNotRevealWhetherADatabaseExistsBeforeAuth() throws Exception {
+		listen(true, false);
+		assertEquals(io.metaloom.graph.protocol.Frames.AUTH_REQUIRED, firstAnswerToHello("nosuch"));
+		assertEquals(io.metaloom.graph.protocol.Frames.AUTH_REQUIRED, firstAnswerToHello("sales"));
+
+		// Once the caller has said who they are, a missing name is still reported as missing.
+		QueryFailedException missing = assertThrows(QueryFailedException.class,
+			() -> GraphClient.login("127.0.0.1", port, "nosuch", "reader", "reader-pw").close());
+		assertEquals(WireError.NO_SUCH_DATABASE, missing.error());
+	}
+
+	/**
+	 * More concurrent AUTH frames than there are processors are answered {@code OVERLOADED}, not queued.
+	 *
+	 * <p>
+	 * One verification is a hundred milliseconds of CPU, so a burst of them queued behind each other is a CPU-bound
+	 * outage — and it was queued on the query pool, so every query waited behind the hashing too. The right password
+	 * every time, so the failure throttle (which also answers OVERLOADED) cannot be what refuses.
+	 * </p>
+	 */
+	@Test
+	public void testABurstOfAuthFramesIsBoundedRatherThanQueued() throws Exception {
+		listen(true, false);
+		int peers = Runtime.getRuntime().availableProcessors() * 4 + 4;
+		List<java.net.Socket> sockets = new java.util.ArrayList<>();
+		try {
+			for (int i = 0; i < peers; i++) {
+				java.net.Socket socket = new java.net.Socket();
+				sockets.add(socket);
+				socket.connect(new java.net.InetSocketAddress("127.0.0.1", port), 5_000);
+				socket.setSoTimeout(30_000);
+				io.metaloom.graph.protocol.WireValueCodec.Writer hello =
+					new io.metaloom.graph.protocol.WireValueCodec.Writer(64);
+				hello.i32(io.metaloom.graph.protocol.Protocol.VERSION);
+				io.metaloom.graph.protocol.WireValueCodec.encode(hello, "");
+				socket.getOutputStream().write(io.metaloom.graph.protocol.Frames.frame(
+					io.metaloom.graph.protocol.Frames.HELLO, 0, hello).getBytes());
+				assertEquals(io.metaloom.graph.protocol.Frames.AUTH_REQUIRED, readFrame(socket).type);
+			}
+			// Every AUTH as close together as a loop can send them.
+			io.metaloom.graph.protocol.WireValueCodec.Writer auth =
+				new io.metaloom.graph.protocol.WireValueCodec.Writer(64);
+			auth.i32(io.metaloom.graph.protocol.Frames.MECHANISM_PASSWORD);
+			io.metaloom.graph.protocol.WireValueCodec.encode(auth, "reader");
+			io.metaloom.graph.protocol.WireValueCodec.encode(auth, "reader-pw");
+			byte[] frame = io.metaloom.graph.protocol.Frames.frame(
+				io.metaloom.graph.protocol.Frames.AUTH, 0, auth).getBytes();
+			for (java.net.Socket socket : sockets) {
+				socket.getOutputStream().write(frame);
+				socket.getOutputStream().flush();
+			}
+			int welcomed = 0;
+			int overloaded = 0;
+			for (java.net.Socket socket : sockets) {
+				Frame answer = readFrame(socket);
+				if (answer.type == io.metaloom.graph.protocol.Frames.WELCOME) {
+					welcomed++;
+				} else if (answer.type == io.metaloom.graph.protocol.Frames.ERROR
+					&& WireError.fromCode(new io.metaloom.graph.protocol.WireValueCodec.Reader(answer.payload).i32())
+						== WireError.OVERLOADED) {
+					overloaded++;
+				}
+			}
+			assertTrue(overloaded > 0, "no AUTH was refused: " + welcomed + " of " + peers + " were verified");
+			assertTrue(welcomed > 0, "and some were still served");
+			assertEquals(peers, welcomed + overloaded);
+		} finally {
+			for (java.net.Socket socket : sockets) {
+				socket.close();
+			}
+		}
+	}
+
+	private record Frame(int type, byte[] payload) {
+	}
+
+	private static Frame readFrame(java.net.Socket socket) throws java.io.IOException {
+		java.io.DataInputStream in = new java.io.DataInputStream(socket.getInputStream());
+		byte[] header = new byte[8];
+		in.readFully(header);
+		int length = java.nio.ByteBuffer.wrap(header, 0, 4).order(java.nio.ByteOrder.LITTLE_ENDIAN).getInt();
+		byte[] payload = new byte[length];
+		in.readFully(payload);
+		return new Frame(header[4] & 0xFF, payload);
+	}
+
+	/** The type of the first frame a server sends after a HELLO naming {@code database}. */
+	private int firstAnswerToHello(String database) throws Exception {
+		try (java.net.Socket socket = new java.net.Socket()) {
+			socket.connect(new java.net.InetSocketAddress("127.0.0.1", port), 5_000);
+			socket.setSoTimeout(10_000);
+			io.metaloom.graph.protocol.WireValueCodec.Writer hello =
+				new io.metaloom.graph.protocol.WireValueCodec.Writer(64);
+			hello.i32(io.metaloom.graph.protocol.Protocol.VERSION);
+			io.metaloom.graph.protocol.WireValueCodec.encode(hello, database);
+			socket.getOutputStream().write(io.metaloom.graph.protocol.Frames.frame(
+				io.metaloom.graph.protocol.Frames.HELLO, 0, hello).getBytes());
+			socket.getOutputStream().flush();
+			byte[] header = new byte[8];
+			new java.io.DataInputStream(socket.getInputStream()).readFully(header);
+			return header[4] & 0xFF;
 		}
 	}
 

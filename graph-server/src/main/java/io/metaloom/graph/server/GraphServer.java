@@ -463,6 +463,11 @@ public final class GraphServer implements AutoCloseable {
 		Router router = Router.router(vertx);
 		router.route().handler(BodyHandler.create().setBodyLimit(1 << 20));
 
+		// The CSRF half that SameSite cannot cover: with --no-auth there is no cookie to withhold. A form can POST
+		// text/plain, urlencoded or multipart cross-origin without a preflight, and a text/plain body can be valid
+		// JSON; application/json cannot be sent cross-origin without one. PUT and DELETE always need a preflight.
+		router.post("/api/*").handler(GraphServer::requireJson);
+
 		// Before every other /api route, because Vert.x matches in order and a filter that ran after them would not be
 		// one. Mounted on /api/* only: the login page is served by StaticHandler from this same origin, and a filter
 		// over /* would refuse the bundle to a browser that has not logged in yet — a blank page, no error, nothing in
@@ -518,13 +523,6 @@ public final class GraphServer implements AutoCloseable {
 			return;
 		}
 		Map<String, Object> parameters = body.getJsonObject("parameters", new JsonObject()).getMap();
-		GraphStore store;
-		try {
-			store = storeFor(context);
-		} catch (RuntimeException e) {
-			respondToFailure(context, e);
-			return;
-		}
 
 		// Parsed here, on the event loop, because parsing is pure and cheap and running is neither. A syntax error is
 		// much the most common failure and now costs no worker thread and no read view.
@@ -584,6 +582,10 @@ public final class GraphServer implements AutoCloseable {
 		// queries from one browser do not serialise behind each other.
 		inFlight.incrementAndGet();
 		vertx.<JsonObject>executeBlocking(() -> {
+			// Resolved only now: after the privilege check, so a missing name answers 404 only to somebody who may
+			// see it (otherwise 403 vs 404 lists the databases), and on a worker, because the first open of a store
+			// maps its segments and holds the GraphDatabases monitor while it does.
+			GraphStore store = storeFor(context);
 			long started = System.nanoTime();
 			QueryAbort deadline = queryTimeoutMillis <= 0
 				? QueryAbort.NEVER
@@ -913,10 +915,11 @@ public final class GraphServer implements AutoCloseable {
 	 *
 	 * <p>
 	 * Any, rather than a specific one: the question a picker asks is "is this database mine to work with", and
-	 * somebody granted only {@code BACKUP} on it still needs to see that it is there.
+	 * somebody granted only {@code BACKUP} on it still needs to see that it is there. Public because {@code
+	 * graph_list_databases} answers the same question and must not answer it differently.
 	 * </p>
 	 */
-	private static boolean visibleTo(Principal principal, String database) {
+	public static boolean visibleTo(Principal principal, String database) {
 		for (Privilege privilege : Privilege.values()) {
 			if (!privilege.isGlobalOnly() && principal.may(privilege, database)) {
 				return true;
@@ -1070,13 +1073,21 @@ public final class GraphServer implements AutoCloseable {
 
 		@Override
 		public void write(byte[] bytes, int off, int len) {
+			// Copied, because the dump writer reuses its buffer and Buffer.buffer(byte[]) wraps rather than copies.
 			response.write(Buffer.buffer(java.util.Arrays.copyOfRange(bytes, off, off + len)));
 			// The whole point of doing this on a worker: when the socket cannot keep up, this thread waits instead of
 			// queueing the rest of a database in memory. An event loop could not block here, which is the other reason
 			// the walk is not on one.
 			while (response.writeQueueFull()) {
+				// Woken by the drain rather than polling on a fixed sleep. The handler is set after the check, so a
+				// drain landing in between is missed — hence the re-check, and a bounded wait as the backstop.
+				java.util.concurrent.CountDownLatch drained = new java.util.concurrent.CountDownLatch(1);
+				response.drainHandler(ignored -> drained.countDown());
+				if (!response.writeQueueFull()) {
+					break;
+				}
 				try {
-					Thread.sleep(java.time.Duration.ofMillis(5));
+					drained.await(50, TimeUnit.MILLISECONDS);
 				} catch (InterruptedException e) {
 					Thread.currentThread().interrupt();
 					throw new java.io.UncheckedIOException(new IOException("Interrupted writing the backup"));
@@ -1237,6 +1248,29 @@ public final class GraphServer implements AutoCloseable {
 
 	private static void fail(RoutingContext context, int status, String kind, String message) {
 		fail(context, status, kind, message, 0, 0);
+	}
+
+	/**
+	 * Refuses a POST whose body is not declared as JSON, 415.
+	 *
+	 * <p>
+	 * Logout is exempt: it carries no body, the UI sends none, and ending a session is not something a forged request
+	 * gains from.
+	 * </p>
+	 */
+	private static void requireJson(RoutingContext context) {
+		if ("/api/logout".equals(context.normalizedPath())) {
+			context.next();
+			return;
+		}
+		String type = context.request().getHeader("content-type");
+		String media = type == null ? "" : type.split(";", 2)[0].trim();
+		if (media.equalsIgnoreCase("application/json")) {
+			context.next();
+			return;
+		}
+		fail(context, 415, "contenttype", "Send the body as Content-Type: application/json"
+			+ (type == null ? "" : ", not '" + type + "'") + ".");
 	}
 
 	private static void fail(RoutingContext context, int status, String kind, String message, int line, int column) {

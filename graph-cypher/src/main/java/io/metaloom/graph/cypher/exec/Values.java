@@ -106,6 +106,36 @@ public final class Values {
 		if (left == null || right == null) {
 			return null;
 		}
+		// A null inside a list or map is as unknown as one outside it: [1, null] = [1, 2] is null, but a known
+		// difference anywhere still decides it, so [1, null] = [2, null] is false.
+		if (left instanceof List<?> a && right instanceof List<?> b) {
+			if (a.size() != b.size()) {
+				return Boolean.FALSE;
+			}
+			boolean unknown = false;
+			for (int i = 0; i < a.size(); i++) {
+				Object element = equal(a.get(i), b.get(i));
+				if (Boolean.FALSE.equals(element)) {
+					return Boolean.FALSE;
+				}
+				unknown |= element == null;
+			}
+			return unknown ? null : Boolean.TRUE;
+		}
+		if (left instanceof Map<?, ?> a && right instanceof Map<?, ?> b) {
+			if (!a.keySet().equals(b.keySet())) {
+				return Boolean.FALSE;
+			}
+			boolean unknown = false;
+			for (Map.Entry<?, ?> entry : a.entrySet()) {
+				Object element = equal(entry.getValue(), b.get(entry.getKey()));
+				if (Boolean.FALSE.equals(element)) {
+					return Boolean.FALSE;
+				}
+				unknown |= element == null;
+			}
+			return unknown ? null : Boolean.TRUE;
+		}
 		return equalKnown(left, right);
 	}
 
@@ -122,15 +152,18 @@ public final class Values {
 				return false;
 			}
 			for (int i = 0; i < a.size(); i++) {
-				Object x = a.get(i);
-				Object y = b.get(i);
-				if (x == null || y == null) {
-					if (x != y) {
-						return false;
-					}
-					continue;
+				if (!sameOrBothNull(a.get(i), b.get(i))) {
+					return false;
 				}
-				if (!equalKnown(x, y)) {
+			}
+			return true;
+		}
+		if (left instanceof Map<?, ?> a && right instanceof Map<?, ?> b) {
+			if (!a.keySet().equals(b.keySet())) {
+				return false;
+			}
+			for (Map.Entry<?, ?> entry : a.entrySet()) {
+				if (!sameOrBothNull(entry.getValue(), b.get(entry.getKey()))) {
 					return false;
 				}
 			}
@@ -148,6 +181,63 @@ public final class Values {
 		return left.equals(right);
 	}
 
+	private static boolean sameOrBothNull(Object left, Object right) {
+		return left == null || right == null ? left == right : equalKnown(left, right);
+	}
+
+	/**
+	 * A key with Java equality and hashing that agree with Cypher equivalence, for grouping and DISTINCT.
+	 *
+	 * <p>
+	 * Equivalence is equality with two changes: null is equivalent to null, and NaN to NaN. An integral float becomes
+	 * the integer it equals, so 1 and 1.0 land in one bucket; a node or a relationship becomes its identity, because two
+	 * reads of one element are one element whatever properties each snapshot holds.
+	 * </p>
+	 */
+	public static Object groupingKey(Object value) {
+		return switch (value) {
+			case null -> null;
+			case Double d -> integralOrSelf(d);
+			case Float f -> integralOrSelf(f.doubleValue());
+			case Integer i -> i.longValue();
+			case Short s -> s.longValue();
+			case Byte b -> b.longValue();
+			case CypherNode node -> new ElementKey("node", node.id());
+			case CypherRelationship relationship -> relationship.id() != null
+				? new ElementKey("relationship", relationship.id())
+				: new ElementKey("edge", List.of(relationship.startId(), relationship.type(), relationship.endId()));
+			case CypherPath path -> new ElementKey("path",
+				List.of(groupingKey(path.nodes()), groupingKey(path.relationships())));
+			case List<?> list -> {
+				List<Object> out = new ArrayList<>(list.size());
+				for (Object element : list) {
+					out.add(groupingKey(element));
+				}
+				yield out;
+			}
+			case Map<?, ?> map -> {
+				Map<Object, Object> out = new java.util.HashMap<>();
+				for (Map.Entry<?, ?> entry : map.entrySet()) {
+					out.put(entry.getKey(), groupingKey(entry.getValue()));
+				}
+				yield out;
+			}
+			default -> value;
+		};
+	}
+
+	/** A record rather than a list, so that no list a query builds can collide with an element's identity. */
+	private record ElementKey(String kind, Object identity) {
+	}
+
+	private static Object integralOrSelf(double value) {
+		// -0.0 is 0 here too, as it is under =.
+		if (value == Math.rint(value) && value >= -0x1p63 && value < 0x1p63) {
+			return (long) value;
+		}
+		return value;
+	}
+
 	public static Object notEqual(Object left, Object right) {
 		Object equal = equal(left, right);
 		return equal == null ? null : !(Boolean) equal;
@@ -159,6 +249,16 @@ public final class Values {
 	public static Object compare(Object left, Object right, java.util.function.IntPredicate accept) {
 		if (left == null || right == null) {
 			return null;
+		}
+		if (left instanceof Number a && right instanceof Number b && !(isIntegral(a) && isIntegral(b))) {
+			// IEEE rather than Double.compare, whose total order is for sorting: -0.0 < 0.0 is false, and NaN is
+			// neither less than, equal to nor greater than anything.
+			double x = a.doubleValue();
+			double y = b.doubleValue();
+			if (Double.isNaN(x) || Double.isNaN(y)) {
+				return Boolean.FALSE;
+			}
+			return accept.test(x < y ? -1 : x > y ? 1 : 0);
 		}
 		Integer order = order(left, right);
 		return order == null ? null : accept.test(order);
@@ -287,7 +387,8 @@ public final class Values {
 		}
 		Number a = number(left, "+");
 		Number b = number(right, "+");
-		return isIntegral(a) && isIntegral(b) ? (Object) (a.longValue() + b.longValue())
+		return isIntegral(a) && isIntegral(b)
+			? (Object) exact("+", () -> Math.addExact(a.longValue(), b.longValue()))
 			: (Object) (a.doubleValue() + b.doubleValue());
 	}
 
@@ -297,7 +398,8 @@ public final class Values {
 		}
 		Number a = number(left, "-");
 		Number b = number(right, "-");
-		return isIntegral(a) && isIntegral(b) ? (Object) (a.longValue() - b.longValue())
+		return isIntegral(a) && isIntegral(b)
+			? (Object) exact("-", () -> Math.subtractExact(a.longValue(), b.longValue()))
 			: (Object) (a.doubleValue() - b.doubleValue());
 	}
 
@@ -307,7 +409,8 @@ public final class Values {
 		}
 		Number a = number(left, "*");
 		Number b = number(right, "*");
-		return isIntegral(a) && isIntegral(b) ? (Object) (a.longValue() * b.longValue())
+		return isIntegral(a) && isIntegral(b)
+			? (Object) exact("*", () -> Math.multiplyExact(a.longValue(), b.longValue()))
 			: (Object) (a.doubleValue() * b.doubleValue());
 	}
 
@@ -321,7 +424,7 @@ public final class Values {
 			if (b.longValue() == 0) {
 				throw new CypherTypeException("/ by zero");
 			}
-			return a.longValue() / b.longValue();
+			return exact("/", () -> Math.divideExact(a.longValue(), b.longValue()));
 		}
 		return a.doubleValue() / b.doubleValue();
 	}
@@ -354,10 +457,21 @@ public final class Values {
 			return null;
 		}
 		Number number = number(value, "-");
-		return isIntegral(number) ? (Object) (-number.longValue()) : (Object) (-number.doubleValue());
+		return isIntegral(number) ? (Object) exact("-", () -> Math.negateExact(number.longValue()))
+			: (Object) (-number.doubleValue());
 	}
 
 	// ---------------------------------------------------------------- helpers
+
+	/** 64-bit integer arithmetic that refuses to wrap: a silently negative sum is a wrong answer that throws nothing. */
+	public static long exact(String operator, java.util.function.LongSupplier operation) {
+		try {
+			return operation.getAsLong();
+		} catch (ArithmeticException e) {
+			throw new CypherTypeException("Integer overflow in " + operator
+				+ ": the result does not fit in 64 bits");
+		}
+	}
 
 	public static boolean isIntegral(Number number) {
 		return number instanceof Long || number instanceof Integer || number instanceof Short

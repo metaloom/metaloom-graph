@@ -1,6 +1,5 @@
 package io.metaloom.graph.core.store.adj;
 
-import java.util.Set;
 
 import io.metaloom.graph.core.id.ElementId;
 
@@ -8,7 +7,7 @@ import io.metaloom.graph.core.id.ElementId;
  * One node's adjacency entries, one block at a time.
  *
  * <p>
- * This is the streaming form of {@link AdjacencyStore#edges(long, java.util.Set)}, and that method is now a drain of
+ * This is the streaming form of {@link AdjacencyStore#edges(long, TypeFilter)}, and that method is now a drain of
  * it — there is one walk of the chain in this project, not two. The difference is <em>when</em> a block is decoded: the
  * array form decodes the whole chain before the caller sees anything, so a query that wants one edge out of a million
  * pays for a million. Here a block is acquired and decoded only when the entries of the previous one have run out, so
@@ -16,7 +15,7 @@ import io.metaloom.graph.core.id.ElementId;
  * </p>
  *
  * <p>
- * <b>The two filter levels are the ones {@link AdjacencyStore#edges(long, java.util.Set)} documents, applied in the
+ * <b>The two filter levels are the ones {@link AdjacencyStore#edges(long, TypeFilter)} documents, applied in the
  * same places.</b> Per block it is {@link AdjacencyBlock#admitsAnyType}, which decides whether up to 8,000 entries are
  * varint-decoded at all; per entry it is {@link PackedEdge#excludedByType}, which is the single authority on what one
  * entry's bits prove. Neither rule is re-derived here — a second implementation of "type 0 means the cache is absent,
@@ -43,7 +42,7 @@ public final class EdgeCursor {
 
 	private final AdjacencyStore store;
 	private final long nodeId;
-	private final Set<Integer> typeIds;
+	private final TypeFilter typeIds;
 	private final long chainLimit;
 
 	/** The block to visit next, or {@link ElementId#NULL} once the chain is exhausted. */
@@ -57,7 +56,7 @@ public final class EdgeCursor {
 	private long current;
 	private boolean valid;
 
-	EdgeCursor(AdjacencyStore store, long nodeId, Set<Integer> typeIds, long[] inline, long headBlockId,
+	EdgeCursor(AdjacencyStore store, long nodeId, TypeFilter typeIds, long[] inline, long headBlockId,
 		long chainLimit) {
 		this.store = store;
 		this.nodeId = nodeId;

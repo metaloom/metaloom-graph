@@ -54,6 +54,10 @@ public final class VarInt {
 			int b = src[offset++] & 0xFF;
 			result |= ((long) (b & 0x7F)) << shift;
 			if ((b & 0x80) == 0) {
+				if (shift == 63 && b > 1) {
+					// The tenth byte holds bit 63 alone; more than that is bits a long does not have, silently dropped.
+					throw new IllegalArgumentException("Overlong varint at offset " + (offset - 1));
+				}
 				out[0] = result;
 				return offset;
 			}
@@ -99,6 +103,10 @@ public final class VarInt {
 			int b = Byte.toUnsignedInt(src.get(Layouts.BYTE, position++));
 			result |= ((long) (b & 0x7F)) << shift;
 			if ((b & 0x80) == 0) {
+				if (shift == 63 && b > 1) {
+					// The tenth byte holds bit 63 alone; more than that is bits a long does not have, silently dropped.
+					throw new IllegalArgumentException("Overlong varint at offset " + (position - 1));
+				}
 				out[0] = result;
 				return position;
 			}

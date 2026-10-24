@@ -45,13 +45,24 @@ public class PasswordHashTest {
 		assertTrue(second.verify("same".toCharArray()));
 	}
 
+	/**
+	 * An empty password is never set and never verifies.
+	 *
+	 * <p>
+	 * {@code ""} is exactly what an empty form field sends. It is refused when a hash is made, with this class's own
+	 * message rather than {@code PBEKeySpec}'s, and an empty attempt at login is false — after the derivation, so it
+	 * costs what any other wrong password costs — rather than an exception escaping from inside the JCA.
+	 * </p>
+	 */
 	@Test
-	public void testAnEmptyPasswordIsHandledRatherThanThrowing() {
-		// PBEKeySpec refuses an empty char array. That has to be this class's rule rather than an exception escaping
-		// from inside the JCA, because "" is exactly what an empty form field sends.
-		PasswordHash hash = PasswordHash.of(new char[0], 1);
-		assertTrue(hash.verify(new char[0]));
-		assertFalse(hash.verify("something".toCharArray()));
+	public void testAnEmptyPasswordIsRefusedRatherThanHashed() {
+		assertThrows(IllegalArgumentException.class, () -> PasswordHash.of(new char[0], 1));
+		assertThrows(IllegalArgumentException.class, () -> PasswordHash.of(null, 1));
+
+		PasswordHash hash = cheap("something");
+		assertFalse(hash.verify(new char[0]));
+		assertFalse(hash.verify(null));
+		assertTrue(hash.verify("something".toCharArray()));
 	}
 
 	// ---------------------------------------------------------------- the text form

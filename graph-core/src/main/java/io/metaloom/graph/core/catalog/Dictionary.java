@@ -1,18 +1,23 @@
 package io.metaloom.graph.core.catalog;
 
+import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+
+import io.metaloom.graph.core.store.prop.ValueCodec;
 
 /**
  * A persistent string to id mapping.
@@ -34,6 +39,9 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class Dictionary implements AutoCloseable {
 
+	/** The longest entry, in UTF-8 bytes, that load accepts — and therefore that intern may write. */
+	public static final int MAX_ENTRY_BYTES = 1 << 20;
+
 	private final Path path;
 	private final Map<String, Integer> forward = new ConcurrentHashMap<>();
 	/** Index 0 is reserved and always null. Replaced wholesale on append, so readers never see a partial update. */
@@ -49,19 +57,35 @@ public final class Dictionary implements AutoCloseable {
 		this.maxId = maxId;
 		Files.createDirectories(path.getParent());
 		if (Files.exists(path)) {
-			load();
+			long validEnd = load();
+			if (validEnd < Files.size(path)) {
+				// A torn tail from an interrupted append. It was never forced, so no committed record can name it, and
+				// appending behind it would make the next entry unreadable — cut it off first.
+				try (FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
+					channel.truncate(validEnd);
+					channel.force(true);
+				}
+			}
 		}
 		this.fileOut = new FileOutputStream(path.toFile(), true);
 		this.out = new BufferedOutputStream(fileOut);
 	}
 
-	private void load() throws IOException {
+	/** Loads every complete entry and returns the byte offset just past the last one. */
+	private long load() throws IOException {
 		List<String> loaded = new ArrayList<>();
 		loaded.add(null); // id 0 is reserved
-		try (DataInputStream in = new DataInputStream(Files.newInputStream(path))) {
-			while (in.available() > 0) {
-				int length = in.readInt();
-				if (length < 0 || length > 1 << 20) {
+		long validEnd = 0;
+		try (DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(path)))) {
+			while (true) {
+				byte[] header = in.readNBytes(4);
+				if (header.length < 4) {
+					// End of file, or a length cut short by a crash; either way nothing more is complete.
+					break;
+				}
+				int length = ((header[0] & 0xFF) << 24) | ((header[1] & 0xFF) << 16) | ((header[2] & 0xFF) << 8)
+					| (header[3] & 0xFF);
+				if (length < 0 || length > MAX_ENTRY_BYTES) {
 					throw new IOException("Corrupt dictionary entry length " + length + " in " + path);
 				}
 				byte[] bytes = in.readNBytes(length);
@@ -72,9 +96,11 @@ public final class Dictionary implements AutoCloseable {
 				String value = new String(bytes, StandardCharsets.UTF_8);
 				forward.put(value, loaded.size());
 				loaded.add(value);
+				validEnd += 4 + length;
 			}
 		}
 		reverse = loaded.toArray(new String[0]);
+		return validEnd;
 	}
 
 	/** Returns the id for the string, assigning a new one if needed. */
@@ -88,7 +114,13 @@ public final class Dictionary implements AutoCloseable {
 		if (id > maxId) {
 			throw new IllegalStateException("Dictionary " + path.getFileName() + " exhausted its id space (" + maxId + ")");
 		}
-		byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+		// Strict: a lone surrogate would be written as '?' and come back as a different key after a reopen.
+		byte[] bytes = ValueCodec.utf8(value);
+		if (bytes.length > MAX_ENTRY_BYTES) {
+			// load() refuses anything longer, so accepting it here would make the store unopenable.
+			throw new IllegalArgumentException("Dictionary entry of " + bytes.length + " UTF-8 bytes exceeds the "
+				+ MAX_ENTRY_BYTES + " byte limit");
+		}
 		try {
 			out.write((bytes.length >>> 24) & 0xFF);
 			out.write((bytes.length >>> 16) & 0xFF);

@@ -142,7 +142,8 @@ public final class McpJsonRpcHandler {
 		}
 		GraphMcpTool tool = byName.get(name);
 		if (tool == null) {
-			metrics.recordMcpToolCall(name, "error");
+			// Not the name itself: it is client-chosen, and as a label it would be one new series per string sent.
+			metrics.recordMcpToolCall("unknown", "error");
 			return Future.succeededFuture(JsonRpcResponse.error(request.id(), McpConstants.METHOD_NOT_FOUND,
 				"No tool named '" + name + "'"));
 		}
@@ -150,11 +151,15 @@ public final class McpJsonRpcHandler {
 		// stops a client calling one by a name it remembers from an earlier session against a different server.
 		// The other half of the second enforcement point. tools/list already hid what this principal cannot use; this
 		// is what stops a call naming a tool remembered from a session as somebody else.
-		if (!tool.descriptor().permits(principal.get(), defaultDatabase)) {
+		// Against the database the call names, not the default: every store tool takes a 'database' argument.
+		String database = tool.database(arguments);
+		String target = database == null ? defaultDatabase : database;
+		if (!tool.descriptor().permits(principal.get(), target)) {
 			metrics.recordMcpToolCall(name, "refused");
 			return Future.succeededFuture(JsonRpcResponse.ok(request.id(), GraphMcpToolResults.error(
 				"'" + principal.get().name() + "' has not been granted what '" + name + "' needs ("
-					+ tool.descriptor().requiredPrivileges() + "). Do not retry; ask an administrator.")));
+					+ tool.descriptor().requiredPrivileges() + ") on '" + target
+					+ "'. Do not retry; ask an administrator.")));
 		}
 		if (tool.descriptor().write() && !allowWrite) {
 			metrics.recordMcpToolCall(name, "refused");

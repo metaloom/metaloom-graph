@@ -76,6 +76,28 @@ public final class AuthPolicy {
 		return throttle;
 	}
 
+	/**
+	 * How many passwords may be verified at once, across every front end.
+	 *
+	 * <p>
+	 * One derivation is around a hundred milliseconds of CPU, so a hundred concurrent logins is fifteen CPU-seconds.
+	 * Bounding it turns a flood into a refusal — 503 on HTTP, {@code OVERLOADED} on the wire — rather than into a
+	 * server that stops answering queries because it is busy hashing. Here rather than in one front end, because the
+	 * CPU being rationed is the process's: a bound per port would let a flood use each port's share at once.
+	 * </p>
+	 */
+	private final java.util.concurrent.Semaphore verifications =
+		new java.util.concurrent.Semaphore(Runtime.getRuntime().availableProcessors());
+
+	/** @return false when the bound is reached; the caller refuses rather than waits. A true must be released. */
+	public boolean tryBeginVerification() {
+		return verifications.tryAcquire();
+	}
+
+	public void endVerification() {
+		verifications.release();
+	}
+
 	/** The principal a request gets when it presented nothing: anonymous-and-permitted, or nobody. */
 	public Optional<Principal> unauthenticated() {
 		return store == null ? Optional.of(Principal.ANONYMOUS) : Optional.empty();
@@ -111,7 +133,42 @@ public final class AuthPolicy {
 		if (store == null) {
 			return Optional.of(Principal.ANONYMOUS);
 		}
+		reloadAtMostEverySecond();
 		return sessions.userFor(token).flatMap(store::principal);
+	}
+
+	/**
+	 * The principal a user name resolves to <b>now</b>: for a connection authenticated earlier that holds no token —
+	 * the binary port. Empty once the user is disabled or dropped, so a front end can end the connection.
+	 */
+	public Optional<Principal> principalFor(String user) {
+		if (store == null) {
+			return Optional.of(Principal.ANONYMOUS);
+		}
+		reloadAtMostEverySecond();
+		return store.principal(user);
+	}
+
+	/** When {@link #resolve} last looked at the file, in {@code System.nanoTime} terms. */
+	private volatile long lastReloadCheck = System.nanoTime();
+
+	private static final long RELOAD_CHECK_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(1);
+
+	/**
+	 * Picks up an edit another process made to {@code .auth} — the CLI disabling a user while the server runs.
+	 *
+	 * <p>
+	 * Without it only a login re-read the file, and a disabled user's existing session kept working until its idle
+	 * timeout. Rate-limited because this runs on the event loop for every request: one {@code stat} a second, not one
+	 * per request. Two threads racing past the check both stat, which is harmless.
+	 * </p>
+	 */
+	private void reloadAtMostEverySecond() {
+		long now = System.nanoTime();
+		if (now - lastReloadCheck >= RELOAD_CHECK_NANOS) {
+			lastReloadCheck = now;
+			store.reloadIfChanged();
+		}
 	}
 
 	public void close() {

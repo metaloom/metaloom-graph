@@ -26,6 +26,11 @@ public final class TransactionImpl implements Transaction {
 	private final long id;
 	private final WriteContext context;
 	private final Completion completion;
+	/**
+	 * The thread that began it. The store's gate hold and its per-thread state belong to that thread, so a commit or
+	 * rollback from anywhere else would release a lock it does not hold and clear another thread's state.
+	 */
+	private final Thread owner = Thread.currentThread();
 
 	private boolean active = true;
 	private long commitLsn = -1;
@@ -64,6 +69,7 @@ public final class TransactionImpl implements Transaction {
 		if (!active) {
 			throw new GraphStoreException("Transaction " + id + " is no longer active");
 		}
+		checkOwner("commit");
 		try {
 			commitLsn = completion.commit(this);
 		} finally {
@@ -80,8 +86,16 @@ public final class TransactionImpl implements Transaction {
 		if (!active) {
 			return;
 		}
+		checkOwner("roll back");
 		active = false;
 		completion.rollback(this);
+	}
+
+	private void checkOwner(String action) {
+		if (Thread.currentThread() != owner) {
+			throw new GraphStoreException("Transaction " + id + " belongs to thread '" + owner.getName()
+				+ "' and cannot " + action + " from '" + Thread.currentThread().getName() + "'");
+		}
 	}
 
 	@Override

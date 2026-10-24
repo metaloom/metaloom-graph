@@ -3,7 +3,6 @@ package io.metaloom.graph.core.index;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashSet;
 import java.util.List;
 import java.util.PriorityQueue;
 import java.util.Set;
@@ -117,18 +116,20 @@ public final class HnswIndex {
 
 		long entry = catalog.vectorEntryPoint(ord);
 		int entryLevel = catalog.vectorMaxLevel(ord);
-		if (ElementId.isNull(entry) || !vectors.exists(entry)) {
+		if (ElementId.isNull(entry) || !member(entry, ord)) {
 			return new Plan(level, new long[0][], true, 0);
 		}
 
 		VectorMetric metric = definition.metric();
+		double vectorNorm = queryNorm(vector, metric);
 		long current = entry;
 		for (int layer = entryLevel; layer > level; layer--) {
-			current = descend(current, vector, metric, layer, m);
+			current = descend(ord, current, vector, vectorNorm, metric, layer, m);
 		}
 		long[][] linksByLayer = new long[level + 1][];
 		for (int layer = Math.min(entryLevel, level); layer >= 0; layer--) {
-			List<Candidate> found = searchLayer(current, vector, metric, definition.efConstruction(), layer, m);
+			List<Candidate> found = searchLayer(ord, current, vector, vectorNorm, metric, definition.efConstruction(),
+				layer, m);
 			List<Candidate> chosen = select(found, vectors.capacityAt(layer, m), vectorId, vector, metric);
 			long[] links = new long[chosen.size()];
 			for (int i = 0; i < links.length; i++) {
@@ -168,7 +169,7 @@ public final class HnswIndex {
 		}
 		long entry = catalog.vectorEntryPoint(ord);
 		int entryLevel = catalog.vectorMaxLevel(ord);
-		boolean emptyNow = ElementId.isNull(entry) || !vectors.exists(entry);
+		boolean emptyNow = ElementId.isNull(entry) || !member(entry, ord);
 		if (plan.foundEmptyGraph() != emptyNow) {
 			// Either the graph gained an entry point while this was planned against nothing — in which case applying
 			// the plan would strand this record with no links at all — or it lost the one the plan was built on. Both
@@ -190,7 +191,9 @@ public final class HnswIndex {
 			long[] links = new long[planned.length];
 			int kept = 0;
 			for (long neighbour : planned) {
-				if (vectors.exists(neighbour)) {
+				// A member when planned may have left the index since, and a link to it would be a bridge into
+				// whatever graph it has joined.
+				if (member(neighbour, ord)) {
 					links[kept++] = neighbour;
 				}
 			}
@@ -202,7 +205,7 @@ public final class HnswIndex {
 			// finds this record at all. These read the neighbour's own list, which is bounded by M and cheap; it is the
 			// beam search, not this, that had to leave the writer lock.
 			for (long neighbour : links) {
-				linkBack(neighbour, vectorId, layer, m, metric);
+				linkBack(ord, neighbour, vectorId, layer, m, metric);
 			}
 		}
 		if (plan.level() > entryLevel) {
@@ -251,7 +254,7 @@ public final class HnswIndex {
 		int m = definition.m();
 		for (int layer = vectors.topLevel(vectorId); layer >= 0; layer--) {
 			for (long neighbour : vectors.links(vectorId, layer, m)) {
-				if (vectors.exists(neighbour) && !vectors.tombstoned(neighbour)) {
+				if (member(neighbour, ord) && !vectors.tombstoned(neighbour)) {
 					catalog.vectorEntryPoint(ord, neighbour, vectors.topLevel(neighbour));
 					return;
 				}
@@ -275,16 +278,17 @@ public final class HnswIndex {
 	public List<Long> search(int ord, VectorIndexDefinition definition, float[] query, int k, int ef,
 		LongPredicate filter) {
 		long entry = catalog.vectorEntryPoint(ord);
-		if (ElementId.isNull(entry) || !vectors.exists(entry)) {
+		if (ElementId.isNull(entry) || !member(entry, ord)) {
 			return List.of();
 		}
 		int m = definition.m();
 		VectorMetric metric = definition.metric();
+		double queryNorm = queryNorm(query, metric);
 		long current = entry;
 		for (int layer = catalog.vectorMaxLevel(ord); layer > 0; layer--) {
-			current = descend(current, query, metric, layer, m);
+			current = descend(ord, current, query, queryNorm, metric, layer, m);
 		}
-		List<Candidate> found = searchLayer(current, query, metric, Math.max(ef, k), 0, m);
+		List<Candidate> found = searchLayer(ord, current, query, queryNorm, metric, Math.max(ef, k), 0, m);
 		List<Long> result = new ArrayList<>(Math.min(k, found.size()));
 		for (Candidate candidate : found) {
 			if (vectors.tombstoned(candidate.vectorId())) {
@@ -301,18 +305,32 @@ public final class HnswIndex {
 		return result;
 	}
 
+	/**
+	 * Whether a link still names a member of <b>this</b> index, which is the only test that makes a link safe to follow.
+	 *
+	 * <p>
+	 * A record that leaves an index is unlinked and stamped with its new ordinal, but the links <em>to</em> it from its
+	 * old neighbours are left in place, exactly like a link to a deleted record. "Still allocated" is therefore not
+	 * enough: the walk would reach the departed record and return it, and if it has since joined another index its own
+	 * links lead into that graph, so a query for one index would be answered with another's members.
+	 * </p>
+	 */
+	private boolean member(long vectorId, int ord) {
+		return vectors.exists(vectorId) && vectors.indexOrdinal(vectorId) == ord;
+	}
+
 	/** Greedy descent through one upper layer: step to a nearer neighbour until none is nearer. */
-	private long descend(long from, float[] query, VectorMetric metric, int layer, int m) {
+	private long descend(int ord, long from, float[] query, double queryNorm, VectorMetric metric, int layer, int m) {
 		long current = from;
-		double best = distance(current, query, metric);
+		double best = distance(current, query, queryNorm, metric);
 		boolean moved = true;
 		while (moved) {
 			moved = false;
 			for (long neighbour : vectors.links(current, layer, m)) {
-				if (!vectors.exists(neighbour)) {
+				if (!member(neighbour, ord)) {
 					continue;
 				}
-				double d = distance(neighbour, query, metric);
+				double d = distance(neighbour, query, queryNorm, metric);
 				if (d < best) {
 					best = d;
 					current = neighbour;
@@ -324,12 +342,13 @@ public final class HnswIndex {
 	}
 
 	/** The standard beam search of one layer, returning its candidates nearest first. */
-	private List<Candidate> searchLayer(long entry, float[] query, VectorMetric metric, int ef, int layer, int m) {
-		Set<Long> visited = new HashSet<>();
+	private List<Candidate> searchLayer(int ord, long entry, float[] query, double queryNorm, VectorMetric metric,
+		int ef, int layer, int m) {
+		VisitedSet visited = new VisitedSet();
 		PriorityQueue<Candidate> frontier = new PriorityQueue<>(NEAREST_FIRST);
 		PriorityQueue<Candidate> best = new PriorityQueue<>(NEAREST_FIRST.reversed());
 
-		Candidate start = new Candidate(entry, distance(entry, query, metric));
+		Candidate start = new Candidate(entry, distance(entry, query, queryNorm, metric));
 		frontier.add(start);
 		best.add(start);
 		visited.add(entry);
@@ -340,11 +359,13 @@ public final class HnswIndex {
 				break;
 			}
 			for (long neighbour : vectors.links(nearest.vectorId(), layer, m)) {
-				if (!visited.add(neighbour) || !vectors.exists(neighbour)) {
+				if (!visited.add(neighbour) || !member(neighbour, ord)) {
 					continue;
 				}
-				Candidate candidate = new Candidate(neighbour, distance(neighbour, query, metric));
-				if (best.size() < ef || candidate.distance() < best.peek().distance()) {
+				double d = distance(neighbour, query, queryNorm, metric);
+				// Allocated only once it is admitted: most neighbours of a converged beam are not.
+				if (best.size() < ef || d < best.peek().distance()) {
+					Candidate candidate = new Candidate(neighbour, d);
 					frontier.add(candidate);
 					best.add(candidate);
 					if (best.size() > ef) {
@@ -421,7 +442,7 @@ public final class HnswIndex {
 	 * budget early would otherwise never acquire a better neighbour, and the region around it stays reachable only
 	 * through whatever happened to arrive first.
 	 */
-	private void linkBack(long neighbour, long vectorId, int layer, int m, VectorMetric metric) {
+	private void linkBack(int ord, long neighbour, long vectorId, int layer, int m, VectorMetric metric) {
 		long[] existing = vectors.links(neighbour, layer, m);
 		int capacity = vectors.capacityAt(layer, m);
 		if (existing.length < capacity) {
@@ -431,13 +452,14 @@ public final class HnswIndex {
 			return;
 		}
 		float[] anchor = vectors.read(neighbour);
+		double anchorNorm = queryNorm(anchor, metric);
 		List<Candidate> candidates = new ArrayList<>(existing.length + 1);
 		for (long link : existing) {
-			if (vectors.exists(link)) {
-				candidates.add(new Candidate(link, distance(link, anchor, metric)));
+			if (member(link, ord)) {
+				candidates.add(new Candidate(link, distance(link, anchor, anchorNorm, metric)));
 			}
 		}
-		candidates.add(new Candidate(vectorId, distance(vectorId, anchor, metric)));
+		candidates.add(new Candidate(vectorId, distance(vectorId, anchor, anchorNorm, metric)));
 		candidates.sort(NEAREST_FIRST);
 		// The same diversity heuristic as on the way in. Pruning by proximity alone here is what strands an outlier:
 		// its one in-link is the first thing a full, tightly clustered neighbour drops.
@@ -456,16 +478,76 @@ public final class HnswIndex {
 	 * hundreds of times per query and the allocation would cost more than the arithmetic. Euclidean needs both vectors
 	 * in hand and is the one that pays for it.
 	 */
-	private double distance(long vectorId, float[] query, VectorMetric metric) {
+	private double distance(long vectorId, float[] query, double queryNorm, VectorMetric metric) {
 		return switch (metric) {
 			case DOT -> -vectors.dot(vectorId, query);
 			case COSINE -> {
 				double storedNorm = vectors.norm(vectorId);
-				double queryNorm = io.metaloom.graph.core.api.Vectors.norm(query);
 				yield storedNorm == 0 || queryNorm == 0 ? 0
 					: -(vectors.dot(vectorId, query) / (storedNorm * queryNorm));
 			}
 			case EUCLIDEAN -> io.metaloom.graph.core.api.Vectors.euclidean(vectors.read(vectorId), query);
 		};
+	}
+
+	/**
+	 * The query's norm, computed once per walk rather than once per distance. Only cosine needs it, and recomputing it
+	 * per call cost as much as the dot product it divides — a pass over the query for every record visited.
+	 */
+	private static double queryNorm(float[] query, VectorMetric metric) {
+		return metric == VectorMetric.COSINE ? io.metaloom.graph.core.api.Vectors.norm(query) : 0;
+	}
+
+	/**
+	 * The ids one layer search has seen, without boxing them.
+	 *
+	 * <p>
+	 * A {@code HashSet<Long>} allocated a {@code Long} and a map node per visited record, which at
+	 * {@code efConstruction = 200} is a few thousand allocations per insert for a question that is one probe of a
+	 * flat array. Open addressing with linear probing; zero is the empty marker because a vector id is never
+	 * {@link ElementId#NULL}.
+	 * </p>
+	 */
+	private static final class VisitedSet {
+
+		private long[] slots = new long[256];
+		private int size;
+
+		/** Adds the id and reports whether it was new, as {@link Set#add} does. */
+		boolean add(long id) {
+			int mask = slots.length - 1;
+			int at = mix(id) & mask;
+			while (slots[at] != 0) {
+				if (slots[at] == id) {
+					return false;
+				}
+				at = (at + 1) & mask;
+			}
+			slots[at] = id;
+			if (++size * 2 > slots.length) {
+				grow();
+			}
+			return true;
+		}
+
+		private void grow() {
+			long[] old = slots;
+			slots = new long[old.length * 2];
+			int mask = slots.length - 1;
+			for (long id : old) {
+				if (id != 0) {
+					int at = mix(id) & mask;
+					while (slots[at] != 0) {
+						at = (at + 1) & mask;
+					}
+					slots[at] = id;
+				}
+			}
+		}
+
+		private static int mix(long id) {
+			long x = id * 0x9E3779B97F4A7C15L;
+			return (int) (x ^ (x >>> 32));
+		}
 	}
 }

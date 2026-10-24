@@ -260,8 +260,9 @@ public class LazyExecutionTest {
 	public void testAWriteQueryIsNotStreamed() throws Exception {
 		// A write commits before it delivers a row, and its eager semantics come from holding each clause's whole
 		// input. Streaming one would take both away.
+		// `< 1` rather than `= 0`: an equality would seed an index probe and read a tenth of the nodes for that reason.
 		Collecting sink = new Collecting();
-		Cypher.stream(counting, Cypher.parse("MATCH (n:Person) WHERE n.bucket = 0 SET n.seen = true RETURN n.n AS n"),
+		Cypher.stream(counting, Cypher.parse("MATCH (n:Person) WHERE n.bucket < 1 SET n.seen = true RETURN n.n AS n"),
 			Map.of(), sink);
 
 		assertEquals(NODES / 10, sink.rows.size());

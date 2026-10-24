@@ -312,6 +312,55 @@ public class SnapshotIsolationTest {
 	}
 
 	/**
+	 * A read served from the transaction's own copy of a page is still a read.
+	 *
+	 * <p>
+	 * The read set was recorded only when a read missed the overlay, so a page whose first touch was a write — here,
+	 * creating a node on the page another node already lives on — never entered it. The other record's bytes in that
+	 * copy are the snapshot's, and a concurrent commit that changes them at bytes this transaction never wrote is
+	 * invisible to the write set too: the decision was made on stale input and nothing refused it.
+	 * </p>
+	 */
+	@Test
+	public void testSerializableCountsReadsFromItsOwnCopyOfAPage() throws Exception {
+		try (GraphStore store = stores.open()) {
+			long watched = store.createNode("Watched");
+
+			Transaction txn = store.begin(IsolationLevel.SERIALIZABLE);
+			boolean committed = false;
+			try {
+				// Lands on the watched node's page, so the transaction now holds a private copy of it.
+				store.createNode("Mine");
+				boolean unset = store.nodeProperties(watched).isEmpty();
+				assertTrue(unset, "the snapshot has no property on the watched node yet");
+
+				Thread other = new Thread(() -> {
+					try {
+						store.setNodeProperties(watched, Properties.of().set("k", 1L));
+					} catch (java.io.IOException e) {
+						throw new java.io.UncheckedIOException(e);
+					}
+				});
+				other.start();
+				other.join();
+
+				// Decided from what was read: the watched node had no property.
+				store.createNode("BecauseUnset");
+				txn.commit();
+				committed = true;
+			} catch (TransactionConflictException expected) {
+				assertTrue(expected.isReadConflict(), "refused for what it read: " + expected.getMessage());
+			} finally {
+				if (!committed) {
+					txn.rollback();
+				}
+			}
+			assertFalse(committed, "a SERIALIZABLE transaction committed on a read the concurrent commit invalidated");
+			store.verify(io.metaloom.graph.core.api.VerifyLevel.FULL);
+		}
+	}
+
+	/**
 	 * Two doctors whose property blocks cannot share a page with anything, including each other.
 	 *
 	 * <p>

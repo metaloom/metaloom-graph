@@ -23,7 +23,8 @@ import io.metaloom.graph.core.util.Layouts;
  *  4  1  leaf
  *  5  3  reserved
  *  8  8  next_leaf        leaf chaining for range scans
- * 16 14  reserved
+ * 16  4  version          bumped by every change to the page, and by a unique check's claim
+ * 20 10  reserved
  * 30  2  gen
  * 32  8  leftmost_child   internal nodes only
  * 40  N  entries
@@ -43,6 +44,21 @@ public final class BTree {
 	private static final int OFF_COUNT = 0;
 	private static final int OFF_LEAF = 4;
 	private static final int OFF_NEXT_LEAF = 8;
+	/**
+	 * Bumped by every transaction that changes the page, so that any two that change it concurrently conflict.
+	 *
+	 * <p>
+	 * Conflict detection compares bytes, and a B+tree page is the one structure here whose changes <em>move</em>
+	 * bytes. Updating a value removes one entry and inserts another, often in one leaf: the count comes out where it
+	 * started, and the shifted entries between the two positions differ from their old images only where their bytes
+	 * happen to differ — neighbouring keys share their high bytes, so the changed runs are fragments with gaps. A second
+	 * writer's fragments can fall into those gaps, validation finds no overlap, and the merged page interleaves two
+	 * different shifts: entries lost, entries duplicated, and {@code nodesByProperty} silently missing a node
+	 * ({@code IndexLeafMergeTest}). One field every change writes makes the page the unit of conflict, which is what
+	 * a structure that shifts its contents needs. Clear of the generation at 30, which the slot allocator owns.
+	 * </p>
+	 */
+	private static final int OFF_VERSION = 16;
 	private static final int OFF_LEFTMOST = 32;
 
 	private final SegmentSet segments;
@@ -193,6 +209,46 @@ public final class BTree {
 		return result;
 	}
 
+	/**
+	 * Writes to every leaf an entry with this {@code k1} could be inserted into, so that two transactions about to
+	 * insert under one {@code k1} are certain to write a byte in common.
+	 *
+	 * <p>
+	 * This is what a unique check needs and conflict detection cannot otherwise give it. Two inserts into one leaf
+	 * already collide — both shift entries and write the count — but deletion does not rebalance, so a separator
+	 * {@code (k1, nX)} can outlive every entry it once divided and route {@code (k1, n1 < nX)} and
+	 * {@code (k1, n2 >= nX)} to different leaves. Two writers each probing for the other's value then find nothing,
+	 * insert into different pages, and commit side by side with the same unique value, because snapshot isolation does
+	 * not validate what they read. Bumping a counter in each leaf of the range turns that into a write-write conflict.
+	 * </p>
+	 *
+	 * <p>
+	 * The range is taken from the routing, not from the entries: from the leaf {@code (k1, 0)} descends to through the
+	 * one {@code (k1, max)} descends to. A leaf holding no entry of the prefix can still be where one is inserted, which
+	 * is exactly the stale-separator case. When no separator carries this {@code k1} — almost always — that is one leaf,
+	 * the one the insert lands in anyway, so the claim adds no conflict the insert did not already have.
+	 * </p>
+	 */
+	public void claimPrefix(long rootId, long key1) {
+		long leafId = findLeaf(rootId, key1, 0L);
+		long lastId = findLeaf(rootId, key1, -1L);
+		while (!ElementId.isNull(leafId)) {
+			MemorySegment leaf = changing(leafId);
+			segments.touched(leafId);
+			if (leafId == lastId) {
+				return;
+			}
+			leafId = leaf.get(Layouts.LONG, OFF_NEXT_LEAF);
+		}
+	}
+
+	/** An existing page made writable for a change, with the change recorded in its version — see {@link #OFF_VERSION}. */
+	private MemorySegment changing(long id) {
+		MemorySegment node = segments.mutable(id);
+		node.set(Layouts.INT, OFF_VERSION, node.get(Layouts.INT, OFF_VERSION) + 1);
+		return node;
+	}
+
 	// ---------------------------------------------------------------- insert
 
 	/**
@@ -231,10 +287,17 @@ public final class BTree {
 	}
 
 	private Split insertIntoLeaf(long leafId, long key1, long key2, long value) throws IOException {
-		MemorySegment leaf = segments.mutable(leafId);
+		MemorySegment leaf = segments.resolve(leafId);
 		int n = count(leaf);
 		int i = lowerBound(leaf, key1, key2);
-		if (i < n && compare(k1(leaf, i), k2(leaf, i), key1, key2) == 0) {
+		boolean present = i < n && compare(k1(leaf, i), k2(leaf, i), key1, key2) == 0;
+		if (present && payload(leaf, i) == value) {
+			// Already there, as a backfill run twice finds it. Not a change, so not a version bump either: bumping
+			// would make an idempotent re-put conflict with every concurrent writer of the leaf.
+			return null;
+		}
+		leaf = changing(leafId);
+		if (present) {
 			setEntry(leaf, i, key1, key2, value);
 			segments.touched(leafId);
 			return null;
@@ -273,7 +336,7 @@ public final class BTree {
 	}
 
 	private Split insertIntoInternal(long nodeId, long key1, long key2, long childId) throws IOException {
-		MemorySegment node = segments.mutable(nodeId);
+		MemorySegment node = changing(nodeId);
 		int n = count(node);
 		int i = lowerBound(node, key1, key2);
 		if (n < fanout) {
@@ -329,18 +392,48 @@ public final class BTree {
 	/** Removes a key. Nodes are not merged: an underfull node is still a correct one. */
 	public boolean remove(long rootId, long key1, long key2) {
 		long leafId = findLeaf(rootId, key1, key2);
-		MemorySegment leaf = segments.mutable(leafId);
+		// Looked up before the page is made writable: a miss must not copy the leaf into the transaction's overlay.
+		MemorySegment leaf = segments.resolve(leafId);
 		int n = count(leaf);
 		int i = lowerBound(leaf, key1, key2);
 		if (i >= n || compare(k1(leaf, i), k2(leaf, i), key1, key2) != 0) {
 			return false;
 		}
+		leaf = changing(leafId);
 		for (int j = i; j < n - 1; j++) {
 			setEntry(leaf, j, k1(leaf, j + 1), k2(leaf, j + 1), payload(leaf, j + 1));
 		}
 		setCount(leaf, n - 1);
 		segments.touched(leafId);
 		return true;
+	}
+
+	/**
+	 * Every entry in key order, flattened as {@code k1, k2, value} triples. For verification, which has to compare the
+	 * tree with the records as of one instant and so takes the whole of it in one walk rather than leaf by leaf.
+	 */
+	public long[] entries(long rootId) {
+		long[] flat = new long[0];
+		int used = 0;
+		long leafId = findLeaf(rootId, 0L, 0L);
+		while (!ElementId.isNull(leafId)) {
+			MemorySegment leaf = segments.resolve(leafId);
+			int n = count(leaf);
+			if (n < 0 || n > fanout) {
+				throw new io.metaloom.graph.core.api.PageCorruptException("Index page " + ElementId.toString(leafId)
+					+ " declares " + n + " entries, outside 0.." + fanout);
+			}
+			if (used + 3 * n > flat.length) {
+				flat = java.util.Arrays.copyOf(flat, Math.max(2 * flat.length, used + 3 * n));
+			}
+			for (int i = 0; i < n; i++) {
+				flat[used++] = k1(leaf, i);
+				flat[used++] = k2(leaf, i);
+				flat[used++] = payload(leaf, i);
+			}
+			leafId = leaf.get(Layouts.LONG, OFF_NEXT_LEAF);
+		}
+		return used == flat.length ? flat : java.util.Arrays.copyOf(flat, used);
 	}
 
 	/** Total live entries. Diagnostic; walks every leaf. */

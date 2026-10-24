@@ -204,8 +204,112 @@ public class BulkBenchmark {
 		}
 	}
 
+	@Test
+	public void benchDeleteNodeWithMaterialisedEdges() throws Exception {
+		// The cascade deletes every relationship of a hub. Each one used to rewrite the hub's own block, which is freed a
+		// moment later anyway — quadratic in the hub's degree.
+		int hubs = 20;
+		int degree = 2_000;
+		try (GraphStore store = stores.open(bigStore())) {
+			long[] hubIds = new long[hubs];
+			try (io.metaloom.graph.core.api.Transaction txn = store.begin()) {
+				for (int h = 0; h < hubs; h++) {
+					hubIds[h] = store.createNode("Hub");
+					for (int i = 0; i < degree; i++) {
+						store.createRelationship(hubIds[h], "R", store.createNode("Leaf"), Properties.of().set("i", i));
+					}
+				}
+				txn.commit();
+			}
+			long start = System.nanoTime();
+			try (io.metaloom.graph.core.api.Transaction txn = store.begin()) {
+				for (long hub : hubIds) {
+					store.deleteNode(hub);
+				}
+				txn.commit();
+			}
+			report("deleteNode, " + degree + " materialised edges", hubs, start);
+		}
+	}
+
 	private static io.metaloom.graph.core.api.GraphStoreOptions bigStore() {
 		return io.metaloom.graph.core.api.GraphStoreOptions.defaults();
+	}
+
+	/**
+	 * Refilling a full segment after a reopen. The free ring is empty after a reopen and the bump cursor is exhausted,
+	 * so every allocation falls back to the bitmap. That scan used to start at slot 0 every time, which made refilling
+	 * the holes quadratic in their number.
+	 */
+	@Test
+	public void benchRefillAFullSegmentAfterReopen() throws Exception {
+		int slots;
+		int holes = 0;
+		try (GraphStore store = stores.open()) {
+			io.metaloom.graph.core.store.GraphStoreImpl impl = (io.metaloom.graph.core.store.GraphStoreImpl) store;
+			slots = impl.geometry().slotsPerSegment(io.metaloom.graph.core.id.Kind.NODE);
+			long[] ids = new long[slots];
+			try (io.metaloom.graph.core.api.Transaction txn = store.begin()) {
+				for (int i = 0; i < slots; i++) {
+					ids[i] = store.createNode("N");
+				}
+				txn.commit();
+			}
+			try (io.metaloom.graph.core.api.Transaction txn = store.begin()) {
+				for (int i = 0; i < slots; i += 8) {
+					store.deleteNode(ids[i]);
+					holes++;
+				}
+				txn.commit();
+			}
+		}
+		try (GraphStore store = stores.open()) {
+			io.metaloom.graph.core.store.GraphStoreImpl impl = (io.metaloom.graph.core.store.GraphStoreImpl) store;
+			long start = System.nanoTime();
+			try (io.metaloom.graph.core.api.Transaction txn = store.begin()) {
+				for (int i = 0; i < holes; i++) {
+					store.createNode("Refill");
+				}
+				txn.commit();
+			}
+			report("createNode into the holes of a full segment", holes, start);
+			if (impl.segments(io.metaloom.graph.core.id.Kind.NODE).segments().size() != 1) {
+				throw new AssertionError("every hole must be reused before a segment is added");
+			}
+		}
+	}
+
+	/**
+	 * Breadth-first traversal over a random graph, warm. Run twice — with and without
+	 * {@code -Dmetaloom.graph.prefetch.traversal=true} in the fork's argLine — to see what advising the frontier costs.
+	 */
+	@Test
+	public void benchTraverseRandomGraph() throws Exception {
+		int count = 100_000;
+		try (GraphStore store = stores.open(bigStore())) {
+			long[] ids = new long[count];
+			java.util.Random random = new java.util.Random(20261024L);
+			try (io.metaloom.graph.core.api.Transaction txn = store.begin()) {
+				for (int i = 0; i < count; i++) {
+					ids[i] = store.createNode("N");
+				}
+				for (int i = 0; i < count * 4; i++) {
+					store.createEdge(ids[random.nextInt(count)], "E", ids[random.nextInt(count)]);
+				}
+				txn.commit();
+			}
+			for (int round = 0; round < 2; round++) {
+				long edges = 0;
+				long start = System.nanoTime();
+				for (int s = 0; s < 200; s++) {
+					edges += store.traverse(ids[s * 7], Direction.OUT, null, 4).size();
+				}
+				long elapsed = System.nanoTime() - start;
+				System.out.printf("traverse depth 4 (prefetch %s)       %,10d edges, %6.1f ns per edge%n",
+					Boolean.getBoolean("metaloom.graph.prefetch.traversal") ? "on " : "off", edges,
+					(double) elapsed / edges);
+			}
+		}
 	}
 
 	private static void report(String what, int count, long startNanos) {

@@ -212,7 +212,15 @@ public final class McpServer {
 			socket.close((short) 1008, "This MCP port requires a bearer token");
 			return;
 		}
+		// The headers of the upgrade, kept: the session they name is re-resolved at every message, as an SSE POST is,
+		// so a revoke or a disable reaches a socket that stays open for hours instead of waiting for it to close.
+		io.vertx.core.MultiMap upgrade = io.vertx.core.MultiMap.caseInsensitiveMultiMap().addAll(socket.headers());
 		socket.textMessageHandler(text -> {
+			java.util.Optional<Principal> current = principal(upgrade);
+			if (current.isEmpty()) {
+				socket.close((short) 1008, "This session has ended; reconnect with a new token");
+				return;
+			}
 			JsonObject message;
 			try {
 				message = new JsonObject(text);
@@ -221,7 +229,7 @@ public final class McpServer {
 					.error(null, McpConstants.PARSE_ERROR, malformed.getMessage()).toJson().encode());
 				return;
 			}
-			handler.handle(JsonRpcRequest.from(message), caller.get()).onComplete(outcome -> {
+			handler.handle(JsonRpcRequest.from(message), current.get()).onComplete(outcome -> {
 				JsonRpcResponse response = outcome.succeeded() ? outcome.result()
 					: JsonRpcResponse.error(message.getValue("id"), McpConstants.INTERNAL_ERROR,
 						String.valueOf(outcome.cause()));

@@ -126,6 +126,12 @@ public final class GraphClient implements AutoCloseable {
 	private volatile boolean closed;
 
 	/**
+	 * Why the connection ended, once it has. Set before the open streams are failed, so a query racing the drop either
+	 * sees it or is among the streams failed — never neither, which would leave its caller blocked forever.
+	 */
+	private volatile GraphClientException lost;
+
+	/**
 	 * What the server said about itself, so the client does not have to assume.
 	 *
 	 * @param database
@@ -412,15 +418,29 @@ public final class GraphClient implements AutoCloseable {
 		if (closed) {
 			throw new GraphClientException("This client is closed");
 		}
+		failIfLost();
 		int streamId = allocateStreamId();
 		RowStream stream = new RowStream(this, streamId);
 		streams.put(streamId, stream);
+		// Again after registering: connectionLost sets the flag before it sweeps the streams, so this or the sweep
+		// sees the drop.
+		if (lost != null) {
+			streams.remove(streamId);
+			failIfLost();
+		}
 
 		WireValueCodec.Writer payload = new WireValueCodec.Writer(cypher.length() + 64);
 		WireValueCodec.encode(payload, cypher);
 		WireValueCodec.encode(payload, parameters);
 		payload.i64(queryOptions.deadlineMillis());
-		socket.write(Frames.frame(Frames.QUERY, streamId, payload));
+		socket.write(Frames.frame(Frames.QUERY, streamId, payload)).onFailure(failure -> {
+			// A write that never left: no server frame will ever answer it.
+			RowStream unanswered = streams.remove(streamId);
+			if (unanswered != null) {
+				unanswered.onError(new QueryFailedException(WireError.PROTOCOL,
+					"The query could not be sent: " + failure.getMessage(), 0, 0));
+			}
+		});
 		return stream;
 	}
 
@@ -560,7 +580,18 @@ public final class GraphClient implements AutoCloseable {
 		return raw.stream().map(name -> WireValueCodec.expect(name, String.class, "a column name")).toList();
 	}
 
+	private void failIfLost() {
+		GraphClientException cause = lost;
+		if (cause != null) {
+			throw new GraphClientException("This connection has ended (" + cause.getMessage() + "); connect again",
+				cause);
+		}
+	}
+
 	private void connectionLost(GraphClientException cause) {
+		if (lost == null) {
+			lost = cause;
+		}
 		if (!handshake.isDone()) {
 			handshake.completeExceptionally(cause);
 		}

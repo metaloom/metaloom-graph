@@ -32,10 +32,10 @@ nearest-neighbour search over vector properties — [VECTOR.md](VECTOR.md)), and
 moving anything (native hole punching) and by **compacting** — relocating records, rewriting every
 reference to them and pulling the high water marks down.
 
-Reads take no lock and scale to **10x at 32 threads**; writes do not scale at all and are not meant to.
-
-It is **not concurrent for writers** — writers serialise on one lock — but readers get **MVCC snapshot
-isolation**: `store.beginRead()` fixes a view across many reads while the writer commits underneath.
+Reads take no lock and scale to **10x at 32 threads**. Writers run **concurrently** on private page
+copies and serialise only at the commit point and in slot allocation ([TRANSACTIONS.md §6](TRANSACTIONS.md));
+the commit still fsyncs under its lock, so durable commits do not share an fsync. Readers get **MVCC
+snapshot isolation**: `store.beginRead()` fixes a view across many reads while writers commit underneath.
 There is now an **online logical backup** — a portable dump taken under an MVCC snapshot without stopping
 writers, with a CLI to take and restore it ([BACKUP.md](BACKUP.md)). There is still no *physical* snapshot,
 no incremental backup and no point-in-time recovery.
@@ -163,7 +163,7 @@ These constants are defined normatively in [ID_ENCODING.md](ID_ENCODING.md) and
 | Slots per segment | `min(2^24, SEGMENT_CAPACITY / stride)` | Slot field is 24 bit; large strides simply use fewer bits |
 | `NULL_ID` | `0L` | Kind 0 is reserved as "none", so a zeroed page is unambiguously empty |
 | Generation width | 12 bit | 4096 slot reuse cycles before wrap; see [ID_ENCODING.md §4](ID_ENCODING.md#4-generations-and-dangling-ids) |
-| WAL segment size | 64 MiB | Preallocated, `O_DIRECT`, 4 KiB aligned |
+| WAL segment size | 64 MiB | Preallocated, 4 KiB aligned; buffered by default, `O_DIRECT` when the direct engine is chosen ([WAL.md](WAL.md)) |
 | WAL record header | 40 B | See [WAL.md §2](WAL.md#2-record-format) |
 
 **The address function** — the single most important line of code in the project:

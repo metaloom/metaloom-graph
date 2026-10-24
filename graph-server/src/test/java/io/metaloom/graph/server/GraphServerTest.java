@@ -643,4 +643,41 @@ public class GraphServerTest {
 			assertNotNull(new JsonObject(response.body()).getJsonArray("rows"));
 		}
 	}
+
+	/**
+	 * A POST that is not {@code application/json} is refused before it is read.
+	 *
+	 * <p>
+	 * An HTML form can POST {@code text/plain}, {@code application/x-www-form-urlencoded} or
+	 * {@code multipart/form-data} to any origin with no preflight, and a {@code text/plain} body can be made to be
+	 * valid JSON. Without this check any web page a user of a {@code --no-auth --allow-write} server opens can write
+	 * to it. {@code spec/AUTH.md} section 6.1.
+	 * </p>
+	 */
+	@Test
+	public void testAPostThatIsNotJsonIsRefused() throws Exception {
+		for (String type : java.util.List.of("text/plain", "application/x-www-form-urlencoded",
+			"multipart/form-data; boundary=x")) {
+			HttpResponse<String> response = client.send(HttpRequest.newBuilder(URI.create(base + "/api/query"))
+				.header("content-type", type)
+				.POST(HttpRequest.BodyPublishers.ofString(
+					new JsonObject().put("query", "CREATE (n:Forged)").encode()))
+				.timeout(Duration.ofSeconds(20)).build(), HttpResponse.BodyHandlers.ofString());
+			assertEquals(415, response.statusCode(), type + ": " + response.body());
+		}
+		HttpResponse<String> untyped = client.send(HttpRequest.newBuilder(URI.create(base + "/api/query"))
+			.POST(HttpRequest.BodyPublishers.ofString(new JsonObject().put("query", "CREATE (n:Forged)").encode()))
+			.timeout(Duration.ofSeconds(20)).build(), HttpResponse.BodyHandlers.ofString());
+		assertEquals(415, untyped.statusCode(), untyped.body());
+
+		String count = post("MATCH (n:Forged) RETURN count(n) AS c").body();
+		assertTrue(count.contains("\"c\":0") || count.contains("[0]"), "a forged write ran: " + count);
+
+		// A charset parameter is still JSON.
+		HttpResponse<String> withCharset = client.send(HttpRequest.newBuilder(URI.create(base + "/api/query"))
+			.header("content-type", "application/json; charset=utf-8")
+			.POST(HttpRequest.BodyPublishers.ofString(new JsonObject().put("query", "MATCH (n) RETURN n").encode()))
+			.timeout(Duration.ofSeconds(20)).build(), HttpResponse.BodyHandlers.ofString());
+		assertEquals(200, withCharset.statusCode(), withCharset.body());
+	}
 }

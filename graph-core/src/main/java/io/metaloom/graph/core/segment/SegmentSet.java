@@ -102,6 +102,18 @@ public final class SegmentSet implements AutoCloseable {
 				for (int i = 0; i < count; i++) {
 					segments.add(SegmentFile.open(dir, kind, i, geometry));
 				}
+			} catch (RuntimeException | IOException e) {
+				// The set never comes into existence, so nothing else will ever close the segments opened before the
+				// one that failed.
+				for (SegmentFile opened : segments) {
+					try {
+						opened.abandon();
+					} catch (IOException suppressed) {
+						e.addSuppressed(suppressed);
+					}
+				}
+				segments.clear();
+				throw e;
 			}
 		}
 	}
@@ -454,7 +466,7 @@ public final class SegmentSet implements AutoCloseable {
 			long high = segment.superblock().highWaterSlot();
 			if (high >= slotsPerSegment) {
 				// The bump cursor is exhausted: try to recycle before adding a segment.
-				int scanned = nextFreeUnreserved(segment, 0, slotsPerSegment);
+				int scanned = scanExhausted(segment, 1);
 				if (scanned >= 0) {
 					return claim(segment, scanned, 1);
 				}
@@ -513,6 +525,9 @@ public final class SegmentSet implements AutoCloseable {
 			}
 			SegmentFile segment = activeSegment();
 			long high = segment.superblock().highWaterSlot();
+			// The mark as it stood before this allocation, skip included: a rollback restores this, and recording it
+			// after the skip left the mark raised by the skipped tail where a crash would have put it back.
+			long before = high;
 			long inPage = high % slotsPerPage;
 			if (inPage + count > slotsPerPage) {
 				// Skip the page tail rather than straddle. The skipped slots go on the free ring.
@@ -523,15 +538,16 @@ public final class SegmentSet implements AutoCloseable {
 				high += skip;
 			}
 			if (high + count > slotsPerSegment) {
-				int scanned = nextFreeRunUnreserved(segment, 0, slotsPerSegment, count);
+				int scanned = scanExhausted(segment, count);
 				if (scanned >= 0) {
 					return claim(segment, scanned, count);
 				}
 				segment.superblock().sealed(true);
 				segment = addSegment();
 				high = 0;
+				before = 0;
 			}
-			noteHighWater(segment, high);
+			noteHighWater(segment, before);
 			segment.superblock().highWaterSlot(high + count);
 			return claim(segment, (int) high, count);
 		} finally {
@@ -667,6 +683,36 @@ public final class SegmentSet implements AutoCloseable {
 	}
 
 	/** The first slot in {@code [from, limit)} that is neither allocated in the mapping nor reserved in flight. */
+	/** Where the next scan of an exhausted segment starts, by segment number. A hint only; held under the alloc lock. */
+	private final Map<Integer, Integer> exhaustedScanFrom = new HashMap<>();
+
+	/**
+	 * A free run in a segment whose bump cursor is exhausted, scanning from where the last such scan stopped and
+	 * wrapping once.
+	 *
+	 * <p>
+	 * The ring is empty after every reopen, so this is how a full segment is refilled, one allocation at a time.
+	 * Starting each scan at slot 0 made that quadratic in the number of holes — measured at 15x slower than an ordinary
+	 * create on 16,384 holes in one segment. The wrap keeps it complete: a slot freed below the cursor is still found.
+	 * </p>
+	 */
+	private int scanExhausted(SegmentFile segment, int count) {
+		int number = segment.segmentNumber();
+		int from = Math.min(exhaustedScanFrom.getOrDefault(number, 0), slotsPerSegment);
+		int found = count == 1 ? nextFreeUnreserved(segment, from, slotsPerSegment)
+			: nextFreeRunUnreserved(segment, from, slotsPerSegment, count);
+		if (found < 0 && from > 0) {
+			// Runs that start below the cursor and reach past it are covered by the limit.
+			int limit = (int) Math.min(slotsPerSegment, (long) from + count - 1);
+			found = count == 1 ? nextFreeUnreserved(segment, 0, limit)
+				: nextFreeRunUnreserved(segment, 0, limit, count);
+		}
+		if (found >= 0) {
+			exhaustedScanFrom.put(number, found + count);
+		}
+		return found;
+	}
+
 	private int nextFreeUnreserved(SegmentFile segment, int from, int limit) {
 		int number = segment.segmentNumber();
 		for (int slot = from; slot >= 0 && slot < limit;) {

@@ -68,6 +68,22 @@ public class NullSemanticsTest {
 		}
 	}
 
+	/** A null inside a list or a map is just as unknown as one outside it, unless another element already differs. */
+	@Test
+	public void testANestedNullMakesEqualityUnknown() throws Exception {
+		try (GraphStore store = stores.open()) {
+			assertNull(value(store, "[null] = [null]"));
+			assertNull(value(store, "[1, null] = [1, 2]"));
+			assertEquals(Boolean.FALSE, value(store, "[1, null] = [2, null]"), "a known difference decides it");
+			assertEquals(Boolean.FALSE, value(store, "[1, null] = [1]"), "and so does a different length");
+			assertNull(value(store, "[1, null] <> [1, 2]"));
+			assertNull(value(store, "{a: null} = {a: null}"));
+			assertEquals(Boolean.TRUE, value(store, "{a: 1} = {a: 1.0}"), "map values compare as Cypher values");
+			assertEquals(Boolean.FALSE, value(store, "{a: 1} = {b: 1}"));
+			assertEquals(Boolean.TRUE, value(store, "[{a: 1}] = [{a: 1.0}]"));
+		}
+	}
+
 	@Test
 	public void testOrderingComparisonsWithNullAreNull() throws Exception {
 		try (GraphStore store = stores.open()) {

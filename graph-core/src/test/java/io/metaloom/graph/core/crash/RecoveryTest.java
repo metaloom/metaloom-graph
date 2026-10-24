@@ -2,6 +2,7 @@ package io.metaloom.graph.core.crash;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -20,6 +21,8 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 
 import io.metaloom.graph.core.api.Direction;
 import io.metaloom.graph.core.api.GraphStore;
+import io.metaloom.graph.core.api.GraphStoreOptions;
+import io.metaloom.graph.core.api.PageCorruptException;
 import io.metaloom.graph.core.api.Properties;
 import io.metaloom.graph.core.api.Transaction;
 import io.metaloom.graph.core.fixture.TempStore;
@@ -198,6 +201,59 @@ public class RecoveryTest {
 		// A clean close checkpoints, so reopening must replay nothing and the log must have been trimmed.
 		try (GraphStore reopened = stores.open()) {
 			assertEquals(20, reopened.stats().nodeCount());
+			reopened.verify();
+		}
+	}
+
+	/**
+	 * A manifest that points into a log segment that no longer exists must stop the open, not replay nothing.
+	 *
+	 * <p>
+	 * The state is the one a kill between {@code close()} trimming the log and the manifest reaching the device used
+	 * to leave: the manifest still names the old checkpoint, and the segment holding it is gone. Recovery then found
+	 * no first segment and quietly replayed nothing, and the writer resumed at the old LSN with later segments still
+	 * on disk — whose stale records a second crash would replay over newer data. Reproduced here by putting back the
+	 * manifest as it stood on the device before the close.
+	 * </p>
+	 */
+	@Test
+	public void testAMissingStartSegmentRefusesToOpen() throws Exception {
+		GraphStoreOptions options = GraphStoreOptions.builder()
+			.segmentCapacity(TempStore.TEST_SEGMENT_CAPACITY)
+			.walSegmentBytes(64 * 1024)
+			.build();
+		Path manifest = stores.path().resolve("MANIFEST");
+		GraphStoreImpl store = (GraphStoreImpl) stores.open(options);
+		for (int i = 0; i < 400; i++) {
+			store.createNode("N", Properties.of().set("i", i).set("name", "node-" + i));
+		}
+		assertTrue(store.wal().nextLsn() > 2 * 64 * 1024, "the log must have rolled past its first segments");
+		byte[] onDevice = Files.readAllBytes(manifest);
+		store.close();
+		assertFalse(Files.exists(stores.path().resolve("wal").resolve(String.format("wal-%016x.log", 0L))),
+			"the close must have trimmed the first segment for the state to arise");
+
+		Files.write(manifest, onDevice);
+
+		PageCorruptException refused = assertThrows(PageCorruptException.class, () -> stores.open(options).close(),
+			"a checkpoint whose log segment is missing is not a clean store");
+		assertTrue(refused.getMessage().contains("missing"), refused.getMessage());
+	}
+
+	/** The close path makes the new checkpoint durable before it deletes the log that the old one needs. */
+	@Test
+	public void testACloseThatTrimsTheLogLeavesAManifestThatOpens() throws Exception {
+		GraphStoreOptions options = GraphStoreOptions.builder()
+			.segmentCapacity(TempStore.TEST_SEGMENT_CAPACITY)
+			.walSegmentBytes(64 * 1024)
+			.build();
+		try (GraphStore store = stores.open(options)) {
+			for (int i = 0; i < 400; i++) {
+				store.createNode("N", Properties.of().set("i", i));
+			}
+		}
+		try (GraphStore reopened = stores.open(options)) {
+			assertEquals(400, reopened.stats().nodeCount());
 			reopened.verify();
 		}
 	}

@@ -154,6 +154,76 @@ public class InvariantTest {
 	 * needs twenty-odd and never could.
 	 * </p>
 	 */
+	/** A node the label tree has lost is never returned by a label scan, and only a full verify can say so. */
+	@Test
+	public void testAMissingLabelEntryIsCaught() throws Exception {
+		try (GraphStore store = stores.open()) {
+			GraphStoreImpl impl = (GraphStoreImpl) store;
+			long id = store.createNode("Person", Properties.of().set("k", "v"));
+			store.verify(VerifyLevel.FULL);
+
+			// The label entry goes and the record keeps the label: a hook that forgot one direction.
+			try (Transaction txn = store.begin()) {
+				int labelId = impl.catalog().lookupLabel("Person");
+				impl.indexCatalog().tree().remove(impl.indexCatalog().labelRootForTest(), labelId, id);
+				txn.commit();
+			}
+			GraphStoreException failure = assertThrows(GraphStoreException.class,
+				() -> store.verify(VerifyLevel.FULL));
+			assertTrue(failure.getMessage().contains("missing from the label index"), failure.getMessage());
+		}
+	}
+
+	/** An entry under a value the node does not hold is the dangling entry a missed delete or update leaves. */
+	@Test
+	public void testADanglingPropertyEntryIsCaught() throws Exception {
+		try (GraphStore store = stores.open()) {
+			GraphStoreImpl impl = (GraphStoreImpl) store;
+			long id = store.createNode("Person", Properties.of().set("k", "v"));
+			store.verify(VerifyLevel.FULL);
+
+			try (Transaction txn = store.begin()) {
+				long keyId = impl.catalog().lookupKey("k");
+				long root = impl.indexCatalog().propertyRootForTest();
+				// The key id with a hash no stored value has — what the tree holds after the value changed under it.
+				long stale = (keyId << 32) | 0x5EEDL;
+				assertTrue(impl.indexCatalog().tree().put(root, stale, id, id) == root);
+				txn.commit();
+			}
+			GraphStoreException failure = assertThrows(GraphStoreException.class,
+				() -> store.verify(VerifyLevel.FULL));
+			assertTrue(failure.getMessage().contains("Property index entry"), failure.getMessage());
+		}
+	}
+
+	/** A vector index whose walk starts outside it answers from the wrong graph, and no single record shows that. */
+	@Test
+	public void testAVectorEntryPointOutsideItsIndexIsCaught() throws Exception {
+		io.metaloom.graph.core.api.GraphStoreOptions options = io.metaloom.graph.core.api.GraphStoreOptions.builder()
+			.pageSize(io.metaloom.graph.core.segment.Geometry.DEFAULT_PAGE_SIZE)
+			.segmentCapacity(TempStore.TEST_SEGMENT_CAPACITY)
+			.vectorDimensions(3)
+			.build();
+		try (GraphStore store = stores.open(options)) {
+			GraphStoreImpl impl = (GraphStoreImpl) store;
+			store.createNode("Doc", Properties.of().set("embedding", new float[] { 1f, 0f, 0f }));
+			long outsider = store.createNode("Other", Properties.of().set("embedding", new float[] { 0f, 1f, 0f }));
+			store.createVectorIndex(io.metaloom.graph.core.api.VectorIndexDefinition.of("Doc", "embedding", 3,
+				io.metaloom.graph.core.api.VectorMetric.COSINE));
+			store.verify(VerifyLevel.FULL);
+
+			try (Transaction txn = store.begin()) {
+				int keyId = impl.catalog().lookupKey("embedding");
+				long vectorId = impl.propertyStore().ownedIdOf(impl.nodeStore().propBlockId(outsider), keyId);
+				impl.indexCatalog().vectorEntryPoint(0, vectorId, 0);
+				txn.commit();
+			}
+			GraphStoreException failure = assertThrows(GraphStoreException.class,
+				() -> store.verify(VerifyLevel.FULL));
+			assertTrue(failure.getMessage().contains("not a live member"), failure.getMessage());
+		}
+	}
+
 	@Test
 	public void testAMultiExtentBlobVerifies() throws Exception {
 		try (GraphStore store = stores.open()) {

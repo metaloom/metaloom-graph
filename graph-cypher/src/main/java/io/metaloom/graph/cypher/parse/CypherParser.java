@@ -202,7 +202,7 @@ public final class CypherParser {
 			return DEFAULT_PERIODIC_COMMIT;
 		}
 		Token size = take();
-		long rows = Long.parseLong(size.text());
+		long rows = integer(size);
 		if (rows <= 0) {
 			// Zero would be "commit every no rows", which is either an infinite loop or the whole file in one
 			// transaction depending on how it were read. Neither is what was written.
@@ -739,13 +739,13 @@ public final class CypherParser {
 		int max = Integer.MAX_VALUE;
 		boolean sawMin = false;
 		if (peek().type() == Token.Type.INTEGER) {
-			min = (int) Long.parseLong(take().text());
+			min = rangeBound(take());
 			sawMin = true;
 		}
 		if (peek().isSymbol("..")) {
 			take();
 			if (peek().type() == Token.Type.INTEGER) {
-				max = (int) Long.parseLong(take().text());
+				max = rangeBound(take());
 			}
 		} else if (sawMin) {
 			// `*2` is exactly two hops, not two-or-more.
@@ -755,6 +755,20 @@ public final class CypherParser {
 			throw error(previous(), "A variable-length range must have min <= max, got " + min + ".." + max);
 		}
 		return new Ast.Range(min, max);
+	}
+
+	/** A hop count. Past an int no walk can get there, so a larger bound is clamped rather than truncated to 32 bits. */
+	private int rangeBound(Token token) {
+		return (int) Math.min(Integer.MAX_VALUE, integer(token));
+	}
+
+	/** An integer token as a long, or a syntax error with a caret — never a NumberFormatException. */
+	private long integer(Token token) {
+		try {
+			return Long.parseLong(token.text());
+		} catch (NumberFormatException e) {
+			throw error(token, "The integer " + token.text() + " does not fit in 64 bits");
+		}
 	}
 
 	private Map<String, Expr> propertyMap() {
@@ -788,8 +802,100 @@ public final class CypherParser {
 
 	// ---------------------------------------------------------------- expressions (Pratt)
 
+	/**
+	 * How deep the parser may recurse into one expression — parentheses, lists, arguments, unary operators.
+	 *
+	 * <p>
+	 * A recursive-descent parser over a query string is a stack overflow anyone who can send a query can trigger, and
+	 * a {@link StackOverflowError} is an Error, not a refusal: it can surface anywhere above. Each level here is a
+	 * dozen frames, so this is far below what any thread's stack holds and far above what any written query needs.
+	 * </p>
+	 */
+	public static final int MAX_NESTING = 200;
+
+	/**
+	 * How deep the finished tree of one expression may be. Larger than {@link #MAX_NESTING} because a flat chain —
+	 * {@code a OR b OR c …}, the shape a generated query has — is built by a loop here but walked recursively by
+	 * everything after the parser.
+	 */
+	public static final int MAX_DEPTH = 1_000;
+
+	private int nesting;
+
 	public Expr expression() {
-		return or();
+		Token start = peek();
+		descend(start);
+		try {
+			Expr expression = or();
+			if (nesting == 1 && depth(expression) > MAX_DEPTH) {
+				throw error(start, "This expression is nested more than " + MAX_DEPTH + " levels deep");
+			}
+			return expression;
+		} finally {
+			nesting--;
+		}
+	}
+
+	private void descend(Token at) {
+		if (++nesting > MAX_NESTING) {
+			throw error(at, "This expression is nested more than " + MAX_NESTING + " levels deep");
+		}
+	}
+
+	/** One level of recursion that does not pass through {@link #expression()}: a prefix operator, or {@code ^}. */
+	private Expr nested(java.util.function.Supplier<Expr> inner) {
+		descend(previous());
+		try {
+			return inner.get();
+		} finally {
+			nesting--;
+		}
+	}
+
+	/** The depth of a tree, walked with an explicit stack: recursing here would be the overflow being guarded. */
+	private static int depth(Expr root) {
+		int deepest = 0;
+		java.util.ArrayDeque<Object[]> stack = new java.util.ArrayDeque<>();
+		stack.push(new Object[] { root, 1 });
+		while (!stack.isEmpty()) {
+			Object[] entry = stack.pop();
+			int level = (Integer) entry[1];
+			deepest = Math.max(deepest, level);
+			if (deepest > MAX_DEPTH) {
+				return deepest;
+			}
+			for (Expr child : children((Expr) entry[0])) {
+				if (child != null) {
+					stack.push(new Object[] { child, level + 1 });
+				}
+			}
+		}
+		return deepest;
+	}
+
+	private static List<Expr> children(Expr expression) {
+		return switch (expression) {
+			case Ast.Literal ignored -> List.of();
+			case Ast.Variable ignored -> List.of();
+			case Ast.Parameter ignored -> List.of();
+			case Ast.ListLiteral list -> list.elements();
+			case Ast.MapLiteral map -> List.copyOf(map.entries().values());
+			case Ast.Property property -> List.of(property.target());
+			case Ast.Index index -> List.of(index.target(), index.index());
+			case Ast.Binary binary -> List.of(binary.left(), binary.right());
+			case Ast.Unary unary -> List.of(unary.operand());
+			case Ast.Comparison comparison -> List.of(comparison.left(), comparison.right());
+			case Ast.LabelPredicate predicate -> List.of(predicate.target());
+			case Ast.IsNull isNull -> List.of(isNull.operand());
+			case Ast.FunctionCall call -> call.arguments();
+			case Ast.Case branch -> {
+				List<Expr> all = new ArrayList<>(branch.whens());
+				all.addAll(branch.thens());
+				all.add(branch.subject());
+				all.add(branch.otherwise());
+				yield all;
+			}
+		};
 	}
 
 	private Expr or() {
@@ -822,13 +928,16 @@ public final class CypherParser {
 	private Expr not() {
 		if (peek().isKeyword("NOT")) {
 			take();
-			return new Ast.Unary(Op.NOT, not());
+			return new Ast.Unary(Op.NOT, nested(this::not));
 		}
 		return comparison();
 	}
 
 	private Expr comparison() {
 		Expr left = additive();
+		// The right operand of the last ordering or equality comparison, while the chain continues: `a < b < c` is
+		// `a < b AND b < c`, as in openCypher, not a boolean compared with c.
+		Expr chained = null;
 		while (true) {
 			Token token = peek();
 			Op op = null;
@@ -850,15 +959,18 @@ public final class CypherParser {
 				take();
 				expectKeyword("WITH");
 				left = new Ast.Comparison(Op.STARTS_WITH, left, additive());
+				chained = null;
 				continue;
 			} else if (token.isKeyword("ENDS")) {
 				take();
 				expectKeyword("WITH");
 				left = new Ast.Comparison(Op.ENDS_WITH, left, additive());
+				chained = null;
 				continue;
 			} else if (token.isKeyword("CONTAINS")) {
 				take();
 				left = new Ast.Comparison(Op.CONTAINS, left, additive());
+				chained = null;
 				continue;
 			} else if (token.isKeyword("IS")) {
 				take();
@@ -869,13 +981,24 @@ public final class CypherParser {
 				}
 				expectKeyword("NULL");
 				left = new Ast.IsNull(left, negated);
+				chained = null;
 				continue;
 			}
 			if (op == null) {
 				return left;
 			}
 			take();
-			left = new Ast.Comparison(op, left, additive());
+			Expr right = additive();
+			if (op == Op.IN) {
+				left = new Ast.Comparison(op, left, right);
+				chained = null;
+			} else if (chained != null) {
+				left = new Ast.Binary(Op.AND, left, new Ast.Comparison(op, chained, right));
+				chained = right;
+			} else {
+				left = new Ast.Comparison(op, left, right);
+				chained = right;
+			}
 		}
 	}
 
@@ -903,7 +1026,7 @@ public final class CypherParser {
 		if (peek().isSymbol("^")) {
 			take();
 			// Right associative: 2^3^2 is 2^(3^2).
-			return new Ast.Binary(Op.POWER, left, power());
+			return new Ast.Binary(Op.POWER, left, nested(this::power));
 		}
 		return left;
 	}
@@ -911,11 +1034,17 @@ public final class CypherParser {
 	private Expr unary() {
 		if (peek().isSymbol("-")) {
 			take();
-			return new Ast.Unary(Op.NEGATE, unary());
+			// The one integer literal that only exists negated: 9223372036854775808 does not fit in a long, and its
+			// negation does. Folded here because no later stage can see the minus and the digits together.
+			if (peek().type() == Token.Type.INTEGER && peek().text().equals("9223372036854775808")) {
+				take();
+				return new Ast.Literal(Long.MIN_VALUE);
+			}
+			return new Ast.Unary(Op.NEGATE, nested(this::unary));
 		}
 		if (peek().isSymbol("+")) {
 			take();
-			return unary();
+			return nested(this::unary);
 		}
 		return postfix();
 	}
@@ -963,7 +1092,7 @@ public final class CypherParser {
 		switch (token.type()) {
 			case INTEGER -> {
 				take();
-				return new Ast.Literal(Long.parseLong(token.text()));
+				return new Ast.Literal(integer(token));
 			}
 			case FLOAT -> {
 				take();
@@ -1113,6 +1242,12 @@ public final class CypherParser {
 	}
 
 	private Expr functionCall(String name) {
+		String upper = name.toUpperCase(java.util.Locale.ROOT);
+		if (upper.equals("ANY") || upper.equals("NONE") || upper.equals("SINGLE")) {
+			// ALL is a keyword and is refused in primary(); these three are not, so they arrive as a function name and
+			// would otherwise fail at the WHERE inside them.
+			throw error(previous(), upper + " predicates are not supported in this build");
+		}
 		if (name.equals("shortestPath") || name.equals("allShortestPaths")) {
 			// It parses as a function call here and its argument is a pattern, so the error would otherwise be about
 			// the arrow rather than about where the call is allowed to appear.

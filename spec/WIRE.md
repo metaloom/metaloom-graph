@@ -63,6 +63,15 @@ before `RecordParser` is even told to expect that many bytes. A length prefix of
 textbook unvalidated length field, and seven defects of exactly that kind have been found in this
 project's storage parsers. A frame that fails the check ends *that connection* and touches no other.
 
+**Until `WELCOME` the server's limit is 16 KiB, not 16 MiB** (`WireServer.HANDSHAKE_MAX_FRAME_BYTES`,
+through `FrameReader.attach`'s per-header ceiling). `HELLO` and `AUTH` are a few hundred bytes; the
+full limit before the handshake let a peer that had presented nothing make the server buffer sixteen
+megabytes per connection. A peer also has **10 seconds** (`DEFAULT_HANDSHAKE_TIMEOUT_MILLIS`) to send
+its `HELLO` and, when asked, its `AUTH` — counted only while the server waits on the peer, not while it
+verifies a password or opens a store. There is deliberately no idle timeout after `WELCOME`: the
+protocol has no keep-alive and a pooled client idle between queries is normal. There is no
+per-address connection cap either; that is still open.
+
 **The stream id** is in the header rather than in each payload because the dispatcher has to route a
 frame before it has decoded anything. One connection carries many queries at once; stream 0 is the
 connection itself.
@@ -127,10 +136,30 @@ decisive:
 client with no credential to offer learns so immediately and fails with a message, instead of parking
 on a socket waiting for a `WELCOME` that is never coming.
 
-The connection has four states rather than two — `NEW`, `GREETED`, `AUTHENTICATING`, `READY` — and the
+The connection has five states — `NEW`, `GREETED`, `AUTHENTICATING`, `OPENING`, `READY` — and the
 third earns its place. A password is verified on a worker thread, so between the `AUTH` frame arriving
 and the answer coming back there is a window in which a client could pipeline a `QUERY`. Everything is
 refused in that window: a query racing an unfinished credential check is not a race worth having.
+`OPENING` is the same window for the database, refused the same way.
+
+**With authentication on, the database is resolved only after `AUTH` succeeds.** Resolving it at
+`HELLO` answered `NO_SUCH_DATABASE` to a peer that had presented nothing — a listing of the databases
+for anyone who can reach the port — and opened a store on its behalf. Now every `HELLO` gets
+`AUTH_REQUIRED`, and a missing name is reported after the credential. With authentication off it is
+resolved straight after `HELLO`, as before. Either way the open runs on Vert.x's default worker pool,
+not on the event loop: the first open of a store maps its segments while holding the
+`GraphDatabases` monitor, which on a loop stalled every connection sharing it. Not on the query pool
+either, so a handshake never waits behind running queries.
+
+**Grants are re-resolved at every `QUERY`**, by user name, from the identity store — as HTTP resolves
+them per request ([AUTH.md §6.1](AUTH.md)). A revoke or a grant reaches an open connection on its next
+query; a user who is disabled or dropped gets `UNAUTHENTICATED` on stream 0 and the connection closes.
+Freezing them at `AUTH` let a pooled connection outlive a revoke for as long as it stayed up.
+
+Password verification shares one bound with HTTP's login — a semaphore of `availableProcessors()` in
+`AuthPolicy` — and past it an `AUTH` is answered `OVERLOADED` and the connection closed, rather than
+queued. It runs on the default worker pool rather than the query pool, so a burst of handshakes cannot
+make queries wait behind PBKDF2.
 
 **The database is fixed for the connection.** A stream therefore never has to say which database it
 belongs to, and the server resolves the store once instead of per query. That is not only simplicity:
@@ -171,6 +200,13 @@ In increasing order of decisiveness:
    bytes is unencodable**. That settles it; the other three merely agree. (Write clauses did not change
    this: a write's *parameters* reach the store through the storage codec, which does have a blob
    store; a result being encoded outward still does not.)
+
+**The depth limit, `MAX_DEPTH` 32, counts containers only.** A node's labels, a relationship's type and
+a map's or a property map's keys are strings in positions only a string may take; the encoder writes
+them without a depth, and the decoder now reads them the same way. It used to decode them as values
+one level down, so a node or relationship at exactly depth 32 encoded and then failed to decode — a
+result the server could send and the client could not read
+(`WireValueCodecTest.testTheDepthLimitIsTheSameInBothDirections`).
 
 ### Two encoding decisions worth keeping
 
@@ -390,6 +426,7 @@ engine in it.
 |---|---|
 | **Rows already sent before an error are not a result** | The stream throws at exactly the row where the `ERROR` arrived, and `close()` reports one nothing else observed. Returning them as if the stream had merely ended is truncated data with no way to tell |
 | **No automatic reconnect** | Reconnecting mid-stream would silently resume against a *different* snapshot, so a result spanning the break would mix two points in time. Whether to run the query again is the caller's decision, and it is a real one |
+| **A dropped connection fails every later `query()` at once** | The streams open at the drop are failed by `connectionLost`; after it, `query()` throws `GraphClientException` rather than writing to a dead socket and leaving its caller in `hasNext()` for ever. The flag is set before the open streams are swept, so a query racing the drop is caught by one or the other. A `QUERY` whose write fails fails its stream too |
 | **A stream id is freed by the server's terminal frame, not by `close()`** | Frames for a cancelled stream are still in flight. Reusing the id early delivers one query's rows to another — a wrong answer rather than a crash, and therefore the worse bug |
 | **Not thread-safe per stream** | One stream, one consuming thread. Several streams may be consumed by several threads |
 
@@ -501,6 +538,8 @@ make cleartext safe; neither substitutes for the other.
 | `QuerySummaryTest` | The `COMPLETE` payload: round trip, every truncation offset refused, trailing bytes ignored |
 | `WireServerOptionsTest` | The multiplication in §5, enforced |
 | `WireServerTest` (databases) | Two connections to two databases from one process seeing different data; an unknown database and a name that is not a name both refused at the handshake |
+| `WireServerTest` (handshake) | A 1 MiB header before `WELCOME` refused from the header alone; a peer that never says `HELLO` disconnected at the deadline while an idle connected client is not; a `query()` after the server went away failing instead of hanging |
+| `WireAuthTest` (handshake) | `HELLO` answered `AUTH_REQUIRED` whether or not its database exists, and `NO_SUCH_DATABASE` only after the credential; a burst of 4×cores `AUTH` frames partly answered `OVERLOADED` rather than queued; a revoke, a re-grant and a disable each reaching an already-open connection |
 | `WireTlsTest` | §7.1 end to end against a certificate generated per test: a query over the encrypted listener, both listeners serving one store at once, a login crossing the encrypted one, `close()` stopping both acceptors, and `--wire-tls-only` opening no plaintext listener. Weighted towards **refusal** — an untrusted certificate, a certificate for the wrong name, a plaintext client on the encrypted port and the reverse — because those are the paths where a mistake produces something that looks like it is working. Same class-level `@Timeout` and event-loop count as `WireServerTest`, for the same two reasons |
 | `ClientTlsTest` | What the client verifies, and that a copy method does not drop the transport. Cheap assertions that earn their place because the value they pin down — hostname verification on — is one Vert.x defaults the other way |
 | `ClientDependencyTest` | Fails if graph-core or graph-cypher ever reaches the client's classpath. Checked by **loading**, not by reading a pom, because a transitive arrival would pass a pom check |

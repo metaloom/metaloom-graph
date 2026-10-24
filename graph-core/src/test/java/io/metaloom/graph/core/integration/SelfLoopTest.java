@@ -91,4 +91,34 @@ public class SelfLoopTest {
 			store.verify(VerifyLevel.FULL);
 		}
 	}
+
+	/**
+	 * The delete cascade leaves the dying node's own entries alone — its chain is freed whole — and must still take
+	 * every far end's entry and degree, a materialised self-loop's included.
+	 */
+	@Test
+	public void testDeletingANodeWithMaterialisedEdgesCleansEveryFarEnd() throws Exception {
+		try (GraphStore store = stores.open()) {
+			long a = store.createNode("N");
+			long b = store.createNode("N");
+			long c = store.createNode("N");
+			long loop = store.createRelationship(a, "R", a, io.metaloom.graph.core.api.Properties.of().set("w", 1));
+			long out = store.createRelationship(a, "R", b);
+			long in = store.createRelationship(c, "R", a);
+			long kept = store.createRelationship(b, "R", c);
+
+			store.deleteNode(a);
+			for (long rel : new long[] { loop, out, in }) {
+				assertTrue(!store.relationshipExists(rel), "every relationship of a dies with it");
+			}
+			assertTrue(store.relationshipExists(kept));
+			assertEquals(1, store.degreeOut(b));
+			assertEquals(0, store.degreeIn(b), "b lost its incoming edge from a");
+			assertEquals(0, store.degreeOut(c), "c lost its outgoing edge to a");
+			assertEquals(1, store.degreeIn(c));
+			assertEquals(1, store.neighbours(b, Direction.BOTH).size());
+			assertEquals(1, store.neighbours(c, Direction.BOTH).size());
+			store.verify(VerifyLevel.FULL);
+		}
+	}
 }

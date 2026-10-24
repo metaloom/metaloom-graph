@@ -136,8 +136,13 @@ public final class CypherLexer {
 				advance();
 			}
 			String text = source.substring(start, index);
-			return new Token(Token.Type.INTEGER, String.valueOf(Long.parseLong(text.substring(2), 16)),
-				startLine, startColumn);
+			try {
+				return new Token(Token.Type.INTEGER, String.valueOf(Long.parseLong(text.substring(2), 16)),
+					startLine, startColumn);
+			} catch (NumberFormatException e) {
+				throw error(startLine, startColumn, text.length() == 2 ? "A hex literal needs at least one digit"
+					: "The hex literal " + text + " does not fit in a 64-bit integer");
+			}
 		}
 		while (index < source.length() && Character.isDigit(source.charAt(index))) {
 			advance();
@@ -235,6 +240,9 @@ public final class CypherLexer {
 						String hex = source.substring(index, index + 4);
 						for (int i = 0; i < 4; i++) {
 							advance();
+						}
+						if (!hex.chars().allMatch(digit -> isHex((char) digit))) {
+							throw error(line, column - 4, "A \\u escape needs four hex digits, not '" + hex + "'");
 						}
 						out.append((char) Integer.parseInt(hex, 16));
 					}

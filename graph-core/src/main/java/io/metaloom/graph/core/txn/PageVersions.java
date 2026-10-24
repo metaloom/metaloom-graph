@@ -118,7 +118,7 @@ public final class PageVersions {
 	private volatile long horizonLsn;
 
 	/** The smallest {@code oldest} across every chain, so vacuum can decline in one comparison. */
-	private volatile long oldestRetainedLsn = Long.MAX_VALUE;
+	private final AtomicLong oldestRetainedLsn = new AtomicLong(Long.MAX_VALUE);
 
 	/** The newest chain entry for a page, or null when the mapping is the only version there has ever been. */
 	public Version head(long pageKey) {
@@ -171,11 +171,9 @@ public final class PageVersions {
 			chain.head = new Version(commitLsn, offset, before, chain.head);
 			return chain;
 		});
-		if (commitLsn < oldestRetainedLsn) {
-			// Only reachable for the first entry of the first chain: commit LSNs increase, so every later entry is
-			// younger than something already retained.
-			oldestRetainedLsn = commitLsn;
-		}
+		// Effectively only for the first entry after the store emptied: commit LSNs increase, so every later entry is
+		// younger than something already retained. A min rather than a store, because vacuum raises this concurrently.
+		oldestRetainedLsn.accumulateAndGet(commitLsn, Math::min);
 		retainedBytes.addAndGet(length);
 		entries.incrementAndGet();
 	}
@@ -271,7 +269,8 @@ public final class PageVersions {
 		if (oldestActiveLsn > horizonLsn) {
 			horizonLsn = oldestActiveLsn;
 		}
-		if (chains.isEmpty() || oldestRetainedLsn > oldestActiveLsn) {
+		long retainedBefore = oldestRetainedLsn.get();
+		if (chains.isEmpty() || retainedBefore > oldestActiveLsn) {
 			// Nothing retained is old enough to cut. This is the state the store is in for the whole life of a pinned
 			// view — every entry was created after it began — and answering in one comparison is what keeps a long
 			// reader from making every commit walk the accumulated chains.
@@ -284,10 +283,19 @@ public final class PageVersions {
 			Chain chain = entry.getValue();
 			Version head = chain.head;
 			if (head.supersededAt <= oldestActiveLsn) {
-				// The whole chain is dead, including the head. Conditional removal, because a commit may have
-				// prepended a newer entry to the same page since the head was read.
-				if (chains.remove(entry.getKey(), chain)) {
-					reclaimed += drop(head);
+				// The whole chain is dead, including the head. Decided inside the map's own lock on the key, which is
+				// the lock record() prepends under: record() keeps the same Chain object, so a removal conditioned on
+				// the object alone still matched after a newer entry had been prepended and took that entry with it.
+				Version[] removed = new Version[1];
+				chains.computeIfPresent(entry.getKey(), (key, current) -> {
+					if (current.head.supersededAt <= oldestActiveLsn) {
+						removed[0] = current.head;
+						return null;
+					}
+					return current;
+				});
+				if (removed[0] != null) {
+					reclaimed += drop(removed[0]);
 					continue;
 				}
 				head = chain.head;
@@ -309,7 +317,11 @@ public final class PageVersions {
 			chain.oldest = last.supersededAt;
 			oldestSurviving = Math.min(oldestSurviving, chain.oldest);
 		}
-		oldestRetainedLsn = oldestSurviving;
+		// Raised only if nothing lowered it during the walk. A record() that did may have created a chain this walk
+		// never visited, so its value is kept as a lower bound rather than overwritten.
+		if (!oldestRetainedLsn.compareAndSet(retainedBefore, oldestSurviving)) {
+			oldestRetainedLsn.accumulateAndGet(oldestSurviving, Math::min);
+		}
 		retainedBytes.addAndGet(-reclaimed);
 		return reclaimed;
 	}
@@ -319,7 +331,7 @@ public final class PageVersions {
 		long reclaimed = retainedBytes.getAndSet(0);
 		chains.clear();
 		entries.set(0);
-		oldestRetainedLsn = Long.MAX_VALUE;
+		oldestRetainedLsn.set(Long.MAX_VALUE);
 		return reclaimed;
 	}
 

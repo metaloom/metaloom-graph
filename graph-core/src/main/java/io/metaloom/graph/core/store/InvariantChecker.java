@@ -10,6 +10,8 @@ import java.util.Set;
 import io.metaloom.graph.core.api.VerifyOptions;
 import io.metaloom.graph.core.id.ElementId;
 import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.index.IndexCatalog;
+import io.metaloom.graph.core.store.vec.VectorRecord;
 import io.metaloom.graph.core.segment.SegmentSet;
 import io.metaloom.graph.core.store.adj.AdjacencyStore;
 import io.metaloom.graph.core.store.adj.PackedEdge;
@@ -50,6 +52,8 @@ public final class InvariantChecker {
 	/** Null in a store with no vector storage, in which case the vector check has nothing to walk. */
 	private final VectorStore vectors;
 	private final Map<Kind, SegmentSet> segmentSets;
+	/** Null unless {@link #withIndexes} was called, in which case the secondary indexes are checked too. */
+	private IndexCatalog indexes;
 
 	private VerifyOptions options = VerifyOptions.consistentSnapshot();
 	private Pacer pacer = Pacer.NONE;
@@ -71,6 +75,12 @@ public final class InvariantChecker {
 		this.blobs = blobs;
 		this.vectors = vectors;
 		this.segmentSets = segmentSets;
+	}
+
+	/** Checks the secondary indexes against the records as well. */
+	public InvariantChecker withIndexes(IndexCatalog catalog) {
+		this.indexes = catalog;
+		return this;
 	}
 
 	/** Runs every check and returns the violations, empty when the store is structurally sound. */
@@ -100,6 +110,7 @@ public final class InvariantChecker {
 		checkAdjacencyChains(violations);
 		checkBlobChains(violations);
 		checkVectorRecords(violations);
+		checkIndexes(violations);
 		if (stopped) {
 			violations.add("(scan stopped early: " + (violations.size() >= options.maxViolations()
 				? "violation limit of " + options.maxViolations() + " reached"
@@ -490,6 +501,176 @@ public final class InvariantChecker {
 					+ ElementId.toString(recorded) + " but is referenced by " + ElementId.toString(ownerId));
 			}
 		}
+	}
+
+	// ---------------------------------------------------------------- secondary indexes
+
+	/**
+	 * The label, property and composite trees agree with the node records, in both directions, and every declared
+	 * vector index starts its walk from one of its own members.
+	 *
+	 * <p>
+	 * <b>Both directions, because they fail differently.</b> An entry naming a node that is gone, or that no longer
+	 * carries the label or the value, is the dangling entry a missed hook leaves behind; lookups verify their candidates
+	 * so it costs reads rather than answers, and nothing else would ever report it. A node <em>missing</em> from a tree is
+	 * worse and quieter: an indexed lookup simply never returns it. Until this check existed neither was looked at by
+	 * {@code verify(FULL)}, which every test that ends with one was taken to have proved.
+	 * </p>
+	 *
+	 * <p>
+	 * Each tree is read in one walk before any of its entries is checked, so a throttled scan never follows a leaf
+	 * pointer across a pause. Only node properties are indexed, so relationships are not visited.
+	 * </p>
+	 */
+	private void checkIndexes(List<String> violations) {
+		if (indexes == null || !indexes.isInitialised()) {
+			return;
+		}
+		SegmentSet nodeSet = segmentSets.get(Kind.NODE);
+		List<IndexCatalog.Composite> composites = indexes.composites();
+
+		long[] labels = indexes.labelEntries();
+		for (int i = 0; i < labels.length; i += 3) {
+			if (!step(violations)) {
+				return;
+			}
+			long nodeId = labels[i + 1];
+			int labelId = (int) labels[i];
+			if (labels[i + 2] != nodeId || !nodeSet.isLive(nodeId) || !nodes.hasLabel(nodeId, labelId)) {
+				violations.add("Label index entry for label " + labelId + " names " + ElementId.toString(nodeId)
+					+ ", which is not a live node carrying that label");
+			}
+		}
+		long[] props = indexes.propertyEntries();
+		for (int i = 0; i < props.length; i += 3) {
+			if (!step(violations)) {
+				return;
+			}
+			long nodeId = props[i + 1];
+			int keyId = (int) (props[i] >>> 32);
+			Object value = nodeSet.isLive(nodeId) ? properties.read(nodes.propBlockId(nodeId), keyId) : null;
+			if (props[i + 2] != nodeId || value == null || !IndexCatalog.isPropertyKey(props[i], keyId, value)) {
+				violations.add("Property index entry for key " + keyId + " names " + ElementId.toString(nodeId)
+					+ ", which is not a live node holding a value with that hash");
+			}
+		}
+		long[] composite = indexes.compositeEntries();
+		for (int i = 0; i < composite.length; i += 3) {
+			if (!step(violations)) {
+				return;
+			}
+			long nodeId = composite[i + 1];
+			boolean matched = false;
+			if (composite[i + 2] == nodeId && nodeSet.isLive(nodeId)) {
+				for (IndexCatalog.Composite declared : composites) {
+					if (!nodes.hasLabel(nodeId, declared.labelId())) {
+						continue;
+					}
+					Object value = properties.read(nodes.propBlockId(nodeId), declared.keyId());
+					if (value != null
+						&& IndexCatalog.isCompositeKey(composite[i], declared.labelId(), declared.keyId(), value)) {
+						matched = true;
+						break;
+					}
+				}
+			}
+			if (!matched) {
+				violations.add("Composite index entry names " + ElementId.toString(nodeId)
+					+ ", which is not a live node satisfying any declared (label, key) with that value");
+			}
+		}
+
+		for (long nodeId : nodeSet.liveIds()) {
+			if (!step(violations)) {
+				return;
+			}
+			int[] held = nodes.labels(nodeId);
+			for (int labelId : held) {
+				if (labelId != 0 && !indexes.hasLabelEntry(nodeId, labelId)) {
+					violations.add("Node " + ElementId.toString(nodeId) + " carries label " + labelId
+						+ " but is missing from the label index");
+				}
+			}
+			Map<Integer, Object> values = properties.read(nodes.propBlockId(nodeId));
+			for (Map.Entry<Integer, Object> entry : values.entrySet()) {
+				if (entry.getValue() != null && !indexes.hasPropertyEntry(nodeId, entry.getKey(), entry.getValue())) {
+					violations.add("Node " + ElementId.toString(nodeId) + " holds key " + entry.getKey()
+						+ " but is missing from the property index");
+				}
+			}
+			for (IndexCatalog.Composite declared : composites) {
+				Object value = values.get(declared.keyId());
+				if (value == null || !contains(held, declared.labelId())) {
+					continue;
+				}
+				if (!indexes.hasCompositeEntry(nodeId, declared.labelId(), declared.keyId(), value)) {
+					violations.add("Node " + ElementId.toString(nodeId) + " satisfies the composite index on label "
+						+ declared.labelId() + ", key " + declared.keyId() + " but is missing from it");
+				}
+			}
+		}
+		checkVectorIndexes(violations);
+	}
+
+	/**
+	 * Every declared vector index's entry point, when it has one, is a live member of that index — and an index whose
+	 * members are linked has one.
+	 *
+	 * <p>
+	 * The entry point is the one link whose loss disconnects the graph rather than degrading it: a search that cannot
+	 * start answers every query with nothing, and an entry point that has moved into another index walks that index's
+	 * graph instead. Neither is visible from any single record, which is why it is checked here.
+	 * </p>
+	 */
+	private void checkVectorIndexes(List<String> violations) {
+		if (vectors == null || segmentSets.get(Kind.VEC) == null) {
+			return;
+		}
+		List<io.metaloom.graph.core.api.VectorIndexDefinition> declared = indexes.vectorIndexes();
+		if (declared.isEmpty()) {
+			return;
+		}
+		boolean[] hasEntry = new boolean[declared.size()];
+		for (int ord = 0; ord < declared.size(); ord++) {
+			if (declared.get(ord) == null) {
+				continue;
+			}
+			long entry = indexes.vectorEntryPoint(ord);
+			if (ElementId.isNull(entry)) {
+				continue;
+			}
+			hasEntry[ord] = true;
+			if (!vectors.exists(entry) || vectors.indexOrdinal(entry) != ord) {
+				violations.add("Vector index " + ord + " starts its walk at " + ElementId.toString(entry)
+					+ ", which is not a live member of that index");
+			}
+		}
+		for (long vectorId : segmentSets.get(Kind.VEC).liveIds()) {
+			if (!step(violations)) {
+				return;
+			}
+			if ((vectors.flags(vectorId) & VectorRecord.FLAG_LINKED) == 0) {
+				continue;
+			}
+			int ord = vectors.indexOrdinal(vectorId);
+			if (ord < 0 || ord >= declared.size() || declared.get(ord) == null) {
+				violations.add("Vector record " + ElementId.toString(vectorId)
+					+ " is marked linked but belongs to no declared index");
+			} else if (!hasEntry[ord]) {
+				violations.add("Vector record " + ElementId.toString(vectorId) + " is linked into index " + ord
+					+ ", which has no entry point, so no search can reach it");
+				hasEntry[ord] = true;
+			}
+		}
+	}
+
+	private static boolean contains(int[] values, int wanted) {
+		for (int value : values) {
+			if (value == wanted) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private long withCurrentGeneration(Kind kind, long idWithoutGen) {

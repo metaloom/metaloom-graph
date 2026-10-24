@@ -189,6 +189,22 @@ public class AuthorizationTest {
 		assertForbidden(query("MERGE (n:Customer {id: 1})", "hr", loader), "MATCH");
 	}
 
+	/**
+	 * A database the caller holds nothing on is refused the same way whether or not it exists.
+	 *
+	 * <p>
+	 * The privilege is checked before the name is resolved. The other order answers 404 for a missing name and 403 for
+	 * a present one, which tells anybody with any login which databases there are.
+	 * </p>
+	 */
+	@Test
+	public void testAQueryDoesNotRevealWhetherAnUngrantedDatabaseExists() throws Exception {
+		assertForbidden(query("MATCH (n) RETURN n", "hr", loader), "MATCH");
+		assertForbidden(query("MATCH (n) RETURN n", "nosuch", loader), "MATCH");
+		// And somebody who may look still learns that it is missing.
+		assertEquals(404, query("MATCH (n) RETURN n", "nosuch", reader).statusCode());
+	}
+
 	@Test
 	public void testAWildcardGrantReachesEveryDatabase() throws Exception {
 		assertEquals(200, query("MATCH (n) RETURN n LIMIT 1", "sales", reader).statusCode());
@@ -323,6 +339,60 @@ public class AuthorizationTest {
 
 		// The grant really did not happen.
 		assertFalse(identities.principal("helpdesk").orElseThrow().may(Privilege.MERGE, "sales"));
+	}
+
+	/**
+	 * Nor by creating a user that holds a role.
+	 *
+	 * <p>
+	 * Putting somebody in a role hands them that role's grants, which is what {@code MANAGE_ROLES} governs. Without
+	 * this the helpdesk creates a second account in the admin role and logs in as it.
+	 * </p>
+	 */
+	@Test
+	public void testManagingUsersDoesNotAllowCreatingAUserInARole() throws Exception {
+		assertForbidden(post("/api/users", new JsonObject().put("name", "mole").put("password", "mole-pw")
+			.put("roles", new JsonArray().add(AuthStore.ADMIN)), helpdesk), "MANAGE_ROLES");
+		assertTrue(identities.user("mole").isEmpty(), "the account was created anyway");
+
+		// A user with no role is still the helpdesk's to create.
+		assertEquals(200, post("/api/users", new JsonObject().put("name", "newcomer").put("password", "newcomer-pw"),
+			helpdesk).statusCode());
+		// And an administrator may do both at once.
+		assertEquals(200, post("/api/users", new JsonObject().put("name", "analyst").put("password", "analyst-pw")
+			.put("roles", new JsonArray().add("reader")), admin).statusCode());
+	}
+
+	/**
+	 * Nor by resetting the password of somebody who may manage roles.
+	 *
+	 * <p>
+	 * A reset is a login as that user. Resetting a reader's password is the helpdesk's job; resetting the admin's is
+	 * becoming the admin.
+	 * </p>
+	 */
+	@Test
+	public void testManagingUsersDoesNotAllowTakingOverAnAdministrator() throws Exception {
+		assertForbidden(post("/api/users/admin/password", new JsonObject().put("password", "taken-over"), helpdesk),
+			"MANAGE_ROLES");
+		assertEquals(401, post("/api/login",
+			new JsonObject().put("user", "admin").put("password", "taken-over"), null).statusCode());
+		assertEquals(200, post("/api/login",
+			new JsonObject().put("user", "admin").put("password", "admin-pw"), null).statusCode());
+	}
+
+	/** An empty password is refused on both routes that set one, rather than becoming a login with no secret. */
+	@Test
+	public void testAnEmptyPasswordIsRefused() throws Exception {
+		HttpResponse<String> created = post("/api/users", new JsonObject().put("name", "blank").put("password", ""),
+			admin);
+		assertEquals(400, created.statusCode(), created.body());
+		assertTrue(identities.user("blank").isEmpty(), "a user was created with an empty password");
+
+		HttpResponse<String> reset = post("/api/users/reader/password", new JsonObject().put("password", ""), reader);
+		assertEquals(400, reset.statusCode(), reset.body());
+		assertEquals(200, post("/api/login",
+			new JsonObject().put("user", "reader").put("password", "reader-pw"), null).statusCode());
 	}
 
 	@Test

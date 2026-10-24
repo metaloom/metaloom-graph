@@ -99,6 +99,50 @@ public class VisibilityTest {
 	}
 
 	/**
+	 * A blob's length is bounded by what the store could hold. Bounded by the <em>current</em> live count, a view
+	 * reading a blob whose extents a later commit freed was told its own data was corrupt.
+	 */
+	@Test
+	public void testABlobFreedAfterTheViewBeganIsStillReadable() throws Exception {
+		try (GraphStore store = stores.open()) {
+			byte[] big = new byte[30_000];
+			new java.util.Random(7).nextBytes(big);
+			long node = store.createNode("Doomed", Properties.of().set("data", big));
+
+			try (ReadTransaction view = store.beginRead()) {
+				store.deleteNode(node);
+				assertTrue(java.util.Arrays.equals(big, (byte[]) store.nodeProperty(node, "data")),
+					"the view must read the blob it began with, whatever has been freed since");
+			}
+			assertFalse(store.nodeExists(node));
+			store.verify(io.metaloom.graph.core.api.VerifyLevel.FULL);
+		}
+	}
+
+	/** The same bound for an adjacency chain: a later delete must not make the view's chain look like a cycle. */
+	@Test
+	public void testAnAdjacencyChainFreedAfterTheViewBeganIsStillWalkable() throws Exception {
+		try (GraphStore store = stores.open()) {
+			long node = store.createNode("Doomed");
+			try (Transaction txn = store.begin()) {
+				// Self-loops, so every block in the store belongs to this one node and the delete frees all of them.
+				for (int i = 0; i < 5_000; i++) {
+					store.createEdge(node, "E" + (i % 3), node);
+				}
+				txn.commit();
+			}
+
+			try (ReadTransaction view = store.beginRead()) {
+				store.deleteNode(node);
+				assertEquals(10_000, store.neighbours(node, Direction.BOTH).size(),
+					"the view walks the chain it began with, whatever has been freed since");
+			}
+			assertFalse(store.nodeExists(node));
+			store.verify(io.metaloom.graph.core.api.VerifyLevel.FULL);
+		}
+	}
+
+	/**
 	 * The case that separates page versioning from record versioning.
 	 *
 	 * <p>

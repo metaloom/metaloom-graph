@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
 
 import io.metaloom.graph.cypher.ast.Ast;
 import io.metaloom.graph.cypher.ast.Ast.Expr;
@@ -26,9 +27,75 @@ public final class Evaluator {
 	private final GraphAccess graph;
 	private final Map<String, Object> parameters;
 
+	/** Null except in an evaluator made by {@link #folding}, where it answers each aggregating call. */
+	private final Function<Ast.FunctionCall, Object> aggregates;
+
 	public Evaluator(GraphAccess graph, Map<String, Object> parameters) {
 		this.graph = graph;
-		this.parameters = parameters == null ? Map.of() : parameters;
+		this.parameters = parameters == null ? Map.of() : normalisedParameters(parameters);
+		this.aggregates = null;
+	}
+
+	private Evaluator(Evaluator base, Function<Ast.FunctionCall, Object> aggregates) {
+		this.graph = base.graph;
+		this.parameters = base.parameters;
+		this.aggregates = aggregates;
+	}
+
+	/**
+	 * The same evaluator, with each aggregating call answered by {@code aggregates} instead of refused.
+	 *
+	 * <p>
+	 * This is how an aggregate nested anywhere in an expression works — {@code size(collect(x))},
+	 * {@code {c: count(*)}}, {@code collect(x)[0]} — without the aggregation operator having to know every expression
+	 * shape: it folds the calls, and this evaluates everything around them as usual.
+	 * </p>
+	 */
+	Evaluator folding(Function<Ast.FunctionCall, Object> aggregates) {
+		return new Evaluator(this, aggregates);
+	}
+
+	/**
+	 * Parameters in Cypher's two numeric types, once per query.
+	 *
+	 * <p>
+	 * A JSON body decodes {@code 30} as an Integer and {@code Map.of("a", 30)} boxes one too, while the store and every
+	 * write path speak Long and Double. Left as they came, they compare correctly and then fail the first write.
+	 * </p>
+	 */
+	private static Map<String, Object> normalisedParameters(Map<String, Object> parameters) {
+		Map<String, Object> out = new LinkedHashMap<>();
+		for (Map.Entry<String, Object> entry : parameters.entrySet()) {
+			out.put(entry.getKey(), normaliseParameter(entry.getValue()));
+		}
+		return out;
+	}
+
+	private static Object normaliseParameter(Object value) {
+		return switch (value) {
+			case null -> null;
+			case Integer i -> i.longValue();
+			case Short s -> s.longValue();
+			case Byte b -> b.longValue();
+			case Float f -> f.doubleValue();
+			case java.math.BigInteger big when big.bitLength() < 64 -> big.longValue();
+			case List<?> list -> {
+				List<Object> out = new ArrayList<>(list.size());
+				for (Object element : list) {
+					out.add(normaliseParameter(element));
+				}
+				yield out;
+			}
+			case Map<?, ?> map -> {
+				Map<String, Object> out = new LinkedHashMap<>();
+				for (Map.Entry<?, ?> entry : map.entrySet()) {
+					out.put(String.valueOf(entry.getKey()), normaliseParameter(entry.getValue()));
+				}
+				yield out;
+			}
+			// A float[] stays one: it is how a query vector is passed, and the vector functions take it as it is.
+			default -> value;
+		};
 	}
 
 	public GraphAccess graph() {
@@ -81,7 +148,9 @@ public final class Evaluator {
 			};
 			case Ast.Binary binary -> binary(binary, row);
 			case Ast.Comparison comparison -> comparison(comparison, row);
-			case Ast.FunctionCall call -> Functions.call(this, call, row);
+			case Ast.FunctionCall call -> aggregates != null && Functions.isAggregate(call.name())
+				? aggregates.apply(call)
+				: Functions.call(this, call, row);
 			case Ast.Case caseExpression -> caseValue(caseExpression, row);
 		};
 	}

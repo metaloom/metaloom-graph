@@ -146,6 +146,22 @@ reason `create(String, GraphStoreOptions)` exists: geometry is fixed at creation
 It is not on the HTTP surface. Nothing over the network replaces a database — restore is offline only
 ([BACKUP.md §6](BACKUP.md)).
 
+The CLI's restore no longer calls it. `replace` deletes the original **before** the dump is read, and a
+dump is only known to be whole at its trailer, so a truncated or corrupt one restored with `--force`
+lost the original and left half a database. It now uses the pair
+
+```java
+GraphStore stage(String name, GraphStoreOptions storeOptions) throws IOException   // empty store beside it
+GraphStore install(String name, GraphStoreOptions storeOptions) throws IOException // swap the staged one in
+void discardStaged(String name) throws IOException
+```
+
+`stage` opens an empty store in `.staging-<name>` under the root — a dot-name, which `validate` can
+never accept, so it is never listed and never addressable. The restore fills and verifies it, closes it,
+and `install` renames the original to `.replaced-<name>`, renames the staged directory into place, then
+deletes the original — the same "never observed empty" property `replace` has, by two renames within
+one directory. A failure before `install` calls `discardStaged` and the original is untouched.
+
 ---
 
 ## 4. Selection
@@ -167,7 +183,8 @@ switched the query but not the sidebar would show one database's labels beside a
 
 ### Binary: per connection, at the handshake
 
-`HELLO` carries the name; `WELCOME` echoes what the server resolved.
+`HELLO` carries the name; `WELCOME` echoes what the server resolved. With authentication on the name is
+resolved only after `AUTH`, and the open runs on a worker ([WIRE.md §1](WIRE.md)).
 
 ```java
 try (GraphClient client = GraphClient.connect("localhost", 8081, "sales");

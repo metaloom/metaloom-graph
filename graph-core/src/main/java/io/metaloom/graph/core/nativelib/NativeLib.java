@@ -45,8 +45,13 @@ public final class NativeLib {
 
 	private static final int O_RDWR = 2;
 	private static final int O_CREAT = 0100;
-	/** {@code asm-generic/fcntl.h} on x86-64, aarch64 and riscv. Not portable to every architecture. */
-	private static final int O_DIRECT = 040000;
+	/**
+	 * {@code O_DIRECT} is one of the flags arm64 does <em>not</em> take from {@code asm-generic/fcntl.h}: its own header
+	 * defines it as {@code 0200000}, and {@code 040000} there is {@code O_DIRECTORY}. With the generic value every
+	 * direct open on aarch64 failed and fell back to buffered I/O without saying so — and the jar ships an aarch64
+	 * library. x86-64 and riscv use the generic value.
+	 */
+	private static final int O_DIRECT = System.getProperty("os.arch", "").contains("aarch64") ? 0200000 : 040000;
 	private static final int O_DSYNC = 010000;
 
 	/** {@code POSIX_FADV_DONTNEED} from {@code fcntl.h}. */

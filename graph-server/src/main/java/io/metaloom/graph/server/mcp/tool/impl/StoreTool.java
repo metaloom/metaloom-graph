@@ -37,6 +37,11 @@ abstract class StoreTool implements GraphMcpTool {
 		return requested == null || requested.isBlank() ? defaultDatabase : requested;
 	}
 
+	@Override
+	public String database(JsonObject arguments) {
+		return databaseName(arguments);
+	}
+
 	GraphStore store(String name) {
 		try {
 			return databases.database(name);

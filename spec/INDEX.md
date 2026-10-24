@@ -50,7 +50,8 @@ Node header, 40 bytes:
  4  1  leaf
  5  3  reserved
  8  8  next_leaf        leaf chaining, for a prefix scan that spans pages
-16 14  reserved
+16  4  version          bumped by every change to the page and by a unique check's claim (§2.2, §6.1)
+20 10  reserved
 30  2  gen              maintained by the slot allocator — see the warning below
 32  8  leftmost_child   internal nodes only
 40  N  entries          24 bytes each: (k1, k2, value)
@@ -66,6 +67,16 @@ levels are a few hundred kilobytes that stay in page cache.
 **Deletion does not rebalance.** An entry is removed and an underfull node is left underfull. That is
 correct — it is still a valid tree — and merging is deferred to compaction, which rebuilds the whole
 tree anyway. The cost is a tree that degrades under a delete-heavy workload until something compacts.
+It has one consequence that is not about cost: a separator `(k1, nX)` outlives the entries it divided,
+so one `k1` can route to several leaves that hold none of it — which is what §6.1 has to answer.
+
+**A root is written only when it moves**, which is when the root itself splits. `IndexCatalog` used to
+write the unchanged id back after every insert, which made the catalog page writable — an 8 KiB copy into
+the overlay and a diff at commit — in every indexed write for bytes that came out identical. Not a
+conflict source, as it happens: validation compares the copy with its base, so an unchanged root is no
+changed run. Halving the `INDEX` record writes of a labelled two-property `createNode` (6.08 to 3.08,
+`IndexPathBenchmark`) is the whole effect. `BTree.remove` likewise looks the key up before making the leaf
+writable, so a miss copies nothing.
 
 ### 2.1 The offset-30 trap, which cost a defect
 
@@ -78,6 +89,25 @@ at **64**, with a comment saying why. Anyone adding a field to an index page sho
 not reason about the gap.
 
 ---
+
+### 2.2 The page is the unit of conflict, and the version field is what makes it so
+
+Concurrent writers are validated byte by byte ([TRANSACTIONS.md](TRANSACTIONS.md)): a run this transaction
+changed conflicts only with a run someone else committed over the same bytes. That is right for fixed-stride
+records and **wrong for a B+tree page, whose changes move bytes**. Updating a property removes one entry and
+inserts another, usually in one leaf; the count ends where it started, and the shifted entries between the
+two positions differ from their old images only where their bytes differ — neighbouring keys share their
+high bytes, so the changed runs are fragments with gaps. A second writer's fragments fit into those gaps,
+nothing overlaps, both commit, and the merged leaf interleaves two different shifts: entries lost or
+duplicated, and `nodesByProperty` silently not returning a node. `IndexLeafMergeTest` (six writers updating
+disjoint nodes) lost an entry on every run before the fix, and `verify(FULL)`'s new index check (§10) found
+the same damage in four existing concurrency tests.
+
+So every change to an existing page bumps its `version` field (`BTree.changing`), and any two transactions
+that change one page concurrently write those bytes in common and conflict. That costs nothing that
+mattered: two inserts into one leaf already conflicted on the count. A re-put of an entry that is already
+there is not a change and does not bump. **The underlying hazard is the byte-level merge, not the tree**:
+any other structure that shifts its contents within a page is exposed to it the same way.
 
 ## 3. The three indexes
 
@@ -190,6 +220,16 @@ multiply the write cost of every node by the size of its label set. So:
 - `createIndex(label, key)` **scans every live node and backfills**, in the declaring transaction, the
   way `addUniqueConstraint` scans before declaring. An index covering only writes made after it would
   answer confidently with a subset, which is worse than no index at all;
+- **every declaration excludes every other writer** — create or drop, composite, unique or vector — by
+  holding the write gate exclusively (`GraphStoreImpl.declare`). The scan and a concurrent writer meet
+  nowhere on disk: the scan's snapshot cannot hold the writer's uncommitted node, the writer's hook reads
+  the declaration lists as of a snapshot that cannot hold the declaration, and the two write disjoint
+  bytes, so both used to commit — an index that permanently missed the node, or a unique constraint over a
+  duplicate (`IndexDeclarationRaceTest`). A vector index's *build* runs after the gate is released; only
+  its declaration and membership scan hold it. **Inside an explicit transaction** the gate cannot be
+  taken — the caller holds it shared and a read-write lock does not upgrade — so the declaration joins that
+  transaction and is not isolated from concurrent writers. Every production caller (the HTTP route, the
+  MCP tool, restore) declares outside one;
 - the four maintenance hooks (§5) consult the declared list, so a store that has declared none pays a
   catalog-page read per hook call and no tree work at all;
 - the tree's root is `NULL` until the first declaration, so a store with no composite index does not
@@ -310,7 +350,10 @@ Two forms, **on node properties only**:
 
 Declaring either **scans the live data first** and refuses if it already breaks the constraint, rather
 than declaring something that is already false. The label-scoped scan covers only the nodes carrying
-the label, which is the whole difference between the two.
+the label, which is the whole difference between the two. The scan finds duplicates in a map of its own,
+keyed by `IndexCatalog.ValueKey` — `valueHash` and `valueEquals` put where a `HashMap` uses them — because
+a raw `float[]` key hashes by identity and two identical vectors never met. It held a `byte[]` special
+case before; the key covers that and every list shape too.
 
 Enforcement is `checkUnique`, which probes the index, verifies each candidate against the stored value,
 and raises `ConstraintViolationException` naming the key, the value and the node already holding it —
@@ -342,6 +385,25 @@ all.
 
 **There is no unique constraint on a relationship property**, because there is no relationship property
 index for one to be built on.
+
+### 6.1 Two writers, one value
+
+A unique check is a read, and snapshot isolation does not validate reads. It holds anyway in the usual
+case because both writers insert the same key prefix into the same leaf, both write its count, and the
+second is refused. It did **not** hold when the prefix spans leaves (§2): `(k, n1 < nX)` and
+`(k, n2 >= nX)` route to different leaves, each writer's probe reads both and finds nothing, each inserts
+into its own page, and both committed with the same value (`UniqueConstraintRaceTest`).
+
+So `conflicts` and `compositeConflicts` **claim** what they probe: `BTree.claimPrefix` bumps the `version`
+field (§2.2) of every leaf from the one `(k, 0)` routes to through the one `(k, max)` routes to. Two writers
+about to insert under one `k` now write a byte in common, and the loser retries into the violation. The
+range comes from the routing, not the entries, because a leaf holding none of the prefix can still be
+where it is inserted — that is the stale-separator case exactly. Almost always it is one leaf, the one the
+insert lands in anyway, so the claim adds no conflict the insert did not already have. It is skipped when
+the element being written already holds an entry under the value (a `setNodeProperties` that keeps it),
+because that write inserts nothing there. The test reproduces the race on the property tree; the
+composite tree has the same separators and takes the same claim, but an attempt to build the race there
+did not fail before the fix, so that half rests on the argument rather than on a test.
 
 ---
 
@@ -430,7 +492,20 @@ with the numbers and routes what remains to two adjacency tasks, neither of whic
 | `MultiLabelTest` | An entry per label rather than per node, spill in and out of the overflow block, and `addNodeLabel`/`removeNodeLabel` leaving the index exactly right |
 | `CompactionTest` | Ids move and both trees still answer — the case `resetTrees` exists for |
 | `ReferenceModelTest` | The differential that matters: every indexed lookup must equal what an in-memory reference model says, over a randomised workload. Two composite indexes are declared **partway through** it, so the backfill and the hooks are both on trial — and the undeclared pairs check that the fallback path gives the same answer |
-| `CypherWriteVersusApiTest` | Write through Cypher, then verify with the API **and** `verify(FULL)`, whose `NoDanglingRefs` checker is what catches an index entry pointing at a freed slot |
+| `CypherWriteVersusApiTest` | Write through Cypher, then verify with the API **and** `verify(FULL)` |
+| `IndexDeclarationRaceTest` | A composite index, both unique constraints and a vector index, each declared while another writer is mid-transaction: the declaration must cover the writer's node, or refuse over its duplicate |
+| `UniqueConstraintRaceTest` | Two writers giving one unique value to nodes on either side of a stale separator (§6.1) |
+| `IndexLeafMergeTest` | Six writers updating disjoint nodes, then every node looked up by its value: the byte-level merge of shifted leaves (§2.2) |
+| `InvariantTest` | That `verify(FULL)`'s index check fires: a missing label entry, a dangling property entry, a vector entry point outside its index |
+
+**`verify(FULL)` checks the trees against the records** (`InvariantChecker.checkIndexes`), and until
+this revision it did not: the claim that `NoDanglingRefs` caught an index entry pointing at a freed slot
+was never true — that checker covers record references only. Both directions are checked now. Every
+label, property and composite entry must name a live node that carries the label, or holds a value with
+that hash under a declared pair; every live node must have an entry per label, per property and per
+declared pair it satisfies. Each tree is read in one walk before its entries are checked, so a throttled
+scan never follows a leaf pointer across a pause — though, like every other cross-record check, a
+throttled one can still report a state that never existed whole.
 
 The load-bearing one is `ReferenceModelTest`: an index that agrees with itself proves nothing, and an
 index that disagrees with a model built independently of it is the only defect class this layer can
@@ -462,5 +537,5 @@ Each of these is a task with a verdict, an effort estimate and a definition of d
 
 ---
 
-_Git HEAD revision: `0970e6b`_
-_Last updated: 2026-08-16 (IDX-7: the declared composite index, its drop, and the label-scoped unique constraint)_
+_Git HEAD revision: `4f21a62`_
+_Last updated: 2026-10-24 (declarations exclude concurrent writers; unique checks claim the leaves they probe; roots written only when they move; `verify(FULL)` checks the trees)_

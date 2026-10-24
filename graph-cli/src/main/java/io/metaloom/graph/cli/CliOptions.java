@@ -47,9 +47,13 @@ import java.util.function.UnaryOperator;
  * @param password
  *            a password given with {@code --password=} or read from stdin for {@code --password-stdin}, or null to
  *            generate one
+ * @param token
+ *            a session token for {@code --server}, from {@code GRAPH_TOKEN}, or null to send none. A variable and not a
+ *            flag, for the reason {@code GRAPH_ADMIN_PASSWORD} is preferred: a flag is in shell history and in
+ *            {@code ps}
  */
 public record CliOptions(String command, String database, Path path, String server, String file, boolean force,
-	boolean quiet, List<String> arguments, String password) {
+	boolean quiet, List<String> arguments, String password, String token) {
 
 	/** Raised by {@code --help}, so the parser never prints or exits by itself. */
 	public static final class HelpRequested extends RuntimeException {
@@ -66,7 +70,9 @@ public record CliOptions(String command, String database, Path path, String serv
 		new EnvVar("GRAPH_SERVER", "The base URL of a running server, as --server does."),
 		new EnvVar("GRAPH_DATABASE", "The database to act on when the command does not name one."),
 		new EnvVar("GRAPH_ADMIN_PASSWORD", "The password for 'auth reset-admin' and 'auth user add'. Preferred over "
-			+ "--password=, which a shell records in its history."));
+			+ "--password=, which a shell records in its history."),
+		new EnvVar("GRAPH_TOKEN", "A session token for --server, sent as a bearer token: the \"token\" that "
+			+ "POST /api/login returns. Needed whenever the server has authentication on, which is the default."));
 
 	/**
 	 * The one command that reaches no store and no server.
@@ -214,7 +220,8 @@ public record CliOptions(String command, String database, Path path, String serv
 				path = null;
 			}
 		}
-		return new CliOptions(command, database, path, server, file, force, quiet, arguments, password);
+		return new CliOptions(command, database, path, server, file, force, quiet, arguments, password,
+			read(env, "GRAPH_TOKEN"));
 	}
 
 	/**
@@ -297,7 +304,7 @@ public record CliOptions(String command, String database, Path path, String serv
 			                    server. This is the mode that works when a server will not start.
 			  --server=<url>    Use a running server, e.g. http://localhost:8080. The backup is
 			                    taken online: writers are not stopped, and the dump is a single
-			                    point in time.
+			                    point in time. A server with authentication on needs GRAPH_TOKEN.
 
 			OPTIONS
 			  --out=<file>      Where to write the dump. '-' writes to stdout.
@@ -306,8 +313,9 @@ public record CliOptions(String command, String database, Path path, String serv
 			  --password=<pw>   A password for an auth command. Visible in shell history and in 'ps';
 			                    prefer --password-stdin or GRAPH_ADMIN_PASSWORD.
 			  --password-stdin  Read the password from stdin, one line.
-			  --force           Let restore replace a database that already exists. It is dropped
-			                    and recreated, so everything in it is lost. For 'auth reset-admin',
+			  --force           Let restore replace a database that already holds data. Everything
+			                    in it is lost, but only once the dump has been read to its end and
+			                    verified: a damaged dump leaves it untouched. For 'auth reset-admin',
 			                    replace an identity file that is corrupt and cannot be read.
 			  --quiet, -q       No progress on stderr.
 			  --help, -h        This.

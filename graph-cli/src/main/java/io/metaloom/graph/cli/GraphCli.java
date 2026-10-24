@@ -141,7 +141,7 @@ public final class GraphCli {
 						progress());
 				}
 			} else {
-				summary = RemoteGraph.backup(options.server(), options.database(), out, progress());
+				summary = RemoteGraph.backup(options.server(), options.token(), options.database(), out, progress());
 			}
 		}
 		Duration elapsed = Duration.ofNanos(System.nanoTime() - started);
@@ -186,15 +186,29 @@ public final class GraphCli {
 			if (occupied) {
 				err.println("Replacing the existing '" + options.database() + "', because --force was given");
 			}
-			// One step, not drop-then-create: dropping refuses to remove the last database in a root, and the target
+			// Built beside the target and swapped in only once it has been read to the trailer and verified: the
+			// checksum is at the end, so replacing first would trade the original for half a damaged dump. Not
+			// drop-then-create either, because dropping refuses to remove the last database in a root, and the target
 			// here is very often the only one there is. Created with the DUMP's geometry, not the root's — page size,
 			// segment capacity and vector dimensions are fixed at creation, so this is the only moment at which a
 			// target can be made able to hold the data.
-			GraphStore store = databases.replace(options.database(), header.geometry());
-			GraphRestore.Summary summary = GraphRestore.readBody(store, in, header);
-
-			err.println("Verifying the restored store");
-			store.verify(VerifyLevel.FULL);
+			GraphStore staged = databases.stage(options.database(), header.geometry());
+			GraphRestore.Summary summary;
+			try {
+				summary = GraphRestore.readBody(staged, in, header);
+				err.println("Verifying the restored store");
+				staged.verify(VerifyLevel.FULL);
+			} catch (IOException | RuntimeException failed) {
+				try {
+					staged.close();
+					databases.discardStaged(options.database());
+				} catch (IOException | RuntimeException cleanup) {
+					failed.addSuppressed(cleanup);
+				}
+				throw failed;
+			}
+			staged.close();
+			databases.install(options.database(), header.geometry());
 
 			Duration elapsed = Duration.ofNanos(System.nanoTime() - started);
 			err.printf("Restored '%s': %,d nodes, %,d relationships, %,d lightweight edges, "
@@ -215,7 +229,7 @@ public final class GraphCli {
 				}
 			}
 		} else {
-			for (String name : RemoteGraph.databases(options.server())) {
+			for (String name : RemoteGraph.databases(options.server(), options.token())) {
 				println(name);
 			}
 		}

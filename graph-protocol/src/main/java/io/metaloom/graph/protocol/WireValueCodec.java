@@ -490,7 +490,7 @@ public final class WireValueCodec {
 		int labelCount = r.countWithin(r.varint());
 		List<String> labels = new ArrayList<>(Math.min(labelCount, 16));
 		for (int i = 0; i < labelCount; i++) {
-			labels.add(expect(decode(r, depth + 1), String.class, "a node label"));
+			labels.add(decodeKey(r, "a node label"));
 		}
 		return new WireNode(id, labels, decodeProperties(r, depth));
 	}
@@ -498,7 +498,7 @@ public final class WireValueCodec {
 	private static WireRelationship decodeRelationship(Reader r, int depth) {
 		int flags = r.u8();
 		Long id = (flags & REL_MATERIALISED) != 0 ? r.i64() : null;
-		String type = expect(decode(r, depth + 1), String.class, "a relationship type");
+		String type = decodeKey(r, "a relationship type");
 		long startId = r.i64();
 		long endId = r.i64();
 		return new WireRelationship(id, type, startId, endId, decodeProperties(r, depth));
@@ -511,7 +511,7 @@ public final class WireValueCodec {
 		}
 		Map<String, Object> properties = new LinkedHashMap<>();
 		for (int i = 0; i < count; i++) {
-			properties.put(expect(decode(r, depth + 1), String.class, "a property key"), decode(r, depth + 1));
+			properties.put(decodeKey(r, "a property key"), decode(r, depth + 1));
 		}
 		return properties;
 	}
@@ -520,9 +520,25 @@ public final class WireValueCodec {
 		int count = r.countWithin(r.varint());
 		Map<String, Object> map = new LinkedHashMap<>();
 		for (int i = 0; i < count; i++) {
-			map.put(expect(decode(r, depth + 1), String.class, "a map key"), decode(r, depth + 1));
+			map.put(decodeKey(r, "a map key"), decode(r, depth + 1));
 		}
 		return map;
+	}
+
+	/**
+	 * A string where only a string may stand: a label, a relationship type, a key.
+	 *
+	 * <p>
+	 * Not a level of nesting, so no depth, exactly as the encoder writes it with {@code encodeString}. Decoding it as a
+	 * value one level down made a node or relationship at exactly {@link #MAX_DEPTH} encodable and undecodable.
+	 * </p>
+	 */
+	private static String decodeKey(Reader r, String where) {
+		int tag = r.u8();
+		if ((tag & 0x1F) != T_STRING) {
+			throw new WireFormatException("Expected String for " + where + " but found value tag " + (tag & 0x1F));
+		}
+		return decodeString(r, tag >>> 5);
 	}
 
 	private static Long decodeInt(Reader r, int sizeClass) {

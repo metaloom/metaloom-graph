@@ -241,11 +241,11 @@ public final class ValueCodec {
 				w.u8(tag(T_FLOAT, 1));
 				w.i64(Double.doubleToRawLongBits(d));
 			}
-			case String s -> encodeBytes(w, T_STRING, s.getBytes(StandardCharsets.UTF_8), blobs);
+			case String s -> encodeBytes(w, T_STRING, utf8(s), blobs);
 			case byte[] b -> encodeBytes(w, T_BYTES, b, blobs);
 			case Instant i -> {
 				w.u8(tag(T_TIMESTAMP, 0));
-				w.i64(i.getEpochSecond() * 1_000_000L + i.getNano() / 1000L);
+				w.i64(micros(i));
 			}
 			case UUID u -> {
 				w.u8(tag(T_UUID, 0));
@@ -290,6 +290,43 @@ public final class ValueCodec {
 			default -> throw new IllegalArgumentException(
 				"Unsupported property value type: " + value.getClass().getName());
 		}
+	}
+
+	/** Microseconds since the epoch, refusing an instant a long cannot hold rather than wrapping it into another. */
+	private static long micros(Instant instant) {
+		long seconds = instant.getEpochSecond();
+		long micros = instant.getNano() / 1000L;
+		try {
+			if (seconds < 0 && micros > 0) {
+				// As Instant.toEpochMilli does: borrow a second first, or the earliest representable microsecond
+				// overflows in the multiplication although the sum fits.
+				return Math.addExact(Math.multiplyExact(seconds + 1, 1_000_000L), micros - 1_000_000L);
+			}
+			return Math.addExact(Math.multiplyExact(seconds, 1_000_000L), micros);
+		} catch (ArithmeticException e) {
+			throw new IllegalArgumentException("Timestamp " + instant + " is outside the microsecond range a property "
+				+ "can store (about 292,000 years either side of 1970)", e);
+		}
+	}
+
+	/**
+	 * Strict UTF-8. {@code String.getBytes} silently writes '?' for a lone surrogate, so two distinct strings would read
+	 * back as one; checking first keeps the common path the JDK's fast encoder.
+	 */
+	public static byte[] utf8(String value) {
+		for (int i = 0; i < value.length(); i++) {
+			char c = value.charAt(i);
+			if (!Character.isSurrogate(c)) {
+				continue;
+			}
+			if (Character.isHighSurrogate(c) && i + 1 < value.length() && Character.isLowSurrogate(value.charAt(i + 1))) {
+				i++;
+				continue;
+			}
+			throw new IllegalArgumentException("String holds a lone surrogate at index " + i
+				+ ", which has no UTF-8 encoding");
+		}
+		return value.getBytes(StandardCharsets.UTF_8);
 	}
 
 	private static void encodeInt(Writer w, long value) {
@@ -456,8 +493,12 @@ public final class ValueCodec {
 	private static byte[] readBytes(Reader r, int sizeClass, BlobStore blobs, boolean materialise, List<Long> ownedIds) {
 		if (sizeClass == 0) {
 			int length = r.u8();
-			byte[] data = r.bytes(length);
-			return materialise ? data : null;
+			if (!materialise) {
+				// A single-key read skips every value ahead of its key; copying each one out was pure garbage.
+				r.skip(length);
+				return null;
+			}
+			return r.bytes(length);
 		}
 		r.i32(); // total length, informational
 		long blobId = r.i64();
@@ -468,7 +509,7 @@ public final class ValueCodec {
 	}
 
 	private static Object skip(Reader r, int bytes) {
-		r.bytes(bytes);
+		r.skip(bytes);
 		return null;
 	}
 

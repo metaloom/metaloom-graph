@@ -270,4 +270,35 @@ public class RollbackTest {
 				"a committed write must change the files, or the assertion above proves nothing");
 		}
 	}
+
+	/**
+	 * A rolled-back run allocation that had to skip a page tail must leave the high water mark where it found it.
+	 * The mark was recorded for the rollback after the skip, so a rollback with no other writer put it back to the
+	 * skipped position instead — a state a crash at the same point would not have produced.
+	 */
+	@Test
+	public void testARolledBackRunThatSkippedAPageTailRestoresTheMark() throws Exception {
+		try (GraphStore store = stores.open()) {
+			GraphStoreImpl impl = (GraphStoreImpl) store;
+			store.createNode("Small", Properties.of().set("a", 1L));
+			io.metaloom.graph.core.segment.SegmentFile props = impl.segments(io.metaloom.graph.core.id.Kind.PROP)
+				.segments().get(0);
+			int cellsPerPage = impl.geometry().recordsPerPage(io.metaloom.graph.core.id.Kind.PROP);
+			// Single-cell blocks until the next multi-cell block can no longer fit in the current page.
+			while (cellsPerPage - props.superblock().highWaterSlot() % cellsPerPage > 2) {
+				store.createNode("Small", Properties.of().set("a", 1L));
+			}
+			long before = props.superblock().highWaterSlot();
+			assertTrue(before % cellsPerPage != 0, "the mark must sit inside a page for the tail to be skipped");
+
+			try (Transaction txn = store.begin()) {
+				store.createNode("Large", Properties.of().set("text", "x".repeat(200)));
+				assertTrue(props.superblock().highWaterSlot() > before + 2, "the block must have skipped the tail");
+				txn.rollback();
+			}
+			assertEquals(before, props.superblock().highWaterSlot(),
+				"a rollback with no other writer must restore the mark, skipped tail included");
+			store.verify(VerifyLevel.FULL);
+		}
+	}
 }

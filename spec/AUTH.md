@@ -66,7 +66,7 @@ the first thing to know: some name a Cypher clause, some an HTTP route, some an 
 | `CREATE_DATABASE` | yes | `PUT /api/databases/{name}` |
 | `DROP_DATABASE` | yes | `DELETE /api/databases/{name}` |
 | `BACKUP` | | `GET /api/databases/{name}/backup` |
-| `MANAGE_USERS` | yes | Create, drop, enable, disable a user; set another user's password. **Global only** |
+| `MANAGE_USERS` | yes | Create (with no roles), drop, enable, disable a user; set another user's password — except one who holds an administrative privilege the caller lacks. **Global only** |
 | `MANAGE_ROLES` | yes | Create and drop a role; grant and revoke. **Global only** |
 
 Four of these repay explanation.
@@ -85,6 +85,20 @@ cost, the other is a correctness event.
 reset a forgotten password" is a helpdesk task; "may grant myself `MERGE ON *`" is privilege
 escalation. Folding them together would mean everyone trusted with the first could silently do the
 second.
+
+The split only holds if no `MANAGE_USERS` route reaches the second by another door, and two did:
+
+- **Creating a user in a role is granting.** `POST /api/users` with a non-empty `roles` also needs
+  `MANAGE_ROLES`; without it the helpdesk could create a second account in `admin` and log in as it.
+  A user with no roles is still the helpdesk's to create.
+- **Resetting a password is becoming that user.** `POST /api/users/{name}/password` for somebody else
+  is refused, naming the privilege, when the target holds an administrative (global-only) privilege
+  the caller does not — the helpdesk resets a reader's password, not the admin's. Disabled users
+  count, because re-enabling one is another `MANAGE_USERS` call. Resetting a reader's password does
+  hand the helpdesk that reader's access for a moment; that is the job the privilege exists for.
+
+`AuthorizationTest.testManagingUsersDoesNotAllowCreatingAUserInARole` and
+`testManagingUsersDoesNotAllowTakingOverAnAdministrator` pin both.
 
 **`INTROSPECT` is separate from `MATCH`** because either without the other is a real role: a
 monitoring principal that may see sizes and not contents, and a query principal that may read data
@@ -246,6 +260,11 @@ salt and a 256-bit derived key. From the JDK, so no dependency was added.
   before failing — or the login endpoint is a user enumerator.
 - Canonical text form, which is what `auth list` prints:
   `pbkdf2-sha512$210000$<base64url salt>$<base64url hash>`.
+- **An empty password is refused.** `PasswordHash.of` throws for one, which every path that sets a
+  password goes through — `AuthStore.createUser`, `setPassword`, `bootstrap`, `resetAdmin`, and so the
+  HTTP routes (400), the CLI and `GRAPH_INITIAL_PASSWORD`. `verify` answers false for an empty attempt
+  *after* the derivation, so it costs what any wrong password costs, and even against a hash an older
+  build made from `""`.
 
 ### 4.1 The cost is also an amplifier
 
@@ -254,7 +273,9 @@ frame arrive on an event loop. Three consequences, all of them load-bearing:
 
 - Verification runs on `executeBlocking`, never inline on the loop.
 - A semaphore of `availableProcessors()` bounds concurrent verifications; past it HTTP answers 503 and
-  the wire answers `OVERLOADED`.
+  the wire answers `OVERLOADED`. **One semaphore, in `AuthPolicy`**, shared by both ports, because the
+  CPU being rationed is the process's. The wire's verification runs on Vert.x's default worker pool,
+  not its query pool, so a burst of handshakes does not queue queries behind it.
 - The failure throttle rejects **before** the derivation runs, per user name and per source address.
   A throttle that ran the KDF first would be the amplifier rather than the defence.
 
@@ -317,15 +338,29 @@ a password gate is still an unbounded map.
 
 **Grants are resolved per request, not frozen into the session**, and the enabled flag is re-checked
 per request, so a revoke or a disable takes effect immediately rather than at the next login. Freezing
-at login is the more common bug.
+at login is the more common bug. An edit made by **another process** — the CLI's `auth` commands
+against a running server — is picked up too: resolving a session re-stats `.auth/AUTH` at most once a
+second and re-reads it when it changed, where before only a login did, so a user disabled on disk kept
+their session until its idle timeout.
+
+**A query's privileges are checked before its database is resolved.** The other order answered 404 for
+a missing name and 403 for a present one, which listed the databases to anybody with a login; now a
+caller who holds nothing there gets 403 either way, and only somebody who may look learns that a name
+is missing. The store is resolved on the worker, not the event loop.
 
 Three routes sit **outside** the filter: `POST /api/login`, `POST /api/logout` and `GET /api/whoami`.
 `whoami` must answer without a session, because it is how the UI discovers whether to render a login
 page at all. **So does the static bundle** — the filter is mounted on `/api/*` only, or the login page
 could not load.
 
-CSRF rests on `SameSite=Strict` **plus** every mutating route requiring
-`Content-Type: application/json`, which an HTML form cannot produce cross-origin without a preflight.
+CSRF rests on `SameSite=Strict` **plus** every `POST` under `/api/` requiring
+`Content-Type: application/json` (parameters such as `charset` allowed), which an HTML form cannot
+produce cross-origin without a preflight; anything else is 415 before the body is read. The second
+half is the one that matters on a `--no-auth --allow-write` server, where there is no cookie for
+`SameSite` to withhold and a `text/plain` form body can be made to be valid JSON. Only `POST`, because
+a cross-origin `PUT` or `DELETE` always needs a preflight; `POST /api/logout` is exempt, carrying no
+body. The UI sends `application/json` on every `POST` with a body. Until this check existed the
+sentence above was a claim, not a property.
 
 ### 6.2 The binary port
 
@@ -334,11 +369,23 @@ repeating here is why credentials are not in `HELLO`: **a password is only ever 
 asked for it.** A client holding credentials against a server with authentication off completes the
 handshake without ever transmitting them.
 
+Three further properties, mechanics in [WIRE.md §1](WIRE.md): the database named in `HELLO` is resolved
+only **after** `AUTH`, so an unauthenticated peer cannot learn which names exist; the grants are
+**re-resolved at every query**, as HTTP's are per request, and a user disabled or dropped meanwhile has
+the connection closed; and the verification shares the HTTP login's bound (§4.1).
+
 ### 6.3 MCP
 
 `Authorization: Bearer` on all three transports. The websocket cannot decline an upgrade — Vert.x 5
 removed `accept()`/`reject()` from `ServerWebSocket` — so an unauthenticated `/mcp/ws` is closed with
-1008, exactly as the wrong-path branch already does.
+1008, exactly as the wrong-path branch already does. The session is **re-resolved at every message**
+on the websocket, as it is at every POST on the SSE transport, and a message arriving after the session
+ended — logout, timeout, a disable or a drop — closes the socket with 1008. Resolving once at the
+upgrade let a disabled user's agent keep driving the port for as long as its socket stayed up.
+
+Every store tool is checked against the database **its `database` argument names**, not the server's
+default, and `graph_list_databases` lists only what the caller holds something on — the same filter as
+`GET /api/databases` ([MCP.md §5](MCP.md)).
 
 The write gate's two enforcement points ([MCP.md §5](MCP.md)) become privilege checks and keep their
 reasoning: `tools/list` omits what the principal cannot use, and `tools/call` re-checks before
@@ -442,15 +489,15 @@ Servers start in-process on port 0 and close in `@AfterEach`; there are no abstr
 | `PrivilegeTest`, `GrantTest`, `PrincipalTest` | graph-core | unit | Wildcards, the global-only refusal, name parsing |
 | `AuthCodecTest` | graph-core | unit | Round trip, version refusal, unknown privilege, duplicate name, CRC |
 | `AuthHostileInputTest` | graph-core | unit | Truncation, garbage, huge counts, every single-bit mutation |
-| `PasswordHashTest` | graph-core | unit | Verification, salting, the text form, the unknown-user cost |
+| `PasswordHashTest` | graph-core | unit | Verification, salting, the text form, the unknown-user cost, the empty password refused |
 | `PasswordHashCostTest` | graph-core | slow | One verification takes 20 ms to 1 s — catches `iterations` set to 1 |
 | `AuthStoreTest` | graph-core | unit | Bootstrap, CRUD, `generation`, the lock, reload, and that `.auth/` is not a database |
 | `PrivilegeMappingTest` | graph-cypher | unit | The clause table, and agreement with `isWrite()` and `readsFiles()` |
-| `AuthenticationTest` | graph-server | unit | Login, cookies, Bearer, expiry, the exempt routes, the exempt port |
-| `AuthorizationTest` | graph-server | unit | Every route with and without its privilege; the escalation test |
+| `AuthenticationTest` | graph-server | unit | Login, cookies, Bearer, expiry, the exempt routes, the exempt port, a disable made on disk by another process |
+| `AuthorizationTest` | graph-server | unit | Every route with and without its privilege; the escalation tests (grants, a user created in a role, an administrator's password); empty passwords; 403 rather than 404 for an ungranted database |
 | `AuthFlagCompositionTest` | graph-server | unit | The AND rule, both refusals, and `--no-auth` equivalence |
-| `WireAuthTest` | graph-server | unit | The handshake, both error codes, and no leaked event loop |
-| `McpAuthTest` | graph-server | unit | All three transports; a refusal is a JSON-RPC error |
+| `WireAuthTest` | graph-server | unit | The handshake, both error codes, no database resolved before AUTH, the shared verification bound, grants re-resolved per query, and no leaked event loop |
+| `McpAuthTest` | graph-server | unit | All three transports; a refusal is a JSON-RPC error; a tool checked against the database it names; the filtered database list; a websocket re-checked per message |
 | `BootstrapTest` | graph-server | unit | The printed password, the ignored variable, the refusals |
 | `AuthCliTest` | graph-cli | unit | Every `auth` subcommand, offline-only, stdout/stderr split |
 | `auth.test.ts`, `api.test.ts` | frontend | vitest | `may()` and the wildcard; 401 and 403 mapping |

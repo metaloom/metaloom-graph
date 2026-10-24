@@ -119,6 +119,34 @@ public class WireValueCodecTest {
 	}
 
 	/**
+	 * Whatever the encoder accepts at the depth limit, the decoder accepts too.
+	 *
+	 * <p>
+	 * A label, a relationship type or a key is a string in a position only a string may take, not a level of nesting.
+	 * Counting it as one made a node or a relationship at exactly {@link WireValueCodec#MAX_DEPTH} encode and then
+	 * fail to decode: a result the server could send and the client could not read.
+	 * </p>
+	 */
+	@Test
+	public void testTheDepthLimitIsTheSameInBothDirections() {
+		WireNode node = new WireNode(1, List.of("A"), Map.of());
+		WireRelationship rel = new WireRelationship(9L, "R", 1, 2, Map.of());
+		for (Object leaf : List.of(node, rel, new WirePath(List.of(node, node), List.of(rel)))) {
+			// Wrapped in lists so that the leaf sits at exactly the deepest level the encoder allows.
+			Object value = leaf;
+			int levels = leaf instanceof WirePath ? WireValueCodec.MAX_DEPTH - 1 : WireValueCodec.MAX_DEPTH;
+			for (int i = 0; i < levels; i++) {
+				value = List.of(value);
+			}
+			Object decoded = roundTrip(value);
+			for (int i = 0; i < levels; i++) {
+				decoded = ((List<?>) decoded).get(0);
+			}
+			assertEquals(leaf.getClass(), decoded.getClass(), "at the depth limit: " + leaf);
+		}
+	}
+
+	/**
 	 * Ids are fixed 8 bytes rather than zigzag, and this is the measurement that says why.
 	 */
 	@Test

@@ -37,14 +37,17 @@ public final class Catalog implements AutoCloseable {
 		return labels.intern(label);
 	}
 
-	/** Interns a relationship type, rejecting one that would not fit a packed adjacency entry. */
+	/**
+	 * Interns a relationship type. Types share the label id space, so the id can exceed {@link #MAX_EDGE_TYPE_ID};
+	 * such a type is still legal, it just cannot ride in a packed adjacency entry — see {@link #packable}.
+	 */
 	public int internEdgeType(String type) {
-		int id = internLabel(type);
-		if (id > MAX_EDGE_TYPE_ID) {
-			throw new IllegalStateException("Relationship type '" + type + "' was assigned id " + id
-				+ ", beyond the " + MAX_EDGE_TYPE_ID + " that a packed adjacency entry can carry");
-		}
-		return id;
+		return internLabel(type);
+	}
+
+	/** Whether a relationship type id fits the 14 bit type field of a lightweight adjacency entry. */
+	public static boolean packable(int typeId) {
+		return typeId > 0 && typeId <= MAX_EDGE_TYPE_ID;
 	}
 
 	public String label(int id) {

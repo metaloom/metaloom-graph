@@ -90,7 +90,9 @@ bytes, which is less than the cost of the metadata that per-property mutability 
 
 ## 3. Dictionaries
 
-Two dictionaries, both stored as `INDEX`-kind B+trees plus a dense array for the reverse mapping:
+Two dictionaries. Each is an append-only file of `[u32 big-endian length][UTF-8 bytes]` records under
+`dict/`, loaded whole into a concurrent forward map and a dense reverse array at open (`Dictionary`);
+the `INDEX`-kind B+tree once planned for them was never needed and is not built:
 
 | Dictionary | Maps | Id width | Cardinality |
 |------------|------|----------|-------------|
@@ -99,19 +101,32 @@ Two dictionaries, both stored as `INDEX`-kind B+trees plus a dense array for the
 
 Relationship types are constrained to **14 bits (16,384)** by the packed-edge layout
 ([RELATIONSHIP_STORAGE.md §3](RELATIONSHIP_STORAGE.md#3-the-packed-edge-8-bytes)). Types beyond
-that are legal but force every edge of that type to be materialised. Node labels use the full 32-bit
-`label_id` space since they live in the node record.
+that are legal but force every edge of that type to be materialised: `createEdge` escalates to a
+relationship record whose adjacency entry caches no type, and `deleteEdge` finds it by endpoints and
+type. Labels and types share one id space, so a store that has seen 16,383 distinct names of either
+kind is past the limit. Node labels use the full 32-bit `label_id` space since they live in the node
+record.
 
 Interning:
 
-- Forward lookup (string -> id) is a B+tree probe, done **once per session per string** and then
-  cached in an on-heap `HashMap` in the `Catalog`.
-- Reverse lookup (id -> string) is a dense array read; ids are assigned sequentially so the array is
-  a direct index.
-- Dictionary entries are **never deleted**, only marked unused. A dictionary id is stable for the
-  life of the store, which is what makes it safe to embed one in a million records.
-- Dictionary writes are WAL-logged like everything else and are visible to concurrent readers only
-  after the interning transaction commits.
+- Forward lookup (string -> id) is a `ConcurrentHashMap` probe; reverse lookup (id -> string) is a
+  dense array read off a volatile reference, since ids are assigned sequentially. Neither takes a lock.
+- Dictionary entries are **never deleted**. A dictionary id is stable for the life of the store,
+  which is what makes it safe to embed one in a million records.
+- Dictionary writes are **not** WAL-logged. An intern appends at once and is visible to every thread
+  immediately, rolled back or not; the file is fsynced at commit *before* the WAL commit record, so
+  a committed record never names an id that is not durable.
+- **A torn tail is cut off at open.** A crash mid-append leaves a partial length or a partial body
+  after the last complete record. It was never forced, so nothing committed names it; `load` stops
+  there and the file is truncated to the last complete record before the next append — otherwise the
+  next entry would land behind the garbage and be unreadable after the following reopen
+  (`DictionaryTest`).
+- **An entry is at most 1 MiB of UTF-8**, enforced by `intern` as well as by `load`. Accepting a
+  longer one would write a store that refuses to open.
+- **Strings are encoded strictly.** A lone UTF-16 surrogate has no UTF-8 form and the JDK's
+  `getBytes` silently writes `?` for it, so `"k\uD800"` and `"k\uDBFF"` would be two ids in memory
+  and one string after a reopen. `intern` refuses it with `IllegalArgumentException`, as does the
+  value codec for a `STRING` property.
 
 Space effect: a store with 10M nodes each carrying `name` and `createdAt` stores the strings
 `"name"` and `"createdAt"` **once**, not 10 million times. In the PoC that is 130 MB of repeated key
@@ -131,7 +146,7 @@ text.
 | `FLOAT` | 3 | 0 f32, 1 f64 | 4 or 8 B | done |
 | `STRING` | 4 | 0 inline, 1 blob | 1 B length + UTF-8, or 4 B length + 8 B `BLOB` id | done |
 | `BYTES` | 5 | 0 inline, 1 blob | same | done |
-| `TIMESTAMP` | 6 | — | 8 B epoch micros, UTC | done |
+| `TIMESTAMP` | 6 | — | 8 B epoch micros, UTC | done — about ±292,000 years around 1970; an `Instant` outside that is refused, not wrapped |
 | `UUID` | 7 | — | 16 B | done |
 | `ELEMENT_REF` | 8 | — | 8 B `ElementId` | done — a property pointing at another element |
 | `VECTOR_F32` | 9 | — | 4 B dim + 8 B `BLOB` id | done — a vector the store has no fixed record for |

@@ -189,6 +189,99 @@ public class ConcurrentReaderTest {
 	}
 
 	/**
+	 * A view that opens after compaction has started. The refusal used to be checked once, before the first batch, and
+	 * {@code beginRead()} does not take the write gate — so a view could open between two batches and have the next
+	 * one relocate, free or punch what it was reading. Every unit now checks under the gate.
+	 */
+	@Test
+	public void testAViewOpenedMidCompactionStopsTheNextBatch() throws Exception {
+		try (GraphStore store = stores.open()) {
+			List<Long> ids = new ArrayList<>();
+			try (Transaction txn = store.begin()) {
+				for (int i = 0; i < 2000; i++) {
+					ids.add(store.createNode("Person", Properties.of().set("i", i)));
+				}
+				txn.commit();
+			}
+			try (Transaction txn = store.begin()) {
+				for (int i = 0; i < ids.size(); i++) {
+					if (i % 4 != 0) {
+						store.deleteNode(ids.get(i));
+					}
+				}
+				txn.commit();
+			}
+			io.metaloom.graph.core.store.GraphStoreImpl impl = (io.metaloom.graph.core.store.GraphStoreImpl) store;
+			CountDownLatch opened = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			io.metaloom.graph.core.maintenance.MaintenanceRunner runner = new io.metaloom.graph.core.maintenance.MaintenanceRunner() {
+
+				private int units;
+
+				@Override
+				public void runWrite(Unit unit) throws java.io.IOException {
+					impl.runWrite(unit);
+				}
+
+				@Override
+				public void runExclusive(Unit unit) throws java.io.IOException {
+					if (++units == 2) {
+						// A reader on another thread, opened between the first batch and the second.
+						Thread reader = new Thread(() -> {
+							try (ReadTransaction view = store.beginRead()) {
+								opened.countDown();
+								release.await();
+							} catch (InterruptedException e) {
+								Thread.currentThread().interrupt();
+							}
+						});
+						reader.start();
+						try {
+							opened.await();
+						} catch (InterruptedException e) {
+							throw new java.io.InterruptedIOException();
+						}
+					}
+					impl.runExclusive(unit);
+				}
+
+				@Override
+				public void runUnlogged(Unit unit) throws java.io.IOException {
+					impl.runUnlogged(unit);
+				}
+
+				@Override
+				public void runRead(Unit unit) throws java.io.IOException {
+					impl.runRead(unit);
+				}
+
+				@Override
+				public void runCheckpoint() throws java.io.IOException {
+					impl.runCheckpoint();
+				}
+			};
+			io.metaloom.graph.core.api.CompactionOptions options = io.metaloom.graph.core.api.CompactionOptions
+				.builder().livenessThreshold(1.0).maxRelocationsPerTransaction(64).build();
+			try {
+				GraphStoreException refused = assertThrows(GraphStoreException.class,
+					() -> new io.metaloom.graph.core.maintenance.Compactor(impl.segmentSets(), impl.nodeStore(),
+						impl.relStore(), impl.adjacencyStore(), impl.propertyStore(), impl.blobStore(),
+						impl.indexCatalog(), runner).compact(options));
+				assertTrue(refused.getMessage().contains("read view"), refused.getMessage());
+			} finally {
+				release.countDown();
+			}
+			while (store.snapshotStats().openViews() > 0) {
+				Thread.onSpinWait();
+			}
+			store.verify(io.metaloom.graph.core.api.VerifyLevel.FULL);
+			assertEquals(500, store.nodesByLabel("Person").size(), "the batches that ran lost nothing");
+			store.compact(io.metaloom.graph.core.api.CompactionOptions.always());
+			store.verify(io.metaloom.graph.core.api.VerifyLevel.FULL);
+		}
+	}
+
+	/**
 	 * A view opened on a pooled thread must not be inherited by whatever runs there next.
 	 *
 	 * <p>

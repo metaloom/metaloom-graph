@@ -35,6 +35,12 @@ public final class Functions {
 	private Functions() {
 	}
 
+	/**
+	 * The most elements one {@code range()} may build. A list is materialised and boxed, so without a bound
+	 * {@code range(1, 2000000000)} is an OutOfMemoryError for every query sharing the process, not a slow answer.
+	 */
+	public static final long MAX_RANGE = 10_000_000;
+
 	/** Recognised by the planner, computed by the aggregation operator. */
 	public static final Set<String> AGGREGATES = Set.of("count", "sum", "avg", "min", "max", "collect");
 
@@ -86,10 +92,10 @@ public final class Functions {
 		for (Ast.Expr argument : call.arguments()) {
 			args.add(evaluator.evaluate(argument, row));
 		}
-		return apply(name, call, args);
+		return apply(evaluator, name, call, args);
 	}
 
-	private static Object apply(String name, Ast.FunctionCall call, List<Object> args) {
+	private static Object apply(Evaluator evaluator, String name, Ast.FunctionCall call, List<Object> args) {
 		switch (name) {
 			case "id" -> {
 				expect(call, 1);
@@ -147,7 +153,8 @@ public final class Functions {
 					return null;
 				}
 				if (args.get(0) instanceof CypherRelationship relationship) {
-					return relationship.startId();
+					// The node, not its id, so that `startNode(r) = a` and `startNode(r).name` mean what they say.
+					return evaluator.graph().node(relationship.startId());
 				}
 				throw typeError("startNode", args.get(0));
 			}
@@ -157,7 +164,7 @@ public final class Functions {
 					return null;
 				}
 				if (args.get(0) instanceof CypherRelationship relationship) {
-					return relationship.endId();
+					return evaluator.graph().node(relationship.endId());
 				}
 				throw typeError("endNode", args.get(0));
 			}
@@ -240,10 +247,24 @@ public final class Functions {
 				if (step == 0) {
 					throw new CypherTypeException("range() step cannot be zero");
 				}
-				List<Object> out = new ArrayList<>();
+				if (step > 0 ? from > to : from < to) {
+					return new ArrayList<>();
+				}
+				// Counted up front, unsigned, rather than by stepping until past the bound: near Long.MAX_VALUE the
+				// step wraps and that loop never ends.
+				long span = step > 0 ? to - from : from - to;
+				long steps = Long.divideUnsigned(span, step > 0 ? step : -step);
+				if (Long.compareUnsigned(steps, MAX_RANGE) >= 0) {
+					throw new CypherTypeException("range() would produce more than " + MAX_RANGE
+						+ " elements, which is more than a query may build as one list");
+				}
+				List<Object> out = new ArrayList<>((int) steps + 1);
 				// Inclusive of both bounds, as in Cypher: range(1,3) is [1,2,3].
-				for (long i = from; step > 0 ? i <= to : i >= to; i += step) {
-					out.add(i);
+				for (long i = 0; i <= steps; i++) {
+					if ((i & 1023) == 1023) {
+						evaluator.graph().checkAbortNow();
+					}
+					out.add(from + i * step);
 				}
 				return out;
 			}
@@ -283,15 +304,17 @@ public final class Functions {
 					return null;
 				}
 				String string = stringArg("substring", args.get(0));
-				int start = (int) Values.number(args.get(1), "substring").longValue();
+				// Compared as longs and only then narrowed: an (int) cast first turns 4294967297 into 1.
+				long start = Values.number(args.get(1), "substring").longValue();
 				if (start < 0 || start > string.length()) {
 					throw new CypherTypeException("substring() start " + start + " is outside the string");
 				}
 				if (args.size() < 3) {
-					return string.substring(start);
+					return string.substring((int) start);
 				}
-				int length = (int) Values.number(args.get(2), "substring").longValue();
-				return string.substring(start, Math.min(string.length(), start + Math.max(0, length)));
+				long length = Math.max(0, Values.number(args.get(2), "substring").longValue());
+				return string.substring((int) start, (int) Math.min(string.length(), start + Math.min(length,
+					string.length())));
 			}
 			case "replace" -> {
 				expect(call, 3);
@@ -349,7 +372,7 @@ public final class Functions {
 					return null;
 				}
 				Number number = Values.number(args.get(0), "abs");
-				return Values.isIntegral(number) ? (Object) Math.abs(number.longValue())
+				return Values.isIntegral(number) ? (Object) Values.exact("abs", () -> Math.absExact(number.longValue()))
 					: (Object) Math.abs(number.doubleValue());
 			}
 			case "ceil" -> {

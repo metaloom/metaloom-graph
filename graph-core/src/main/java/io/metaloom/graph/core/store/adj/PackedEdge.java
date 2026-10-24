@@ -136,7 +136,7 @@ public final class PackedEdge {
 	 * That is the one direction this must never get wrong; a false <em>negative</em> only costs the record read that
 	 * used to be unconditional.
 	 */
-	public static boolean excludedByType(long edge, java.util.Set<Integer> typeIds) {
+	public static boolean excludedByType(long edge, TypeFilter typeIds) {
 		if (typeIds == null) {
 			return false;
 		}
@@ -144,7 +144,7 @@ public final class PackedEdge {
 		if (typeId == TYPE_NOT_RECORDED && isMaterialised(edge)) {
 			return false;
 		}
-		return !typeIds.contains(typeId);
+		return !typeIds.admits(typeId);
 	}
 
 	public static long location(long edge) {

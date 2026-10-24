@@ -57,21 +57,50 @@ public final class PatternMatcher {
 		this.graph = evaluator.graph();
 	}
 
+	/**
+	 * A row part-way through a MATCH, with the relationships it has crossed so far.
+	 *
+	 * <p>
+	 * Uniqueness is per MATCH rather than per comma-separated part of it, so the set travels from one part to the next:
+	 * {@code (a)-[r1]->(b), (c)-[r2]->(d)} over a single edge is no rows, not one row binding that edge twice.
+	 * </p>
+	 */
+	private record Bound(Row row, Set<Object> used) {
+	}
+
 	/** Expands one incoming row into every row that satisfies the pattern. */
 	public List<Row> match(List<Ast.PatternPart> pattern, Row input) {
-		List<Row> rows = List.of(input);
-		for (Ast.PatternPart part : pattern) {
-			List<Row> next = new ArrayList<>();
-			for (Row row : rows) {
-				next.addAll(matchPart(part, row));
+		return match(pattern, null, input);
+	}
+
+	/**
+	 * The same, with the clause's WHERE available to choose a start point.
+	 *
+	 * <p>
+	 * The WHERE is <em>not</em> applied here — the caller still filters on it. It is only read for top-level equalities
+	 * on the leading node that can seed an index probe, exactly as an inline map does. See {@link #seedEqualities}.
+	 * </p>
+	 */
+	public List<Row> match(List<Ast.PatternPart> pattern, Ast.Expr where, Row input) {
+		List<Bound> rows = List.of(new Bound(input, Set.of()));
+		for (int index = 0; index < pattern.size(); index++) {
+			Ast.PatternPart part = pattern.get(index);
+			Map<String, Ast.Expr> hints = index == 0 ? seedEqualities(part, where) : Map.of();
+			List<Bound> next = new ArrayList<>();
+			for (Bound bound : rows) {
+				next.addAll(expand(part, seed(part.nodes().get(0), hints, bound.row()), bound.used()));
 			}
 			rows = next;
 			if (rows.isEmpty()) {
 				// Nothing satisfies the pattern so far; the remaining parts cannot rescue it.
-				return rows;
+				return List.of();
 			}
 		}
-		return rows;
+		List<Row> out = new ArrayList<>(rows.size());
+		for (Bound bound : rows) {
+			out.add(bound.row());
+		}
+		return out;
 	}
 
 	/**
@@ -94,17 +123,24 @@ public final class PatternMatcher {
 	 * @return false if the consumer stopped the walk
 	 */
 	public boolean match(List<Ast.PatternPart> pattern, Row input, RowConsumer consumer) {
-		return matchFrom(pattern, 0, input, consumer);
+		return match(pattern, null, input, consumer);
 	}
 
-	private boolean matchFrom(List<Ast.PatternPart> pattern, int index, Row row, RowConsumer consumer) {
+	/** The pushed form of {@link #match(List, Ast.Expr, Row)}. */
+	public boolean match(List<Ast.PatternPart> pattern, Ast.Expr where, Row input, RowConsumer consumer) {
+		return matchFrom(pattern, where, 0, new Bound(input, Set.of()), consumer);
+	}
+
+	private boolean matchFrom(List<Ast.PatternPart> pattern, Ast.Expr where, int index, Bound bound,
+		RowConsumer consumer) {
 		if (index == pattern.size()) {
-			return consumer.accept(row);
+			return consumer.accept(bound.row());
 		}
 		Ast.PatternPart part = pattern.get(index);
-		return seed(part.nodes().get(0), row, seeded -> {
-			for (Row expanded : expand(part, List.of(seeded))) {
-				if (!matchFrom(pattern, index + 1, expanded, consumer)) {
+		Map<String, Ast.Expr> hints = index == 0 ? seedEqualities(part, where) : Map.of();
+		return seed(part.nodes().get(0), hints, bound.row(), seeded -> {
+			for (Bound expanded : expand(part, List.of(seeded), bound.used())) {
+				if (!matchFrom(pattern, where, index + 1, expanded, consumer)) {
 					return false;
 				}
 			}
@@ -112,14 +148,15 @@ public final class PatternMatcher {
 		});
 	}
 
-	private List<Row> matchPart(Ast.PatternPart part, Row input) {
-		return expand(part, seed(part.nodes().get(0), input));
-	}
-
-	/** The relationship steps of one pattern part, from rows that already bind its leading node. */
-	private List<Row> expand(Ast.PatternPart part, List<Row> seedRows) {
+	/**
+	 * The relationship steps of one pattern part, from rows that already bind its leading node.
+	 *
+	 * @param crossed
+	 *            the relationships earlier parts of the same MATCH crossed, which this part may not cross again
+	 */
+	private List<Bound> expand(Ast.PatternPart part, List<Row> seedRows, Set<Object> crossed) {
 		if (part.selector() != Ast.PathSelector.ALL) {
-			return shortest(part, seedRows);
+			return shortest(part, seedRows, crossed);
 		}
 		List<Ast.NodePattern> nodes = part.nodes();
 		List<Ast.RelPattern> relationships = part.relationships();
@@ -130,7 +167,7 @@ public final class PatternMatcher {
 		List<List<CypherNode>> pathNodes = new ArrayList<>();
 		List<List<CypherRelationship>> pathRels = new ArrayList<>();
 		for (Row row : rows) {
-			usedPerRow.add(new HashSet<>());
+			usedPerRow.add(crossed);
 			List<CypherNode> starting = new ArrayList<>();
 			starting.add((CypherNode) row.get(anchorName(nodes.get(0))));
 			pathNodes.add(starting);
@@ -161,9 +198,18 @@ public final class PatternMatcher {
 					// The relationship binds before the node it leads to, so that `RETURN *` lists variables in the
 					// order the pattern names them: (a)-[r]->(b) gives a, r, b.
 					if (relationship.variable() != null) {
-						bound = bound.with(relationship.variable(), relationship.range() == null
+						Object value = relationship.range() == null
 							? candidate.relationships().get(0)
-							: new ArrayList<Object>(candidate.relationships()));
+							: new ArrayList<Object>(candidate.relationships());
+						// Bound by an earlier clause, it is a join, exactly as a reused node variable is.
+						if (row.has(relationship.variable())) {
+							Object already = row.get(relationship.variable());
+							if (already == null || !Values.equalKnown(already, value)) {
+								continue;
+							}
+						} else {
+							bound = bound.with(relationship.variable(), value);
+						}
 					}
 					// A node pattern that reuses a bound variable is a join, not a new binding.
 					String targetName = anchorName(target);
@@ -182,7 +228,10 @@ public final class PatternMatcher {
 					used.addAll(candidate.keys());
 					List<CypherNode> walkNodes = new ArrayList<>(pathNodes.get(i));
 					walkNodes.addAll(candidate.intermediateNodes());
-					walkNodes.add(reached);
+					// A zero-length step reaches the node the path already ends on, which must not be listed twice.
+					if (!candidate.relationships().isEmpty()) {
+						walkNodes.add(reached);
+					}
 					List<CypherRelationship> walkRels = new ArrayList<>(pathRels.get(i));
 					walkRels.addAll(candidate.relationships());
 
@@ -197,19 +246,20 @@ public final class PatternMatcher {
 			pathNodes = nextPathNodes;
 			pathRels = nextPathRels;
 			if (rows.isEmpty()) {
-				return rows;
+				return List.of();
 			}
 		}
 
-		if (part.pathVariable() != null) {
-			List<Row> bound = new ArrayList<>(rows.size());
-			for (int i = 0; i < rows.size(); i++) {
-				bound.add(rows.get(i).with(part.pathVariable(),
-					new CypherPath(List.copyOf(pathNodes.get(i)), List.copyOf(pathRels.get(i)))));
+		List<Bound> out = new ArrayList<>(rows.size());
+		for (int i = 0; i < rows.size(); i++) {
+			Row row = rows.get(i);
+			if (part.pathVariable() != null) {
+				row = row.with(part.pathVariable(),
+					new CypherPath(List.copyOf(pathNodes.get(i)), List.copyOf(pathRels.get(i))));
 			}
-			return bound;
+			out.add(new Bound(row, usedPerRow.get(i)));
 		}
-		return rows;
+		return out;
 	}
 
 	// ---------------------------------------------------------------- shortest paths
@@ -230,14 +280,14 @@ public final class PatternMatcher {
 	 * shortest path. That is openCypher's rule and it is why the search cannot stop at the first node it reaches.
 	 * </p>
 	 */
-	private List<Row> shortest(Ast.PatternPart part, List<Row> seedRows) {
+	private List<Bound> shortest(Ast.PatternPart part, List<Row> seedRows, Set<Object> used) {
 		Ast.NodePattern startPattern = part.nodes().get(0);
 		Ast.NodePattern endPattern = part.nodes().get(1);
 		Ast.RelPattern relationship = part.relationships().get(0);
 		boolean everyShortest = part.selector() == Ast.PathSelector.ALL_SHORTEST;
 		String endName = anchorName(endPattern);
 
-		List<Row> out = new ArrayList<>();
+		List<Bound> out = new ArrayList<>();
 		for (Row row : seedRows) {
 			CypherNode from = (CypherNode) row.get(anchorName(startPattern));
 			// An end already bound by an earlier clause narrows the search to one destination rather than filtering
@@ -258,7 +308,13 @@ public final class PatternMatcher {
 				if (part.pathVariable() != null) {
 					bound = bound.with(part.pathVariable(), path);
 				}
-				out.add(bound);
+				// The search itself ignores what earlier parts crossed — a route is shortest or it is not — but the
+				// parts after it must not cross this one's relationships again.
+				Set<Object> crossed = new HashSet<>(used);
+				for (CypherRelationship step : path.relationships()) {
+					crossed.add(key(step));
+				}
+				out.add(new Bound(bound, crossed));
 			}
 		}
 		return out;
@@ -396,8 +452,9 @@ public final class PatternMatcher {
 
 	// ---------------------------------------------------------------- seeding
 
+
 	/** Every row the first node pattern can produce, choosing the cheapest access path available. */
-	private List<Row> seed(Ast.NodePattern pattern, Row input) {
+	private List<Row> seed(Ast.NodePattern pattern, Map<String, Ast.Expr> hints, Row input) {
 		String name = anchorName(pattern);
 		if (input.has(name) && input.get(name) instanceof CypherNode bound) {
 			// Already bound by an earlier clause: verify rather than scan.
@@ -405,7 +462,7 @@ public final class PatternMatcher {
 		}
 
 		List<Row> rows = new ArrayList<>();
-		List<Long> candidates = candidates(pattern, input);
+		List<Long> candidates = candidates(pattern, hints, input);
 		if (candidates != null) {
 			for (long id : candidates) {
 				if (!graph.exists(id)) {
@@ -439,13 +496,13 @@ public final class PatternMatcher {
 	 *
 	 * @return false if the consumer stopped the seeding
 	 */
-	private boolean seed(Ast.NodePattern pattern, Row input, RowConsumer consumer) {
+	private boolean seed(Ast.NodePattern pattern, Map<String, Ast.Expr> hints, Row input, RowConsumer consumer) {
 		String name = anchorName(pattern);
 		if (input.has(name) && input.get(name) instanceof CypherNode bound) {
 			return !matches(pattern, bound, input) || consumer.accept(input);
 		}
 
-		List<Long> candidates = candidates(pattern, input);
+		List<Long> candidates = candidates(pattern, hints, input);
 		if (candidates != null) {
 			for (long id : candidates) {
 				if (!graph.exists(id)) {
@@ -466,6 +523,62 @@ public final class PatternMatcher {
 	}
 
 	/**
+	 * The equalities in a WHERE that may choose the leading node's start point, as key to value expression.
+	 *
+	 * <p>
+	 * {@code MATCH (n:Person) WHERE n.email = $e} is the same predicate as {@code (n:Person {email: $e})}, and should
+	 * cost the same. Only a top-level conjunct qualifies — under OR or NOT the row could pass without it — and only one
+	 * whose other side cannot depend on the pattern being matched: a literal, a parameter, or a property of a variable
+	 * this MATCH does not bind. The WHERE is still applied to every row afterwards, so a hint can narrow the candidates
+	 * and can never decide the answer.
+	 * </p>
+	 */
+	private static Map<String, Ast.Expr> seedEqualities(Ast.PatternPart part, Ast.Expr where) {
+		String name = part.nodes().get(0).variable();
+		if (where == null || name == null || part.selector() != Ast.PathSelector.ALL) {
+			return Map.of();
+		}
+		Map<String, Ast.Expr> hints = new LinkedHashMap<>();
+		collectEqualities(where, name, hints);
+		return hints;
+	}
+
+	private static void collectEqualities(Ast.Expr expression, String name, Map<String, Ast.Expr> hints) {
+		if (expression instanceof Ast.Binary binary && binary.op() == Ast.Op.AND) {
+			collectEqualities(binary.left(), name, hints);
+			collectEqualities(binary.right(), name, hints);
+			return;
+		}
+		if (expression instanceof Ast.Comparison comparison && comparison.op() == Ast.Op.EQUAL) {
+			hint(comparison.left(), comparison.right(), name, hints);
+			hint(comparison.right(), comparison.left(), name, hints);
+		}
+	}
+
+	private static void hint(Ast.Expr side, Ast.Expr other, String name, Map<String, Ast.Expr> hints) {
+		if (side instanceof Ast.Property property && property.target() instanceof Ast.Variable variable
+			&& variable.name().equals(name) && independentOf(other, name)) {
+			hints.putIfAbsent(property.key(), other);
+		}
+	}
+
+	/**
+	 * Whether a value can be computed before the seed node exists. Deliberately narrow: anything else is left to the
+	 * WHERE, which is correct whatever it contains.
+	 */
+	private static boolean independentOf(Ast.Expr expression, String name) {
+		return switch (expression) {
+			case Ast.Literal ignored -> true;
+			case Ast.Parameter ignored -> true;
+			// Evaluated against the incoming row; a variable this MATCH binds later is not in it, and the probe is then
+			// skipped rather than guessed.
+			case Ast.Property property -> property.target() instanceof Ast.Variable variable
+				&& !variable.name().equals(name);
+			default -> false;
+		};
+	}
+
+	/**
 	 * A candidate id list from an index, or null when only a full scan will do.
 	 *
 	 * <p>
@@ -478,36 +591,43 @@ public final class PatternMatcher {
 	 * <p>
 	 * Otherwise an indexed property beats a label because it is far more selective, and the pattern's inline map is
 	 * exactly the equality predicate the property index answers. Only a literal-valued entry qualifies: one whose
-	 * value depends on the row cannot be probed before the row exists.
+	 * value depends on the row cannot be probed before the row exists. The WHERE equalities in {@code hints} are
+	 * considered after the inline map, and only when their value is a scalar the index certainly holds.
 	 * </p>
 	 */
-	private List<Long> candidates(Ast.NodePattern pattern, Row row) {
-		if (pattern.properties() != null && !pattern.properties().isEmpty()) {
-			String probeKey = null;
-			Object probeValue = null;
-			for (Map.Entry<String, Ast.Expr> entry : pattern.properties().entrySet()) {
-				Object value;
-				try {
-					value = evaluator.evaluate(entry.getValue(), row);
-				} catch (RuntimeException e) {
-					continue;
-				}
-				if (value == null) {
-					continue;
-				}
-				for (String label : pattern.labels()) {
-					if (graph.hasIndex(label, entry.getKey())) {
-						return graph.nodesByLabelAndProperty(label, entry.getKey(), value);
-					}
-				}
-				if (probeKey == null) {
-					probeKey = entry.getKey();
-					probeValue = value;
+	private List<Long> candidates(Ast.NodePattern pattern, Map<String, Ast.Expr> hints, Row row) {
+		String probeKey = null;
+		Object probeValue = null;
+		List<Map.Entry<String, Ast.Expr>> equalities = new ArrayList<>();
+		if (pattern.properties() != null) {
+			equalities.addAll(pattern.properties().entrySet());
+		}
+		int inline = equalities.size();
+		equalities.addAll(hints.entrySet());
+		for (int i = 0; i < equalities.size(); i++) {
+			Map.Entry<String, Ast.Expr> entry = equalities.get(i);
+			Object value;
+			try {
+				value = evaluator.evaluate(entry.getValue(), row);
+			} catch (RuntimeException e) {
+				continue;
+			}
+			if (value == null || i >= inline && !(value instanceof String || value instanceof Boolean
+				|| value instanceof Long || value instanceof Double)) {
+				continue;
+			}
+			for (String label : pattern.labels()) {
+				if (graph.hasIndex(label, entry.getKey())) {
+					return probe(label, entry.getKey(), value);
 				}
 			}
-			if (probeKey != null) {
-				return graph.nodesByProperty(probeKey, probeValue);
+			if (probeKey == null) {
+				probeKey = entry.getKey();
+				probeValue = value;
 			}
+		}
+		if (probeKey != null) {
+			return probe(null, probeKey, probeValue);
 		}
 		if (!pattern.labels().isEmpty()) {
 			// The rarest label would be the better choice; the store does not expose per-label counts, so the first
@@ -516,6 +636,38 @@ public final class PatternMatcher {
 		}
 		return null;
 	}
+
+	/**
+	 * One equality probe, under Cypher equality rather than the index's.
+	 *
+	 * <p>
+	 * The index is keyed on the stored value's own type, so {@code 30} and {@code 30.0} hash apart there while
+	 * {@code 30 = 30.0} is true here. An integral number is therefore probed in both spellings and the two answers
+	 * joined; an empty answer is a real answer, with no scan behind it, so missing the other spelling would lose rows
+	 * rather than cost time. A non-integral float has no integer twin, and nothing else has a twin at all.
+	 * </p>
+	 */
+	private List<Long> probe(String label, String key, Object value) {
+		List<Long> found = label == null ? graph.nodesByProperty(key, value)
+			: graph.nodesByLabelAndProperty(label, key, value);
+		Object twin = switch (value) {
+			case Long l -> (double) l;
+			case Double d when d == Math.rint(d) && d >= -0x1p63 && d < 0x1p63 -> (long) (double) d;
+			default -> null;
+		};
+		if (twin == null) {
+			return found;
+		}
+		List<Long> other = label == null ? graph.nodesByProperty(key, twin)
+			: graph.nodesByLabelAndProperty(label, key, twin);
+		if (other.isEmpty()) {
+			return found;
+		}
+		Set<Long> union = new LinkedHashSet<>(found);
+		union.addAll(other);
+		return new ArrayList<>(union);
+	}
+
 
 	private boolean matches(Ast.NodePattern pattern, CypherNode node, Row row) {
 		for (String label : pattern.labels()) {

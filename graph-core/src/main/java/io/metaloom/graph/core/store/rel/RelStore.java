@@ -85,6 +85,26 @@ public final class RelStore {
 		return record(id).get(Layouts.LONG, OFF_FROM);
 	}
 
+	/**
+	 * The record, resolved once, for a caller that wants several of its fields. Each id-taking accessor here is a record
+	 * touch of its own, and a traversal resolving type and both endpoints that way paid three of them per edge.
+	 */
+	public MemorySegment view(long id) {
+		return record(id);
+	}
+
+	public static long fromId(MemorySegment view) {
+		return view.get(Layouts.LONG, OFF_FROM);
+	}
+
+	public static long toId(MemorySegment view) {
+		return view.get(Layouts.LONG, OFF_TO);
+	}
+
+	public static int typeId(MemorySegment view) {
+		return view.get(Layouts.INT, OFF_TYPE_ID);
+	}
+
 	public long toId(long id) {
 		return record(id).get(Layouts.LONG, OFF_TO);
 	}

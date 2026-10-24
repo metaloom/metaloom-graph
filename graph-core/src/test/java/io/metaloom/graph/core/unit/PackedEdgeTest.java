@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 import io.metaloom.graph.core.id.ElementId;
 import io.metaloom.graph.core.id.Kind;
 import io.metaloom.graph.core.store.adj.PackedEdge;
+import io.metaloom.graph.core.store.adj.TypeFilter;
 
 @Tag("unit")
 public class PackedEdgeTest {
@@ -84,7 +85,7 @@ public class PackedEdgeTest {
 	@Test
 	public void testAnEntryWithNoCachedTypeSurvivesEveryTypeFilter() {
 		long relId = ElementId.encode(Kind.REL, 1, 42, 3);
-		java.util.Set<Integer> filter = java.util.Set.of(7);
+		TypeFilter filter = TypeFilter.of(7);
 		assertFalse(PackedEdge.excludedByType(PackedEdge.ofRelationship(relId), filter));
 		assertFalse(PackedEdge.excludedByType(PackedEdge.ofRelationship(relId, 7), filter));
 		assertTrue(PackedEdge.excludedByType(PackedEdge.ofRelationship(relId, 8), filter));
@@ -93,6 +94,21 @@ public class PackedEdgeTest {
 		assertFalse(PackedEdge.excludedByType(PackedEdge.pack(PackedEdge.DIR_OUT, 7, 5), filter));
 		// No filter excludes nothing.
 		assertFalse(PackedEdge.excludedByType(PackedEdge.pack(PackedEdge.DIR_OUT, 8, 5), null));
+	}
+
+	/** The primitive filter must agree with the set it replaced, across word boundaries and past the 14 bit field. */
+	@Test
+	public void testATypeFilterAdmitsExactlyItsIds() {
+		int[] ids = { 1, 63, 64, 65, 1000, PackedEdge.MAX_TYPE, PackedEdge.MAX_TYPE + 5 };
+		TypeFilter filter = TypeFilter.of(ids);
+		java.util.Set<Integer> expected = new java.util.HashSet<>();
+		for (int id : ids) {
+			expected.add(id);
+		}
+		for (int id = -2; id < PackedEdge.MAX_TYPE + 70; id++) {
+			assertEquals(expected.contains(id), filter.admits(id), "type " + id);
+		}
+		assertFalse(TypeFilter.of(java.util.List.of()).admits(1), "a filter that resolved to nothing admits nothing");
 	}
 
 	@Test

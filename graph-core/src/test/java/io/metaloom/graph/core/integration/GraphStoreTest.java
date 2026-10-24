@@ -206,6 +206,45 @@ public class GraphStoreTest {
 		}
 	}
 
+	/**
+	 * Labels and relationship types share one dictionary, and a packed adjacency entry carries only 14 bits of type. A
+	 * type beyond that is still legal — it escalates to a materialised relationship whose entry does not cache the type
+	 * (RELATIONSHIP_STORAGE.md §3) — rather than being refused once a store has seen 16,383 distinct names.
+	 */
+	@Test
+	public void testATypeBeyondFourteenBitsEscalatesToAMaterialisedEdge() throws Exception {
+		try (GraphStore store = stores.open()) {
+			try (io.metaloom.graph.core.api.Transaction txn = store.begin()) {
+				for (int i = 0; i < io.metaloom.graph.core.store.adj.PackedEdge.MAX_TYPE; i++) {
+					store.createNode("L" + i);
+				}
+				txn.commit();
+			}
+			long a = store.createNode("A");
+			long b = store.createNode("B");
+
+			long rel = store.createRelationship(a, "BIG", b, Properties.of().set("w", 1));
+			assertEquals("BIG", store.relationshipType(rel));
+			store.createEdge(a, "BIGGER", b);
+
+			assertEquals(1, store.neighbours(a, Direction.OUT, Set.of("BIG")).size());
+			List<Edge> bigger = store.neighbours(a, Direction.OUT, Set.of("BIGGER"));
+			assertEquals(1, bigger.size(), "a property-free edge of an unpackable type is still an edge");
+			assertEquals("BIGGER", bigger.get(0).type());
+			assertEquals(b, bigger.get(0).neighbourId());
+			assertEquals(1, store.neighbours(b, Direction.IN, Set.of("BIGGER")).size());
+			assertEquals(2, store.degreeOut(a));
+			assertEquals(2, store.degreeIn(b));
+
+			assertTrue(store.deleteEdge(a, "BIGGER", b), "and deleteEdge finds it by endpoints and type");
+			assertFalse(store.deleteEdge(a, "BIGGER", b));
+			assertEquals(0, store.neighbours(a, Direction.OUT, Set.of("BIGGER")).size());
+			assertEquals(1, store.degreeOut(a));
+			assertEquals(1, store.degreeIn(b));
+			store.verify(io.metaloom.graph.core.api.VerifyLevel.FULL);
+		}
+	}
+
 	@Test
 	public void testUnknownNodeIsRejected() throws Exception {
 		try (GraphStore store = stores.open()) {

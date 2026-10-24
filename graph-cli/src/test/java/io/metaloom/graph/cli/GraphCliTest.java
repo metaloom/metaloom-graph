@@ -157,4 +157,80 @@ public class GraphCliTest {
 		assertEquals(1, run("database", "inspect", "--in=" + truncated));
 		assertTrue(errText().contains("dump could not be read"), errText());
 	}
+
+	/**
+	 * {@code --server} sends a session token when one is configured.
+	 *
+	 * <p>
+	 * Authentication is on by default, so a CLI that sent nothing could never back up or list a default server: it
+	 * would be refused with a 401 every time. Against a stand-in server that refuses anything without the token, so
+	 * the test needs no graph server on this module's classpath.
+	 * </p>
+	 */
+	@Test
+	public void testTheServerCommandsSendTheConfiguredToken() throws Exception {
+		com.sun.net.httpserver.HttpServer stub = com.sun.net.httpserver.HttpServer.create(
+			new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+		stub.createContext("/api/databases", exchange -> {
+			boolean presented = "Bearer secret-token".equals(exchange.getRequestHeaders().getFirst("Authorization"));
+			byte[] body = (presented ? "{\"databases\":[{\"name\":\"alpha\"},{\"name\":\"beta\"}]}"
+				: "{\"error\":\"unauthenticated\"}").getBytes(StandardCharsets.UTF_8);
+			exchange.sendResponseHeaders(presented ? 200 : 401, body.length);
+			exchange.getResponseBody().write(body);
+			exchange.close();
+		});
+		stub.start();
+		try {
+			String url = "http://127.0.0.1:" + stub.getAddress().getPort();
+			assertEquals(1, run("database", "list", "--server=" + url), "a 401 must be an error");
+			assertTrue(errText().contains("GRAPH_TOKEN"), "and say how to send a token: " + errText());
+
+			CliOptions options = CliOptions.parse(new String[] { "database", "list", "--server=" + url },
+				name -> name.equals("GRAPH_TOKEN") ? "secret-token" : null);
+			assertEquals(0, new GraphCli(options, new PrintStream(err, true, StandardCharsets.UTF_8), out,
+				new ByteArrayInputStream(new byte[0])).run(), errText());
+			String printed = out.toString(StandardCharsets.UTF_8);
+			assertTrue(printed.contains("alpha") && printed.contains("beta"), printed);
+		} finally {
+			stub.stop(0);
+		}
+	}
+
+	/**
+	 * A damaged dump restored with {@code --force} leaves the database it was meant to replace exactly as it was.
+	 *
+	 * <p>
+	 * The checksum is in the trailer, so a dump is only known to be whole once all of it has been read. Replacing the
+	 * target first and finding out at the end would trade the user's data for half of somebody else's.
+	 * </p>
+	 */
+	@Test
+	public void testADamagedDumpRestoredWithForceKeepsTheOriginal() throws Exception {
+		Path source = seed("source", 50);
+		Path dump = tmp.resolve("out.dump");
+		assertEquals(0, run("database", "backup", "--path=" + source, "--out=" + dump, "--quiet"));
+		byte[] whole = Files.readAllBytes(dump);
+
+		Path target = seed("target", 99);
+		Path truncated = tmp.resolve("truncated.dump");
+		Files.write(truncated, java.util.Arrays.copyOf(whole, whole.length - 8));
+		assertEquals(1, run("database", "restore", "--path=" + target, "--in=" + truncated, "--force"));
+		assertEquals(99, nodeCountOf(target, "default"), "a failed restore replaced the original: " + errText());
+
+		Path corrupt = tmp.resolve("corrupt.dump");
+		byte[] flipped = whole.clone();
+		flipped[flipped.length / 2] ^= 0x5A;
+		Files.write(corrupt, flipped);
+		assertEquals(1, run("database", "restore", "--path=" + target, "--in=" + corrupt, "--force"));
+		assertEquals(99, nodeCountOf(target, "default"), "a failed restore replaced the original: " + errText());
+
+		// Nothing half-made is left lying about where a database would be listed.
+		try (GraphDatabases databases = GraphDatabases.open(target)) {
+			assertEquals(List.of(GraphDatabases.DEFAULT_NAME), databases.names());
+		}
+
+		// And a whole dump still replaces it.
+		assertEquals(0, run("database", "restore", "--path=" + target, "--in=" + dump, "--force"), errText());
+		assertEquals(50, nodeCountOf(target, "default"));
+	}
 }

@@ -434,6 +434,86 @@ public class WireServerTest {
 		assertServerStillWorks();
 	}
 
+	/**
+	 * Before the handshake completes, a frame may not claim more than a handshake needs.
+	 *
+	 * <p>
+	 * {@link Frames#MAX_FRAME_BYTES} is sixteen megabytes, and a peer that has presented nothing could otherwise have
+	 * the server hold that much for it — per connection, with no limit on connections. HELLO and AUTH are a few
+	 * hundred bytes, so the cap until WELCOME is small, and the oversized claim is refused at the header.
+	 * </p>
+	 */
+	@Test
+	public void testABigFrameBeforeTheHandshakeIsRefusedAtTheHeader() throws Exception {
+		listen();
+		try (RawConnection raw = new RawConnection(port)) {
+			ByteBuffer header = ByteBuffer.allocate(Frames.HEADER_BYTES).order(ByteOrder.LITTLE_ENDIAN);
+			header.putInt(1 << 20);
+			header.put((byte) Frames.HELLO);
+			header.put((byte) 0);
+			header.putShort((short) 0);
+			raw.out.write(header.array());
+			raw.out.flush();
+
+			// Answered now, from the header alone, rather than after a megabyte the peer never has to send.
+			RawFrame answer = raw.read();
+			assertEquals(Frames.ERROR, answer.type());
+			assertEquals(WireError.PROTOCOL, answer.error());
+		}
+		assertServerStillWorks();
+	}
+
+	/** A peer that connects and never says HELLO is let go, rather than holding a socket for ever. */
+	@Test
+	public void testAPeerThatNeverCompletesTheHandshakeIsDisconnected() throws Exception {
+		listen();
+		server.handshakeTimeoutMillis(300);
+		try (RawConnection raw = new RawConnection(port)) {
+			RawFrame answer = raw.read();
+			assertEquals(Frames.ERROR, answer.type());
+			assertEquals(WireError.PROTOCOL, answer.error());
+			assertTrue(answer.message().contains("handshake"), answer.message());
+			assertEquals(-1, raw.in.read(), "the connection should have been closed after the refusal");
+		}
+		// A client that does complete it is unaffected, including once it has been idle past the deadline.
+		try (GraphClient client = connect()) {
+			Thread.sleep(600);
+			try (RowStream stream = client.query("MATCH (n:Person) RETURN n.name")) {
+				assertTrue(stream.hasNext());
+			}
+		}
+	}
+
+	/**
+	 * A query on a client whose connection has gone fails at once rather than waiting forever.
+	 *
+	 * <p>
+	 * The streams open at the moment of the drop are failed by {@code connectionLost}; a query started after it would
+	 * otherwise be written to a dead socket and block its caller in {@code hasNext()} on a frame that cannot come.
+	 * </p>
+	 */
+	@Test
+	public void testAQueryAfterTheConnectionDroppedFailsInsteadOfHanging() throws Exception {
+		listen();
+		try (GraphClient client = connect()) {
+			try (RowStream warm = client.query("RETURN 1 AS one")) {
+				assertTrue(warm.hasNext());
+			}
+			server.close();
+			server = null;
+			// Give the close a moment to reach the client, so the query below is the one that starts after the drop
+			// rather than one the drop happens to catch in flight.
+			Thread.sleep(300);
+			org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
+				assertThrows(GraphClientException.class, () -> {
+					try (RowStream stream = client.query("RETURN 1 AS one")) {
+						stream.hasNext();
+					}
+				});
+			});
+		}
+	}
+
 	private void assertServerStillWorks() {
 		try (GraphClient client = connect(); RowStream stream = client.query("MATCH (n:Person) RETURN n.name")) {
 			assertTrue(stream.hasNext());

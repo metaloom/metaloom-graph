@@ -3,8 +3,10 @@ package io.metaloom.graph.core.unit;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.time.Instant;
 import java.util.Random;
 
 import org.junit.jupiter.api.Tag;
@@ -67,6 +69,35 @@ public class ValueCodecTest {
 		assertEquals("hello", roundTrip("hello"));
 		assertEquals("König ✓", roundTrip("König ✓"), "UTF-8 must survive intact");
 		assertEquals(2 + 5, encodedSize("hello"), "tag, length, five bytes");
+	}
+
+	/**
+	 * A timestamp is stored as microseconds in a long, which spans about 292,000 years either side of 1970. Beyond that
+	 * the multiplication used to wrap silently, so Instant.MAX read back as a date in year -171978.
+	 */
+	@Test
+	public void testTimestampsOutsideTheMicrosecondRangeAreRefused() throws Exception {
+		assertThrows(IllegalArgumentException.class, () -> roundTrip(Instant.MAX));
+		assertThrows(IllegalArgumentException.class, () -> roundTrip(Instant.MIN));
+		Instant latest = Instant.ofEpochSecond(Math.floorDiv(Long.MAX_VALUE, 1_000_000L),
+			Math.floorMod(Long.MAX_VALUE, 1_000_000L) * 1000L);
+		assertEquals(latest, roundTrip(latest), "the last representable microsecond round-trips");
+		assertThrows(IllegalArgumentException.class, () -> roundTrip(latest.plusNanos(1000)),
+			"and one microsecond later is refused, not wrapped");
+		Instant earliest = Instant.ofEpochSecond(Math.floorDiv(Long.MIN_VALUE, 1_000_000L),
+			Math.floorMod(Long.MIN_VALUE, 1_000_000L) * 1000L);
+		assertEquals(earliest, roundTrip(earliest));
+		assertThrows(IllegalArgumentException.class, () -> roundTrip(earliest.minusNanos(1000)));
+		Instant beforeEpoch = Instant.parse("1969-12-31T23:59:59.999999Z");
+		assertEquals(beforeEpoch, roundTrip(beforeEpoch));
+	}
+
+	/** A lone surrogate has no UTF-8 form; the JDK writes '?', so two distinct strings would read back equal. */
+	@Test
+	public void testALoneSurrogateIsRefused() throws Exception {
+		assertThrows(IllegalArgumentException.class, () -> roundTrip("k\uD800"));
+		assertThrows(IllegalArgumentException.class, () -> roundTrip("\uDC00k"));
+		assertEquals("k\uD83D\uDE00", roundTrip("k\uD83D\uDE00"), "a proper pair is fine");
 	}
 
 	@Test

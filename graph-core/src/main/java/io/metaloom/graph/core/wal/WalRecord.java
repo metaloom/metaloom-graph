@@ -1,5 +1,7 @@
 package io.metaloom.graph.core.wal;
 
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
@@ -71,18 +73,48 @@ public final class WalRecord {
 	public static final int PAGE_IMAGE_HEADER_BYTES = 17;
 
 	public static byte[] encode(long lsn, long prevLsn, long txnId, int type, byte[] payload) {
-		int length = HEADER_BYTES + payload.length;
-		ByteBuffer buffer = ByteBuffer.allocate(length).order(ByteOrder.LITTLE_ENDIAN);
+		byte[] record = new byte[HEADER_BYTES + payload.length];
+		System.arraycopy(payload, 0, record, HEADER_BYTES, payload.length);
+		return seal(record, lsn, prevLsn, txnId, type);
+	}
+
+	/**
+	 * A whole {@link #TYPE_PAGE_IMAGE} record, built in one array straight from the page.
+	 * <p>
+	 * The same bytes as {@code encode(..., encodePageImage(...))}, without the two intermediate arrays and copies that
+	 * route costs per changed run — and a commit logs one record per run.
+	 */
+	public static byte[] encodePageImageRecord(long lsn, long prevLsn, long txnId, int kindCode, int segmentNumber,
+		int pageIndex, int offsetInPage, MemorySegment source, long sourceOffset, int length) {
+		byte[] record = new byte[pageImageRecordLength(length)];
+		ByteBuffer buffer = ByteBuffer.wrap(record).order(ByteOrder.LITTLE_ENDIAN);
+		buffer.put(HEADER_BYTES, (byte) kindCode);
+		buffer.putInt(HEADER_BYTES + 1, segmentNumber);
+		buffer.putInt(HEADER_BYTES + 5, pageIndex);
+		buffer.putInt(HEADER_BYTES + 9, offsetInPage);
+		buffer.putInt(HEADER_BYTES + 13, length);
+		MemorySegment.copy(source, ValueLayout.JAVA_BYTE, sourceOffset, record, HEADER_BYTES + PAGE_IMAGE_HEADER_BYTES,
+			length);
+		return seal(record, lsn, prevLsn, txnId, TYPE_PAGE_IMAGE);
+	}
+
+	/** Total length of a page image record carrying {@code length} bytes. */
+	public static int pageImageRecordLength(int length) {
+		return HEADER_BYTES + PAGE_IMAGE_HEADER_BYTES + length;
+	}
+
+	/** Writes the header into a record whose payload is already in place, and its CRC last. */
+	private static byte[] seal(byte[] record, long lsn, long prevLsn, long txnId, int type) {
+		ByteBuffer buffer = ByteBuffer.wrap(record).order(ByteOrder.LITTLE_ENDIAN);
 		buffer.putLong(OFF_LSN, lsn);
 		buffer.putLong(OFF_PREV_LSN, prevLsn);
 		buffer.putLong(OFF_TXN_ID, txnId);
-		buffer.putInt(OFF_LENGTH, length);
+		buffer.putInt(OFF_LENGTH, record.length);
 		buffer.putShort(OFF_TYPE, (short) type);
 		buffer.putShort(OFF_FLAGS, (short) 0);
 		buffer.putInt(OFF_CRC, 0);
-		System.arraycopy(payload, 0, buffer.array(), HEADER_BYTES, payload.length);
-		buffer.putInt(OFF_CRC, Crc.crc32c(buffer.array(), 0, length));
-		return buffer.array();
+		buffer.putInt(OFF_CRC, Crc.crc32c(record, 0, record.length));
+		return record;
 	}
 
 	/** Validates a record read at {@code expectedLsn}. Returns the total length, or -1 when this is end of log. */

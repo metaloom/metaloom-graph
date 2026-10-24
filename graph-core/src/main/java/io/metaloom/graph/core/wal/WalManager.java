@@ -2,11 +2,14 @@ package io.metaloom.graph.core.wal;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -17,7 +20,6 @@ import io.metaloom.graph.core.id.Kind;
 import io.metaloom.graph.core.page.PageOverlay;
 import io.metaloom.graph.core.segment.SegmentFile;
 import io.metaloom.graph.core.segment.SegmentSet;
-import io.metaloom.graph.core.util.Layouts;
 
 /**
  * Commit, recovery and checkpointing.
@@ -85,6 +87,20 @@ public final class WalManager implements AutoCloseable {
 		return lastCommitLsn;
 	}
 
+	/**
+	 * Stops the log accepting anything more, for a commit that failed after its records were logged.
+	 *
+	 * @see WalWriter#poison(Throwable)
+	 */
+	public void poison(Throwable cause) {
+		writer.poison(cause);
+	}
+
+	/** Whether the log has failed and is refusing writes until the store is reopened. */
+	public boolean isPoisoned() {
+		return writer.isPoisoned();
+	}
+
 	// ---------------------------------------------------------------- commit
 
 	/**
@@ -145,11 +161,9 @@ public final class WalManager implements AutoCloseable {
 			for (int[] run : diff.runs()) {
 				int offset = run[0];
 				int length = run[1];
-				byte[] image = new byte[length];
-				MemorySegment.copy(copy, offset, MemorySegment.ofArray(image), 0, length);
-				byte[] payload = WalRecord.encodePageImage(kind.code(), segmentNumber, pageIndex, offset,
-					image, 0, length);
-				prevLsn = writer.append(prevLsn, txnId, WalRecord.TYPE_PAGE_IMAGE, payload);
+				// Straight from the overlay copy into one record array, rather than through an image and a payload.
+				prevLsn = writer.appendPageImage(prevLsn, txnId, kind.code(), segmentNumber, pageIndex, offset, copy,
+					offset, length);
 				writes.add(new PageWrite(file, kind, segmentNumber, pageIndex, copy, offset, length));
 			}
 		}
@@ -181,29 +195,24 @@ public final class WalManager implements AutoCloseable {
 		int size = (int) modified.byteSize();
 		int start = -1;
 		int lastDifferent = -1;
-		for (int i = 0; i < size; i += 8) {
-			int chunk = Math.min(8, size - i);
-			boolean same;
-			if (chunk == 8) {
-				same = original.get(Layouts.LONG, i) == modified.get(Layouts.LONG, i);
-			} else {
-				same = true;
-				for (int j = 0; j < chunk; j++) {
-					if (original.get(Layouts.BYTE, i + j) != modified.get(Layouts.BYTE, i + j)) {
-						same = false;
-						break;
-					}
-				}
+		// The unit is still the 8-byte chunk, so the runs are exactly what a chunk-by-chunk loop produces. mismatch()
+		// only finds the next differing chunk faster: it is vectorised, and a commit usually changes a few dozen bytes
+		// of a page, so almost all of the page is skipped in one call rather than walked a long at a time.
+		int i = 0;
+		while (i < size) {
+			long found = MemorySegment.mismatch(original, i, size, modified, i, size);
+			if (found < 0) {
+				break;
 			}
-			if (!same) {
-				if (start < 0) {
-					start = i;
-				} else if (i - lastDifferent > RUN_MERGE_GAP) {
-					runs.add(new int[] { start, lastDifferent + 8 - start });
-					start = i;
-				}
-				lastDifferent = i;
+			int chunk = (int) (i + found) & ~7;
+			if (start < 0) {
+				start = chunk;
+			} else if (chunk - lastDifferent > RUN_MERGE_GAP) {
+				runs.add(new int[] { start, lastDifferent + 8 - start });
+				start = chunk;
 			}
+			lastDifferent = chunk;
+			i = chunk + 8;
 		}
 		if (start >= 0) {
 			int end = Math.min(size, lastDifferent + 8);
@@ -220,6 +229,7 @@ public final class WalManager implements AutoCloseable {
 	 */
 	public static long recover(Path storePath, long segmentBytes, long fromLsn, Map<Kind, SegmentSet> segmentSets)
 		throws IOException {
+		requireContiguousLog(storePath, segmentBytes, fromLsn);
 		long resumeLsn = fromLsn;
 		int committedTransactions = 0;
 		int appliedImages = 0;
@@ -264,6 +274,53 @@ public final class WalManager implements AutoCloseable {
 				committedTransactions, appliedImages, resumeLsn);
 		}
 		return resumeLsn;
+	}
+
+	/**
+	 * Refuses a log with a segment missing between the checkpoint and the newest segment on disk.
+	 *
+	 * <p>
+	 * Segment files are created on the first append into them and deleted only below a durable checkpoint, so the
+	 * ones from the checkpoint onwards are always contiguous. A hole means the log lost a file — or the manifest is
+	 * older than the trim that removed it — and the reader would stop at the hole and report a clean end of log.
+	 * Opening on that is recovering to a wrong point, and resuming the writer there leaves the segments past the hole
+	 * holding stale records that self-identify as valid. Fatal instead, as spec/WAL.md section 6.1 requires.
+	 * </p>
+	 */
+	private static void requireContiguousLog(Path storePath, long segmentBytes, long fromLsn) throws IOException {
+		Path dir = storePath.resolve("wal");
+		if (!Files.isDirectory(dir)) {
+			return;
+		}
+		long startBase = fromLsn / segmentBytes * segmentBytes;
+		List<Long> bases = new ArrayList<>();
+		try (Stream<Path> files = Files.list(dir)) {
+			for (Path p : (Iterable<Path>) files::iterator) {
+				String name = p.getFileName().toString();
+				if (!name.startsWith("wal-") || !name.endsWith(".log")) {
+					continue;
+				}
+				try {
+					long base = Long.parseUnsignedLong(name.substring(4, name.indexOf('.')), 16);
+					if (base >= startBase) {
+						bases.add(base);
+					}
+				} catch (NumberFormatException e) {
+					// Not one of ours; leave it alone.
+				}
+			}
+		}
+		Collections.sort(bases);
+		long expected = startBase;
+		for (long base : bases) {
+			if (base != expected) {
+				throw new PageCorruptException("WAL segment " + dir.resolve(String.format("wal-%016x.log", expected))
+					+ " is missing: recovery starts at checkpoint LSN " + fromLsn + " and the log continues in "
+					+ String.format("wal-%016x.log", base) + ". Refusing to open rather than recover to a wrong point;"
+					+ " restore the missing segment, or the store from a backup.");
+			}
+			expected += segmentBytes;
+		}
 	}
 
 	private static void apply(Map<Kind, SegmentSet> segmentSets, WalRecord.PageImage image, long lsn) {

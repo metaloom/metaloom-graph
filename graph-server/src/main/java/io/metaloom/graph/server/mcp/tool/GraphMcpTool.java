@@ -40,6 +40,18 @@ public interface GraphMcpTool {
 		return execute(arguments);
 	}
 
+	/**
+	 * The database this call is about, which is what the handler checks {@code requiredPrivileges} against.
+	 *
+	 * <p>
+	 * Null for a tool that touches no store. A store tool answers from its {@code database} argument: checking the
+	 * server's default instead would let a grant scoped to one database act on every other.
+	 * </p>
+	 */
+	default String database(JsonObject arguments) {
+		return null;
+	}
+
 	default String name() {
 		return descriptor().name();
 	}

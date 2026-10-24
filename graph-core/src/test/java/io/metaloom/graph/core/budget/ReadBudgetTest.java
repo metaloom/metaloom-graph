@@ -288,8 +288,8 @@ public class ReadBudgetTest {
 	 * <p>
 	 * Before the type was cached in the adjacency entry, the filter could not run until the record had been read, so a
 	 * query for five rare edges among five thousand paid five thousand random 64 byte reads — the supernode cost this
-	 * whole line of work is about. Each surviving candidate still costs four REL touches: its generation, its type, and
-	 * its two endpoints.
+	 * whole line of work is about. Each surviving candidate still costs two REL touches: its generation, then one resolve
+	 * for its type and its two endpoints together (it was four, one per field).
 	 */
 	@Test
 	public void testATypeFilteredSupernodeReadsOnlyTheSurvivingRelationships() throws Exception {
@@ -312,8 +312,8 @@ public class ReadBudgetTest {
 				"the filter must still return every rare edge");
 
 			IoStats filtered = cost(impl, () -> store.neighbours(hub, Direction.OUT, java.util.Set.of("RARE")));
-			assertTrue(filtered.recordReads(Kind.REL) <= 4L * rare,
-				"a filtered scan must read only the surviving relationship records, at most four touches each: "
+			assertEquals(2L * rare, filtered.recordReads(Kind.REL),
+				"a filtered scan must read only the surviving relationship records, two touches each: "
 					+ filtered);
 
 			// The contrast is the point: with no filter every entry is resolved, which is what the filtered scan used

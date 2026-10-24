@@ -126,6 +126,17 @@ public class MergeTest {
 		}
 	}
 
+	/** 36 and 36.0 are one Cypher value, so a MERGE spelling it the other way must find the node, not duplicate it. */
+	@Test
+	public void testMergeMatchesAnIntegerWrittenAsAFloat() throws Exception {
+		try (GraphStore store = people()) {
+			CypherResult result = Cypher.query(store, "MERGE (n:Person {age: 36.0}) RETURN n.name AS name");
+			assertEquals(List.of("Ada"), result.column("name"));
+			assertEquals(0, result.stats().nodesCreated());
+			assertEquals(3, countNodes(store));
+		}
+	}
+
 	@Test
 	public void testMergingAcrossTwoQueriesIsAlsoIdempotent() throws Exception {
 		try (GraphStore store = people()) {

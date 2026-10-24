@@ -3,6 +3,8 @@ package io.metaloom.graph.server.mcp.tool.impl;
 import java.util.List;
 
 import io.metaloom.graph.core.api.GraphDatabases;
+import io.metaloom.graph.core.api.Principal;
+import io.metaloom.graph.server.GraphServer;
 import io.metaloom.graph.server.mcp.model.McpToolDescriptor;
 import io.metaloom.graph.server.mcp.tool.GraphMcpTool;
 import io.metaloom.graph.server.mcp.tool.GraphMcpToolResults;
@@ -33,8 +35,15 @@ public final class ListDatabasesTool implements GraphMcpTool {
 
 	@Override
 	public Future<JsonObject> execute(JsonObject arguments) {
+		return execute(arguments, Principal.ANONYMOUS);
+	}
+
+	/** Filtered by the caller exactly as {@code GET /api/databases} is, so the two ports cannot list differently. */
+	@Override
+	public Future<JsonObject> execute(JsonObject arguments, Principal principal) {
 		// Blocking: names() lists a directory and probes each entry for a store layout.
-		return vertx.executeBlocking(() -> GraphMcpToolResults.json(
-			new JsonObject().put("databases", new JsonArray(databases.names()))), false);
+		return vertx.executeBlocking(() -> GraphMcpToolResults.json(new JsonObject().put("databases",
+			new JsonArray(databases.names().stream().filter(name -> GraphServer.visibleTo(principal, name)).toList()))),
+			false);
 	}
 }
