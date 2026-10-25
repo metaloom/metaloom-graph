@@ -81,7 +81,7 @@ spec:
             - name: GRAPH_ROOT
               value: /data
             - name: GRAPH_HTTP_PORT
-              value: {{ .Values.service.httpPort | quote }}
+              value: {{ .Values.service.httpPort | int64 | quote }}
             - name: GRAPH_DATABASE
               value: {{ .Values.graph.database | quote }}
             - name: GRAPH_ALLOW_WRITE
@@ -103,16 +103,16 @@ spec:
               value: {{ .Values.graph.demoSize | quote }}
             {{- end }}
             - name: GRAPH_QUERY_TIMEOUT_MILLIS
-              value: {{ .Values.graph.queryTimeoutMillis | quote }}
+              value: {{ .Values.graph.queryTimeoutMillis | int64 | quote }}
             - name: GRAPH_SLOW_QUERY_MILLIS
-              value: {{ .Values.graph.slowQueryMillis | quote }}
+              value: {{ .Values.graph.slowQueryMillis | int64 | quote }}
             - name: GRAPH_MAX_STREAMS
-              value: {{ .Values.graph.maxStreams | quote }}
+              value: {{ .Values.graph.maxStreams | int64 | quote }}
             - name: GRAPH_WIRE_ENABLED
               value: {{ .Values.wire.enabled | quote }}
             {{- if .Values.wire.enabled }}
             - name: GRAPH_WIRE_PORT
-              value: {{ .Values.service.wirePort | quote }}
+              value: {{ .Values.service.wirePort | int64 | quote }}
             # Loopback unless deliberately widened: the cleartext port carries a password in the clear, so the
             # Service port existing is not the same as it being reachable, and that is on purpose.
             - name: GRAPH_WIRE_HOST
@@ -125,7 +125,7 @@ spec:
             - name: GRAPH_WIRE_TLS_KEY
               value: /tls/{{ .Values.wire.tls.privateKeyKey }}
             - name: GRAPH_WIRE_TLS_PORT
-              value: {{ .Values.service.wireTlsPort | quote }}
+              value: {{ .Values.service.wireTlsPort | int64 | quote }}
             - name: GRAPH_WIRE_TLS_HOST
               value: {{ .Values.wire.tls.host | default .Values.wire.host | quote }}
             {{- if .Values.wire.tls.only }}
@@ -138,13 +138,13 @@ spec:
               value: {{ .Values.metrics.enabled | quote }}
             {{- if .Values.metrics.enabled }}
             - name: GRAPH_METRICS_PORT
-              value: {{ .Values.service.metricsPort | quote }}
+              value: {{ .Values.service.metricsPort | int64 | quote }}
             {{- end }}
             - name: GRAPH_MCP_ENABLED
               value: {{ .Values.mcp.enabled | quote }}
             {{- if .Values.mcp.enabled }}
             - name: GRAPH_MCP_PORT
-              value: {{ .Values.service.mcpPort | quote }}
+              value: {{ .Values.service.mcpPort | int64 | quote }}
             - name: GRAPH_MCP_HOST
               value: {{ .Values.mcp.host | quote }}
             {{- end }}
@@ -155,7 +155,7 @@ spec:
               value: {{ .Values.auth.enabled | quote }}
             {{- if .Values.auth.enabled }}
             - name: GRAPH_SESSION_TIMEOUT_MILLIS
-              value: {{ .Values.auth.sessionTimeoutMillis | quote }}
+              value: {{ .Values.auth.sessionTimeoutMillis | int64 | quote }}
             {{- if or .Values.auth.initialPassword .Values.auth.existingSecret }}
             # secretKeyRef and never a literal: an env var set with `value:` is visible in `kubectl describe pod` and
             # in /proc/<pid>/environ to anything sharing the namespace.

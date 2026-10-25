@@ -292,6 +292,46 @@ What still does **not** work:
 - There is **no point-in-time recovery** and **no incremental backup**. The log is trimmed at each checkpoint, so it
   cannot be replayed against an older copy or an older dump.
 
+### 5.1 Upgrading across a store format version
+
+A build reads exactly one store format version. A new build whose version is higher refuses the old stores with a
+`MigrationRequiredException` that names the command below, and changes nothing; nothing is upgraded on open. The
+design is [MIGRATION.md](MIGRATION.md); the procedure is:
+
+```bash
+# 0. Which version is it? Reads the manifest only: no lock, works with the server running, works on a store the
+#    new build refuses to open.
+metaloom-graph-cli database info sales --path=/data/graphs
+
+# 1. Stop the server cleanly — SIGTERM, so the stores are checkpointed (§8.9). A store killed with kill -9 has
+#    committed work in its log that only the OLD build can replay: start the old server once and stop it cleanly,
+#    and the plan below will stop saying "blocked".
+# 2. Take a dump with the old build as well, if the database matters (§5). The migration keeps the original, but a
+#    dump is the copy that does not depend on any format at all.
+# 3. With the NEW build: the plan. Changes nothing; exit status 1 if it could not run.
+metaloom-graph-cli database migrate sales --path=/data/graphs --dry-run
+# 4. Migrate. Copies the store beside itself (instant on btrfs/xfs with reflink, otherwise its allocated size),
+#    runs the steps on the copy, opens it and runs verify(FULL), then swaps it in.
+metaloom-graph-cli database migrate sales --path=/data/graphs
+# 5. Start the new server. Once the migrated database has been checked, delete the original:
+rm -r /data/graphs/sales.pre-migration-v4
+```
+
+One database per run; repeat for each one under the root. In a container, stop the server's container and run the
+new image's CLI against the volume: `docker run --rm -v graphdata:/data metaloom/graph-server:<new> metaloom-graph-cli
+database migrate default`.
+
+- **A failed migration leaves the original untouched** and removes its partial copy; the message says why.
+- **A crash during a migration** — power, `kill -9`, a full disk — is finished by running the same command again. Until
+  then the store refuses to open, with a message naming the marker file, so that nothing can open it half way
+  through the swap.
+- **Rolling back**: stop the server, `mv sales sales.migrated` and `mv sales.pre-migration-v4 sales`, and run the old
+  build. The original is byte for byte what it was.
+- **Disk**: the original stays until you delete it, so plan for twice the store's size. A second migration from the
+  same version refuses to run while the earlier backup is still there.
+- **Downgrading** is not supported: an older build refuses a newer store. Take a dump with the newer build and restore
+  it with the older one, at the cost of element ids.
+
 ---
 
 ## 6. Disaster Recovery
@@ -311,7 +351,12 @@ Recovery time is proportional to `walBytesSinceCheckpoint`. If it is slow, check
 | `Store at ... is already open in this JVM` | The same process opened it twice | A bug in the calling code |
 | `Both superblock copies of X segment N are invalid` | A segment header is destroyed. The A/B pair means a torn write cannot do this; this is real damage | Restore from backup. The segment is unreadable |
 | `Segment X-N has <field> A but this store expects B` | Geometry mismatch: the store was created with different options | Open it with the options it was created with. Page size and segment capacity are not changeable |
-| `Segment format version N, expected M` | Written by a different version of the engine | Use that version. There is no in-place upgrade |
+| `Store at ... has format version N and this build reads version M. Migrate it first` | The store is older than this build | Follow §5.1: `metaloom-graph-cli database migrate <db> --path=<root>`. Nothing was changed by the open |
+| `... There is no migration path from version N` | The store predates the first version this build can migrate (1 and 2 today) | Dump it with the build that wrote it, restore it with this one |
+| `Store at ... has format version N, which is newer than this build` | Written by a newer build | Use that build. There is no downgrade |
+| `... uses features this build does not know (feature flags 0x...)` | A newer build turned on an optional feature this one cannot read | Use that build |
+| `A migration of the store at ... was interrupted` | A `database migrate` stopped part way; `.migration-<db>` is beside the store | Run the same `database migrate` again; it finishes or restarts. To abandon one stopped before verification, delete the two paths the message names |
+| `Segment format version N, expected M` | A segment's own header is from another layout while the manifest says this one — a store assembled from two builds | Restore it whole. A store migrated by `database migrate` never has this |
 | `Recovery references X segment N, which does not exist` | The log names a segment file that is gone | The store directory is incomplete. Restore it whole |
 | `WAL segment .../wal-....log is missing: recovery starts at checkpoint LSN ...` | A log segment between the checkpoint and the newest segment is gone — a partial copy, or a manifest older than the trim that removed it | Restore the missing segment, or the store from a backup. Opening anyway would recover to a wrong point |
 
@@ -587,5 +632,5 @@ Stated plainly, because an operations document that implies capabilities the sys
 
 ---
 
-_Git HEAD revision: `f2b6d5f`_
-_Last updated: 2026-10-24 (client, server and CLI review: closed streams, budget leak, slot release order, shutdown grace, strict UTF-8, MCP argument shapes, atomic backups)_
+_Git HEAD revision: `8f8caad`_
+_Last updated: 2026-10-25 (§5.1 upgrading across a store format version; migration messages in §6.2)_

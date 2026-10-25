@@ -4,13 +4,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.lang.reflect.InvocationHandler;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
-import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.function.LongConsumer;
+import java.util.function.LongPredicate;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -18,8 +16,10 @@ import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
+import io.metaloom.graph.core.api.ForwardingGraphStore;
 import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.Properties;
+import io.metaloom.graph.core.api.ScanOptions;
 import io.metaloom.graph.core.api.Transaction;
 import io.metaloom.graph.core.fixture.TempStore;
 import io.metaloom.graph.cypher.ast.Ast;
@@ -249,32 +249,64 @@ public class CompositeIndexPlanTest {
 	}
 
 	/**
-	 * Every {@link GraphStore} method the executor calls, in order, recorded by a proxy that delegates to the real
-	 * store.
+	 * The access-path methods the executor calls, in order, recorded by a decorator that forwards to the real store.
 	 * <p>
-	 * A proxy rather than a hand-written stub because the point is to observe the choice without changing it: the
+	 * A decorator rather than a hand-written stub because the point is to observe the choice without changing it: the
 	 * executor must run against the same store it always does, and a stub that answered differently would be testing
-	 * the stub.
+	 * the stub. Only the methods these tests ask about are recorded — the seeds (the three index lookups and the two
+	 * scans) and the per-candidate read; {@link ForwardingGraphStore} forwards the rest unrecorded. (It used to be a
+	 * dynamic proxy recording every call; {@code GraphStore} is sealed now, and a proxy cannot implement it.)
+	 * </p>
 	 */
-	private static final class Calls implements InvocationHandler {
+	private static final class Calls {
 
 		private final List<String> names = new ArrayList<>();
-		private GraphStore delegate;
 
 		GraphStore wrap(GraphStore store) {
-			this.delegate = store;
-			return (GraphStore) Proxy.newProxyInstance(GraphStore.class.getClassLoader(),
-				new Class<?>[] { GraphStore.class }, this);
-		}
+			return new ForwardingGraphStore(store) {
 
-		@Override
-		public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
-			names.add(method.getName());
-			try {
-				return method.invoke(delegate, args);
-			} catch (InvocationTargetException e) {
-				throw e.getCause();
+			@Override
+			public void forEachNode(LongConsumer consumer) {
+				names.add("forEachNode");
+				super.forEachNode(consumer);
 			}
+
+			@Override
+			public boolean forEachNodeWhile(LongPredicate consumer, ScanOptions options) {
+				names.add("forEachNodeWhile");
+				return super.forEachNodeWhile(consumer, options);
+			}
+
+			@Override
+			public boolean forEachNodeWhile(LongPredicate consumer) {
+				names.add("forEachNodeWhile");
+				return super.forEachNodeWhile(consumer);
+			}
+
+			@Override
+			public List<String> nodeLabels(long nodeId) {
+				names.add("nodeLabels");
+				return super.nodeLabels(nodeId);
+			}
+
+			@Override
+			public List<Long> nodesByLabel(String label) {
+				names.add("nodesByLabel");
+				return super.nodesByLabel(label);
+			}
+
+			@Override
+			public List<Long> nodesByLabelAndProperty(String label, String key, Object value) {
+				names.add("nodesByLabelAndProperty");
+				return super.nodesByLabelAndProperty(label, key, value);
+			}
+
+			@Override
+			public List<Long> nodesByProperty(String key, Object value) {
+				names.add("nodesByProperty");
+				return super.nodesByProperty(key, value);
+			}
+			};
 		}
 
 		boolean made(String method) {

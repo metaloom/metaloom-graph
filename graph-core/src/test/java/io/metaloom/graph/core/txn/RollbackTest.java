@@ -281,9 +281,9 @@ public class RollbackTest {
 		try (GraphStore store = stores.open()) {
 			GraphStoreImpl impl = (GraphStoreImpl) store;
 			store.createNode("Small", Properties.of().set("a", 1L));
-			io.metaloom.graph.core.segment.SegmentFile props = impl.segments(io.metaloom.graph.core.id.Kind.PROP)
+			io.metaloom.graph.core.segment.SegmentFile props = impl.segments(io.metaloom.graph.core.api.Kind.PROP)
 				.segments().get(0);
-			int cellsPerPage = impl.geometry().recordsPerPage(io.metaloom.graph.core.id.Kind.PROP);
+			int cellsPerPage = impl.geometry().recordsPerPage(io.metaloom.graph.core.api.Kind.PROP);
 			// Single-cell blocks until the next multi-cell block can no longer fit in the current page.
 			while (cellsPerPage - props.superblock().highWaterSlot() % cellsPerPage > 2) {
 				store.createNode("Small", Properties.of().set("a", 1L));

@@ -1,7 +1,7 @@
 package io.metaloom.graph.core.segment;
 
 import io.metaloom.graph.core.id.ElementId;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 
 /**
  * Per-kind segment geometry, derived from the page size and the segment capacity.

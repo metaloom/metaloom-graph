@@ -4,7 +4,7 @@
     <modelVersion>4.0.0</modelVersion>
     <groupId>io.metaloom.graph</groupId>
     <artifactId>metaloom-graph</artifactId>
-    <version>0.0.1-SNAPSHOT</version>
+    <version>0.1.0-alpha.1</version>
     <packaging>pom</packaging>
 
     <parent>
@@ -44,6 +44,12 @@
         free of FFM. See spec/WIRE.md.
     -->
     <modules>
+        <!--
+            Build tooling first: every library module below runs its API lock test against it. Test scope only, and it
+            depends on nothing in this reactor, so it adds nothing to any module's runtime classpath. See
+            spec/API_LOCK.md.
+        -->
+        <module>graph-api-lock</module>
         <module>graph-core</module>
         <module>graph-cypher</module>
         <module>graph-protocol</module>
@@ -105,6 +111,12 @@
 
     <dependencyManagement>
         <dependencies>
+            <dependency>
+                <groupId>io.metaloom.graph</groupId>
+                <artifactId>graph-api-lock</artifactId>
+                <version>${project.version}</version>
+                <scope>test</scope>
+            </dependency>
             <dependency>
                 <groupId>io.metaloom.graph</groupId>
                 <artifactId>graph-core</artifactId>

@@ -21,7 +21,7 @@ import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.IoStats;
 import io.metaloom.graph.core.api.Transaction;
 import io.metaloom.graph.core.fixture.TempStore;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 import io.metaloom.graph.core.store.GraphStoreImpl;
 
 /**

@@ -288,6 +288,94 @@ public class AbandonedViewScanTest {
 		}
 	}
 
+	/**
+	 * A view abandoned while an older write transaction holds the horizon down is still told so.
+	 *
+	 * <p>
+	 * Abandonment takes the view out of the active set, but the view itself used to learn of it only by comparing its
+	 * LSN with the horizon — and the horizon is the oldest <em>remaining</em> view's LSN, which a write transaction
+	 * that began first keeps at or below the abandoned one's. Out of the active set, the view also stops being a reason
+	 * to record before-images: when that writer commits it is the only one registered, so it keeps nothing. Until the
+	 * next vacuum raised the horizon, the abandoned view therefore read the writer's commit from the mapping with every
+	 * check passing. {@code testAnAbandonedViewNeverAnswersFromTheFuture} hit that window in about one run in three;
+	 * holding vacuum off from the writer's commit onwards makes it every run.
+	 * </p>
+	 */
+	@Test
+	@org.junit.jupiter.api.Timeout(60)
+	public void testAViewAbandonedBehindAnOlderWriterIsStillToldSo() throws Exception {
+		GraphStoreOptions options = GraphStoreOptions.builder()
+			.pageSize(Geometry.DEFAULT_PAGE_SIZE)
+			.segmentCapacity(TempStore.TEST_SEGMENT_CAPACITY)
+			.retainedVersionBytes(1024)
+			.walSyncMode(WalSyncMode.ASYNC)
+			.build();
+		java.util.concurrent.ExecutorService writer = java.util.concurrent.Executors.newSingleThreadExecutor();
+		try (GraphStore store = stores.open(options)) {
+			long watched = store.createNode("Watched", io.metaloom.graph.core.api.Properties.of().set("x", 0L));
+			long target = store.createNode("Target");
+			// Enough nodes between them that the churned record is on another node page: the writer must not lose a
+			// conflict to the churn, it must win and commit.
+			for (int i = 0; i < 300; i++) {
+				store.createNode("Filler");
+			}
+			long churned = store.createNode("Churned", io.metaloom.graph.core.api.Properties.of().set("x", 0L));
+			TransactionManager transactions = field(store, "transactions", TransactionManager.class);
+			java.util.concurrent.locks.ReentrantLock vacuumLock = field(transactions, "vacuumLock",
+				java.util.concurrent.locks.ReentrantLock.class);
+
+			// The older writer: begun first, so its view is older than the reader's and holds the horizon down.
+			AtomicReference<Transaction> older = new AtomicReference<>();
+			writer.submit(() -> older.set(store.begin())).get();
+
+			try (ReadTransaction view = store.beginRead()) {
+				assertTrue(view.snapshotLsn() > 0);
+				org.junit.jupiter.api.Assertions.assertEquals(0, store.neighbours(watched, Direction.OUT, null).size());
+
+				// Other commits overdraw the budget while the view is open; vacuum abandons it, the only reader.
+				Thread churn = Thread.ofPlatform().name("churn").start(() -> {
+					try {
+						for (int i = 0; transactions.abandonedCount() == 0 && i < 1_000; i++) {
+							store.setNodeProperties(churned, io.metaloom.graph.core.api.Properties.of()
+								.set("x", (long) i).set("pad", "p".repeat(400)));
+						}
+					} catch (java.io.IOException e) {
+						throw new java.io.UncheckedIOException(e);
+					}
+				});
+				churn.join(30_000);
+				assertTrue(transactions.abandonedCount() > 0, "the view was never abandoned, so nothing was tested");
+
+				// The older writer now commits a change to the watched node — an edge, which touches no index page the
+				// churn also wrote, so the writer does not simply lose a conflict — and its vacuum, the one that would
+				// raise the horizon past the view, is held off.
+				vacuumLock.lock();
+				try {
+					writer.submit(() -> {
+						store.createEdge(watched, "SEES", target);
+						older.get().commit();
+						return null;
+					}).get();
+
+					Object read;
+					try {
+						read = store.neighbours(watched, Direction.OUT, null).size();
+					} catch (SnapshotTooOldException e) {
+						read = e;
+					}
+					assertTrue(read instanceof SnapshotTooOldException, "the abandoned view saw " + read
+						+ " neighbours — the older writer's edge, committed after the view began — without being told"
+						+ " it was abandoned; its snapshot holds none");
+				} finally {
+					vacuumLock.unlock();
+				}
+			}
+			store.verify(VerifyLevel.FULL);
+		} finally {
+			writer.shutdownNow();
+		}
+	}
+
 	@SuppressWarnings("unchecked")
 	private static <T> T field(Object owner, String name, Class<T> type) throws ReflectiveOperationException {
 		java.lang.reflect.Field field = owner.getClass().getDeclaredField(name);

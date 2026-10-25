@@ -51,9 +51,11 @@ import java.util.function.UnaryOperator;
  *            a session token for {@code --server}, from {@code GRAPH_TOKEN}, or null to send none. A variable and not a
  *            flag, for the reason {@code GRAPH_ADMIN_PASSWORD} is preferred: a flag is in shell history and in
  *            {@code ps}
+ * @param dryRun
+ *            for {@code database migrate}: print the plan and what would stop it, and change nothing
  */
 public record CliOptions(String command, String database, Path path, String server, String file, boolean force,
-	boolean quiet, List<String> arguments, String password, String token) {
+	boolean quiet, List<String> arguments, String password, String token, boolean dryRun) {
 
 	/** Raised by {@code --help}, so the parser never prints or exits by itself. */
 	public static final class HelpRequested extends RuntimeException {
@@ -96,6 +98,18 @@ public record CliOptions(String command, String database, Path path, String serv
 	 */
 	private static final String AUTH_PREFIX = "auth ";
 
+	/**
+	 * The commands that read or rewrite a store's files directly, and so cannot go through a server.
+	 *
+	 * <p>
+	 * {@code database migrate} needs the server <b>stopped</b> — it rewrites the files a server would have mapped —
+	 * so offering it over HTTP would be offering something no running server can do. {@code database info} reads
+	 * eight kilobytes of manifest and takes no lock, which works whether a server is running or not, and is the one
+	 * question that must be answerable about a store the server refuses to open.
+	 * </p>
+	 */
+	private static final List<String> PATH_ONLY = List.of("database migrate", "database info");
+
 	public CliOptions {
 		arguments = List.copyOf(arguments);
 		if (path == null && server == null && !TRANSPORTLESS.contains(command)) {
@@ -105,6 +119,15 @@ public record CliOptions(String command, String database, Path path, String serv
 		}
 		if (path != null && server != null) {
 			throw new IllegalArgumentException("--path and --server are alternatives; pass one");
+		}
+		if (command != null && PATH_ONLY.contains(command) && server != null) {
+			throw new IllegalArgumentException("'" + command + "' works on the store's files and cannot go through "
+				+ "--server. Use --path=<root>" + (command.equals("database migrate")
+					? ", with the server stopped: a migration rewrites the files a running server has mapped."
+					: ". It takes no lock, so it works while a server is running."));
+		}
+		if (dryRun && !"database migrate".equals(command)) {
+			throw new IllegalArgumentException("--dry-run applies to 'database migrate' only");
 		}
 		if (command != null && command.startsWith(AUTH_PREFIX) && server != null) {
 			throw new IllegalArgumentException("'" + command + "' works on the identity file directly and cannot go "
@@ -144,6 +167,7 @@ public record CliOptions(String command, String database, Path path, String serv
 		String password = null;
 		boolean force = false;
 		boolean quiet = false;
+		boolean dryRun = false;
 		List<String> words = new ArrayList<>();
 
 		String value;
@@ -167,6 +191,8 @@ public record CliOptions(String command, String database, Path path, String serv
 				force = true;
 			} else if (argument.equals("--quiet") || argument.equals("-q")) {
 				quiet = true;
+			} else if (argument.equals("--dry-run")) {
+				dryRun = true;
 			} else if (argument.startsWith("--path=")) {
 				path = Path.of(after(argument));
 			} else if (argument.startsWith("--server=")) {
@@ -221,7 +247,7 @@ public record CliOptions(String command, String database, Path path, String serv
 			}
 		}
 		return new CliOptions(command, database, path, server, file, force, quiet, arguments, password,
-			read(env, "GRAPH_TOKEN"));
+			read(env, "GRAPH_TOKEN"), dryRun);
 	}
 
 	/**
@@ -267,13 +293,15 @@ public record CliOptions(String command, String database, Path path, String serv
 
 	public static String usage() {
 		StringBuilder out = new StringBuilder("""
-			metaloom-graph-cli — back up and restore a MetaLoom graph database, and recover access to one
+			metaloom-graph-cli — back up, restore and migrate a MetaLoom graph database, and recover access to one
 
 			USAGE
 			  metaloom-graph-cli database backup  [<database>] (--path=<root> | --server=<url>) --out=<file>
 			  metaloom-graph-cli database restore [<database>] (--path=<root> | --server=<url>) --in=<file> [--force]
 			  metaloom-graph-cli database list             (--path=<root> | --server=<url>)
 			  metaloom-graph-cli database inspect          --in=<file>
+			  metaloom-graph-cli database info    [<database>] --path=<root>
+			  metaloom-graph-cli database migrate [<database>] --path=<root> [--dry-run]
 
 			  metaloom-graph-cli auth reset-admin  --path=<root> [--password=<pw> | --password-stdin]
 			  metaloom-graph-cli auth list         --path=<root>
@@ -281,6 +309,19 @@ public record CliOptions(String command, String database, Path path, String serv
 			  metaloom-graph-cli auth role         --path=<root> add <name> | drop <name>
 			  metaloom-graph-cli auth grant        --path=<root> <role> <PRIVILEGE> <database|*>
 			  metaloom-graph-cli auth revoke       --path=<root> <role> <PRIVILEGE> <database|*>
+
+			MIGRATING A STORE
+			  A build reads exactly one store format version, and refuses an older store with a message
+			  naming 'database migrate'. 'database info' prints a store's version without opening it.
+
+			  'database migrate' copies the store beside itself, runs every migration step on the copy,
+			  opens the copy and verifies it, and only then swaps it in. The original is kept as
+			  <database>.pre-migration-v<N> in the root; delete it once the migrated store is checked.
+			  A failure leaves the original untouched; a crash is finished by running it again.
+
+			  The server must be stopped, and the store must have been closed cleanly: committed work
+			  still in the log can only be replayed by the build that wrote it. --dry-run prints the
+			  plan and anything that would stop it, changes nothing, and exits 1 if it could not run.
 
 			THE AUTH COMMANDS
 			  They edit <root>/.auth/, which holds the users, roles and grants. They are --path only:
@@ -317,6 +358,7 @@ public record CliOptions(String command, String database, Path path, String serv
 			                    in it is lost, but only once the dump has been read to its end and
 			                    verified: a damaged dump leaves it untouched. For 'auth reset-admin',
 			                    replace an identity file that is corrupt and cannot be read.
+			  --dry-run         For 'database migrate': print the plan, change nothing.
 			  --quiet, -q       No progress on stderr.
 			  --help, -h        This.
 

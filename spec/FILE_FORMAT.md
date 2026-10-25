@@ -5,7 +5,8 @@ record layouts. Adjacency internals are in [RELATIONSHIP_STORAGE.md](RELATIONSHI
 property internals are in [PROPERTY_STORAGE.md](PROPERTY_STORAGE.md); the WAL is in
 [WAL.md](WAL.md).
 
-Format version described here: **v1**.
+Store format version described here: **4** (`StoreFormat.CURRENT_VERSION`). What that number covers, the other
+version fields in the store, and how a store moves from one version to the next are in [MIGRATION.md](MIGRATION.md).
 
 ---
 
@@ -110,7 +111,7 @@ silently misreading.
 ```
 offset size field
 0      8    magic            "MLGSSEG\0"
-8      4    format_version   1
+8      4    format_version   2 — the superblock's own version, see §10
 12     4    kind
 16     4    segment_number
 20     4    page_size
@@ -209,27 +210,32 @@ already in cache.
 
 ## 4. Manifest
 
-`MANIFEST` is a 8 KiB file holding two 4 KiB copies, flipped exactly like a superblock.
+`MANIFEST` is a 8 KiB file holding two 4 KiB copies, flipped exactly like a superblock. The layout as `Manifest`
+writes it:
 
 ```
 offset size field
-0      8    magic            "MLGSMAN\0"
-8      4    format_version
+0      8    magic            "MLGSMAN\0"                 frozen in every version (MIGRATION.md §2.3)
+8      4    format_version   the store format version     frozen; 3 means 4 without vectors (MIGRATION.md §2.2)
 12     4    page_size
-16     16   store_uuid
-32     8    manifest_sequence
-40     8    checkpoint_lsn        start of the last completed checkpoint
-48     8    wal_min_lsn           oldest LSN still required for recovery
-56     8    next_txn_id
-64     8    oldest_valid_ts       snapshot retention horizon
-72     8x8  segment_count[kind]   one per kind 0..7
-136    8    label_dict_root
-144    8    key_dict_root
-152    8    index_catalog_root
-160    8    flags
-168    ...  reserved
-4092   4    crc32c
+16     8    segment_capacity
+24     16   store_uuid       hi, then lo
+40     8    manifest_sequence                             frozen; the higher valid copy is active
+48     8    checkpoint_lsn        where recovery starts; the end of the last checkpoint's records
+56     8    wal_min_lsn           oldest LSN still required for recovery
+64     8    next_txn_id
+72     4    vec_stride            VEC record size, 0 = no vector storage
+76     4    vec_dimensions
+80     8    feature_flags         bit 0: vector storage. An unknown bit is refused
+88     ...  reserved (zero)
+4092   4    crc32c                over bytes 0..4091         frozen
 ```
+
+There is no per-kind segment count, label or key dictionary root, or index catalog root here, though earlier
+revisions of this section listed them: segment sets are found by listing `seg/<kind>/`, the dictionaries are the two
+files in `dict/`, and the index catalog is slot 0 of the first `INDEX` segment, where a transaction can change it
+([INDEX.md](INDEX.md)). The log segment size is not recorded either; it is the length of the preallocated `wal-*.log`
+files.
 
 The manifest flip is the store's **commit point for metadata**: adding a segment, completing a
 checkpoint, and advancing the WAL retention horizon all become visible atomically when the new copy
@@ -499,13 +505,26 @@ records returns wrong answers rather than slow ones.
 
 ## 10. Format Versioning
 
-- `format_version` lives in the manifest and in every superblock; they must agree.
-- A reader refuses to open a store with a higher `format_version` than it knows.
-- Strides and `DATA_START` are **frozen** per version. New fields use reserved bytes only.
-- A version bump ships with an offline converter that rewrites segments; there is no in-place
-  upgrade of a stride.
-- `page_size` is fixed at store creation and cannot be changed without a full rewrite. It is
-  recorded in the manifest and validated against every superblock at open.
+The whole procedure is [MIGRATION.md](MIGRATION.md). In short:
+
+- **The store format version** lives in the manifest at offset 8 and names the whole layout of the store directory —
+  every region, record and codec in this file, the dictionaries and the log. It is **4**; a store without vectors
+  still writes it as 3 ([MIGRATION.md §2.2](MIGRATION.md#22-the-legacy-encoding-and-its-end)).
+- **A reader accepts exactly one version.** `GraphStore.open` refuses an older store with a
+  `MigrationRequiredException` naming `metaloom-graph-cli database migrate`, and a newer one outright. Nothing is
+  upgraded on open.
+- **The segment superblock carries a version of its own**, `format_version` = 2 at offset 8, checked with `!=` along
+  with the geometry fields. It is a local guard: it moves when the superblock's layout does, and always together with
+  the store version, never instead of it. It did not move for multi-label nodes or vectors, whose changes were outside
+  the superblock.
+- **Strides and `DATA_START` are frozen per store version.** New fields use reserved bytes, and when the zeros an
+  older store holds there mean exactly the old behaviour, no bump is needed (`gen_floor` in §3.3 is the precedent).
+- **A bump ships with a migration step** that rewrites a copy of the store from version N to N + 1, and with a new
+  golden fixture; `GoldenFixtureTest` fails a layout change that comes without one
+  ([MIGRATION.md §6](MIGRATION.md#6-changing-the-format-the-procedure)). There is still no in-place upgrade of a
+  stride: the step rewrites the copy, and the original is kept.
+- `page_size`, `segment_capacity` and the vector dimension are geometry, not format: fixed at store creation,
+  recorded in the manifest and validated against every superblock at open. Changing them is a dump and a restore.
 
 ---
 
@@ -549,8 +568,12 @@ records returns wrong answers rather than slow ones.
   batches and inside one, roll the data files back to a pre-compaction snapshot while keeping the
   log, and assert the store is complete and consistent at every stopping point and that rerunning the
   compaction still finishes the job.
-- **Golden file test**: a byte-exact expected segment for a fixed small graph, regenerated only on a
-  deliberate format change. This is the tripwire for accidental layout drift.
+- **Golden fixture test** (`GoldenFixtureTest`, `GoldenFixtureMigrationTest`): a small store written by the build
+  that defined each format version is committed under `graph-core/src/test/resources/format/v<N>/`, and the current
+  build must read it back exactly — through the data and through every index — and must migrate every older one to the
+  current version. Not byte-exact segments: a store's bytes include a random UUID and timestamps, and what matters is
+  that the bytes still *mean* the same thing. This is the tripwire for accidental layout drift
+  ([MIGRATION.md §6](MIGRATION.md#6-changing-the-format-the-procedure)).
 
 ---
 
@@ -571,7 +594,7 @@ records returns wrong answers rather than slow ones.
 - [x] Hole punching for all-free pages
 - [x] Compaction: downward relocation, per-batch forwarding map, full reference rewrite
 - [x] High water mark shrink, empty segment retirement, adjacency and index rebuild
-- [ ] Golden-file layout test
+- [x] Golden fixture test, and a migration process for the next format change ([MIGRATION.md](MIGRATION.md))
 
 ---
 
@@ -589,8 +612,10 @@ records returns wrong answers rather than slow ones.
 | `Compactor` | `io.metaloom.graph.core.maintenance` | Segment compaction: relocation, reference rewrite, retirement |
 | `ForwardingMap` | `io.metaloom.graph.core.maintenance` | Old to new ids for one batch, by full id and by 48-bit location |
 | `MaintenanceRunner` | `io.metaloom.graph.core.maintenance` | How a maintenance task gets a batch into a transaction |
+| `StoreFormat` | `io.metaloom.graph.core.api` | The store format version, and `inspect` for a store of any version |
+| `MigrationRunner` | `io.metaloom.graph.core.migration` | A store from an older version to the current one — [MIGRATION.md](MIGRATION.md) |
 
 ---
 
-_Git HEAD revision: `e4601d1`_
-_Last updated: 2026-08-15_
+_Git HEAD revision: `8f8caad`_
+_Last updated: 2026-10-25 (store format version 4 defined, manifest layout corrected to the code, versioning moved to MIGRATION.md)_

@@ -234,6 +234,10 @@ public final class TransactionManager {
 			if (versions.retainedBytes() <= retainedBytesBudget) {
 				break;
 			}
+			// Told before it leaves the active set, and so before anything it needs is cut: once it is out of the set it
+			// stops being a reason for a commit to keep before-images, and the horizon need not rise past it at all
+			// while an older writer is registered — see Snapshot#abandoned.
+			snapshot.abandon();
 			active.remove(snapshot.id());
 			abandoned.incrementAndGet();
 			reclaimed += versions.vacuum(oldestActiveLsn(currentLsn));

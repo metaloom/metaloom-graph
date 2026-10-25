@@ -157,10 +157,10 @@ public class NativeReclaimTest {
 			}
 			store.checkpoint();
 			io.metaloom.graph.core.segment.SegmentFile segment = ((io.metaloom.graph.core.store.GraphStoreImpl) store)
-				.segments(io.metaloom.graph.core.id.Kind.NODE).segments().get(0);
+				.segments(io.metaloom.graph.core.api.Kind.NODE).segments().get(0);
 			io.metaloom.graph.core.segment.Geometry geometry = ((io.metaloom.graph.core.store.GraphStoreImpl) store)
 				.geometry();
-			assertTrue(NativeLib.punchHole(segment.path(), geometry.dataStart(io.metaloom.graph.core.id.Kind.NODE),
+			assertTrue(NativeLib.punchHole(segment.path(), geometry.dataStart(io.metaloom.graph.core.api.Kind.NODE),
 				geometry.pageSize()), "the punch itself must succeed");
 			store.verify(io.metaloom.graph.core.api.VerifyLevel.FULL);
 			assertEquals(1000 - 128, store.stats().nodeCount());

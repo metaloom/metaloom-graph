@@ -40,9 +40,15 @@ package io.metaloom.graph.core.api;
  * on it beyond that equivalence.
  * </p>
  *
+ * <p>
+ * <b>Sealed</b>: the engine is the only implementation, so a method can be added to this interface without breaking a
+ * caller — which is what lets the API lock count such an addition as compatible (spec/API_LOCK.md).
+ * </p>
+ *
  * @see <a href="../../../../../../../../spec/RELATIONSHIP_STORAGE.md">spec/RELATIONSHIP_STORAGE.md</a> section 5.4
  */
-public interface NeighbourCursor extends AutoCloseable {
+public sealed interface NeighbourCursor extends AutoCloseable
+	permits io.metaloom.graph.core.store.GraphStoreImpl.NeighbourWalk {
 
 	/**
 	 * Advances to the next edge, decoding a block only when the entries of the previous one have run out.

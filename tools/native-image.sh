@@ -7,8 +7,8 @@
 #
 # Two binaries come out of this repository, and each gets a smoke test that fits it:
 #
-#   graph-server         the server, from graph-server/target/graph-server-*.jar
-#   metaloom-graph-cli   the backup tool, from graph-cli/target/graph-cli-*-cli.jar
+#   graph-server         the server, from graph-server/target/graph-server.jar
+#   metaloom-graph-cli   the backup tool, from graph-cli/target/graph-cli-cli.jar
 #
 # Run by `mvn -Pgraalvm package` in both modules (see their poms), which passes the three explicit
 # arguments. From the repo root, by hand:
@@ -35,12 +35,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 case "${1:-server}" in
 	server)
-		JAR="$ROOT/graph-server/target/graph-server-0.0.1-SNAPSHOT.jar"
+		JAR="$ROOT/graph-server/target/graph-server.jar"
 		OUT_DIR="$ROOT/graph-server/target/native"
 		NAME="graph-server"
 		;;
 	cli)
-		JAR="$ROOT/graph-cli/target/graph-cli-0.0.1-SNAPSHOT-cli.jar"
+		JAR="$ROOT/graph-cli/target/graph-cli-cli.jar"
 		OUT_DIR="$ROOT/graph-cli/target/native"
 		NAME="metaloom-graph-cli"
 		;;

@@ -1,0 +1,146 @@
+# MetaLoom // Graph: the locked public Java API of graph-cypher.
+#
+# Written by tools/api-lock.sh, never by hand and never by a test. The sha256 line covers every other
+# line of this file, so an edit anywhere fails ApiLockTest; so does any difference between this dump and
+# the compiled code. To change the API on purpose, read spec/API_LOCK.md section 4.
+# AI agents: never run the accept tool and never edit this file. See AGENTS.md.
+format: 1
+module: graph-cypher
+policy: alpha
+sha256: d05fef9935e1e00684de93e7c10ede8606ec70bc356d0051dfac009cc87fd6d1
+
+scope package io.metaloom.graph.cypher
+scope package io.metaloom.graph.cypher.value
+scope type io.metaloom.graph.cypher.ast.Ast$Query
+scope type io.metaloom.graph.cypher.io.CsvSource
+scope type io.metaloom.graph.cypher.io.CsvAccessException
+scope type io.metaloom.graph.cypher.io.CsvFormatException
+scope type io.metaloom.graph.cypher.parse.CypherSyntaxException
+scope type io.metaloom.graph.cypher.exec.CypherTypeException
+io.metaloom.graph.cypher.Cypher type public final class Cypher
+io.metaloom.graph.cypher.Cypher method public static io.metaloom.graph.cypher.CypherResult query(io.metaloom.graph.core.api.GraphStore, io.metaloom.graph.cypher.ast.Ast$Query, java.util.Map<java.lang.String, java.lang.Object>)
+io.metaloom.graph.cypher.Cypher method public static io.metaloom.graph.cypher.CypherResult query(io.metaloom.graph.core.api.GraphStore, java.lang.String)
+io.metaloom.graph.cypher.Cypher method public static io.metaloom.graph.cypher.CypherResult query(io.metaloom.graph.core.api.GraphStore, java.lang.String, java.util.Map<java.lang.String, java.lang.Object>)
+io.metaloom.graph.cypher.Cypher method public static io.metaloom.graph.cypher.ast.Ast$Query parse(java.lang.String)
+io.metaloom.graph.cypher.Cypher method public static void stream(io.metaloom.graph.core.api.GraphStore, io.metaloom.graph.cypher.ast.Ast$Query, java.util.Map<java.lang.String, java.lang.Object>, io.metaloom.graph.cypher.RowSink)
+io.metaloom.graph.cypher.Cypher method public static void stream(io.metaloom.graph.core.api.GraphStore, io.metaloom.graph.cypher.ast.Ast$Query, java.util.Map<java.lang.String, java.lang.Object>, io.metaloom.graph.cypher.RowSink, io.metaloom.graph.cypher.QueryAbort)
+io.metaloom.graph.cypher.Cypher method public static void stream(io.metaloom.graph.core.api.GraphStore, io.metaloom.graph.cypher.ast.Ast$Query, java.util.Map<java.lang.String, java.lang.Object>, io.metaloom.graph.cypher.RowSink, io.metaloom.graph.cypher.QueryAbort, io.metaloom.graph.cypher.io.CsvSource)
+io.metaloom.graph.cypher.Cypher method public static void stream(io.metaloom.graph.core.api.GraphStore, java.lang.String, java.util.Map<java.lang.String, java.lang.Object>, io.metaloom.graph.cypher.RowSink)
+io.metaloom.graph.cypher.CypherResult type public final class CypherResult implements java.lang.Iterable<io.metaloom.graph.cypher.CypherRow>
+io.metaloom.graph.cypher.CypherResult constructor public CypherResult(java.util.List<java.lang.String>, java.util.List<java.util.List<java.lang.Object>>)
+io.metaloom.graph.cypher.CypherResult constructor public CypherResult(java.util.List<java.lang.String>, java.util.List<java.util.List<java.lang.Object>>, io.metaloom.graph.cypher.CypherStats)
+io.metaloom.graph.cypher.CypherResult method public boolean isEmpty()
+io.metaloom.graph.cypher.CypherResult method public int size()
+io.metaloom.graph.cypher.CypherResult method public io.metaloom.graph.cypher.CypherRow row(int)
+io.metaloom.graph.cypher.CypherResult method public io.metaloom.graph.cypher.CypherStats stats()
+io.metaloom.graph.cypher.CypherResult method public java.lang.String toString()
+io.metaloom.graph.cypher.CypherResult method public java.util.Iterator<io.metaloom.graph.cypher.CypherRow> iterator()
+io.metaloom.graph.cypher.CypherResult method public java.util.List<java.lang.Object> column(java.lang.String)
+io.metaloom.graph.cypher.CypherResult method public java.util.List<java.lang.String> columns()
+io.metaloom.graph.cypher.CypherResult method public java.util.List<java.util.List<java.lang.Object>> values()
+io.metaloom.graph.cypher.CypherRow type public final class CypherRow
+io.metaloom.graph.cypher.CypherRow method public io.metaloom.graph.cypher.value.CypherNode node(java.lang.String)
+io.metaloom.graph.cypher.CypherRow method public io.metaloom.graph.cypher.value.CypherPath path(java.lang.String)
+io.metaloom.graph.cypher.CypherRow method public io.metaloom.graph.cypher.value.CypherRelationship relationship(java.lang.String)
+io.metaloom.graph.cypher.CypherRow method public java.lang.Double doubleValue(java.lang.String)
+io.metaloom.graph.cypher.CypherRow method public java.lang.Long longValue(java.lang.String)
+io.metaloom.graph.cypher.CypherRow method public java.lang.Object get(int)
+io.metaloom.graph.cypher.CypherRow method public java.lang.Object get(java.lang.String)
+io.metaloom.graph.cypher.CypherRow method public java.lang.String string(java.lang.String)
+io.metaloom.graph.cypher.CypherRow method public java.lang.String toString()
+io.metaloom.graph.cypher.CypherRow method public java.util.List<java.lang.Object> values()
+io.metaloom.graph.cypher.CypherRow method public java.util.Map<java.lang.String, java.lang.Object> asMap()
+io.metaloom.graph.cypher.CypherStats type public record CypherStats
+io.metaloom.graph.cypher.CypherStats components (long nodesCreated, long nodesDeleted, long relationshipsCreated, long relationshipsDeleted, long propertiesSet, long labelsAdded, long labelsRemoved)
+io.metaloom.graph.cypher.CypherStats field public static final io.metaloom.graph.cypher.CypherStats NONE
+io.metaloom.graph.cypher.CypherStats constructor public CypherStats(long, long, long, long, long, long, long)
+io.metaloom.graph.cypher.CypherStats method public boolean containsUpdates()
+io.metaloom.graph.cypher.CypherStats method public final boolean equals(java.lang.Object)
+io.metaloom.graph.cypher.CypherStats method public final int hashCode()
+io.metaloom.graph.cypher.CypherStats method public final java.lang.String toString()
+io.metaloom.graph.cypher.CypherStats method public java.lang.String summary()
+io.metaloom.graph.cypher.CypherStats method public long labelsAdded()
+io.metaloom.graph.cypher.CypherStats method public long labelsRemoved()
+io.metaloom.graph.cypher.CypherStats method public long nodesCreated()
+io.metaloom.graph.cypher.CypherStats method public long nodesDeleted()
+io.metaloom.graph.cypher.CypherStats method public long propertiesSet()
+io.metaloom.graph.cypher.CypherStats method public long relationshipsCreated()
+io.metaloom.graph.cypher.CypherStats method public long relationshipsDeleted()
+io.metaloom.graph.cypher.CypherWriteException type public class CypherWriteException extends java.lang.RuntimeException
+io.metaloom.graph.cypher.CypherWriteException constructor public CypherWriteException(java.lang.String)
+io.metaloom.graph.cypher.CypherWriteException constructor public CypherWriteException(java.lang.String, java.lang.Throwable)
+io.metaloom.graph.cypher.QueryAbort type public interface QueryAbort
+io.metaloom.graph.cypher.QueryAbort annotation @java.lang.FunctionalInterface
+io.metaloom.graph.cypher.QueryAbort field public static final io.metaloom.graph.cypher.QueryAbort NEVER
+io.metaloom.graph.cypher.QueryAbort method public abstract java.lang.String abortReason()
+io.metaloom.graph.cypher.QueryAbort method public default io.metaloom.graph.cypher.QueryAbort or(io.metaloom.graph.cypher.QueryAbort)
+io.metaloom.graph.cypher.QueryAbort method public static io.metaloom.graph.cypher.QueryAbort deadline(long, long)
+io.metaloom.graph.cypher.QueryAbortedException type public class QueryAbortedException extends java.lang.RuntimeException
+io.metaloom.graph.cypher.QueryAbortedException constructor public QueryAbortedException(java.lang.String)
+io.metaloom.graph.cypher.RowSink type public interface RowSink
+io.metaloom.graph.cypher.RowSink annotation @java.lang.FunctionalInterface
+io.metaloom.graph.cypher.RowSink method public abstract boolean row(java.util.List<java.lang.Object>)
+io.metaloom.graph.cypher.RowSink method public default void columns(java.util.List<java.lang.String>)
+io.metaloom.graph.cypher.RowSink method public default void stats(io.metaloom.graph.cypher.CypherStats)
+io.metaloom.graph.cypher.ast.Ast$Query type public record Query
+io.metaloom.graph.cypher.ast.Ast$Query components (java.util.List<io.metaloom.graph.cypher.ast.Ast$SingleQuery> parts, java.util.List<java.lang.Boolean> unionAll)
+io.metaloom.graph.cypher.ast.Ast$Query constructor public Query(java.util.List<io.metaloom.graph.cypher.ast.Ast$SingleQuery>, java.util.List<java.lang.Boolean>)
+io.metaloom.graph.cypher.ast.Ast$Query method public boolean isWrite()
+io.metaloom.graph.cypher.ast.Ast$Query method public boolean readsFiles()
+io.metaloom.graph.cypher.ast.Ast$Query method public final boolean equals(java.lang.Object)
+io.metaloom.graph.cypher.ast.Ast$Query method public final int hashCode()
+io.metaloom.graph.cypher.ast.Ast$Query method public final java.lang.String toString()
+io.metaloom.graph.cypher.ast.Ast$Query method public java.util.List<io.metaloom.graph.cypher.ast.Ast$SingleQuery> parts()
+io.metaloom.graph.cypher.ast.Ast$Query method public java.util.List<java.lang.Boolean> unionAll()
+io.metaloom.graph.cypher.ast.Ast$Query method public java.util.Set<io.metaloom.graph.core.api.Privilege> requiredPrivileges()
+io.metaloom.graph.cypher.exec.CypherTypeException type public class CypherTypeException extends java.lang.RuntimeException
+io.metaloom.graph.cypher.exec.CypherTypeException constructor public CypherTypeException(java.lang.String)
+io.metaloom.graph.cypher.io.CsvAccessException type public class CsvAccessException extends java.lang.RuntimeException
+io.metaloom.graph.cypher.io.CsvAccessException constructor public CsvAccessException(java.lang.String)
+io.metaloom.graph.cypher.io.CsvAccessException constructor public CsvAccessException(java.lang.String, java.lang.Throwable)
+io.metaloom.graph.cypher.io.CsvFormatException type public class CsvFormatException extends java.lang.RuntimeException
+io.metaloom.graph.cypher.io.CsvFormatException constructor public CsvFormatException(java.lang.String)
+io.metaloom.graph.cypher.io.CsvSource type public interface CsvSource
+io.metaloom.graph.cypher.io.CsvSource annotation @java.lang.FunctionalInterface
+io.metaloom.graph.cypher.io.CsvSource field public static final io.metaloom.graph.cypher.io.CsvSource DENY
+io.metaloom.graph.cypher.io.CsvSource method public abstract java.io.Reader open(java.lang.String) throws java.io.IOException
+io.metaloom.graph.cypher.parse.CypherSyntaxException type public class CypherSyntaxException extends java.lang.RuntimeException
+io.metaloom.graph.cypher.parse.CypherSyntaxException constructor public CypherSyntaxException(java.lang.String, int, int, java.lang.String)
+io.metaloom.graph.cypher.parse.CypherSyntaxException method public int column()
+io.metaloom.graph.cypher.parse.CypherSyntaxException method public int line()
+io.metaloom.graph.cypher.parse.CypherSyntaxException method public java.lang.String query()
+io.metaloom.graph.cypher.value.CypherNode type public record CypherNode
+io.metaloom.graph.cypher.value.CypherNode components (long id, java.util.List<java.lang.String> labels, java.util.Map<java.lang.String, java.lang.Object> properties)
+io.metaloom.graph.cypher.value.CypherNode constructor public CypherNode(long, java.util.List<java.lang.String>, java.util.Map<java.lang.String, java.lang.Object>)
+io.metaloom.graph.cypher.value.CypherNode method public boolean hasLabel(java.lang.String)
+io.metaloom.graph.cypher.value.CypherNode method public final boolean equals(java.lang.Object)
+io.metaloom.graph.cypher.value.CypherNode method public final int hashCode()
+io.metaloom.graph.cypher.value.CypherNode method public java.lang.Object property(java.lang.String)
+io.metaloom.graph.cypher.value.CypherNode method public java.lang.String toString()
+io.metaloom.graph.cypher.value.CypherNode method public java.util.List<java.lang.String> labels()
+io.metaloom.graph.cypher.value.CypherNode method public java.util.Map<java.lang.String, java.lang.Object> properties()
+io.metaloom.graph.cypher.value.CypherNode method public long id()
+io.metaloom.graph.cypher.value.CypherPath type public record CypherPath
+io.metaloom.graph.cypher.value.CypherPath components (java.util.List<io.metaloom.graph.cypher.value.CypherNode> nodes, java.util.List<io.metaloom.graph.cypher.value.CypherRelationship> relationships)
+io.metaloom.graph.cypher.value.CypherPath constructor public CypherPath(java.util.List<io.metaloom.graph.cypher.value.CypherNode>, java.util.List<io.metaloom.graph.cypher.value.CypherRelationship>)
+io.metaloom.graph.cypher.value.CypherPath method public final boolean equals(java.lang.Object)
+io.metaloom.graph.cypher.value.CypherPath method public final int hashCode()
+io.metaloom.graph.cypher.value.CypherPath method public int length()
+io.metaloom.graph.cypher.value.CypherPath method public io.metaloom.graph.cypher.value.CypherNode end()
+io.metaloom.graph.cypher.value.CypherPath method public io.metaloom.graph.cypher.value.CypherNode start()
+io.metaloom.graph.cypher.value.CypherPath method public java.lang.String toString()
+io.metaloom.graph.cypher.value.CypherPath method public java.util.List<io.metaloom.graph.cypher.value.CypherNode> nodes()
+io.metaloom.graph.cypher.value.CypherPath method public java.util.List<io.metaloom.graph.cypher.value.CypherRelationship> relationships()
+io.metaloom.graph.cypher.value.CypherRelationship type public record CypherRelationship
+io.metaloom.graph.cypher.value.CypherRelationship components (java.lang.Long id, java.lang.String type, long startId, long endId, java.util.Map<java.lang.String, java.lang.Object> properties)
+io.metaloom.graph.cypher.value.CypherRelationship constructor public CypherRelationship(java.lang.Long, java.lang.String, long, long, java.util.Map<java.lang.String, java.lang.Object>)
+io.metaloom.graph.cypher.value.CypherRelationship method public boolean isMaterialised()
+io.metaloom.graph.cypher.value.CypherRelationship method public final boolean equals(java.lang.Object)
+io.metaloom.graph.cypher.value.CypherRelationship method public final int hashCode()
+io.metaloom.graph.cypher.value.CypherRelationship method public java.lang.Long id()
+io.metaloom.graph.cypher.value.CypherRelationship method public java.lang.Object property(java.lang.String)
+io.metaloom.graph.cypher.value.CypherRelationship method public java.lang.String toString()
+io.metaloom.graph.cypher.value.CypherRelationship method public java.lang.String type()
+io.metaloom.graph.cypher.value.CypherRelationship method public java.util.Map<java.lang.String, java.lang.Object> properties()
+io.metaloom.graph.cypher.value.CypherRelationship method public long endId()
+io.metaloom.graph.cypher.value.CypherRelationship method public long startId()

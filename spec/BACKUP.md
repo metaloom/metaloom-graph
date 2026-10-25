@@ -16,14 +16,14 @@ has to match, and it does not carry a single byte of the store's on-disk format.
 | | |
 |---|---|
 | **Module** | `graph-cli`, the sixth. `graph-server` depends on it for the format, so there is one encoder |
-| **Binary** | `graph-cli-<version>-cli.jar`, main class `io.metaloom.graph.cli.GraphCli`; or a GraalVM binary, `mvn -Pgraalvm verify` ([GRAALVM.md §10](GRAALVM.md#10-the-second-binary)) |
+| **Binary** | `graph-cli/target/graph-cli-cli.jar` (released as `graph-cli-<version>-cli.jar`), main class `io.metaloom.graph.cli.GraphCli`; or a GraalVM binary, `mvn -Pgraalvm verify` ([GRAALVM.md §10](GRAALVM.md#10-the-second-binary)) |
 | **In a container** | Both images carry it as `metaloom-graph-cli` — §7.1 |
 | **Offline** | `--path=<root>` opens the store directly. Takes the `LOCK`, so the server must not hold it |
 | **Online** | `--server=<url>` drives `GET /api/databases/{name}/backup`, **behind `--allow-backup`** |
 | **Restore** | Offline only. It creates the target from the dump's geometry, which a running server cannot do |
 | **Consistency** | One `SNAPSHOT` view for the whole walk. Writers are **not** stopped |
 | **Ids** | **Not preserved.** §4 |
-| **Format version** | 1, versioned independently of the store format |
+| **Format version** | 1, versioned independently of the store format — which is why a dump is the path between builds that cannot read each other's stores ([MIGRATION.md §7](MIGRATION.md#7-policy)) |
 
 **What this closes.** [OPERATIONS.md §10](OPERATIONS.md) listed "no online backup" as the largest gap
 after authentication, and [PROGRESS.md §7](PROGRESS.md) makes a 1.0 API freeze wait for "at least the
@@ -266,6 +266,9 @@ metaloom-graph-cli database list           --path=/data/graphs
 metaloom-graph-cli database inspect        --in=sales.dump
 ```
 
+The same binary carries `database info` and `database migrate`, which read and migrate a store's on-disk format
+rather than its contents; they are [MIGRATION.md §5](MIGRATION.md#5-the-cli).
+
 - **Options follow `GraphServerOptions`' shape**: a record, a `parse` taking the environment as a
   function, a declared `VARIABLES` list the help text is generated from, and a `HelpRequested` exception
   rather than an exit buried in a parser.
@@ -361,7 +364,12 @@ Two changes, both narrow:
 - **No incremental or point-in-time backup.** The log is trimmed at each checkpoint, so it cannot be
   replayed against an older dump.
 - **No restore over the network** (§6).
-- **No physical snapshot.** `NativeLib.reflink` is still bound and still called by nothing.
+- **No physical snapshot.** `NativeLib.reflink` is bound, and its only caller is the migration's store copy
+  ([MIGRATION.md §4.3](MIGRATION.md#43-the-copy)), which is most of a physical snapshot already: a reflink or sparse
+  copy of a cleanly closed store, without its log.
+- **A dump is not how a store moves to a newer format version.** `metaloom-graph-cli database migrate` does that in
+  place and keeps ids ([MIGRATION.md](MIGRATION.md)). A dump is the way across a version that has no migration path
+  — versions 1 and 2 — and the only way back to an older build.
 - **No compression.** A dump is very compressible and `gzip` is one pipe away; building it in would mean
   choosing a codec on everyone's behalf.
 - **No parallel restore.** The engine has one writer, so there is nothing to parallelise into.
@@ -378,5 +386,5 @@ Two changes, both narrow:
 
 ---
 
-_Git HEAD revision: `f2b6d5f`_
-_Last updated: 2026-10-24 (client, server and CLI review: closed streams, budget leak, slot release order, shutdown grace, strict UTF-8, MCP argument shapes, atomic backups)_
+_Git HEAD revision: `8f8caad`_
+_Last updated: 2026-10-25 (dump versus migration; reflink's first caller)_

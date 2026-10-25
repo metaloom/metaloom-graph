@@ -30,6 +30,10 @@ RELEASE="${RELEASE:-g}"
 IMAGE_TAG="${IMAGE_TAG:-helmtest}"
 HTTP_PORT="${HTTP_PORT:-18080}"
 METRICS_PORT="${METRICS_PORT:-18082}"
+# The administrator's first password, set through the chart's auth.initialPassword: authentication is on,
+# as it is in every default install, and the phases below log in rather than turning it off.
+# Fixed rather than random: --reuse keeps the volume, and with it the identity file the first run wrote.
+GRAPH_PASSWORD="${GRAPH_PASSWORD:-helm-test-password}"
 
 BUILD=0
 CORE_ONLY=0
@@ -118,6 +122,18 @@ check_contains "$rendered" "readOnlyRootFilesystem: true" "root filesystem is re
 check_contains "$rendered" "mountPath: /tmp" "and /tmp is a writable mount, or the native layer would not load"
 check_contains "$rendered" "GRAPH_WIRE_HOST" "the wire host is set explicitly rather than left to the image"
 
+# Helm reads a YAML integer of a million or more as a float and prints it as 1.8e+06, which the server
+# refuses to parse — so the default sessionTimeoutMillis of 1800000 crash-looped every install until the
+# templates piped numbers through int64. Checked with the default and with a large value set by hand.
+check_contains "$rendered" '"1800000"' "a large integer renders as an integer (the default session timeout)"
+large="$(helm template "$RELEASE" "$CHART" --set graph.queryTimeoutMillis=3600000 --set graph.slowQueryMillis=86400000)"
+check_contains "$large" '"3600000"' "and so does one set with --set"
+if echo "$large$rendered" | grep -qE 'value: "?[0-9.]+e\+[0-9]+'; then
+	fail "a value rendered in scientific notation"
+else
+	pass "no value renders in scientific notation"
+fi
+
 # TLS on the binary port. The refusal first, because a chart that mounted an empty secret name would
 # produce a pod stuck in ContainerCreating with the reason three kubectl commands away.
 tls_refusal="$(helm template "$RELEASE" "$CHART" --set wire.tls.enabled=true 2>&1 || true)"
@@ -168,7 +184,7 @@ $KUBECTL apply --dry-run=server -f <(helm template "$RELEASE" "$CHART" -f "$TEST
 section "3. Install"
 helm upgrade --install "$RELEASE" "$CHART" \
 	-f "$TEST_DIR/values/default.yaml" \
-	--set image.tag="$IMAGE_TAG" \
+	--set image.tag="$IMAGE_TAG" --set auth.initialPassword="$GRAPH_PASSWORD" \
 	--wait --timeout 5m >/dev/null 2>&1 || fatal "helm install failed"
 pass "installed"
 graph_wait_ready
@@ -193,7 +209,8 @@ check_contains "$result" "columns" "a Cypher query returns a result"
 
 section "5. Read-only by default"
 status="$(query_status 'CREATE (n:Thing) RETURN n')"
-check_eq "$status" "403" "a write query is refused (no port here has authentication)"
+check_eq "$status" "403" "a write query is refused, even for the administrator"
+check_eq "$(anonymous_query_status)" "401" "and a query with no credential is refused outright"
 
 # ---------------------------------------------------------------- 6. metrics
 
@@ -224,7 +241,7 @@ check_nonempty "${recovery:-}" "recovery time is reported ($recovery ms)"
 section "8. Upgrade"
 helm upgrade "$RELEASE" "$CHART" \
 	-f "$TEST_DIR/values/write-enabled.yaml" \
-	--set image.tag="$IMAGE_TAG" \
+	--set image.tag="$IMAGE_TAG" --set auth.initialPassword="$GRAPH_PASSWORD" \
 	--wait --timeout 5m >/dev/null 2>&1 || fail "helm upgrade failed"
 port_forward_stop
 graph_wait_ready
@@ -243,7 +260,7 @@ port_forward_stop
 check "$KUBECTL get pvc | grep -q data-" "the PVC survived the uninstall"
 helm upgrade --install "$RELEASE" "$CHART" \
 	-f "$TEST_DIR/values/write-enabled.yaml" \
-	--set image.tag="$IMAGE_TAG" \
+	--set image.tag="$IMAGE_TAG" --set auth.initialPassword="$GRAPH_PASSWORD" \
 	--wait --timeout 5m >/dev/null 2>&1 || fail "reinstall failed"
 graph_wait_ready
 port_forward_start

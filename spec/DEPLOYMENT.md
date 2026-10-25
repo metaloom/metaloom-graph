@@ -10,10 +10,12 @@ The security posture every decision here follows from is [OPERATIONS.md §9](OPE
 ## 1. TL;DR
 
 ```bash
+./build.sh                                   # tests, jars, image, chart lint, smoke test; spec/RELEASE.md
+# or by hand:
 mvn -o clean package -DskipTests             # native: mvn -o -Pgraalvm clean verify -DskipTests
-container/build-containers.sh jvm            # or: native, or: both
+container/build-containers.sh jvm            # or: native, or: both — tagged <pom version> (and latest)
 docker run --rm -d --name g -e GRAPH_DEMO=true -e GRAPH_ALLOW_BACKUP=true -p 8080:8080 -p 8082:8082 \
-    metaloom/graph-server:latest
+    metaloom/graph-server:latest              # build-containers.sh prints this line with the exact tag
 docker exec g metaloom-graph-cli database backup default --server=http://localhost:8080 --out=- > g.dump
 
 helm install g helm/metaloom-graph --set graph.demo=true
@@ -187,7 +189,9 @@ helm/test/run.sh --keep       # leave the cluster up afterwards
 helm/test/run.sh --down       # delete it
 ```
 
-Nine phases; **35 assertions, all passing** as of this writing. Three of them are the ones worth having:
+Nine phases; **48 assertions, all passing** against `metaloom/graph-server:0.1.0-alpha.1` as of this writing, with
+authentication on as it is in every default install: the chart gets `auth.initialPassword`, and every phase logs in
+as `admin` (again after each restart, since sessions are in memory). Three of them are the ones worth having:
 
 - **Phase 7 deletes the pod and asserts the same node count comes back.** Everything else here could be true of a
   chart for a stateless service. This is the phase that tests what this project *is*.
@@ -255,7 +259,13 @@ Two consequences of the session table being per process, both stated in `NOTES.t
 
 `helm/test/run.sh` deploys the chart on k3d and runs a real pipeline. Its offline phase now renders the chart with TLS
 on, with TLS-only, and with `wire.tls.enabled` and no secret name — asserting the refusal, the mount mode, and that
-adding a certificate leaves the cleartext port open. A cluster phase that logs in and runs an authenticated query is
-still the obvious next addition and has not been written.
+adding a certificate leaves the cleartext port open. The cluster phases log in and run authenticated queries, and
+phase 5 also asserts an anonymous query is refused with 401.
 
-_Last updated: 2026-08-18 (TLS on the binary port)_
+**It caught a crash loop in every default install, and only it could have.** Helm reads a YAML integer of a million
+or more as a float and prints it as `1.8e+06`, so the default `auth.sessionTimeoutMillis: 1800000` reached the server
+as a value it refuses to parse, and the pod never became ready. `helm lint` and `helm template` are both happy with
+that output. Every numeric value in the StatefulSet now goes through `int64`, and the offline phase asserts that no
+rendered value is in scientific notation — with the defaults and with large values set by hand.
+
+_Last updated: 2026-10-25 (build.sh and version tags in the TL;DR; images tagged with the pom version)_

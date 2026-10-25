@@ -14,8 +14,10 @@ import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
+import io.metaloom.graph.core.api.ForwardingGraphStore;
 import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.Properties;
+import io.metaloom.graph.core.api.ScanOptions;
 import io.metaloom.graph.core.api.Transaction;
 import io.metaloom.graph.core.fixture.TempStore;
 
@@ -79,40 +81,46 @@ public class LazyExecutionTest {
 	 * The store, with its node scan counted.
 	 *
 	 * <p>
-	 * A proxy rather than a hand-written delegate because {@code GraphStore} has forty methods and thirty-eight of them
-	 * would be noise. Counting at the store boundary rather than inside the executor is deliberate: it measures what
-	 * was actually asked of the engine, which is the claim, rather than what the executor believes it asked for.
+	 * A {@link ForwardingGraphStore}, which forwards everything it does not override, so only the three counted
+	 * methods are written out. Counting at the store boundary rather than inside the executor is deliberate: it
+	 * measures what was actually asked of the engine, which is the claim, rather than what the executor believes it
+	 * asked for. (It used to be a dynamic proxy; {@code GraphStore} is sealed now, and a proxy cannot implement it.)
 	 * </p>
 	 */
 	private static GraphStore counting(GraphStore delegate, AtomicInteger nodesRead, AtomicInteger scanCallbacks) {
-		return (GraphStore) java.lang.reflect.Proxy.newProxyInstance(GraphStore.class.getClassLoader(),
-			new Class<?>[] { GraphStore.class }, (proxy, method, args) -> {
-				try {
-					// One call per node the executor turned into a value, whichever access path found it.
-					if (method.getName().equals("nodeLabels")) {
-						nodesRead.incrementAndGet();
-					}
-					if (method.getName().equals("forEachNodeWhile")) {
-						java.util.function.LongPredicate inner = (java.util.function.LongPredicate) args[0];
-						return delegate.forEachNodeWhile(id -> {
-							scanCallbacks.incrementAndGet();
-							return inner.test(id);
-						});
-					}
-					if (method.getName().equals("forEachNode")) {
-						java.util.function.LongConsumer inner = (java.util.function.LongConsumer) args[0];
-						delegate.forEachNode(id -> {
-							scanCallbacks.incrementAndGet();
-							inner.accept(id);
-						});
-						return null;
-					}
-					return method.invoke(delegate, args);
-				} catch (java.lang.reflect.InvocationTargetException e) {
-					// Or every store failure would reach the test as a reflection wrapper.
-					throw e.getCause();
-				}
-			});
+		return new ForwardingGraphStore(delegate) {
+
+			@Override
+			public List<String> nodeLabels(long nodeId) {
+				// One call per node the executor turned into a value, whichever access path found it.
+				nodesRead.incrementAndGet();
+				return super.nodeLabels(nodeId);
+			}
+
+			@Override
+			public boolean forEachNodeWhile(java.util.function.LongPredicate consumer) {
+				return super.forEachNodeWhile(id -> {
+					scanCallbacks.incrementAndGet();
+					return consumer.test(id);
+				});
+			}
+
+			@Override
+			public boolean forEachNodeWhile(java.util.function.LongPredicate consumer, ScanOptions options) {
+				return super.forEachNodeWhile(id -> {
+					scanCallbacks.incrementAndGet();
+					return consumer.test(id);
+				}, options);
+			}
+
+			@Override
+			public void forEachNode(java.util.function.LongConsumer consumer) {
+				super.forEachNode(id -> {
+					scanCallbacks.incrementAndGet();
+					consumer.accept(id);
+				});
+			}
+		};
 	}
 
 	private List<List<Object>> run(String query) {

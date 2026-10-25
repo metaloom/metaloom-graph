@@ -16,12 +16,15 @@ maintainers:
 # Changelog, newest first. Kept here rather than in a separate file so that whoever bumps the version
 # has to look at what changed, and so `helm show chart` carries it.
 #
-#   0.1.0  First release. StatefulSet with one replica, four ports, /health and /ready probes.
-#          NOT upgradeable from anything, and note that persistence.size cannot be changed by a
-#          `helm upgrade` — a volumeClaimTemplate is immutable once the StatefulSet exists.
+#   0.1.0-alpha.1  First release, with MetaLoom // Graph 0.1.0-alpha.1. StatefulSet with one
+#                  replica, four ports, /health and /ready probes. A pre-release version on purpose:
+#                  Helm skips it unless asked with --devel or an explicit --version. NOT upgradeable
+#                  from anything, and note that persistence.size cannot be changed by a `helm upgrade`
+#                  — a volumeClaimTemplate is immutable once the StatefulSet exists.
 #
-version: 0.1.0
+version: 0.1.0-alpha.1
 
-# "latest" until the project cuts a release. The image helper falls back to this when image.tag is
-# empty, so a chart user gets whatever the tag points at rather than a version that does not exist.
-appVersion: "latest"
+# The image tag the chart deploys when image.tag is empty: the release this chart version was cut
+# with, never "latest", so the same chart version always deploys the same image. Kept equal to the
+# project version in the root pom.xml; build.sh refuses a release where the two disagree.
+appVersion: "0.1.0-alpha.1"

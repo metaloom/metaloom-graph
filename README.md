@@ -10,7 +10,7 @@ SSD. The defining design constraint:
 
 ## Status
 
-Durable, transactional, indexed, compacting, hardened, with snapshot isolation for readers, an openCypher subset that reads and writes, and a browser UI. 642 Java tests, 17 in the UI and 12 in the Rust crate, plus 30 browser cases on demand.
+Durable, transactional, indexed, compacting, hardened, with snapshot isolation for readers, an openCypher subset that reads and writes, and a browser UI. **First release: 0.1.0-alpha.1** — see [CHANGELOG.md](CHANGELOG.md) for what is in it, what is not, and what an alpha does and does not promise. 1,577 Java tests across seven modules, 17 in the UI and 12 in the Rust crate, plus 30 browser cases on demand and an 11-check smoke test of the built image.
 
 | | |
 |---|---|
@@ -213,9 +213,11 @@ query's peak *server* memory is its widest intermediate result. What streaming b
 memory, a first row that arrives before the last one is found, cancellation, and a deadline the engine
 honours while it scans.
 
-**Both ports require a login; neither has transport security.** A connection presents a credential in
-the handshake and a password crosses in cleartext, so the binary one still binds loopback — a credential
-says who the peer is, and only the network under it says who could read the credential on its way past.
+**Both ports require a login; only the binary port can encrypt.** A connection presents a credential in
+the handshake. On HTTP and on the cleartext binary port a password crosses unencrypted, so the binary port
+binds loopback by default and HTTP expects a proxy in front of it — a credential says who the peer is, and
+only the network under it says who could read the credential on its way past. The TLS listener above is the
+exception.
 [spec/AUTH.md](spec/AUTH.md) is the design. Which transport, and the measured trial that chose it:
 [spec/TRANSPORT_DECISION.md](spec/TRANSPORT_DECISION.md).
 
@@ -224,11 +226,11 @@ says who the peer is, and only the network under it says who could read the cred
 `graph-server` builds a single runnable jar — engine, query language, Vert.x and the UI inside it:
 
 ```bash
-java -jar graph-server/target/graph-server-0.0.1-SNAPSHOT.jar /data/mygraph 8080
+java -jar graph-server/target/graph-server.jar /data/mygraph 8080
 
 # Nothing to look at yet? --demo fills an empty store with an air route network.
-java -jar graph-server/target/graph-server-0.0.1-SNAPSHOT.jar --demo /tmp/demo 8080
-java -jar graph-server/target/graph-server-0.0.1-SNAPSHOT.jar --demo-size=large /tmp/big 8080
+java -jar graph-server/target/graph-server.jar --demo /tmp/demo 8080
+java -jar graph-server/target/graph-server.jar --demo-size=large /tmp/big 8080
 tools/demo-server.sh          # the same thing from the reactor
 ```
 
@@ -272,14 +274,25 @@ stays where it is instead of the whole picture jumping.
 
 ## Building
 
-One command builds everything — three Java modules, the Rust native layer and the React UI:
+One command builds and checks everything the way a release is built — the reactor's tests with the native
+layer required, the jars, the container image, the Helm chart, and a smoke test of the image:
+
+```bash
+./build.sh                 # --help for the options; --release cuts a version (spec/RELEASE.md)
+```
+
+The Maven reactor on its own builds the Java modules, the Rust native layer and the React UI:
 
 ```bash
 mvn clean install
 ```
 
+The jars under `target/` have version-free names — `graph-server/target/graph-server.jar` and
+`graph-cli/target/graph-cli-cli.jar` are the runnable ones — so nothing outside the poms names a version.
+
 The reactor is a parent pom over `graph-core`, `graph-cypher`, `graph-protocol`, `graph-client`,
-`graph-cli` and `graph-server`. `graph-core` drives
+`graph-cli` and `graph-server`, plus `graph-api-lock`, the test-scope tooling that locks the public Java API of
+the four library modules ([spec/API_LOCK.md](spec/API_LOCK.md)). `graph-core` drives
 `cargo` through the exec plugin at four points: **build** before compile, **package** the resulting
 shared object into the jar under its platform classifier, **test** the crate with
 `cargo test` and `clippy -D warnings` during `mvn test`, and **clean** the crate's target directory
@@ -288,7 +301,7 @@ during `mvn clean`. `graph-server` drives `npm` on the same terms — install, b
 jar.
 
 ```bash
-mvn test              # the suite across six modules, the UI's own 17, and the Rust crate's 12
+mvn test              # the suite across seven modules (API locks included), the UI's own 17, and the Rust crate's 12
 mvn test -Pslow       # adds the scaling curve, the soak and the long-running reader
 mvn test -Pbench      # adds the benchmarks and the performance gates
 mvn test -Pall-tests  # everything
@@ -299,7 +312,7 @@ mvn test -Phuge -Dtest=GraphScaleBenchmark   # 10M nodes + 20M edges: 11 min, 6.
 
 | Flag | |
 |---|---|
-| `-Dnative.skip=true` | Build with no native layer at all, even where `cargo` is present, **and do not load one that an earlier build left behind**. The whole suite passes on the pure-Java path — 584 tests, 23 skipped rather than 3 — and this is how that is checked. |
+| `-Dnative.skip=true` | Build with no native layer at all, even where `cargo` is present, **and do not load one that an earlier build left behind**. The whole suite passes on the pure-Java path, with the native-only tests skipped, and this is how that is checked; CI runs both. |
 | `-Dui.skip=true` | Build with no browser UI, even where `npm` is present. The API is unaffected and the index page says the bundle is missing. |
 | `-Poffline` | Passes cargo's and npm's offline flags, for warm caches with no network. Pairs with `mvn -o`. |
 | `-DskipTests` | Skips the Rust and UI tests too, not only the Java ones. |
@@ -363,6 +376,22 @@ without the compiled CLI that image could not be backed up from the inside at al
 ```bash
 docker exec g metaloom-graph-cli database backup default --server=http://localhost:8080 --out=- > g.dump
 ```
+
+### Upgrading across an on-disk format version
+
+A build reads exactly one store format version (4 today) and refuses an older store with a message naming the
+command that migrates it — it never upgrades on open. With the server stopped:
+
+```bash
+metaloom-graph-cli database info    default --path=/data/graphs              # the store's version; no lock taken
+metaloom-graph-cli database migrate default --path=/data/graphs --dry-run    # the plan; changes nothing
+metaloom-graph-cli database migrate default --path=/data/graphs              # copy, migrate, verify(FULL), swap
+```
+
+The original is kept beside it as `default.pre-migration-v<N>`, a failure leaves it untouched, and a crash is finished
+by running the command again. [spec/MIGRATION.md](spec/MIGRATION.md) is the design and the procedure every format
+change follows; [spec/OPERATIONS.md §5.1](spec/OPERATIONS.md#51-upgrading-across-a-store-format-version) is the
+checklist.
 
 ## Specification
 

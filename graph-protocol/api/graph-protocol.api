@@ -1,0 +1,167 @@
+# MetaLoom // Graph: the locked public Java API of graph-protocol.
+#
+# Written by tools/api-lock.sh, never by hand and never by a test. The sha256 line covers every other
+# line of this file, so an edit anywhere fails ApiLockTest; so does any difference between this dump and
+# the compiled code. To change the API on purpose, read spec/API_LOCK.md section 4.
+# AI agents: never run the accept tool and never edit this file. See AGENTS.md.
+format: 1
+module: graph-protocol
+policy: alpha
+sha256: c645793e2ef58d79462154796f13de982f434ee9fe7db1aaf7ae0b2cc042a701
+
+scope package io.metaloom.graph.protocol
+io.metaloom.graph.protocol.Credentials type public record Credentials
+io.metaloom.graph.protocol.Credentials components (java.lang.String user, java.lang.String password)
+io.metaloom.graph.protocol.Credentials constructor public Credentials(java.lang.String, java.lang.String)
+io.metaloom.graph.protocol.Credentials method public final boolean equals(java.lang.Object)
+io.metaloom.graph.protocol.Credentials method public final int hashCode()
+io.metaloom.graph.protocol.Credentials method public java.lang.String password()
+io.metaloom.graph.protocol.Credentials method public java.lang.String toString()
+io.metaloom.graph.protocol.Credentials method public java.lang.String user()
+io.metaloom.graph.protocol.FrameReader type public final class FrameReader
+io.metaloom.graph.protocol.FrameReader method public static void attach(io.vertx.core.streams.ReadStream<io.vertx.core.buffer.Buffer>, io.metaloom.graph.protocol.FrameReader$FrameHandler, java.util.function.Consumer<io.metaloom.graph.protocol.WireFormatException>)
+io.metaloom.graph.protocol.FrameReader method public static void attach(io.vertx.core.streams.ReadStream<io.vertx.core.buffer.Buffer>, io.metaloom.graph.protocol.FrameReader$FrameHandler, java.util.function.Consumer<io.metaloom.graph.protocol.WireFormatException>, java.util.function.IntSupplier)
+io.metaloom.graph.protocol.FrameReader$FrameHandler type public interface FrameHandler
+io.metaloom.graph.protocol.FrameReader$FrameHandler annotation @java.lang.FunctionalInterface
+io.metaloom.graph.protocol.FrameReader$FrameHandler method public abstract void frame(int, int, io.vertx.core.buffer.Buffer)
+io.metaloom.graph.protocol.Frames type public final class Frames
+io.metaloom.graph.protocol.Frames field public static final int AUTH = 10
+io.metaloom.graph.protocol.Frames field public static final int AUTH_REQUIRED = 9
+io.metaloom.graph.protocol.Frames field public static final int CANCEL = 4
+io.metaloom.graph.protocol.Frames field public static final int COLUMNS = 5
+io.metaloom.graph.protocol.Frames field public static final int COMPLETE = 7
+io.metaloom.graph.protocol.Frames field public static final int CONNECTION_STREAM = 0
+io.metaloom.graph.protocol.Frames field public static final int ERROR = 8
+io.metaloom.graph.protocol.Frames field public static final int HEADER_BYTES = 8
+io.metaloom.graph.protocol.Frames field public static final int HELLO = 1
+io.metaloom.graph.protocol.Frames field public static final int MAX_FRAME_BYTES = 16777216
+io.metaloom.graph.protocol.Frames field public static final int MECHANISM_PASSWORD = 1
+io.metaloom.graph.protocol.Frames field public static final int QUERY = 3
+io.metaloom.graph.protocol.Frames field public static final int ROWS = 6
+io.metaloom.graph.protocol.Frames field public static final int WELCOME = 2
+io.metaloom.graph.protocol.Frames method public static io.vertx.core.buffer.Buffer frame(int, int, io.metaloom.graph.protocol.WireValueCodec$Writer)
+io.metaloom.graph.protocol.Frames method public static io.vertx.core.buffer.Buffer frame(int, int, io.vertx.core.buffer.Buffer)
+io.metaloom.graph.protocol.Frames method public static io.vertx.core.buffer.Buffer header(int, int, int)
+io.metaloom.graph.protocol.Frames method public static java.lang.String typeName(int)
+io.metaloom.graph.protocol.Frames method public static void checkLength(int)
+io.metaloom.graph.protocol.Protocol type public final class Protocol
+io.metaloom.graph.protocol.Protocol field public static final int DEFAULT_PORT = 8081
+io.metaloom.graph.protocol.Protocol field public static final int VERSION = 4
+io.metaloom.graph.protocol.QuerySummary type public record QuerySummary
+io.metaloom.graph.protocol.QuerySummary components (long rows, long elapsedMicros, long nodesCreated, long nodesDeleted, long relationshipsCreated, long relationshipsDeleted, long propertiesSet, long labelsAdded, long labelsRemoved)
+io.metaloom.graph.protocol.QuerySummary field public static final int BYTES = 72
+io.metaloom.graph.protocol.QuerySummary constructor public QuerySummary(long, long, long, long, long, long, long, long, long)
+io.metaloom.graph.protocol.QuerySummary method public boolean containsUpdates()
+io.metaloom.graph.protocol.QuerySummary method public final boolean equals(java.lang.Object)
+io.metaloom.graph.protocol.QuerySummary method public final int hashCode()
+io.metaloom.graph.protocol.QuerySummary method public final java.lang.String toString()
+io.metaloom.graph.protocol.QuerySummary method public long elapsedMicros()
+io.metaloom.graph.protocol.QuerySummary method public long labelsAdded()
+io.metaloom.graph.protocol.QuerySummary method public long labelsRemoved()
+io.metaloom.graph.protocol.QuerySummary method public long nodesCreated()
+io.metaloom.graph.protocol.QuerySummary method public long nodesDeleted()
+io.metaloom.graph.protocol.QuerySummary method public long propertiesSet()
+io.metaloom.graph.protocol.QuerySummary method public long relationshipsCreated()
+io.metaloom.graph.protocol.QuerySummary method public long relationshipsDeleted()
+io.metaloom.graph.protocol.QuerySummary method public long rows()
+io.metaloom.graph.protocol.QuerySummary method public static io.metaloom.graph.protocol.QuerySummary read(io.metaloom.graph.protocol.WireValueCodec$Reader)
+io.metaloom.graph.protocol.QuerySummary method public void write(io.metaloom.graph.protocol.WireValueCodec$Writer)
+io.metaloom.graph.protocol.WireError type public enum WireError
+io.metaloom.graph.protocol.WireError constant CANCELLED ordinal=8
+io.metaloom.graph.protocol.WireError constant CONSTRAINT_VIOLATION ordinal=11
+io.metaloom.graph.protocol.WireError constant INTERNAL ordinal=0
+io.metaloom.graph.protocol.WireError constant NO_SUCH_DATABASE ordinal=9
+io.metaloom.graph.protocol.WireError constant OVERLOADED ordinal=5
+io.metaloom.graph.protocol.WireError constant PROTOCOL ordinal=6
+io.metaloom.graph.protocol.WireError constant READ_ONLY ordinal=10
+io.metaloom.graph.protocol.WireError constant STORE ordinal=4
+io.metaloom.graph.protocol.WireError constant SYNTAX ordinal=1
+io.metaloom.graph.protocol.WireError constant TIMEOUT ordinal=3
+io.metaloom.graph.protocol.WireError constant TYPE ordinal=2
+io.metaloom.graph.protocol.WireError constant UNAUTHENTICATED ordinal=12
+io.metaloom.graph.protocol.WireError constant UNAUTHORIZED ordinal=13
+io.metaloom.graph.protocol.WireError constant UNSUPPORTED_VERSION ordinal=7
+io.metaloom.graph.protocol.WireError method public int code()
+io.metaloom.graph.protocol.WireError method public static io.metaloom.graph.protocol.WireError fromCode(int)
+io.metaloom.graph.protocol.WireError method public static io.metaloom.graph.protocol.WireError valueOf(java.lang.String)
+io.metaloom.graph.protocol.WireError method public static io.metaloom.graph.protocol.WireError[] values()
+io.metaloom.graph.protocol.WireFormatException type public class WireFormatException extends java.lang.RuntimeException
+io.metaloom.graph.protocol.WireFormatException constructor public WireFormatException(java.lang.String)
+io.metaloom.graph.protocol.WireNode type public record WireNode
+io.metaloom.graph.protocol.WireNode components (long id, java.util.List<java.lang.String> labels, java.util.Map<java.lang.String, java.lang.Object> properties)
+io.metaloom.graph.protocol.WireNode constructor public WireNode(long, java.util.List<java.lang.String>, java.util.Map<java.lang.String, java.lang.Object>)
+io.metaloom.graph.protocol.WireNode method public boolean hasLabel(java.lang.String)
+io.metaloom.graph.protocol.WireNode method public final boolean equals(java.lang.Object)
+io.metaloom.graph.protocol.WireNode method public final int hashCode()
+io.metaloom.graph.protocol.WireNode method public java.lang.Object property(java.lang.String)
+io.metaloom.graph.protocol.WireNode method public java.lang.String toString()
+io.metaloom.graph.protocol.WireNode method public java.util.List<java.lang.String> labels()
+io.metaloom.graph.protocol.WireNode method public java.util.Map<java.lang.String, java.lang.Object> properties()
+io.metaloom.graph.protocol.WireNode method public long id()
+io.metaloom.graph.protocol.WirePath type public record WirePath
+io.metaloom.graph.protocol.WirePath components (java.util.List<io.metaloom.graph.protocol.WireNode> nodes, java.util.List<io.metaloom.graph.protocol.WireRelationship> relationships)
+io.metaloom.graph.protocol.WirePath constructor public WirePath(java.util.List<io.metaloom.graph.protocol.WireNode>, java.util.List<io.metaloom.graph.protocol.WireRelationship>)
+io.metaloom.graph.protocol.WirePath method public final boolean equals(java.lang.Object)
+io.metaloom.graph.protocol.WirePath method public final int hashCode()
+io.metaloom.graph.protocol.WirePath method public int length()
+io.metaloom.graph.protocol.WirePath method public io.metaloom.graph.protocol.WireNode end()
+io.metaloom.graph.protocol.WirePath method public io.metaloom.graph.protocol.WireNode start()
+io.metaloom.graph.protocol.WirePath method public java.lang.String toString()
+io.metaloom.graph.protocol.WirePath method public java.util.List<io.metaloom.graph.protocol.WireNode> nodes()
+io.metaloom.graph.protocol.WirePath method public java.util.List<io.metaloom.graph.protocol.WireRelationship> relationships()
+io.metaloom.graph.protocol.WireRelationship type public record WireRelationship
+io.metaloom.graph.protocol.WireRelationship components (java.lang.Long id, java.lang.String type, long startId, long endId, java.util.Map<java.lang.String, java.lang.Object> properties)
+io.metaloom.graph.protocol.WireRelationship constructor public WireRelationship(java.lang.Long, java.lang.String, long, long, java.util.Map<java.lang.String, java.lang.Object>)
+io.metaloom.graph.protocol.WireRelationship method public boolean isMaterialised()
+io.metaloom.graph.protocol.WireRelationship method public final boolean equals(java.lang.Object)
+io.metaloom.graph.protocol.WireRelationship method public final int hashCode()
+io.metaloom.graph.protocol.WireRelationship method public java.lang.Long id()
+io.metaloom.graph.protocol.WireRelationship method public java.lang.Object property(java.lang.String)
+io.metaloom.graph.protocol.WireRelationship method public java.lang.String toString()
+io.metaloom.graph.protocol.WireRelationship method public java.lang.String type()
+io.metaloom.graph.protocol.WireRelationship method public java.util.Map<java.lang.String, java.lang.Object> properties()
+io.metaloom.graph.protocol.WireRelationship method public long endId()
+io.metaloom.graph.protocol.WireRelationship method public long startId()
+io.metaloom.graph.protocol.WireValueCodec type public final class WireValueCodec
+io.metaloom.graph.protocol.WireValueCodec field public static final int MAX_DEPTH = 32
+io.metaloom.graph.protocol.WireValueCodec field public static final int REL_MATERIALISED = 1
+io.metaloom.graph.protocol.WireValueCodec field public static final int T_BOOL = 1
+io.metaloom.graph.protocol.WireValueCodec field public static final int T_FLOAT = 3
+io.metaloom.graph.protocol.WireValueCodec field public static final int T_INT = 2
+io.metaloom.graph.protocol.WireValueCodec field public static final int T_LIST = 10
+io.metaloom.graph.protocol.WireValueCodec field public static final int T_MAP = 11
+io.metaloom.graph.protocol.WireValueCodec field public static final int T_NODE = 12
+io.metaloom.graph.protocol.WireValueCodec field public static final int T_NULL = 0
+io.metaloom.graph.protocol.WireValueCodec field public static final int T_PATH = 14
+io.metaloom.graph.protocol.WireValueCodec field public static final int T_REL = 13
+io.metaloom.graph.protocol.WireValueCodec field public static final int T_STRING = 4
+io.metaloom.graph.protocol.WireValueCodec method public static <T> T expect(java.lang.Object, java.lang.Class<T>, java.lang.String)
+io.metaloom.graph.protocol.WireValueCodec method public static java.lang.Object decode(io.metaloom.graph.protocol.WireValueCodec$Reader)
+io.metaloom.graph.protocol.WireValueCodec method public static java.lang.String wellFormed(java.lang.String)
+io.metaloom.graph.protocol.WireValueCodec method public static void encode(io.metaloom.graph.protocol.WireValueCodec$Writer, java.lang.Object)
+io.metaloom.graph.protocol.WireValueCodec method public static void encodeString(io.metaloom.graph.protocol.WireValueCodec$Writer, java.lang.String)
+io.metaloom.graph.protocol.WireValueCodec$Reader type public static final class Reader
+io.metaloom.graph.protocol.WireValueCodec$Reader constructor public Reader(byte[])
+io.metaloom.graph.protocol.WireValueCodec$Reader constructor public Reader(byte[], int, int)
+io.metaloom.graph.protocol.WireValueCodec$Reader method public byte[] bytes(int)
+io.metaloom.graph.protocol.WireValueCodec$Reader method public int i32()
+io.metaloom.graph.protocol.WireValueCodec$Reader method public int position()
+io.metaloom.graph.protocol.WireValueCodec$Reader method public int remaining()
+io.metaloom.graph.protocol.WireValueCodec$Reader method public int u8()
+io.metaloom.graph.protocol.WireValueCodec$Reader method public java.lang.String utf8(int)
+io.metaloom.graph.protocol.WireValueCodec$Reader method public long i64()
+io.metaloom.graph.protocol.WireValueCodec$Reader method public long varint()
+io.metaloom.graph.protocol.WireValueCodec$UnpairedSurrogateException type public static final class UnpairedSurrogateException extends java.lang.IllegalArgumentException
+io.metaloom.graph.protocol.WireValueCodec$Writer type public static final class Writer
+io.metaloom.graph.protocol.WireValueCodec$Writer constructor public Writer()
+io.metaloom.graph.protocol.WireValueCodec$Writer constructor public Writer(int)
+io.metaloom.graph.protocol.WireValueCodec$Writer method public byte[] array()
+io.metaloom.graph.protocol.WireValueCodec$Writer method public byte[] toArray()
+io.metaloom.graph.protocol.WireValueCodec$Writer method public int position()
+io.metaloom.graph.protocol.WireValueCodec$Writer method public void bytes(byte[])
+io.metaloom.graph.protocol.WireValueCodec$Writer method public void i32(int)
+io.metaloom.graph.protocol.WireValueCodec$Writer method public void i64(long)
+io.metaloom.graph.protocol.WireValueCodec$Writer method public void patchI32(int, int)
+io.metaloom.graph.protocol.WireValueCodec$Writer method public void reset()
+io.metaloom.graph.protocol.WireValueCodec$Writer method public void u8(int)
+io.metaloom.graph.protocol.WireValueCodec$Writer method public void varint(long)

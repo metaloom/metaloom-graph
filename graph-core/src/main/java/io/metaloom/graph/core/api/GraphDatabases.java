@@ -231,6 +231,9 @@ public final class GraphDatabases implements AutoCloseable {
 			if (isStoreDirectory(path)) {
 				throw new GraphStoreException("A database '" + name + "' already exists");
 			}
+			// A database half way through a migration swap has no directory for a moment. Creating an empty one there
+			// — which open() does for "default" when it finds none — is refused before the directory is made.
+			io.metaloom.graph.core.migration.MigrationMarker.refuseIfInterrupted(path);
 			Files.createDirectories(path);
 			GraphStore store = GraphStore.open(path, storeOptions == null ? options : storeOptions);
 			open.put(name, store);

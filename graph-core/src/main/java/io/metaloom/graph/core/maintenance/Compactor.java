@@ -15,7 +15,7 @@ import org.slf4j.LoggerFactory;
 import io.metaloom.graph.core.api.CompactionOptions;
 import io.metaloom.graph.core.api.GraphStoreException;
 import io.metaloom.graph.core.id.ElementId;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 import io.metaloom.graph.core.index.IndexCatalog;
 import io.metaloom.graph.core.segment.SegmentSet;
 import io.metaloom.graph.core.store.adj.AdjacencyStore;

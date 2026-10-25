@@ -4,9 +4,14 @@
 #
 #   container/build-containers.sh [jvm|native|both]      (default: jvm)
 #
-#   TAG=1.2.3   the tag to apply (default: latest). The native variant gets a "-native" suffix.
-#   ENGINE      docker or podman (default: whichever is on PATH, docker first)
+#   TAG=1.2.3     the version tag to apply (default: the project version, read from the root pom.xml)
+#   LATEST=false  do not also tag the image "latest" (default: true). The native variant gets a
+#                 "-native" suffix on both tags: <version>-native and latest-native.
+#   ENGINE        docker or podman (default: whichever is on PATH, docker first)
 #   GRAALVM_HOME  for the native build (default: /opt/jvm/graalvm-25)
+#
+# Nothing in here names a version. The jars under target/ have version-free names (finalName in the
+# server and CLI poms), and the tag comes from the pom, so bumping the version is a pom change only.
 #
 # The build context is the REPOSITORY ROOT, not this directory, because the Containerfiles ADD build
 # outputs from graph-server/target. That is also why .dockerignore and .containerignore matter here:
@@ -16,8 +21,20 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WHAT="${1:-jvm}"
-TAG="${TAG:-latest}"
+
+# The project version, read from the root pom rather than asked of Maven (which would need a plugin and,
+# offline, may not have it): the first <version> after the project's own artifactId, so the parent's
+# version, which comes later in the file, is never picked up by mistake.
+VERSION="$(sed -n '/<artifactId>metaloom-graph<\/artifactId>/,/<\/version>/s|.*<version>\(.*\)</version>.*|\1|p' \
+	"$ROOT/pom.xml" | head -n 1)"
+if [ -z "$VERSION" ]; then
+	echo "Could not read the project version from $ROOT/pom.xml" >&2
+	exit 1
+fi
+TAG="${TAG:-$VERSION}"
+LATEST="${LATEST:-true}"
 IMAGE="metaloom/graph-server"
+REVISION="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 ENGINE="${ENGINE:-}"
 if [ -z "$ENGINE" ]; then
@@ -31,32 +48,66 @@ if [ -z "$ENGINE" ]; then
 	fi
 fi
 
-JAR="$ROOT/graph-server/target/graph-server-0.0.1-SNAPSHOT.jar"
+JAR="$ROOT/graph-server/target/graph-server.jar"
 BINARY="$ROOT/graph-server/target/native/graph-server"
 # Both images also carry the backup tool, because a backup that needs a second artifact fetched and
 # version-matched is a backup that gets taken once. Two artifacts per image, so two checks.
-CLI_JAR="$ROOT/graph-cli/target/graph-cli-0.0.1-SNAPSHOT-cli.jar"
+CLI_JAR="$ROOT/graph-cli/target/graph-cli-cli.jar"
 CLI_BINARY="$ROOT/graph-cli/target/native/metaloom-graph-cli"
+
+# The tags for one variant: the version tag, and "latest" unless LATEST=false.
+tag_args() {
+	local suffix="$1"
+	local args=(-t "$IMAGE:$TAG$suffix")
+	if [ "$LATEST" = "true" ]; then
+		args+=(-t "$IMAGE:latest$suffix")
+	fi
+	echo "${args[@]}"
+}
+
+# OCI labels that say which build an image is, so `docker inspect` answers it without running it.
+label_args() {
+	echo "--label org.opencontainers.image.version=$VERSION --label org.opencontainers.image.revision=$REVISION"
+}
 
 build_jvm() {
 	# Checked rather than built: this script does one thing, and a script that silently ran a Maven
-	# build would hide a stale jar behind a fresh image.
+	# build would hide a stale jar behind a fresh image. build.sh at the root is the one that builds.
 	if [ ! -f "$JAR" ]; then
 		echo "No jar at $JAR" >&2
-		echo "Build it first:  mvn -o clean package -DskipTests" >&2
+		echo "Build it first:  mvn -o clean package -DskipTests   (or ./build.sh)" >&2
 		exit 1
 	fi
-	# The -cli classifier, which is the shaded one. graph-cli-<version>.jar without it is the library
-	# graph-server depends on for the dump format, and has no engine inside it — ADDing that one would
-	# produce an image whose CLI fails on the first class it loads.
+	# The -cli classifier, which is the shaded one. graph-cli.jar without it is the library graph-server
+	# depends on for the dump format, and has no engine inside it — ADDing that one would produce an image
+	# whose CLI fails on the first class it loads.
 	if [ ! -f "$CLI_JAR" ]; then
 		echo "No CLI jar at $CLI_JAR" >&2
-		echo "Build it first:  mvn -o clean package -DskipTests" >&2
+		echo "Build it first:  mvn -o clean package -DskipTests   (or ./build.sh)" >&2
 		exit 1
 	fi
+	require_jar_version "$JAR"
+	require_jar_version "$CLI_JAR"
 	warn_about_skipped_parts "$JAR"
-	echo "==> $IMAGE:$TAG  (JVM, from $(basename "$JAR") and $(basename "$CLI_JAR"))"
-	"$ENGINE" build -f "$ROOT/container/Containerfile" -t "$IMAGE:$TAG" "$ROOT"
+	echo "==> $IMAGE:$TAG  (JVM, version $VERSION, revision $REVISION)"
+	# shellcheck disable=SC2046 # the helpers print separate words on purpose
+	"$ENGINE" build -f "$ROOT/container/Containerfile" $(tag_args "") $(label_args) "$ROOT"
+}
+
+#
+# A jar left over from before a version bump has the same version-free file name as the new one, so the
+# name proves nothing. Its manifest does: Implementation-Version is written from ${project.version}.
+#
+require_jar_version() {
+	local jar="$1"
+	local found
+	found="$(unzip -p "$jar" META-INF/MANIFEST.MF 2>/dev/null | tr -d '\r' \
+		| sed -n 's/^Implementation-Version: //p' | head -n 1)"
+	if [ "$found" != "$VERSION" ]; then
+		echo "$(basename "$jar") was built as version '${found:-unknown}', but the pom says $VERSION." >&2
+		echo "It is stale. Rebuild it:  mvn -o clean package -DskipTests   (or ./build.sh)" >&2
+		exit 1
+	fi
 }
 
 #
@@ -94,8 +145,9 @@ build_native() {
 			exit 1
 		fi
 	done
-	echo "==> $IMAGE:$TAG-native  (GraalVM, server and CLI)"
-	"$ENGINE" build -f "$ROOT/container/Containerfile.native" -t "$IMAGE:$TAG-native" "$ROOT"
+	echo "==> $IMAGE:$TAG-native  (GraalVM, server and CLI, version $VERSION, revision $REVISION)"
+	# shellcheck disable=SC2046
+	"$ENGINE" build -f "$ROOT/container/Containerfile.native" $(tag_args "-native") $(label_args) "$ROOT"
 }
 
 case "$WHAT" in

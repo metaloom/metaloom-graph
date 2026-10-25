@@ -59,12 +59,13 @@ import io.metaloom.graph.core.api.VerifyLevel;
 import io.metaloom.graph.core.api.VerifyOptions;
 import io.metaloom.graph.core.catalog.Catalog;
 import io.metaloom.graph.core.id.ElementId;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 import io.metaloom.graph.core.index.HnswIndex;
 import io.metaloom.graph.core.index.IndexCatalog;
 import io.metaloom.graph.core.maintenance.Compactor;
 import io.metaloom.graph.core.maintenance.MaintenanceRunner;
 import io.metaloom.graph.core.metrics.IoCounters;
+import io.metaloom.graph.core.migration.MigrationMarker;
 import io.metaloom.graph.core.nativelib.NativeLib;
 import io.metaloom.graph.core.txn.MetaJournal;
 import io.metaloom.graph.core.txn.WriteContext;
@@ -402,6 +403,9 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	}
 
 	public static GraphStoreImpl open(Path path, GraphStoreOptions options) throws IOException {
+		// Before the directory is created: past the verified point of an interrupted migration the original may have
+		// been renamed away, and creating an empty store in its place is the one thing that must not happen then.
+		MigrationMarker.refuseIfInterrupted(path);
 		Files.createDirectories(path);
 
 		FileChannel lockChannel = FileChannel.open(path.resolve("LOCK"), StandardOpenOption.CREATE,
@@ -2807,7 +2811,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	 * @param lease
 	 *            the read view to release on close, or null when the caller holds one for the duration
 	 */
-	private final class NeighbourWalk implements NeighbourCursor {
+	public final class NeighbourWalk implements NeighbourCursor {
 
 		private final long nodeId;
 		private final Direction direction;

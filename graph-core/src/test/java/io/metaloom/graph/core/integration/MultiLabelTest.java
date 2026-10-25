@@ -397,10 +397,10 @@ public class MultiLabelTest {
 			java.lang.reflect.Field field = impl.getClass().getDeclaredField("segmentSets");
 			field.setAccessible(true);
 			@SuppressWarnings("unchecked")
-			java.util.Map<io.metaloom.graph.core.id.Kind, io.metaloom.graph.core.segment.SegmentSet> sets =
-				(java.util.Map<io.metaloom.graph.core.id.Kind, io.metaloom.graph.core.segment.SegmentSet>) field
+			java.util.Map<io.metaloom.graph.core.api.Kind, io.metaloom.graph.core.segment.SegmentSet> sets =
+				(java.util.Map<io.metaloom.graph.core.api.Kind, io.metaloom.graph.core.segment.SegmentSet>) field
 					.get(impl);
-			java.lang.foreign.MemorySegment record = sets.get(io.metaloom.graph.core.id.Kind.NODE).mutable(nodeId);
+			java.lang.foreign.MemorySegment record = sets.get(io.metaloom.graph.core.api.Kind.NODE).mutable(nodeId);
 			record.set(io.metaloom.graph.core.util.Layouts.LONG, 24, 0L);
 			record.set(io.metaloom.graph.core.util.Layouts.LONG, 32, 0L);
 			txn.commit();

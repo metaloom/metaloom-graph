@@ -30,9 +30,14 @@ package io.metaloom.graph.core.api;
  * {@link StoreStats} and gives up on it — with {@link SnapshotTooOldException} — before the heap does.
  * </p>
  *
+ * <p>
+ * <b>Sealed</b>: the engine is the only implementation, so a method can be added to this interface without breaking a
+ * caller — which is what lets the API lock count such an addition as compatible (spec/API_LOCK.md).
+ * </p>
+ *
  * @see <a href="../../../../../../../../spec/TRANSACTIONS.md">spec/TRANSACTIONS.md</a> section 3
  */
-public interface ReadTransaction extends AutoCloseable {
+public sealed interface ReadTransaction extends AutoCloseable permits io.metaloom.graph.core.txn.Snapshot {
 
 	/** The LSN this view is fixed at. Under {@link IsolationLevel#READ_COMMITTED} it is the LSN at begin, and unused. */
 	long snapshotLsn();

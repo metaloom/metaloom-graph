@@ -1,0 +1,118 @@
+# MetaLoom // Graph: the locked public Java API of graph-client.
+#
+# Written by tools/api-lock.sh, never by hand and never by a test. The sha256 line covers every other
+# line of this file, so an edit anywhere fails ApiLockTest; so does any difference between this dump and
+# the compiled code. To change the API on purpose, read spec/API_LOCK.md section 4.
+# AI agents: never run the accept tool and never edit this file. See AGENTS.md.
+format: 1
+module: graph-client
+policy: alpha
+sha256: 41c2f11e2a2098c40852734ee824b22e3626407348935d7f5c4f33b0835c3a08
+
+scope package io.metaloom.graph.client
+io.metaloom.graph.client.ClientOptions type public record ClientOptions
+io.metaloom.graph.client.ClientOptions components (java.time.Duration connectTimeout, int readBufferBytes, int socketReceiveBufferBytes, io.metaloom.graph.protocol.Credentials credentials, io.metaloom.graph.client.ClientTls tls)
+io.metaloom.graph.client.ClientOptions field public static final int DEFAULT_READ_BUFFER_BYTES = 4194304
+io.metaloom.graph.client.ClientOptions field public static final int DEFAULT_SOCKET_RECEIVE_BUFFER_BYTES = 262144
+io.metaloom.graph.client.ClientOptions field public static final java.time.Duration DEFAULT_CONNECT_TIMEOUT
+io.metaloom.graph.client.ClientOptions constructor public ClientOptions(java.time.Duration, int, int)
+io.metaloom.graph.client.ClientOptions constructor public ClientOptions(java.time.Duration, int, int, io.metaloom.graph.protocol.Credentials)
+io.metaloom.graph.client.ClientOptions constructor public ClientOptions(java.time.Duration, int, int, io.metaloom.graph.protocol.Credentials, io.metaloom.graph.client.ClientTls)
+io.metaloom.graph.client.ClientOptions method public final boolean equals(java.lang.Object)
+io.metaloom.graph.client.ClientOptions method public final int hashCode()
+io.metaloom.graph.client.ClientOptions method public int readBufferBytes()
+io.metaloom.graph.client.ClientOptions method public int socketReceiveBufferBytes()
+io.metaloom.graph.client.ClientOptions method public io.metaloom.graph.client.ClientOptions withConnectTimeout(java.time.Duration)
+io.metaloom.graph.client.ClientOptions method public io.metaloom.graph.client.ClientOptions withCredentials(io.metaloom.graph.protocol.Credentials)
+io.metaloom.graph.client.ClientOptions method public io.metaloom.graph.client.ClientOptions withCredentials(java.lang.String, java.lang.String)
+io.metaloom.graph.client.ClientOptions method public io.metaloom.graph.client.ClientOptions withReadBufferBytes(int)
+io.metaloom.graph.client.ClientOptions method public io.metaloom.graph.client.ClientOptions withSocketReceiveBufferBytes(int)
+io.metaloom.graph.client.ClientOptions method public io.metaloom.graph.client.ClientOptions withTls(io.metaloom.graph.client.ClientTls)
+io.metaloom.graph.client.ClientOptions method public io.metaloom.graph.client.ClientTls tls()
+io.metaloom.graph.client.ClientOptions method public io.metaloom.graph.protocol.Credentials credentials()
+io.metaloom.graph.client.ClientOptions method public java.lang.String toString()
+io.metaloom.graph.client.ClientOptions method public java.time.Duration connectTimeout()
+io.metaloom.graph.client.ClientOptions method public long maxBufferedBytes()
+io.metaloom.graph.client.ClientOptions method public static io.metaloom.graph.client.ClientOptions defaults()
+io.metaloom.graph.client.ClientTls type public record ClientTls
+io.metaloom.graph.client.ClientTls components (java.nio.file.Path trustCertificate, boolean trustAll, boolean verifyHostname)
+io.metaloom.graph.client.ClientTls constructor public ClientTls(java.nio.file.Path, boolean, boolean)
+io.metaloom.graph.client.ClientTls method public boolean trustAll()
+io.metaloom.graph.client.ClientTls method public boolean verifyHostname()
+io.metaloom.graph.client.ClientTls method public final boolean equals(java.lang.Object)
+io.metaloom.graph.client.ClientTls method public final int hashCode()
+io.metaloom.graph.client.ClientTls method public final java.lang.String toString()
+io.metaloom.graph.client.ClientTls method public io.metaloom.graph.client.ClientTls withVerifyHostname(boolean)
+io.metaloom.graph.client.ClientTls method public java.nio.file.Path trustCertificate()
+io.metaloom.graph.client.ClientTls method public static io.metaloom.graph.client.ClientTls insecure()
+io.metaloom.graph.client.ClientTls method public static io.metaloom.graph.client.ClientTls system()
+io.metaloom.graph.client.ClientTls method public static io.metaloom.graph.client.ClientTls trusting(java.nio.file.Path)
+io.metaloom.graph.client.GraphClient type public final class GraphClient implements java.lang.AutoCloseable
+io.metaloom.graph.client.GraphClient field public static final java.lang.String DEFAULT_DATABASE = ""
+io.metaloom.graph.client.GraphClient method public io.metaloom.graph.client.GraphClient$Welcome server()
+io.metaloom.graph.client.GraphClient method public io.metaloom.graph.client.RowStream query(java.lang.String)
+io.metaloom.graph.client.GraphClient method public io.metaloom.graph.client.RowStream query(java.lang.String, java.util.Map<java.lang.String, java.lang.Object>)
+io.metaloom.graph.client.GraphClient method public io.metaloom.graph.client.RowStream query(java.lang.String, java.util.Map<java.lang.String, java.lang.Object>, io.metaloom.graph.client.QueryOptions)
+io.metaloom.graph.client.GraphClient method public io.metaloom.graph.protocol.QuerySummary execute(java.lang.String)
+io.metaloom.graph.client.GraphClient method public io.metaloom.graph.protocol.QuerySummary execute(java.lang.String, java.util.Map<java.lang.String, java.lang.Object>)
+io.metaloom.graph.client.GraphClient method public io.metaloom.graph.protocol.QuerySummary execute(java.lang.String, java.util.Map<java.lang.String, java.lang.Object>, io.metaloom.graph.client.QueryOptions)
+io.metaloom.graph.client.GraphClient method public java.lang.String database()
+io.metaloom.graph.client.GraphClient method public static io.metaloom.graph.client.GraphClient connect(io.vertx.core.Vertx, java.lang.String, int, io.metaloom.graph.client.ClientOptions)
+io.metaloom.graph.client.GraphClient method public static io.metaloom.graph.client.GraphClient connect(io.vertx.core.Vertx, java.lang.String, int, java.lang.String, io.metaloom.graph.client.ClientOptions)
+io.metaloom.graph.client.GraphClient method public static io.metaloom.graph.client.GraphClient connect(java.lang.String, int)
+io.metaloom.graph.client.GraphClient method public static io.metaloom.graph.client.GraphClient connect(java.lang.String, int, io.metaloom.graph.client.ClientOptions)
+io.metaloom.graph.client.GraphClient method public static io.metaloom.graph.client.GraphClient connect(java.lang.String, int, java.lang.String)
+io.metaloom.graph.client.GraphClient method public static io.metaloom.graph.client.GraphClient connect(java.lang.String, int, java.lang.String, io.metaloom.graph.client.ClientOptions)
+io.metaloom.graph.client.GraphClient method public static io.metaloom.graph.client.GraphClient login(java.lang.String, int, java.lang.String, java.lang.String, java.lang.String)
+io.metaloom.graph.client.GraphClient method public void close()
+io.metaloom.graph.client.GraphClient$Welcome type public record Welcome
+io.metaloom.graph.client.GraphClient$Welcome components (int version, int maxFrameBytes, int maxConcurrentStreams, java.lang.String database, java.lang.String principal, java.util.List<java.lang.String> grants)
+io.metaloom.graph.client.GraphClient$Welcome constructor public Welcome(int, int, int, java.lang.String, java.lang.String, java.util.List<java.lang.String>)
+io.metaloom.graph.client.GraphClient$Welcome method public boolean authenticated()
+io.metaloom.graph.client.GraphClient$Welcome method public final boolean equals(java.lang.Object)
+io.metaloom.graph.client.GraphClient$Welcome method public final int hashCode()
+io.metaloom.graph.client.GraphClient$Welcome method public final java.lang.String toString()
+io.metaloom.graph.client.GraphClient$Welcome method public int maxConcurrentStreams()
+io.metaloom.graph.client.GraphClient$Welcome method public int maxFrameBytes()
+io.metaloom.graph.client.GraphClient$Welcome method public int version()
+io.metaloom.graph.client.GraphClient$Welcome method public java.lang.String database()
+io.metaloom.graph.client.GraphClient$Welcome method public java.lang.String principal()
+io.metaloom.graph.client.GraphClient$Welcome method public java.util.List<java.lang.String> grants()
+io.metaloom.graph.client.GraphClientException type public class GraphClientException extends java.lang.RuntimeException
+io.metaloom.graph.client.GraphClientException constructor public GraphClientException(java.lang.String)
+io.metaloom.graph.client.GraphClientException constructor public GraphClientException(java.lang.String, java.lang.Throwable)
+io.metaloom.graph.client.QueryFailedException type public class QueryFailedException extends io.metaloom.graph.client.GraphClientException
+io.metaloom.graph.client.QueryFailedException constructor public QueryFailedException(io.metaloom.graph.protocol.WireError, java.lang.String, int, int)
+io.metaloom.graph.client.QueryFailedException method public int column()
+io.metaloom.graph.client.QueryFailedException method public int line()
+io.metaloom.graph.client.QueryFailedException method public io.metaloom.graph.protocol.WireError error()
+io.metaloom.graph.client.QueryOptions type public record QueryOptions
+io.metaloom.graph.client.QueryOptions components (long deadlineMillis)
+io.metaloom.graph.client.QueryOptions field public static final io.metaloom.graph.client.QueryOptions SERVER_DEFAULT
+io.metaloom.graph.client.QueryOptions constructor public QueryOptions(long)
+io.metaloom.graph.client.QueryOptions method public final boolean equals(java.lang.Object)
+io.metaloom.graph.client.QueryOptions method public final int hashCode()
+io.metaloom.graph.client.QueryOptions method public final java.lang.String toString()
+io.metaloom.graph.client.QueryOptions method public long deadlineMillis()
+io.metaloom.graph.client.QueryOptions method public static io.metaloom.graph.client.QueryOptions deadline(java.time.Duration)
+io.metaloom.graph.client.Row type public final class Row
+io.metaloom.graph.client.Row method public io.metaloom.graph.protocol.WireNode node(java.lang.String)
+io.metaloom.graph.client.Row method public io.metaloom.graph.protocol.WirePath path(java.lang.String)
+io.metaloom.graph.client.Row method public io.metaloom.graph.protocol.WireRelationship relationship(java.lang.String)
+io.metaloom.graph.client.Row method public java.lang.Double doubleValue(java.lang.String)
+io.metaloom.graph.client.Row method public java.lang.Long longValue(java.lang.String)
+io.metaloom.graph.client.Row method public java.lang.Object get(int)
+io.metaloom.graph.client.Row method public java.lang.Object get(java.lang.String)
+io.metaloom.graph.client.Row method public java.lang.String string(java.lang.String)
+io.metaloom.graph.client.Row method public java.lang.String toString()
+io.metaloom.graph.client.Row method public java.util.List<java.lang.Object> values()
+io.metaloom.graph.client.Row method public java.util.List<java.lang.String> columns()
+io.metaloom.graph.client.Row method public java.util.Map<java.lang.String, java.lang.Object> asMap()
+io.metaloom.graph.client.RowStream type public final class RowStream implements java.lang.AutoCloseable, java.lang.Iterable<io.metaloom.graph.client.Row>
+io.metaloom.graph.client.RowStream method public boolean hasNext()
+io.metaloom.graph.client.RowStream method public io.metaloom.graph.client.Row next()
+io.metaloom.graph.client.RowStream method public io.metaloom.graph.protocol.QuerySummary summary()
+io.metaloom.graph.client.RowStream method public java.util.Iterator<io.metaloom.graph.client.Row> iterator()
+io.metaloom.graph.client.RowStream method public java.util.List<java.lang.String> columns()
+io.metaloom.graph.client.RowStream method public long rowsRead()
+io.metaloom.graph.client.RowStream method public void close()

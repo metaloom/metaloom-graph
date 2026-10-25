@@ -6,8 +6,8 @@ root — [spec/DATABASES.md](../spec/DATABASES.md). A directory that is itself a
 startup, with the two commands that move it into a root.
 
 ```bash
-java -jar target/graph-server-0.0.1-SNAPSHOT.jar /path/to/store 8080
-java -jar target/graph-server-0.0.1-SNAPSHOT.jar --demo /tmp/demo 8080   # with a graph to look at
+java -jar target/graph-server.jar /path/to/store 8080
+java -jar target/graph-server.jar --demo /tmp/demo 8080   # with a graph to look at
 ../tools/demo-server.sh                                                  # the same, from the reactor
 mvn -pl graph-server exec:java -Dexec.args="--demo /tmp/demo 8080"
 ```

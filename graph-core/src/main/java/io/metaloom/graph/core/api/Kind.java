@@ -1,4 +1,4 @@
-package io.metaloom.graph.core.id;
+package io.metaloom.graph.core.api;
 
 /**
  * Record families. The kind occupies the top 4 bits of every {@link ElementId} and selects the segment directory, the

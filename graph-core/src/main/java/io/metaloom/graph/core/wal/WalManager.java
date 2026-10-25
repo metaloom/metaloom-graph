@@ -16,7 +16,7 @@ import org.slf4j.LoggerFactory;
 
 import io.metaloom.graph.core.api.PageCorruptException;
 import io.metaloom.graph.core.api.WalSyncMode;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 import io.metaloom.graph.core.page.PageOverlay;
 import io.metaloom.graph.core.segment.SegmentFile;
 import io.metaloom.graph.core.segment.SegmentSet;

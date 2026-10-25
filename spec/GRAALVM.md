@@ -221,7 +221,7 @@ recorded by running the shipped jar under the tracing agent and exercising every
 
 ```bash
 java -agentlib:native-image-agent=config-output-dir=<dir> \
-     -jar graph-server/target/graph-server-0.0.1-SNAPSHOT.jar --demo /tmp/store 8123
+     -jar graph-server/target/graph-server.jar --demo /tmp/store 8123
 # then: /api/stats, /api/schema, a table query, a graph query, a syntax error, the index page, the assets
 ```
 
@@ -403,7 +403,7 @@ The two differences from the server's profile are both absences:
 - **No logback**, so nothing has to be initialised at build time and
   [§6](#6-logging-is-baked-in)'s consequence does not apply.
 
-It reads the **shaded** jar, `graph-cli-<version>-cli.jar`. The unclassified artifact is the library
+It reads the **shaded** jar, `graph-cli/target/graph-cli-cli.jar`. The unclassified artifact is the library
 `graph-server` depends on for the dump format and contains no engine; handing that one to
 native-image would produce a binary that failed on the first class it loaded.
 

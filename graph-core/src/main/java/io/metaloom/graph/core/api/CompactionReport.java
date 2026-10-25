@@ -2,7 +2,6 @@ package io.metaloom.graph.core.api;
 
 import java.util.Map;
 
-import io.metaloom.graph.core.id.Kind;
 
 /**
  * What one compaction run actually did.

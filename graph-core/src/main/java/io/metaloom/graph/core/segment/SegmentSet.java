@@ -18,7 +18,7 @@ import java.util.stream.Stream;
 
 import io.metaloom.graph.core.api.OutOfSegmentsException;
 import io.metaloom.graph.core.id.ElementId;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 import io.metaloom.graph.core.id.StaleIdException;
 import io.metaloom.graph.core.metrics.IoCounters;
 import io.metaloom.graph.core.txn.MetaJournal;

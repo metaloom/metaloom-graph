@@ -73,6 +73,7 @@ public final class NativeLib {
 	private static final MethodHandle MADVISE;
 	private static final MethodHandle STATX;
 	private static final MethodHandle IOCTL;
+	private static final MethodHandle LSEEK;
 	private static final boolean AVAILABLE;
 	private static final boolean DIRECT_AVAILABLE;
 
@@ -87,6 +88,7 @@ public final class NativeLib {
 		MethodHandle madvise = null;
 		MethodHandle statx = null;
 		MethodHandle ioctl = null;
+		MethodHandle lseek = null;
 		boolean available = false;
 		boolean direct = false;
 		if (ENABLED) {
@@ -152,6 +154,15 @@ public final class NativeLib {
 			} catch (RuntimeException e) {
 				logger.debug("ioctl is unavailable ({}); reflink cloning will not be offered", e.toString());
 			}
+			// lseek for SEEK_DATA / SEEK_HOLE, so a copy of a sparse segment can jump over its holes instead of reading
+			// gigabytes of zeros to find the few pages that hold anything.
+			try {
+				lseek = linker.downcallHandle(libc.findOrThrow("lseek"),
+					FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG,
+						ValueLayout.JAVA_INT));
+			} catch (RuntimeException e) {
+				logger.debug("lseek is unavailable ({}); sparse copies will read their holes", e.toString());
+			}
 		}
 		FALLOCATE = fallocate;
 		OPEN = open;
@@ -163,6 +174,7 @@ public final class NativeLib {
 		MADVISE = madvise;
 		STATX = statx;
 		IOCTL = ioctl;
+		LSEEK = lseek;
 		AVAILABLE = available;
 		DIRECT_AVAILABLE = direct;
 	}
@@ -432,9 +444,9 @@ public final class NativeLib {
 	 *
 	 * <p>
 	 * Capability N3, and the primitive a snapshot would be built on: cloning a segment file costs no data copy and no
-	 * space until one of the two copies is written to. <b>Nothing in the engine calls this yet</b> — there is no
-	 * backup or snapshot feature to call it — so it is bound, tested for behaviour, and otherwise unused. It is here
-	 * because the alternative when that feature arrives is discovering that the filesystem support was never checked.
+	 * space until one of the two copies is written to. Its one caller is the format migration's store copy
+	 * ({@code StoreCopier}), which makes the working copy of a store instant where the filesystem supports it; a
+	 * snapshot or physical backup would be the second.
 	 * </p>
 	 *
 	 * <p>
@@ -469,6 +481,62 @@ public final class NativeLib {
 
 	public static boolean isReflinkAvailable() {
 		return IOCTL != null;
+	}
+
+	private static final int SEEK_DATA = 3;
+	private static final int SEEK_HOLE = 4;
+
+	/**
+	 * The byte ranges of a file that hold data, as {@code [start, end)} pairs in one flat array, found with
+	 * {@code lseek(SEEK_DATA)} and {@code lseek(SEEK_HOLE)}.
+	 *
+	 * <p>
+	 * What the migration's store copy uses to skip the holes of a sparse segment rather than read them: a store with
+	 * default geometry spans about 15 GiB of segment files when it is empty. A range may still contain zeros — a
+	 * filesystem reports allocation, not content — so this narrows a copy and never replaces looking at the bytes.
+	 * </p>
+	 *
+	 * @return the ranges, or null when this platform or filesystem cannot report them; the caller then treats the
+	 *         whole file as data. Support is probed with {@code SEEK_HOLE} at offset 0, which every filesystem that
+	 *         implements either call answers, so a later {@code -1} from {@code SEEK_DATA} can only mean "no more data"
+	 */
+	public static long[] dataExtents(Path path, long size) {
+		if (LSEEK == null || size <= 0) {
+			return null;
+		}
+		int fd = openFile(path, false, false);
+		if (fd < 0) {
+			return null;
+		}
+		try {
+			if ((long) LSEEK.invokeExact(fd, 0L, SEEK_HOLE) < 0) {
+				return null;
+			}
+			long[] extents = new long[16];
+			int count = 0;
+			long position = 0;
+			while (position < size) {
+				long data = (long) LSEEK.invokeExact(fd, position, SEEK_DATA);
+				if (data < 0 || data >= size) {
+					break;
+				}
+				long hole = (long) LSEEK.invokeExact(fd, data, SEEK_HOLE);
+				if (hole < 0 || hole > size) {
+					hole = size;
+				}
+				if (count + 2 > extents.length) {
+					extents = java.util.Arrays.copyOf(extents, extents.length * 2);
+				}
+				extents[count++] = data;
+				extents[count++] = hole;
+				position = hole;
+			}
+			return java.util.Arrays.copyOf(extents, count);
+		} catch (Throwable e) {
+			return null;
+		} finally {
+			closeFile(fd);
+		}
 	}
 
 	public static String describe() {

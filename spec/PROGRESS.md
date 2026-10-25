@@ -40,6 +40,7 @@ not**, in one place.
 | 18 — Operability | **Done** — environment-variable configuration, Prometheus metrics on their own port with `/health` and `/ready`, and a slow query log on every front end | [METRICS.md](METRICS.md), [OPERATIONS.md §3.1, §4](OPERATIONS.md); `MetricsCatalogScrapeTest`, `MetricsServerTest`, `SlowQueryLogTest`, `GraphServerOptionsTest` |
 | 19 — MCP | **Done** — eight tools over HTTP+SSE and WebSocket, off by default and loopback when on, write-gated at two points | [MCP.md](MCP.md); `McpProtocolTest`, `McpServerTest`, `CypherGuideToolTest` |
 | 20 — Deployment | **Done** — JVM and GraalVM container images, a Helm chart, and a k3d harness that runs a real pipeline against them | [DEPLOYMENT.md](DEPLOYMENT.md); `helm/test/run.sh` — 35 assertions across nine phases |
+| 21 — Format migration | **Done** for the process; **no step yet**, since store format version 4 is the 0.1.0-alpha.1 baseline. One version number for the whole layout, older stores refused with the command that migrates them, a copy-on-write runner with resume, `database migrate` and `database info`, and a committed golden fixture that fails the build on an undeclared format change | [MIGRATION.md](MIGRATION.md); `MigrationRunnerTest`, `GoldenFixtureTest`, `GoldenFixtureMigrationTest`, `MigrateCliTest` |
 
 **The engine is usable today** for an embedded workload with concurrent writers: durable, crash-safe,
 transactional, indexed, compacting, with snapshot isolation for readers, a Cypher query
@@ -60,7 +61,8 @@ the only reason the list is now one item long.
 ## 2. Evidence
 
 The repository is six modules — `graph-core`, `graph-cypher`, `graph-protocol`, `graph-client`, `graph-cli`,
-`graph-server` — under one parent pom, and every profile below applies across all of them. `mvn clean install` builds the lot, Rust and
+`graph-server` — plus the test-scope `graph-api-lock` that locks the library modules' public Java API
+([API_LOCK.md](API_LOCK.md)) — under one parent pom, and every profile below applies across all of them. `mvn clean install` builds the lot, Rust and
 the browser UI included: `graph-core` drives cargo at four points, **build** (generate-resources),
 **package** the shared object into the jar (process-classes), **test** the crate with clippy (test),
 and **clean** its target directory (clean); `graph-server` drives npm on the same terms and then
@@ -81,8 +83,8 @@ mvn test -Pcrash -Dtest=CrashMatrixTest -Dgraph.crash.transactions=24   # 2,394 
 tools/kill9-loop.sh 100       # the crash loop, one iteration per store
 tools/verify-native.sh        # cargo miri, then cargo fuzz on both targets
 
-java -jar graph-server/target/graph-server-0.0.1-SNAPSHOT.jar /path/to/store 8080   # the graph browser
-java -jar graph-server/target/graph-server-0.0.1-SNAPSHOT.jar --demo /tmp/demo 8080 # with a graph in it
+java -jar graph-server/target/graph-server.jar /path/to/store 8080   # the graph browser
+java -jar graph-server/target/graph-server.jar --demo /tmp/demo 8080 # with a graph in it
 tools/demo-server.sh [dir] [port] [size]           # the same, from the reactor
 cd graph-server/src/main/frontend && npm run e2e   # 29 Playwright cases against that server
 ```
@@ -927,7 +929,7 @@ trusting anything that depends on it, and skips when it does not. On ext4 or xfs
       binary of its own ([BACKUP.md](BACKUP.md), [GRAALVM.md §10](GRAALVM.md#10-the-second-binary)). A cold copy
       is still the only thing that preserves ids and index structures byte for byte.
 - [ ] **No incremental or physical backup.** The log is trimmed at each checkpoint, so a dump cannot be rolled
-      forward, and `NativeLib.reflink` is still bound and called by nothing.
+      forward, and `NativeLib.reflink` is bound and called only by the format migration's store copy.
 - [ ] **The API is not frozen**, and [reports/API_REVIEW.md](reports/API_REVIEW.md) recommends against
       freezing it: MVCC, cursors and backup would each change the surface.
 
@@ -1084,5 +1086,5 @@ Built. [AUTH.md](AUTH.md) is the design; what follows is what moved.
 
 ---
 
-_Git HEAD revision: `9a607c9`_
-_Last updated: 2026-08-18 (the auto-commit escalation assertion)_
+_Git HEAD revision: `8f8caad`_
+_Last updated: 2026-10-25 (phase 21: the on-disk format migration process)_

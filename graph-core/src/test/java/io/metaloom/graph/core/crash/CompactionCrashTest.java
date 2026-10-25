@@ -22,7 +22,7 @@ import io.metaloom.graph.core.api.Properties;
 import io.metaloom.graph.core.api.Transaction;
 import io.metaloom.graph.core.api.VerifyLevel;
 import io.metaloom.graph.core.fixture.TempStore;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 import io.metaloom.graph.core.maintenance.Compactor;
 import io.metaloom.graph.core.maintenance.MaintenanceRunner;
 import io.metaloom.graph.core.store.GraphStoreImpl;

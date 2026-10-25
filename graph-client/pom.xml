@@ -7,7 +7,7 @@
     <parent>
         <groupId>io.metaloom.graph</groupId>
         <artifactId>metaloom-graph</artifactId>
-        <version>0.0.1-SNAPSHOT</version>
+        <version>0.1.0-alpha.1</version>
     </parent>
 
     <name>MetaLoom // Graph :: Client</name>
@@ -29,6 +29,11 @@
         <dependency>
             <groupId>io.vertx</groupId>
             <artifactId>vertx-core</artifactId>
+        </dependency>
+        <!-- The API lock: ApiLockTest checks this module's public API against api/*.api. See spec/API_LOCK.md. -->
+        <dependency>
+            <groupId>io.metaloom.graph</groupId>
+            <artifactId>graph-api-lock</artifactId>
         </dependency>
     </dependencies>
 </project>

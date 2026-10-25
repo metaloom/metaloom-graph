@@ -282,6 +282,19 @@ horizon before it is used or cached, since vacuum may have truncated the chain u
 raises the horizon before it cuts anything, so a chain seen missing is a horizon seen raised. The cost
 is one volatile read on the path that is about to return the mapping to a view.
 
+**Below the horizon is not the same as abandoned, so the view is told directly.** The horizon is the
+oldest *remaining* view's LSN, and a write transaction that began before the abandoned view keeps it at
+or below the abandoned one's. Out of the active set, the abandoned view has also stopped being a reason
+for a commit to keep before-images: when that older writer commits it is the only one registered, so it
+keeps nothing, and until a later vacuum raised the horizon every check passed and the view read the
+writer's commit from the mapping — with `readsMapping()` taking it there on the fast path, since a commit
+that records nothing never raises the newest-superseded mark either. The load test hit that window in
+about one run in three on a busy machine and in none on a quiet one. So vacuum now calls
+`Snapshot.abandon()` before the view leaves the active set, and every check — `checkAlive`, `pageAsOf`,
+the rebuild re-check, and `readsMapping()`, which answers false for an abandoned view — asks
+"abandoned, or below the horizon". `AbandonedViewScanTest#testAViewAbandonedBehindAnOlderWriterIsStillToldSo`
+schedules it: an older writer, a view abandoned behind it, the writer's commit with vacuum held off.
+
 **Measured** (`LongRunningReaderTest`), one view held across 60,000 property updates over 2,000 nodes:
 
 | | |
@@ -734,7 +747,7 @@ Built, in `io.metaloom.graph.core.txn`:
 | `SnapshotLinearizabilityTest` | 2 | The general form of the anomaly matrix: a view at LSN `L` must show **exactly** the committed state at `L`, whole-graph, checked against a model history keyed by commit LSN. Around 5,000 views per run |
 | `NestedTransactionTest` | 5 | `begin()` refusing to nest; the open transaction surviving the refusal; writes after it still rollback-able; the write gate not leaked |
 | `SerializablePhantomTest` | 9 | Write skew through predicate and point reads at `SERIALIZABLE`, with the two transactions writing disjoint kinds so only the read set can refuse either: unknown labels, keys and composite lookups, a known label, a full scan, a read from the overlay after a blind write; and the one-retry cost of create-if-absent on a new name |
-| `AbandonedViewScanTest` | 2 | A view abandoned by the budget mid-scan and mid-cursor either raises or answers as of its snapshot: scheduled deterministically, and under load against a model keyed by commit LSN |
+| `AbandonedViewScanTest` | 3 | A view abandoned by the budget mid-scan and mid-cursor either raises or answers as of its snapshot: scheduled deterministically, and under load against a model keyed by commit LSN; and a view abandoned behind an older writer, whose commit kept no before-images, is still told |
 | `ViewCatalogReadTest` | 2 | `nearest()` and `buildVectorIndex()` inside a view whose index catalog page has changed |
 
 And in `io.metaloom.graph.core.concurrency`:

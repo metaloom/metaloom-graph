@@ -2,6 +2,11 @@
 
 The surface an embedding application sees. Internals are in [ARCHITECTURE.md](ARCHITECTURE.md).
 
+**This surface is locked.** Every public type and member of graph-core's exported packages — and of
+graph-cypher, graph-protocol and graph-client — is recorded in a committed baseline, and `ApiLockTest` fails
+the build on any difference. Changing the API is allowed during the alpha, but it is a deliberate step: see
+[API_LOCK.md](API_LOCK.md) for what is locked, how to evolve it compatibly, and how a change is accepted.
+
 The PoC's API is a good starting shape — `GraphStorage` with `create`, `readNode`,
 `readRelationship`, `traverse` — but it has no transactions, returns fully materialised objects with
 `Map<String,String>` properties, and offers no cursor or batch form. The target keeps the shape and
@@ -39,7 +44,10 @@ try (GraphStore store = GraphStore.open(Path.of("/data/mygraph"), opts)) {
 ```
 
 `open` creates the store if the directory is empty, and validates the manifest, the superblocks and
-the format version otherwise. `close` stops background workers, checkpoints, flushes and releases
+the format version otherwise. A store at another store format version is refused rather than upgraded —
+`MigrationRequiredException` for an older one, naming the command that migrates it — and
+`StoreFormat.inspect(path)` reads the version and geometry of any store without opening it. `StoreMigration` plans
+and runs a migration from Java ([MIGRATION.md](MIGRATION.md)). `close` stops background workers, checkpoints, flushes and releases
 the `LOCK` file — see [ARCHITECTURE.md §7](ARCHITECTURE.md#7-threading-and-lifecycle).
 
 ---
@@ -406,6 +414,12 @@ format.
   ([TRANSACTIONS.md §8](TRANSACTIONS.md#8-conventions-and-gotchas)). `inOpenTransaction(work)` puts
   the same boundary around work made of several calls inside the caller's transaction; Cypher
   uses it for a write query that joins one.
+- **`GraphStore`, `Transaction`, `ReadTransaction` and `NeighbourCursor` are sealed.** The engine is their only
+  implementation, so a method can be added to any of them without breaking a caller, and the API lock counts that
+  as compatible ([API_LOCK.md](API_LOCK.md)). A decorator — a counting store in a test, tracing, metrics — extends
+  `ForwardingGraphStore`, which forwards every method and is concrete, so the build refuses a `GraphStore` method
+  without its forward. A `java.lang.reflect.Proxy` cannot implement a sealed interface; two Cypher tests used one
+  and now extend `ForwardingGraphStore`.
 - **`reclaim()` checkpoints first**, so it costs a checkpoint on top of the punching. It writes the files
   outside the log, and recovery replaying older log records over those writes was measured breaking a
   store ([WAL.md §7](WAL.md#7-checkpoints)).
@@ -474,7 +488,8 @@ scopes them for the calling thread rather than duplicating them.
 - [x] `reclaim` (hole punching) and `compact` with `CompactionOptions` / `CompactionReport`
 - [x] `metrics()` returning `StoreMetrics` / `IoStats`, and throttled `verify` via `VerifyOptions`
 - [x] Vacuum — reclamation at the end of every commit rather than a separate call or a worker thread
-- [ ] `snapshot` (Phase 6): a whole-store reflink clone. `FICLONE` is bound and called by nothing
+- [ ] `snapshot` (Phase 6): a whole-store reflink clone. `FICLONE` is bound and called only by the migration's store
+      copy ([MIGRATION.md §4.3](MIGRATION.md#43-the-copy))
 - [x] `options()` — the geometry a store was created with, which a restore has to be able to ask for
 - [x] `forEachNodeWhile(consumer, ScanOptions)` — a paced scan, so a whole-store walk does not block every writer.
       The second gap a real consumer found in this API, after `forEachNode` itself ([BACKUP.md §2.1](BACKUP.md))
@@ -524,5 +539,5 @@ New exceptions, both under `GraphStoreException`: `AuthException` for a refused 
 
 ---
 
-_Git HEAD revision: `da8c93e`_
-_Last updated: 2026-08-17 (authentication and RBAC authorization)_
+_Git HEAD revision: `8f8caad`_
+_Last updated: 2026-10-25 (format versions on open: MigrationRequiredException, StoreFormat, StoreMigration)_

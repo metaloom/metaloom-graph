@@ -11,7 +11,7 @@ import io.metaloom.graph.core.api.Properties;
 import io.metaloom.graph.core.api.StoreStats;
 import io.metaloom.graph.core.api.Transaction;
 import io.metaloom.graph.core.fixture.TempStore;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 
 /**
  * The headline space number. The proof of concept spent 1080 bytes on a node record alone, before its property

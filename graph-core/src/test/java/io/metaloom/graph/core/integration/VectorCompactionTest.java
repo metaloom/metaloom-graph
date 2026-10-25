@@ -24,7 +24,7 @@ import io.metaloom.graph.core.api.VectorIndexDefinition;
 import io.metaloom.graph.core.api.VectorMetric;
 import io.metaloom.graph.core.api.VerifyLevel;
 import io.metaloom.graph.core.fixture.TempStore;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 import io.metaloom.graph.core.segment.Geometry;
 
 /**

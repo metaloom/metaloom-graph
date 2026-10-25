@@ -872,8 +872,8 @@ a rewrite of the search.
 ## 8. The server and UI
 
 ```bash
-java -jar graph-server/target/graph-server-0.0.1-SNAPSHOT.jar /path/to/store 8080
-java -jar graph-server/target/graph-server-0.0.1-SNAPSHOT.jar --demo /tmp/demo 8080   # §8.3
+java -jar graph-server/target/graph-server.jar /path/to/store 8080
+java -jar graph-server/target/graph-server.jar --demo /tmp/demo 8080   # §8.3
 mvn -o -pl graph-server exec:java -Dexec.args="/path/to/store 8080"   # from the reactor
 tools/demo-server.sh                                                  # the demo graph on 8080
 ```

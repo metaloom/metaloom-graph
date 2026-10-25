@@ -14,6 +14,7 @@
     "  jlong()                                 mlg_capabilities, mlg_cqe_size  NativeCapabilities, NativeBindings",
     "  jint(jint)                              close(2), fsync(2)              NativeLib",
     "  jlong(jint)                             mlg_cqe_offset                  NativeBindings",
+    "  jlong(jint,jlong,jint)                  lseek(2), SEEK_DATA/SEEK_HOLE   NativeLib",
     "  jint(jint,jint,jint)                    ioctl(2), for FICLONE           NativeLib",
     "  jint(jint,jint,jlong,jlong)             fallocate(2)                    NativeLib",
     "  jint(void*,jint,jint)                   open(2)                         NativeLib",
@@ -61,6 +62,14 @@
       {
         "returnType": "jlong",
         "parameterTypes": [
+          "jint"
+        ]
+      },
+      {
+        "returnType": "jlong",
+        "parameterTypes": [
+          "jint",
+          "jlong",
           "jint"
         ]
       },

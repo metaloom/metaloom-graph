@@ -323,6 +323,10 @@ segment is deleted only when it is entirely below that.
   looks the way it did will break under steal.
 - **Never log a Java object.** Payloads are byte-exact after-images or explicit field lists; a
   serialisation format in the log is a compatibility trap.
+- **The log has no version field, and needs none.** Its framing is part of the store format, and a log never crosses
+  a format version: a migration refuses a store with committed records past its checkpoint and does not copy `wal/`,
+  so the migrated store starts a fresh log at the checkpoint LSN ([MIGRATION.md §4.2](MIGRATION.md#42-why-the-log-must-be-empty-and-is-not-copied)).
+  A store that was killed has to be opened and closed once by the build that wrote it before it can be migrated.
 - **`prev_lsn` chains are per transaction, not per page.** Getting this wrong makes undo silently
   skip records.
 - **CLRs are redo-only.** They are never undone; that is the entire point.
@@ -403,5 +407,5 @@ the data files, idempotence, torn tail, a missing start segment refuses the open
 
 ---
 
-_Git HEAD revision: `4f21a62`_
-_Last updated: 2026-10-24 (WAL review: direct rollover, failure poisoning, close ordering, honest durableLsn, reader window)_
+_Git HEAD revision: `8f8caad`_
+_Last updated: 2026-10-25 (the log and format migration)_

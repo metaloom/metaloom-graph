@@ -14,7 +14,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.metaloom.graph.core.api.PageCorruptException;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 import io.metaloom.graph.core.metrics.IoCounters;
 import io.metaloom.graph.core.nativelib.NativeLib;
 import io.metaloom.graph.core.page.PageOverlay;

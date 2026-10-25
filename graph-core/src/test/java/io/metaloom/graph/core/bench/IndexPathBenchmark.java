@@ -20,7 +20,7 @@ import io.metaloom.graph.core.api.VectorIndexDefinition;
 import io.metaloom.graph.core.api.VectorMetric;
 import io.metaloom.graph.core.api.WalSyncMode;
 import io.metaloom.graph.core.fixture.TempStore;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 import io.metaloom.graph.core.segment.Geometry;
 import io.metaloom.graph.core.store.GraphStoreImpl;
 

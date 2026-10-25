@@ -553,6 +553,6 @@ public class ConcurrentWriterTest {
 
 	private int recordsPerNodePage(GraphStore store) {
 		return ((GraphStoreImpl) store).segmentSets()
-			.get(io.metaloom.graph.core.id.Kind.NODE).slotsPerPage();
+			.get(io.metaloom.graph.core.api.Kind.NODE).slotsPerPage();
 	}
 }

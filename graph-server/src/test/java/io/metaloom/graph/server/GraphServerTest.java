@@ -528,6 +528,8 @@ public class GraphServerTest {
 		// section 4 promises the store works either way, which makes "which way is this one" worth exposing.
 		assertNotNull(json.getString("nativeLayer"), "the native path this process took has to be visible");
 		assertFalse(json.getString("nativeLayer").isBlank(), "nativeLayer must say something");
+		assertEquals(io.metaloom.graph.core.api.StoreFormat.CURRENT_VERSION, json.getInteger("storeFormatVersion"),
+			"the store format version this server's stores are at");
 	}
 
 	/**

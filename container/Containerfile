@@ -87,7 +87,7 @@ RUN mkdir -p /graph /data \
  && chown 1000:0 /graph /data -R \
  && chmod 770 /graph /data
 
-ADD --chown=1000:0 ./graph-server/target/graph-server-0.0.1-SNAPSHOT.jar /graph/graph-server.jar
+ADD --chown=1000:0 ./graph-server/target/graph-server.jar /graph/graph-server.jar
 
 #
 # The backup tool, in the image rather than alongside it.
@@ -110,7 +110,7 @@ ADD --chown=1000:0 ./graph-server/target/graph-server-0.0.1-SNAPSHOT.jar /graph/
 # That works because there is no ENTRYPOINT here and GRAPH_ROOT is already /data. Restore is offline
 # only — it creates the target from the dump's own geometry, which a running server cannot do.
 #
-ADD --chown=1000:0 ./graph-cli/target/graph-cli-0.0.1-SNAPSHOT-cli.jar /graph/graph-cli.jar
+ADD --chown=1000:0 ./graph-cli/target/graph-cli-cli.jar /graph/graph-cli.jar
 ADD ./container/metaloom-graph-cli.sh /usr/local/bin/metaloom-graph-cli
 RUN chmod 755 /usr/local/bin/metaloom-graph-cli
 

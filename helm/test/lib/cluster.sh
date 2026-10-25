@@ -25,7 +25,8 @@ ensure_tools() {
 build_images() {
 	section "Building the image"
 	( cd "$ROOT" && mvn -o clean package -DskipTests ) || fatal "maven build failed"
-	TAG="$IMAGE_TAG" "$ROOT/container/build-containers.sh" jvm || fatal "image build failed"
+	# LATEST=false: a throwaway test tag must not move "latest" off the release it points at.
+	TAG="$IMAGE_TAG" LATEST=false "$ROOT/container/build-containers.sh" jvm || fatal "image build failed"
 }
 
 require_images() {

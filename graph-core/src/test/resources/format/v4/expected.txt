@@ -1,0 +1,236 @@
+# golden fixture, canonical form 1
+node alice [Person, Employee]
+  active = Boolean:true
+  age = Long:34
+  bio = String(300):7089847
+  bytes = bytes[1, 2, 3, -1]
+  embedding = vector[0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25]
+  manager = ref:carol
+  mixed = List[Long:1, String:two, List[Double:3.0, Boolean:false]]
+  name = String:Alice
+  ratio = Float:0.25
+  score = Double:1.5
+  seen = Instant:2023-11-14T22:13:20.123456Z
+  small = Long:7
+  tags = List[String:a, String:b, String:c]
+  uid = String:alice
+  uuid = UUID:0b3d84c4-1c8f-4a1e-9c31-2f2c3d4e5f60
+node anon []
+  note = String:
+  uid = String:anon
+node bob [Person]
+  embedding = vector[9.0, 9.25, 9.5, 9.75, 10.0, 10.25, 10.5, 10.75]
+  motto = String(255):c8d7e2cd
+  name = String:Bob
+  nickname = null
+  uid = String:bob
+node carol [Person, Manager, Admin, Auditor, Remote]
+  embedding = vector[3.0, 3.25, 3.5, 3.75, 4.0, 4.25, 4.5, 4.75]
+  memoir = String(40000):dcfdf58b
+  name = String:Carol
+  uid = String:carol
+node ghost-1 [Ghost]
+  uid = String:ghost-1
+node ghost-11 [Ghost]
+  uid = String:ghost-11
+node ghost-3 [Ghost]
+  uid = String:ghost-3
+node ghost-5 [Ghost]
+  uid = String:ghost-5
+node ghost-7 [Ghost]
+  uid = String:ghost-7
+node ghost-9 [Ghost]
+  uid = String:ghost-9
+node hub [Hub]
+  uid = String:hub
+node leaf-00 [Leaf]
+  i = Long:0
+  uid = String:leaf-00
+node leaf-01 [Leaf]
+  i = Long:1
+  uid = String:leaf-01
+node leaf-02 [Leaf]
+  i = Long:2
+  uid = String:leaf-02
+node leaf-03 [Leaf]
+  i = Long:3
+  uid = String:leaf-03
+node leaf-04 [Leaf]
+  i = Long:4
+  uid = String:leaf-04
+node leaf-05 [Leaf]
+  i = Long:5
+  uid = String:leaf-05
+node leaf-06 [Leaf]
+  i = Long:6
+  uid = String:leaf-06
+node leaf-07 [Leaf]
+  i = Long:7
+  uid = String:leaf-07
+node leaf-08 [Leaf]
+  i = Long:8
+  uid = String:leaf-08
+node leaf-09 [Leaf]
+  i = Long:9
+  uid = String:leaf-09
+node leaf-10 [Leaf]
+  i = Long:10
+  uid = String:leaf-10
+node leaf-11 [Leaf]
+  i = Long:11
+  uid = String:leaf-11
+node leaf-12 [Leaf]
+  i = Long:12
+  uid = String:leaf-12
+node leaf-13 [Leaf]
+  i = Long:13
+  uid = String:leaf-13
+node leaf-14 [Leaf]
+  i = Long:14
+  uid = String:leaf-14
+node leaf-15 [Leaf]
+  i = Long:15
+  uid = String:leaf-15
+node leaf-16 [Leaf]
+  i = Long:16
+  uid = String:leaf-16
+node leaf-17 [Leaf]
+  i = Long:17
+  uid = String:leaf-17
+node leaf-18 [Leaf]
+  i = Long:18
+  uid = String:leaf-18
+node leaf-19 [Leaf]
+  i = Long:19
+  uid = String:leaf-19
+node leaf-20 [Leaf]
+  i = Long:20
+  uid = String:leaf-20
+node leaf-21 [Leaf]
+  i = Long:21
+  uid = String:leaf-21
+node leaf-22 [Leaf]
+  i = Long:22
+  uid = String:leaf-22
+node leaf-23 [Leaf]
+  i = Long:23
+  uid = String:leaf-23
+node leaf-24 [Leaf]
+  i = Long:24
+  uid = String:leaf-24
+node leaf-25 [Leaf]
+  i = Long:25
+  uid = String:leaf-25
+node leaf-26 [Leaf]
+  i = Long:26
+  uid = String:leaf-26
+node leaf-27 [Leaf]
+  i = Long:27
+  uid = String:leaf-27
+node leaf-28 [Leaf]
+  i = Long:28
+  uid = String:leaf-28
+node leaf-29 [Leaf]
+  i = Long:29
+  uid = String:leaf-29
+node leaf-30 [Leaf]
+  i = Long:30
+  uid = String:leaf-30
+node leaf-31 [Leaf]
+  i = Long:31
+  uid = String:leaf-31
+node leaf-32 [Leaf]
+  i = Long:32
+  uid = String:leaf-32
+node leaf-33 [Leaf]
+  i = Long:33
+  uid = String:leaf-33
+node leaf-34 [Leaf]
+  i = Long:34
+  uid = String:leaf-34
+node leaf-35 [Leaf]
+  i = Long:35
+  uid = String:leaf-35
+node leaf-36 [Leaf]
+  i = Long:36
+  uid = String:leaf-36
+node leaf-37 [Leaf]
+  i = Long:37
+  uid = String:leaf-37
+node leaf-38 [Leaf]
+  i = Long:38
+  uid = String:leaf-38
+node leaf-39 [Leaf]
+  i = Long:39
+  uid = String:leaf-39
+node reborn-0 [Reborn]
+  uid = String:reborn-0
+node reborn-1 [Reborn]
+  uid = String:reborn-1
+node reborn-2 [Reborn]
+  uid = String:reborn-2
+node reborn-3 [Reborn]
+  uid = String:reborn-3
+node widget [Product]
+  embedding = vector[1.0, 2.0, 3.0, 4.0, 5.0]
+  name = String:Widget
+  price = Double:9.99
+  uid = String:widget
+edge alice -[BOUGHT]-> widget lightweight
+edge alice -[KNOWS]-> bob materialised {close: Boolean:true, since: Long:2019}
+edge alice -[KNOWS]-> bob materialised {since: Long:2021}
+edge alice -[SUPERVISES]-> alice lightweight
+edge anon -[WATCHES]-> widget materialised {note: String:quietly}
+edge bob -[BOUGHT]-> widget lightweight
+edge carol -[MANAGES]-> alice materialised {note: String(400):d0965241}
+edge hub -[LINKS]-> leaf-00 materialised {i: Long:0}
+edge hub -[LINKS]-> leaf-01 lightweight
+edge hub -[LINKS]-> leaf-02 lightweight
+edge hub -[LINKS]-> leaf-03 lightweight
+edge hub -[LINKS]-> leaf-04 lightweight
+edge hub -[LINKS]-> leaf-05 lightweight
+edge hub -[LINKS]-> leaf-06 lightweight
+edge hub -[LINKS]-> leaf-07 lightweight
+edge hub -[LINKS]-> leaf-08 lightweight
+edge hub -[LINKS]-> leaf-09 lightweight
+edge hub -[LINKS]-> leaf-10 materialised {i: Long:10}
+edge hub -[LINKS]-> leaf-11 lightweight
+edge hub -[LINKS]-> leaf-12 lightweight
+edge hub -[LINKS]-> leaf-13 lightweight
+edge hub -[LINKS]-> leaf-14 lightweight
+edge hub -[LINKS]-> leaf-15 lightweight
+edge hub -[LINKS]-> leaf-16 lightweight
+edge hub -[LINKS]-> leaf-17 lightweight
+edge hub -[LINKS]-> leaf-18 lightweight
+edge hub -[LINKS]-> leaf-19 lightweight
+edge hub -[LINKS]-> leaf-20 materialised {i: Long:20}
+edge hub -[LINKS]-> leaf-21 lightweight
+edge hub -[LINKS]-> leaf-22 lightweight
+edge hub -[LINKS]-> leaf-23 lightweight
+edge hub -[LINKS]-> leaf-24 lightweight
+edge hub -[LINKS]-> leaf-25 lightweight
+edge hub -[LINKS]-> leaf-26 lightweight
+edge hub -[LINKS]-> leaf-27 lightweight
+edge hub -[LINKS]-> leaf-28 lightweight
+edge hub -[LINKS]-> leaf-29 lightweight
+edge hub -[LINKS]-> leaf-30 materialised {i: Long:30}
+edge hub -[LINKS]-> leaf-31 lightweight
+edge hub -[LINKS]-> leaf-32 lightweight
+edge hub -[LINKS]-> leaf-33 lightweight
+edge hub -[LINKS]-> leaf-34 lightweight
+edge hub -[LINKS]-> leaf-35 lightweight
+edge hub -[LINKS]-> leaf-36 lightweight
+edge hub -[LINKS]-> leaf-37 lightweight
+edge hub -[LINKS]-> leaf-38 lightweight
+edge hub -[LINKS]-> leaf-39 lightweight
+index Person.name
+index Product.name unique
+unique uid
+vector Person.embedding dims=8 metric=COSINE m=16 ef=200 state=READY
+count nodes=56 relationships=8 labels=19 keys=24
+lookup label Person -> [alice, bob, carol]
+lookup name=Alice -> [alice]
+lookup Person.name=Bob -> [bob]
+lookup uid=leaf-17 -> [leaf-17]
+nearest scan -> [alice@0.995179, carol@0.988810, bob@0.971680]
+nearest index -> [alice@0.995179, carol@0.988810, bob@0.971680]

@@ -12,7 +12,7 @@ import io.metaloom.graph.core.api.Transaction;
  * Writes a small store for something else to read.
  *
  * <pre>
- * java -cp graph-cli/target/graph-cli-0.0.1-SNAPSHOT-cli.jar tools/GraphSeed.java /tmp/root
+ * java -cp graph-cli/target/graph-cli-cli.jar tools/GraphSeed.java /tmp/root
  * </pre>
  *
  * <p>

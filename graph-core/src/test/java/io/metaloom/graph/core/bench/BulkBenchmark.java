@@ -247,7 +247,7 @@ public class BulkBenchmark {
 		int holes = 0;
 		try (GraphStore store = stores.open()) {
 			io.metaloom.graph.core.store.GraphStoreImpl impl = (io.metaloom.graph.core.store.GraphStoreImpl) store;
-			slots = impl.geometry().slotsPerSegment(io.metaloom.graph.core.id.Kind.NODE);
+			slots = impl.geometry().slotsPerSegment(io.metaloom.graph.core.api.Kind.NODE);
 			long[] ids = new long[slots];
 			try (io.metaloom.graph.core.api.Transaction txn = store.begin()) {
 				for (int i = 0; i < slots; i++) {
@@ -273,7 +273,7 @@ public class BulkBenchmark {
 				txn.commit();
 			}
 			report("createNode into the holes of a full segment", holes, start);
-			if (impl.segments(io.metaloom.graph.core.id.Kind.NODE).segments().size() != 1) {
+			if (impl.segments(io.metaloom.graph.core.api.Kind.NODE).segments().size() != 1) {
 				throw new AssertionError("every hole must be reused before a segment is added");
 			}
 		}

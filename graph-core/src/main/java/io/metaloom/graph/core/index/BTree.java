@@ -6,7 +6,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import io.metaloom.graph.core.id.ElementId;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 import io.metaloom.graph.core.segment.SegmentSet;
 import io.metaloom.graph.core.util.Layouts;
 

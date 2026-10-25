@@ -7,7 +7,7 @@
     <parent>
         <groupId>io.metaloom.graph</groupId>
         <artifactId>metaloom-graph</artifactId>
-        <version>0.0.1-SNAPSHOT</version>
+        <version>0.1.0-alpha.1</version>
     </parent>
 
     <name>MetaLoom // Graph :: CLI</name>
@@ -30,6 +30,18 @@
             <groupId>io.metaloom.graph</groupId>
             <artifactId>graph-core</artifactId>
         </dependency>
+        <!--
+            A logging backend for the runnable jar only. Without one, slf4j 1.7 prints a three-line "no binding" notice
+            on every offline command. Optional, so graph-server, which depends on this module for the dump format and
+            has logback, does not get a second binding. slf4j-simple writes to stderr, so a dump on stdout stays clean;
+            the level is set in simplelogger.properties.
+        -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>1.7.36</version>
+            <optional>true</optional>
+        </dependency>
         <dependency>
             <groupId>io.metaloom.graph</groupId>
             <artifactId>graph-core</artifactId>
@@ -39,7 +51,19 @@
     </dependencies>
 
     <build>
+        <!-- Version-free file names under target/: target/graph-cli-cli.jar is the runnable jar. See graph-server/pom.xml. -->
+        <finalName>${project.artifactId}</finalName>
         <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <!-- Tests log through logback-test.xml like every other module; slf4j-simple is for the jar. -->
+                    <classpathDependencyExcludes>
+                        <classpathDependencyExclude>org.slf4j:slf4j-simple</classpathDependencyExclude>
+                    </classpathDependencyExcludes>
+                </configuration>
+            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
@@ -52,16 +76,18 @@
                         <configuration>
                             <createDependencyReducedPom>false</createDependencyReducedPom>
                             <!--
-                                Attached under a classifier rather than replacing the artifact, because graph-server
-                                depends on this module for the dump format: one encoder, so a dump taken over HTTP is
-                                byte-for-byte the one taken offline. Replacing the main artifact would hand the server
-                                an uber jar with a second copy of graph-core inside it.
+                                Written beside the artifact rather than replacing it, because graph-server depends on
+                                this module for the dump format: one encoder, so a dump taken over HTTP is byte-for-byte
+                                the one taken offline. Replacing the main artifact would hand the server an uber jar
+                                with a second copy of graph-core inside it.
 
-                                So: graph-cli-<version>.jar is the library, graph-cli-<version>-cli.jar is the runnable
-                                one.
+                                So: target/graph-cli.jar is the library, target/graph-cli-cli.jar is the runnable one.
+                                A fixed outputFile rather than an attached classifier, because shade names an attached
+                                jar artifactId-version-classifier whatever finalName says, and every script and the
+                                Containerfile would then have to know the version. The runnable jar is released through
+                                build.sh's dist/ directory (as graph-cli-<version>-cli.jar), not through a repository.
                             -->
-                            <shadedArtifactAttached>true</shadedArtifactAttached>
-                            <shadedClassifierName>cli</shadedClassifierName>
+                            <outputFile>${project.build.directory}/${project.build.finalName}-cli.jar</outputFile>
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                                     <mainClass>io.metaloom.graph.cli.GraphCli</mainClass>
@@ -73,6 +99,9 @@
                                             jars to keep it.
                                         -->
                                         <Enable-Native-Access>ALL-UNNAMED</Enable-Native-Access>
+                                        <!-- Read back at runtime, e.g. by the MCP initialize answer; without it a release reports "dev". -->
+                                        <Implementation-Title>${project.artifactId}</Implementation-Title>
+                                        <Implementation-Version>${project.version}</Implementation-Version>
                                     </manifestEntries>
                                 </transformer>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer" />

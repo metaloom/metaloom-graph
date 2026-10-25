@@ -42,8 +42,12 @@ no incremental backup and no point-in-time recovery.
 
 **Adjacency sizing, if you touch that layer**: a block is a run of 512 byte cells that doubles as the
 node fills, not a page. It was a page until [reports/SCALE.md](reports/SCALE.md) measured what that
-cost — 59 of 61 GiB on a mean-degree-4 graph — and the change took the same graph to 6.2 GiB. Store
-format version 2; version 1 stores are rejected rather than converted.
+cost — 59 of 61 GiB on a mean-degree-4 graph — and the change took the same graph to 6.2 GiB.
+
+**The on-disk format is versioned and migrated** ([MIGRATION.md](MIGRATION.md)). Store format version **4** is the
+0.1.0-alpha.1 baseline; a build opens exactly one version, refuses an older store with the command that migrates it
+(`metaloom-graph-cli database migrate`), and from alpha.1 on every format change ships a migration step and a golden
+fixture — `GoldenFixtureTest` fails one that does not.
 
 What is done and what is left: [PROGRESS.md](PROGRESS.md). Per-phase status with the reason for every
 gap: [reports/PHASE_STATUS.md](reports/PHASE_STATUS.md). Measured numbers:
@@ -74,6 +78,7 @@ CONTEXT.md (this file)
    └─ the spec for your area:
         ├─ ID_ENCODING.md ............ ids, offsets, generations
         ├─ FILE_FORMAT.md ............ segments, pages, records, on-disk layout
+        ├─ MIGRATION.md .............. format versions, migration steps, the runner, golden fixtures
         ├─ RELATIONSHIP_STORAGE.md ... adjacency, traversal, edge compression
         ├─ PROPERTY_STORAGE.md ....... attributes, dictionaries, blobs
         ├─ INDEX.md .................. the label, property and composite B+trees, unique constraints
@@ -90,13 +95,15 @@ CONTEXT.md (this file)
         ├─ TASKS.md .................. deferred work items, area-prefixed — currently URING-1..7
         ├─ GRAALVM.md ................ the two native binaries: FFM under native-image
         ├─ API.md .................... the public Java API
+        ├─ API_LOCK.md ............... the lock on that API: baselines, policy, how a change is accepted
         ├─ TESTING.md ................ test setup, benchmarks, crash testing
         ├─ OPERATIONS.md ............. configuration, sizing, tuning, monitoring, backup, recovery
         ├─ METRICS.md ................ the Prometheus meter catalogue, and the alert rules it implies
         ├─ BACKUP.md ................. the logical dump, the paced scan it needs, and the CLI
         ├─ MCP.md .................... the Model Context Protocol port and its tools
         ├─ AUTH.md ................... users, roles, grants, and where each port checks them
-        └─ DEPLOYMENT.md ............. the container images, the Helm chart and the k3d harness
+        ├─ DEPLOYMENT.md ............. the container images, the Helm chart and the k3d harness
+        └─ RELEASE.md ................ cutting a release: versions, build.sh, the smoke test, image tags
 ```
 
 ---
@@ -109,6 +116,7 @@ CONTEXT.md (this file)
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Target layering, module split, component responsibilities, threading and lifecycle | Byte-level formats |
 | [ID_ENCODING.md](ID_ENCODING.md) | The 64-bit `ElementId`, the id-to-offset function, generations, NULL, id stability under CoW | Record contents |
 | [FILE_FORMAT.md](FILE_FORMAT.md) | Store directory layout, manifest, segment anatomy, page metadata array, free-slot bitmap, node and relationship record layouts, versioning and compaction | Adjacency internals, property internals |
+| [MIGRATION.md](MIGRATION.md) | The inventory of every version field on disk; the store format version, its legacy encoding and the rules for when to bump it; the migration step contract; the copy-on-write runner with its marker, resume and rollback; `database migrate` and `database info`; the golden fixtures and the step-by-step procedure for a format change; the alpha policy | The byte layouts themselves (FILE_FORMAT.md); the logical dump (BACKUP.md) |
 | [RELATIONSHIP_STORAGE.md](RELATIONSHIP_STORAGE.md) | Inline edges, adjacency blocks, edge compression, lightweight edges, traversal cost model | Node record layout |
 | [PROPERTY_STORAGE.md](PROPERTY_STORAGE.md) | Property blocks, key and label dictionaries, value typing, inline vs blob, string dedup | Relationship storage; the property *index* (INDEX.md) |
 | [INDEX.md](INDEX.md) | The three secondary B+trees — label to node, hashed property value to node, and the declared `(label, key)` composite — their page layout, the candidate verification a hashed key requires, the four maintenance hooks, store-wide and label-scoped unique constraints, and why relationships are not indexed | How a property is stored (PROPERTY_STORAGE.md); which access path a query picks (CYPHER.md) |
@@ -126,10 +134,12 @@ CONTEXT.md (this file)
 | [TASKS.md](TASKS.md) | Deferred work items with an area prefix: for each gap a spec identified and did not close, whether it is worth building, what it costs, what would change the verdict, and what "done" means. Currently the io_uring items, URING-1..7, including why the WAL is further from being the ring's first caller than [IO_URING.md §6.1](IO_URING.md) reads | The design of anything on the list; the index backlog (INDEX_TASKS.md); the cross-project backlog order (PROGRESS.md §5) |
 | [GRAALVM.md](GRAALVM.md) | Compiling the server **and the CLI** to native binaries: what native-image does and does not support of the FFM API, downcall registration, the netty substitution, and what each binary costs against its jar — one-sided for the CLI, a real trade for the server | How the FFM layer works (NATIVE_FFM.md) |
 | [API.md](API.md) | The public Java API surface: `GraphStore`, transactions, cursors, traversal, element builders | Internals |
+| [API_LOCK.md](API_LOCK.md) | The API lock: what each library module's locked surface is and why, the dump format, what counts as breaking, how to evolve compatibly, the `alpha`/`stable` policy, **how a person accepts a change with `tools/api-lock.sh`**, and the rule that AI agents never do. **`ApiLockTest` fails the build on any API change** | The API itself (API.md); whether to freeze it (reports/API_REVIEW.md) |
 | [TESTING.md](TESTING.md) | Test layout, fixtures, benchmark harness, crash and fault injection, invariant checkers | Implementation steps |
 | [OPERATIONS.md](OPERATIONS.md) | Running it: sizing, tuning, **how the server is configured from flags and the environment**, what to monitor, **the slow query log**, backup and restore, disaster recovery, what every exception means for an operator, the security posture of every port | Design rationale; how the binary protocol works (WIRE.md); the meter catalogue (METRICS.md) |
 | [BACKUP.md](BACKUP.md) | The logical dump: why not a file copy, how one snapshot makes the walk online without stopping writers, the paced scan that keeps it that way, the format and its hostile-input rules, why ids are not preserved, the restore order, and `metaloom-graph-cli` | The storage format (FILE_FORMAT.md); the operational procedure (OPERATIONS.md §5) |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | The container images and the Helm chart: why the base image is not Alpine, why `/tmp` is load-bearing, why both images also carry `metaloom-graph-cli`, StatefulSet versus Deployment, probes on the monitoring port, and the k3d harness | How the server is configured (OPERATIONS.md §3.1); the native binary itself (GRAALVM.md) |
+| [RELEASE.md](RELEASE.md) | Cutting a release: where the version is written down, `build.sh` and what `--release` refuses, the smoke test of the built image, version-free jar names, which image tags move, `dist/` and the tag, and what is not automated yet | Running the image (DEPLOYMENT.md); the API lock and the format migration process (their own files) |
 | [MCP.md](MCP.md) | The Model Context Protocol port: why it is the one port that is off by default, the two transports and the h2c trap that breaks SSE, the eight tools, the row cap, and the write gate's two enforcement points | The query language (CYPHER.md); the meter catalogue (METRICS.md) |
 | [AUTH.md](AUTH.md) | Identity and what it may do: the fifteen privileges and the three surfaces they span, per-database grants, the `.auth/` file and why it is binary, PBKDF2, why a grant cannot override a capability flag, how each port establishes a principal, why the monitoring port is exempt, and what is still not covered | The frame layout (WIRE.md); the port table and operational posture (OPERATIONS.md §9); the root layout (DATABASES.md) |
 | [METRICS.md](METRICS.md) | The Prometheus catalogue: every `graph_` meter with its type, labels and call site, the cached-versus-live tiers and why size gauges are refreshed on a timer, and the map from OPERATIONS.md §4's thresholds to alert rules. **Parsed by `MetricsCatalogScrapeTest`** — editing it can break the build | Which signals to watch and when to worry (OPERATIONS.md §4) |
@@ -150,6 +160,7 @@ These constants are defined normatively in [ID_ENCODING.md](ID_ENCODING.md) and
 
 | Constant | Value | Rationale |
 |----------|-------|-----------|
+| Store format version | 4 (`StoreFormat.CURRENT_VERSION`) | Names the whole on-disk layout; a build reads exactly one — [MIGRATION.md](MIGRATION.md) |
 | `ElementId` width | 64 bit | Fits a register and a `long`; half the width of the PoC's UUID |
 | Id field layout | `kind:4 | segment:24 | slot:24 | gen:12` | See [ID_ENCODING.md §2](ID_ENCODING.md#2-bit-layout) |
 | `PAGE_SIZE` | 8192 B (configurable 4/8/16 KiB, fixed at store creation) | Multiple of the 4 KiB SSD write unit; amortises per-page metadata |
@@ -268,7 +279,8 @@ Full description in [ARCHITECTURE.md](ARCHITECTURE.md).
 - **`-1` is not a sentinel.** The PoC uses `-1` for "no next segment" and for property-array padding.
   In the target design the sentinel is `NULL_ID` (0). Do not reintroduce `-1`.
 - **Never widen a record in place.** Record strides are frozen per format version. New fields go in
-  reserved bytes; if reserved space runs out, bump the format version and write a converter.
+  reserved bytes; if reserved space runs out, bump the store format version and write a migration step, following
+  [MIGRATION.md §6](MIGRATION.md#6-changing-the-format-the-procedure) — the golden fixture fails the build otherwise.
 
 ### 5.2 FFM rules
 
@@ -327,8 +339,10 @@ Full description in [ARCHITECTURE.md](ARCHITECTURE.md).
 | Know what runs in native code | [NATIVE_FFM.md §2](NATIVE_FFM.md#2-the-native-surface) |
 | Write a crash test | [TESTING.md §6](TESTING.md#6-crash-and-fault-injection) |
 | Work out what to monitor, or why it will not open | [OPERATIONS.md](OPERATIONS.md) |
+| Change anything on disk, or migrate a store to a newer format | [MIGRATION.md §6](MIGRATION.md#6-changing-the-format-the-procedure), [OPERATIONS.md §5.1](OPERATIONS.md#51-upgrading-across-a-store-format-version) |
 | Back a database up, or restore one | [BACKUP.md](BACKUP.md), and [OPERATIONS.md §5](OPERATIONS.md#5-backup-and-restore) for the procedure |
 | Add something to the read path | [TESTING.md §7](TESTING.md#7-benchmarks) first — the budgets are build failures |
+| Change a public type or method, or fix a failing `ApiLockTest` | [API_LOCK.md §3.1](API_LOCK.md) to make it additive; accepting a change is a person's step, never an agent's ([AGENTS.md](../AGENTS.md)) |
 | Pick up the next work item | [PROGRESS.md §5](PROGRESS.md#5-the-backlog-in-the-order-that-buys-the-most), then [PLAN.md](PLAN.md) for its definition |
 | Know whether something is already built | [PROGRESS.md](PROGRESS.md) |
 | Know how it behaves on a large graph | [reports/SCALE.md](reports/SCALE.md) |
@@ -347,13 +361,15 @@ Full description in [ARCHITECTURE.md](ARCHITECTURE.md).
 | `Properties` | `io.metaloom.graph.core.api` | Typed property values; absent and null are distinguishable |
 | `Edge` / `Direction` | `io.metaloom.graph.core.api` | One traversal result and its direction |
 | `ElementId` | `io.metaloom.graph.core.id` | The 64-bit id arithmetic; ids are plain `long` values |
-| `Kind` | `io.metaloom.graph.core.id` | Record families, stride specs and generation offsets |
+| `Kind` | `io.metaloom.graph.core.api` | Record families, stride specs and generation offsets |
 | `Geometry` | `io.metaloom.graph.core.segment` | Per-kind strides, capacities, region offsets, the address function |
 | `SegmentFile` | `io.metaloom.graph.core.segment` | One `.seg` file, mapped once, sliced many times |
 | `Superblock` | `io.metaloom.graph.core.segment` | The A/B double buffered segment header |
 | `FreeSlotBitmap` / `PageMetadataArray` | `io.metaloom.graph.core.segment` | Durable free list; out-of-line per-page metadata |
 | `SegmentSet` | `io.metaloom.graph.core.segment` | All segments of one kind, plus the slot allocator |
-| `Manifest` | `io.metaloom.graph.core.store` | Store metadata and its atomic flip |
+| `Manifest` | `io.metaloom.graph.core.store` | Store metadata and its atomic flip; the store format version field |
+| `StoreFormat` / `StoreMigration` | `io.metaloom.graph.core.api` | The current format version and `inspect`; plan and run a migration |
+| `MigrationRunner` / `FormatMigration` / `MigrationRegistry` | `io.metaloom.graph.core.migration` | The copy-on-write runner, one step N to N + 1, the shipped chain |
 | `Catalog` / `Dictionary` | `io.metaloom.graph.core.catalog` | Label and property-key interning |
 | `NodeStore` / `RelStore` | `io.metaloom.graph.core.store.node`, `...rel` | The 64-byte records |
 | `PropertyStore` / `ValueCodec` | `io.metaloom.graph.core.store.prop` | Property blocks and typed value encoding |
@@ -405,5 +421,5 @@ deliverables and exit criteria are in [PLAN.md](PLAN.md).
 
 ---
 
-_Git HEAD revision: `58cd33e`_
-_Last updated: 2026-08-18 (TLS on the binary port)_
+_Git HEAD revision: `8f8caad`_
+_Last updated: 2026-10-25 (format migration process: MIGRATION.md)_

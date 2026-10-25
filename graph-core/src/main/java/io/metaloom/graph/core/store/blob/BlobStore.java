@@ -5,7 +5,7 @@ import java.lang.foreign.MemorySegment;
 
 import io.metaloom.graph.core.api.PageCorruptException;
 import io.metaloom.graph.core.id.ElementId;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 import io.metaloom.graph.core.nativelib.NativeCodec;
 import io.metaloom.graph.core.segment.SegmentSet;
 import io.metaloom.graph.core.util.Crc;

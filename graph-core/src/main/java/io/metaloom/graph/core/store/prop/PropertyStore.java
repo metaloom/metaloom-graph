@@ -9,7 +9,7 @@ import java.util.Map;
 
 import io.metaloom.graph.core.api.PageCorruptException;
 import io.metaloom.graph.core.id.ElementId;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 import io.metaloom.graph.core.segment.SegmentSet;
 import io.metaloom.graph.core.store.blob.BlobStore;
 import io.metaloom.graph.core.store.vec.VectorStore;

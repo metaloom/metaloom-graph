@@ -7,7 +7,7 @@
     <parent>
         <groupId>io.metaloom.graph</groupId>
         <artifactId>metaloom-graph</artifactId>
-        <version>0.0.1-SNAPSHOT</version>
+        <version>0.1.0-alpha.1</version>
     </parent>
 
     <name>MetaLoom // Graph :: Server</name>
@@ -104,6 +104,12 @@
     </dependencies>
 
     <build>
+        <!--
+            Version-free file names under target/, so scripts, the Containerfile and the documentation never name a
+            version: target/graph-server.jar is the shaded server whatever the POM says. The artifacts installed or
+            deployed to a repository keep their standard versioned names; this only changes the build directory.
+        -->
+        <finalName>${project.artifactId}</finalName>
         <plugins>
             <!--
                 So that running the UI is one short command rather than one long one:
@@ -196,7 +202,7 @@
             <!--
                 One runnable jar: server, engine, query language, Vert.x, Netty and the UI bundle.
 
-                    java -jar graph-server/target/graph-server-0.0.1-SNAPSHOT.jar /path/to/store 8080
+                    java -jar graph-server/target/graph-server.jar /path/to/store 8080
 
                 Three details are load-bearing:
 
@@ -240,6 +246,9 @@
                                     <mainClass>io.metaloom.graph.server.GraphServer</mainClass>
                                     <manifestEntries>
                                         <Enable-Native-Access>ALL-UNNAMED</Enable-Native-Access>
+                                        <!-- Read back at runtime, e.g. by the MCP initialize answer; without it a release reports "dev". -->
+                                        <Implementation-Title>${project.artifactId}</Implementation-Title>
+                                        <Implementation-Version>${project.version}</Implementation-Version>
                                     </manifestEntries>
                                 </transformer>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer" />

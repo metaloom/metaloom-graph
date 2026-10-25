@@ -3,8 +3,9 @@
 A storage engine is only as good as its evidence. This file defines how the project proves that it
 does not lose data.
 
-The suite today is 1,478 tests across the six modules — 631 in `graph-core`, 383 in `graph-cypher`,
-37 in `graph-protocol`, 33 in `graph-client`, 64 in `graph-cli`, 330 in `graph-server` — running in a
+The suite today is 1,577 tests across the seven modules — 36 in `graph-api-lock`, 681 in `graph-core`,
+384 in `graph-cypher`, 38 in `graph-protocol`, 34 in `graph-client`, 74 in `graph-cli`, 330 in
+`graph-server`, the four library modules' counts each including their `ApiLockTest` — running in a
 few minutes, plus benchmarks, a soak, a scaling harness and a `kill -9` loop behind profiles and
 scripts. The PoC suite it replaced had one red test,
 three unbounded benchmarks living in the unit suite, and two tests that passed for reasons unrelated
@@ -49,9 +50,10 @@ to what they asserted ([CURRENT_STATE.md §5](CURRENT_STATE.md#5-test-reality-ch
 | `EverythingAtOnceStressTest` (`-Pslow`), then `NestedApplyLatchTest` | **1 deadlock, within seconds of the first run.** A thread that already held the apply latch shared asked for it again — `setNodeProperties` on a vector-indexed node calls the public `nodeLabels`, a scan callback reads, a cursor is opened inside another — and a `StampedLock` read acquisition that loses its fast-path race queues behind a waiting writer. The waiting writer was a commit, waiting for the hold that same thread still had, with every other writer queued behind the commit lock. The minimised test wedged 3 runs in 3 |
 | `IsolationAnomalyStressTest`, then `ViewCatalogReadTest` | 1. `nearest()` read the vector index declaration off the catalog page outside the read wrapper, so inside a view whose catalog page had changed the engine's internal `NeedsExclusionException` escaped to the caller — and without a view the same read was unprotected from a commit's apply |
 | `ScanWriterStarvationTest` | 1, **a liveness defect with no wrong answer anywhere.** `StampedLock` has no writer preference, and scans and cursors hold the apply latch for their whole length, so four threads looping `forEachNode` kept every commit out: 127 commits a second alone, 3 beside them, single commits waiting 900 ms |
-| `AbandonedViewScanTest` | 1. A view abandoned by the retention budget *during* a scan or cursor — vacuum takes no lock a reader holds — read every page it had not touched yet from the mapping, newer than its snapshot, with no exception: a deterministic schedule had a cursor return 10,840 edges where its snapshot had 12,000 |
+| `AbandonedViewScanTest` | 2. A view abandoned by the retention budget *during* a scan or cursor — vacuum takes no lock a reader holds — read every page it had not touched yet from the mapping, newer than its snapshot, with no exception: a deterministic schedule had a cursor return 10,840 edges where its snapshot had 12,000. The second came back as the same test flaking one run in three once the machine was busy, and it was not a timing artefact: a view abandoned behind an older write transaction learned of it only through the horizon, which that writer held down, and the writer's commit kept no before-images because the abandoned view had left the active set — so the view read the commit from the mapping. Abandonment is now a flag on the view itself (`testAViewAbandonedBehindAnOlderWriterIsStillToldSo` schedules it). **A flaky concurrency test is a defect report until proven otherwise** |
 | `SerializablePhantomTest` | 1, in two shapes. A `SERIALIZABLE` lookup of a label the dictionary did not have — `nodesByLabel`, `nodeHasLabel` — touched no page, so a concurrent transaction that introduced the label and committed left nothing for read-set validation to find, and write skew committed |
 | `StorageModelTest` | **3, and the worst of them only once it ran with the native layer.** (1) A statement that failed inside an explicit transaction committed the part of itself it had already done: `setNodeProperties` wrote the new block before checking the unique constraint, so a caught violation — the ordinary way to use a constraint — committed the refused value with the indexes describing the old one; and a `createNode` whose second value could not be encoded committed a node with no index entries beside an orphaned blob. (2) `verify(FULL)` reported every explicit null property as a dangling index entry on a healthy store, because the property tree indexed nulls and nothing else did. (3) **`reclaim()` followed by a few commits and a crash corrupted the store**: reclaim writes the files outside the log — punches, generation floors, checksums, and a superblock flip in every `force()` — while recovery replays byte-run *differences* from the last checkpoint, so older runs replayed over the reclaimed files put back bytes the newer runs never mention. A live count disagreed with its bitmap; a search over short sequences (`ReclaimCrashTest`) produced a segment whose **both** superblock copies failed their CRC, which does not open. Runs with `-Dnative.skip=true` could not see it at all, because without the native layer `reclaim()` is a no-op — a randomised harness is only as wide as the build it runs in |
+| The first `ApiLockTest` baselines | 1, found by reading the dump rather than by a failure: graph-core's exported `api` package names `io.metaloom.graph.core.id.Kind` in ten signatures across four types (`CompactionOptions`, `CompactionReport`, `IoStats`, `OutOfSegmentsException`), and `module-info.java` does not export `core.id`, so a modular caller can be handed a `Kind` and cannot name its type. Fixed before the alpha by moving `Kind` into `api` — [API_LOCK.md §2](API_LOCK.md) |
 | `SnapshotLinearizabilityTest` | 0 so far, and it is the one that generalises the anomaly matrix: because writers are serialised and the snapshot timestamp *is* the LSN, the state a view is entitled to see is computable rather than merely constrainable. So it asserts equality against a model history keyed by commit LSN, instead of asserting the absence of four named anomalies |
 
 The pattern is worth naming: **every one of these came from a test that compared the engine against
@@ -113,6 +115,15 @@ src/test/java/io/metaloom/graph/core/
                  they drift. What it asserts alone is what a cursor has and a list does not: a
                  position, a read view, and a close
   example/       UsageExampleTest — the documented API, executable, so it cannot rot
+  format/        the golden fixtures (§8.1): GoldenFixtureTest — the committed store of the current format version
+                 reads back exactly, through the data and every index; GoldenFixtureMigrationTest — every committed
+                 fixture, of every version, migrated by the shipped migration reads back as its own expected.txt;
+                 GoldenContent, GoldenFixtures, and GoldenFixtureGenerator (tools/golden-fixture.sh)
+  migration/     the format migration runner (MIGRATION.md §9): MigrationRunnerTest — a synthetic 1 -> 2 -> 3 chain,
+                 failure and verification failure leaving the original byte for byte, a crash at each of seven
+                 points finished by a rerun, every refusal; MigrationRegistryTest — the chain and its gaps;
+                 StoreFormatVersionTest — the manifest's version field and what open does with each value;
+                 StoreCopierTest — the sparse copy
   nativelib/     NativeCodecTest, IoEngineTest, UringIoEngineTest — the crate and the IO engines
                  ForeignDowncallMetadataTest — the GraalVM downcall registrations against the code
   txn/           snapshot isolation: visibility, the anomaly matrix, vacuum, rollback, long readers
@@ -197,9 +208,20 @@ graph-protocol/src/test/java/io/metaloom/graph/protocol/
 graph-client/src/test/java/io/metaloom/graph/client/
                  ClientDependencyTest — fails by *loading* if graph-core or graph-cypher ever reaches
                  the client's classpath
+graph-api-lock/src/test/java/io/metaloom/graph/apilock/
+                 the API lock itself, over fixture classes: ApiDumpTest — every shape a signature takes
+                 (generics, varargs, constants, records, sealed types, enums with bodies, members inherited
+                 from a package-private superclass) and that dumping runs no static initialiser; ApiDiffTest
+                 — what is breaking; BaselineTest — the checksum against each kind of hand edit;
+                 ApiLockToolTest — the alpha and stable policies, and that the check never writes a file
+ApiLockTest      in graph-core, graph-cypher, graph-protocol and graph-client: the module's public Java API
+                 against the committed <module>/api/<module>.api, failing on ANY difference with a
+                 removed/changed/added report. It never writes the baseline; a person accepts a change with
+                 tools/api-lock.sh. Never edited, skipped or weakened to make a build pass (API_LOCK.md)
 graph-cli/src/test/java/io/metaloom/graph/cli/
                  the backup tool: GraphCliTest drives the commands through run() and its exit status,
-                 CliOptionsTest the command line both ways
+                 CliOptionsTest the command line both ways; MigrateCliTest — database migrate and database info,
+                 the plan on stdout, the exit status, and that every refusal leaves the root as it was
   dump/          BackupRoundTripTest — an isomorphism, not an id-by-id equality, because a restore
                  deliberately does not preserve ids; BackupUnderLoadTest — a dump taken while a writer
                  commits is one instant AND the writer made progress; DumpHostileInputTest — a dump is
@@ -254,6 +276,8 @@ mvn test                         # unit + property + integration + budgets + hos
 mvn test -Pslow                  # adds the scaling curve and the soak
 mvn test -Pbench                 # adds the benchmarks and the performance gates
 mvn test -Pall-tests             # everything
+mvn test -pl graph-client -am    # one module; -am builds graph-api-lock, which every API lock needs
+tools/api-lock.sh check          # the four API locks alone, read-only (API_LOCK.md §4)
 mvn test -Dmetaloom.graph.native.enabled=false   # force the pure-Java path
 mvn test -Dnative.skip=true       # the whole pure-Java path: not built, not packaged, not loaded
 mvn test -Dmetaloom.graph.native.required=true   # fail, rather than skip, if the crate did not build
@@ -547,6 +571,27 @@ every thread's stack, throws `StressRun.Hung`, and leaves the daemon workers beh
 `StressRun.withStore` then skips `close()`, which would otherwise wait on the stuck worker's lock and
 turn a red test with a thread dump back into a hung build.
 
+### 8.1 Golden fixtures
+
+`graph-core/src/test/resources/format/v<N>/` holds one store per store format version, written by the build that
+defined that version: a zipped root (`root.zip`, a database and an identity file), the canonical text it must read
+back as (`expected.txt`, `expected-auth.txt`), and the options and commit it came from (`fixture.properties`). Version
+4's is 71 KB zipped: 4 KiB pages and 32 KiB segments keep it small while still rolling the blob kind into a second
+segment. The rules, and the procedure for the next version, are [MIGRATION.md §6](MIGRATION.md#6-changing-the-format-the-procedure):
+
+- **Never regenerate an older version's fixture.** `testEveryFixtureIsTheVersionItIsFiledUnder` fails if one is.
+- **`GoldenContent.canonical` must render every committed fixture as it did when it was generated.**
+- `tools/golden-fixture.sh` writes the current version's fixture and refuses to overwrite it without `--replace`.
+
+The tripwire was checked against a real mistake before it was trusted: moving the unique-key list of the index
+catalog page by eight bytes, with no version bump, fails `testTheCurrentFixtureReadsBackExactly` with the store-wide
+unique constraint missing from the read-back.
+
+`SidecarVersions` (in `fixture/`) is what lets the runner be tested end to end: a store keeps its real, current
+manifest — so the runner's verification is the real open and `verify(FULL)` — while the version the runner sees
+lives in a `TEST_VERSION` file that the test's synthetic steps advance. `StoreFiles.digest` hashes a directory by
+content while skipping holes, so "the original was not changed" is cheap to assert on a store with default geometry.
+
 ---
 
 ## 9. Conventions and Gotchas
@@ -673,6 +718,8 @@ turn a red test with a thread dump back into a hung build.
 - [x] `kill -9` loop harness (`tools/kill9-loop.sh`, `CrashWorkload`) with acknowledgement checking
 - [x] Performance gates in `-Pbench`, throughput floors and exact structural ceilings
 - [x] Dual-run CI (native on/off), plus slow, crash, gates and a Rust build
+- [x] Golden fixtures per store format version, read back and migrated on every build (§8.1, `format/`)
+- [x] The format migration runner, including a crash at every point it can stop at (`migration/`)
 - [ ] Graph fixture generators (chain, star, scale-free, grid)
 - [ ] The remaining invariant checkers as standalone classes
 - [x] `FaultInjectingIoEngine` and the crash matrix (lost, torn, corrupt, reordered and failing writes,
@@ -749,5 +796,5 @@ turn a red test with a thread dump back into a hung build.
 
 ---
 
-_Git HEAD revision: `f2b6d5f`_
-_Last updated: 2026-10-25 (second review round merged: StressRun and concurrency oracles, StorageModelTest, Cypher fuzz and differential, client lifecycle and wire codec properties; suite counts)_
+_Git HEAD revision: `8f8caad`_
+_Last updated: 2026-10-25 (first alpha: the API lock, golden fixtures and the format migration tests; suite counts)_

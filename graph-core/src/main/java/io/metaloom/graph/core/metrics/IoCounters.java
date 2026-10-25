@@ -3,7 +3,7 @@ package io.metaloom.graph.core.metrics;
 import java.util.concurrent.atomic.LongAdder;
 
 import io.metaloom.graph.core.api.IoStats;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 
 /**
  * The store's I/O counters.

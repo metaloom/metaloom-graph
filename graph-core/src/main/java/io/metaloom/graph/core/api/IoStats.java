@@ -1,6 +1,5 @@
 package io.metaloom.graph.core.api;
 
-import io.metaloom.graph.core.id.Kind;
 
 /**
  * A point-in-time snapshot of the store's I/O counters.

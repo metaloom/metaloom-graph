@@ -1,6 +1,6 @@
 package io.metaloom.graph.core.store.vec;
 
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 
 /**
  * The layout of one {@code VEC} record: a header, the vector itself, and the approximate-nearest-neighbour links that

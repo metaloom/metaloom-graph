@@ -4,7 +4,7 @@ import java.lang.foreign.MemorySegment;
 
 import io.metaloom.graph.core.api.FormatVersionException;
 import io.metaloom.graph.core.api.PageCorruptException;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 import io.metaloom.graph.core.txn.MetaJournal;
 import io.metaloom.graph.core.util.Crc;
 import io.metaloom.graph.core.util.Layouts;

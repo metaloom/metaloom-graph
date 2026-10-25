@@ -7,7 +7,7 @@ import io.metaloom.graph.core.id.ElementId;
 import io.metaloom.graph.core.util.Layouts;
 
 /**
- * One adjacency block: a run of consecutive {@link io.metaloom.graph.core.id.Kind#ADJ_CELL_BYTES} cells holding a
+ * One adjacency block: a run of consecutive {@link io.metaloom.graph.core.api.Kind#ADJ_CELL_BYTES} cells holding a
  * compressed sorted region and a raw tail.
  *
  * <p>

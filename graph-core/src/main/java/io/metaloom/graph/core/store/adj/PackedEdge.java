@@ -1,7 +1,7 @@
 package io.metaloom.graph.core.store.adj;
 
 import io.metaloom.graph.core.id.ElementId;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 
 /**
  * One adjacency entry in 8 bytes: {@code dir:2 | type:14 | location:48}.

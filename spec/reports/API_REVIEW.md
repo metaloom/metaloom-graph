@@ -4,6 +4,13 @@ The Phase 9 review of the public surface, and an explicit recommendation on the 
 
 **Recommendation: do not freeze.** The reasons are in §4 and they are specific, not cautious-by-default.
 
+> **Since 2026-10-25 the surface is *locked*, which is not the freeze this review argues against.** Every API
+> change now fails the build until a person accepts it, and during the alpha breaking changes may still be
+> accepted — [API_LOCK.md](../API_LOCK.md). Parts of §1 predate `module-info.java`: the exported package is
+> now `...core.api` alone, and `ElementId`, `Kind` and `StaleIdException` sit in the unexported `...core.id`.
+> `Kind` is still named by exported signatures, which [API_LOCK.md §2](../API_LOCK.md) records as an open
+> decision.
+
 ---
 
 ## 1. What Is Public

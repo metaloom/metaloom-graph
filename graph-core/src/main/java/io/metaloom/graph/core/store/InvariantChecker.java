@@ -9,7 +9,7 @@ import java.util.Set;
 
 import io.metaloom.graph.core.api.VerifyOptions;
 import io.metaloom.graph.core.id.ElementId;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 import io.metaloom.graph.core.index.IndexCatalog;
 import io.metaloom.graph.core.store.vec.VectorRecord;
 import io.metaloom.graph.core.segment.SegmentSet;

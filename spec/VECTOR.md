@@ -475,7 +475,9 @@ Two things follow from the scale, and they changed the design rather than being 
 **What the format bump turned out to be.** Not a bump for most stores: `Manifest.open` compares with `!=`, so
 writing 4 unconditionally would have refused every store on disk to describe a field they do not have. The version is
 a function of the content — 3 when `vec_stride` is zero, 4 when it is not — and both are accepted, with the pair
-required to agree. A store with no vectors is bit-identical to what it was.
+required to agree. A store with no vectors is bit-identical to what it was. Since the format migration work this is
+read differently: 3 and 4 are two encodings of one **store format version, 4**, and vector presence is `vec_stride`
+plus feature bit 0 — [MIGRATION.md §2.2](MIGRATION.md#22-the-legacy-encoding-and-its-end).
 
 **Five things the tests found that the design did not.**
 
@@ -579,7 +581,7 @@ The repository's existing culture applies directly, and one test class matters m
 
 ---
 
-_Git HEAD revision: `4f21a62`_
-_Last updated: 2026-10-24 (the walk follows only its own index's members; a hop's bookkeeping measured and cut;
+_Git HEAD revision: `8f8caad`_
+_Last updated: 2026-10-25 (manifest versions 3 and 4 read as one store format version). Before that 2026-10-24 (the walk follows only its own index's members; a hop's bookkeeping measured and cut;
 the vector declaration excludes concurrent writers — [INDEX.md §3.3](INDEX.md). Before that 2026-08-16: IDX-7 closed, so §1.3's declaration machinery now cites INDEX.md; new §4.4.1: the bulk build's cost measured, the search moved out of
 the writer lock, and why one-member-per-commit — the obvious reading of the plan — was 2.5x slower)_

@@ -11,7 +11,7 @@ import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.SnapshotStats;
 import io.metaloom.graph.core.api.StoreMetrics;
 import io.metaloom.graph.core.api.StoreStats;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 
 /**
  * Turns the engine's four snapshot records into meters.

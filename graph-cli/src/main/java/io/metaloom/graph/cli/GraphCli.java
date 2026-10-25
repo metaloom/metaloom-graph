@@ -20,8 +20,11 @@ import io.metaloom.graph.core.api.Grant;
 import io.metaloom.graph.core.api.GraphDatabases;
 import io.metaloom.graph.core.api.GraphStore;
 import io.metaloom.graph.core.api.GraphStoreException;
+import io.metaloom.graph.core.api.MigrationException;
 import io.metaloom.graph.core.api.Privilege;
 import io.metaloom.graph.core.api.Role;
+import io.metaloom.graph.core.api.StoreFormat;
+import io.metaloom.graph.core.api.StoreMigration;
 import io.metaloom.graph.core.api.User;
 import io.metaloom.graph.core.api.VerifyLevel;
 
@@ -31,6 +34,7 @@ import io.metaloom.graph.core.api.VerifyLevel;
  * <pre>
  * metaloom-graph-cli database backup  mydb --path=/data/graphs --out=mydb.dump
  * metaloom-graph-cli database restore mydb --server=http://localhost:8080 --in=mydb.dump
+ * metaloom-graph-cli database migrate mydb --path=/data/graphs --dry-run
  * </pre>
  *
  * <p>
@@ -40,6 +44,7 @@ import io.metaloom.graph.core.api.VerifyLevel;
  * </p>
  *
  * @see <a href="../../../../../../../spec/BACKUP.md">spec/BACKUP.md</a>
+ * @see <a href="../../../../../../../spec/MIGRATION.md">spec/MIGRATION.md</a> for {@code database migrate}
  */
 public final class GraphCli {
 
@@ -47,12 +52,19 @@ public final class GraphCli {
 	private final PrintStream err;
 	private final OutputStream stdout;
 	private final InputStream stdin;
+	private final StoreMigration migration;
 
 	GraphCli(CliOptions options, PrintStream err, OutputStream stdout, InputStream stdin) {
+		this(options, err, stdout, stdin, StoreMigration.standard());
+	}
+
+	/** @param migration the migration {@code database migrate} runs; a test passes one with a synthetic chain */
+	GraphCli(CliOptions options, PrintStream err, OutputStream stdout, InputStream stdin, StoreMigration migration) {
 		this.options = options;
 		this.err = err;
 		this.stdout = stdout;
 		this.stdin = stdin;
+		this.migration = migration;
 	}
 
 	public static void main(String[] args) {
@@ -85,6 +97,8 @@ public final class GraphCli {
 				case "database restore" -> restore();
 				case "database list" -> list();
 				case "database inspect" -> inspect();
+				case "database info" -> info();
+				case "database migrate" -> migrate();
 				case "auth reset-admin" -> resetAdmin();
 				case "auth list" -> authList();
 				case "auth user" -> authUser();
@@ -264,6 +278,135 @@ public final class GraphCli {
 			println("vector dims      " + (header.geometry().vectorDimensions() == 0 ? "none"
 				: header.geometry().vectorDimensions()));
 		}
+	}
+
+	// ---------------------------------------------------------------- format version and migration
+
+	/**
+	 * A store's format version and geometry, read off its manifest without opening it.
+	 *
+	 * <p>
+	 * No lock and no open, so it answers for a store a running server holds, and — the case it exists for — for one
+	 * this build refuses to open because its version is not the current one.
+	 * </p>
+	 */
+	private void info() throws IOException {
+		Path store = storePath(false);
+		StoreFormat.Info info = StoreFormat.inspect(store);
+		println("store            " + store);
+		println("format version   " + info.describeVersion());
+		println("this build reads " + StoreFormat.CURRENT_VERSION);
+		println("page size        " + info.pageSize());
+		println("segment capacity " + info.segmentCapacity());
+		println("vector dims      " + (info.vectorDimensions() == 0 ? "none"
+			: info.vectorDimensions() + " (record stride " + info.vectorStride() + ")"));
+		println("feature flags    0x" + Long.toHexString(info.featureFlags()));
+		println("checkpoint lsn   " + info.checkpointLsn());
+		println("store uuid       " + info.storeUuid());
+		println("log segment size " + (info.walSegmentBytes() == 0 ? "no log" : info.walSegmentBytes() + " bytes"));
+		// Not migration.plan(): a plan probes the store's lock and reads its log, and info promises neither.
+		if (Files.exists(options.path().resolve(".migration-" + options.database()))) {
+			println("migration        interrupted: run 'database migrate " + options.database() + " --path="
+				+ options.path() + "' to finish it");
+		} else if (info.version() != migration.targetVersion()) {
+			println("migration        needed: run 'database migrate " + options.database() + " --path="
+				+ options.path() + " --dry-run' for the plan");
+		}
+	}
+
+	/**
+	 * Prints the plan on stdout — it is the command's answer, the way {@code inspect} prints a header — then, unless
+	 * this is a dry run, runs it with progress on stderr.
+	 */
+	private void migrate() throws IOException {
+		Path store = storePath(true);
+		StoreMigration.Plan plan = migration.plan(store);
+		printPlan(plan);
+		if (options.dryRun()) {
+			if (!plan.canProceed()) {
+				throw new MigrationException("Dry run: the migration cannot run now, for the reasons under 'blocked'"
+					+ " above. Nothing was changed.");
+			}
+			err.println("Dry run: nothing was changed.");
+			return;
+		}
+		if (plan.upToDate()) {
+			err.println("Nothing to do.");
+			return;
+		}
+		if (!plan.canProceed()) {
+			throw new MigrationException("The migration cannot run now, for the reasons under 'blocked' above."
+				+ " Nothing was changed.");
+		}
+		StoreMigration.Result result = migration.migrate(store,
+			options.quiet() ? StoreMigration.Listener.NONE : err::println);
+		err.printf("Migrated '%s' from format version %d to %d in %s%s.%n", options.database(), result.fromVersion(),
+			result.toVersion(), human(result.elapsed()), result.resumed() ? ", finishing an interrupted migration" : "");
+		if (result.backupDirectory() != null) {
+			err.println("The original is kept at " + result.backupDirectory()
+				+ ". Delete it once the migrated store has been checked; to roll back, stop the server, move the"
+				+ " migrated store aside and rename the original back.");
+		}
+	}
+
+	private void printPlan(StoreMigration.Plan plan) {
+		println("store            " + plan.store());
+		if (plan.interrupted() != null) {
+			println("interrupted      " + plan.interrupted());
+		}
+		if (plan.fromVersion() == plan.toVersion()) {
+			println("format version   " + plan.fromVersion() + (plan.interrupted() == null
+				? ", which is current: nothing to do" : ""));
+		} else {
+			println("format version   " + plan.fromVersion() + " -> " + plan.toVersion());
+		}
+		for (StoreMigration.Step step : plan.steps()) {
+			println("step             " + step.from() + " -> " + step.to() + "  " + step.description());
+		}
+		if (!plan.steps().isEmpty()) {
+			println("copy             " + (plan.bytesToCopy() < 0 ? "size not measurable here"
+				: bytes(plan.bytesToCopy())) + " into " + plan.workDirectory() + " (" + bytes(plan.usableBytes())
+				+ " free; a reflink copy needs none)");
+			println("original kept as " + plan.backupDirectory());
+		}
+		for (String blocker : plan.blockers()) {
+			println("blocked          " + blocker.replace("\n", "\n                 "));
+		}
+	}
+
+	/**
+	 * The database directory under {@code --path}, which has to exist — a migration or an info never creates one.
+	 *
+	 * @param interruptedIsEnough
+	 *            accept a missing directory when an interrupted migration's marker is beside it, since the store may
+	 *            be half way through being renamed
+	 */
+	private Path storePath(boolean interruptedIsEnough) {
+		GraphDatabases.validate(options.database());
+		if (!Files.isDirectory(options.path())) {
+			throw new GraphStoreException("There is no database root at " + options.path() + ". Check --path.");
+		}
+		Path store = options.path().resolve(options.database());
+		boolean interrupted = Files.exists(options.path().resolve(".migration-" + options.database()));
+		if (!GraphDatabases.isStoreDirectory(store) && !(interruptedIsEnough && interrupted)) {
+			throw new GraphStoreException("No database '" + options.database() + "' under " + options.path()
+				+ (interrupted ? ", but an interrupted migration of it: run 'database migrate' to finish it" : ""));
+		}
+		return store;
+	}
+
+	private static String bytes(long count) {
+		if (count < 1024) {
+			return count + " B";
+		}
+		String[] units = { "KiB", "MiB", "GiB", "TiB" };
+		double value = count;
+		int unit = -1;
+		while (value >= 1024 && unit < units.length - 1) {
+			value /= 1024;
+			unit++;
+		}
+		return String.format(java.util.Locale.ROOT, "%.1f %s", value, units[unit]);
 	}
 
 	// ---------------------------------------------------------------- auth
@@ -543,6 +686,7 @@ public final class GraphCli {
 
 	static List<String> commands() {
 		return List.of("database backup", "database restore", "database list", "database inspect",
-			"auth reset-admin", "auth list", "auth user", "auth role", "auth grant", "auth revoke");
+			"database info", "database migrate", "auth reset-admin", "auth list", "auth user", "auth role",
+			"auth grant", "auth revoke");
 	}
 }

@@ -1,5 +1,7 @@
 package io.metaloom.graph.core.id;
 
+import io.metaloom.graph.core.api.Kind;
+
 /**
  * The 64 bit element id: {@code kind:4 | segment:24 | slot:24 | gen:12}.
  * <p>

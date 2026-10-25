@@ -10,3 +10,9 @@ graph-core/native-rust-lib/fuzz/target/
 graph-core/native-rust-lib/fuzz/corpus/
 graph-core/native-rust-lib/fuzz/artifacts/
 /data
+
+# build.sh --release collects the release artefacts here; they are published, not committed.
+/dist
+
+# A baseline the accept tool was interrupted writing; the committed file is the other one.
+*.api.tmp

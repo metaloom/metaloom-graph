@@ -2,7 +2,7 @@ package io.metaloom.graph.core.page;
 
 import java.lang.foreign.MemorySegment;
 
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 import io.metaloom.graph.core.util.LongObjectMap;
 
 /**

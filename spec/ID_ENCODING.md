@@ -329,7 +329,7 @@ Property-based tests belong here; see [TESTING.md §4](TESTING.md#4-property-bas
 | Class | Package | Purpose |
 |-------|---------|---------|
 | `ElementId` | `io.metaloom.graph.core.id` | The 64-bit id record: encode, decode, NULL, kind checks |
-| `Kind` | `io.metaloom.graph.core.id` | Per-kind constants: stride, slots per segment, data start, directory |
+| `Kind` | `io.metaloom.graph.core.api` | Per-kind constants: stride, slots per segment, data start, directory |
 | `StaleIdException` | `io.metaloom.graph.core.id` | Thrown when the generation check fails |
 | `IdAllocator` | `io.metaloom.graph.core.segment` | Hands out fresh ids from the free-slot bitmap, FIFO |
 

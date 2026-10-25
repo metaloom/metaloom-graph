@@ -25,7 +25,7 @@ import io.metaloom.graph.core.api.StoreStats;
 import io.metaloom.graph.core.api.Transaction;
 import io.metaloom.graph.core.api.VerifyLevel;
 import io.metaloom.graph.core.fixture.TempStore;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 
 /**
  * How to use the API, as executable documentation.

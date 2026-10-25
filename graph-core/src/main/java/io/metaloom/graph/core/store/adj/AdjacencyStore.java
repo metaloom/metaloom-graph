@@ -4,7 +4,7 @@ import java.io.IOException;
 
 import io.metaloom.graph.core.api.PageCorruptException;
 import io.metaloom.graph.core.id.ElementId;
-import io.metaloom.graph.core.id.Kind;
+import io.metaloom.graph.core.api.Kind;
 import io.metaloom.graph.core.metrics.IoCounters;
 import io.metaloom.graph.core.segment.SegmentSet;
 import io.metaloom.graph.core.store.node.NodeStore;

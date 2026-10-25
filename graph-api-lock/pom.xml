@@ -1,0 +1,35 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <artifactId>graph-api-lock</artifactId>
+
+    <parent>
+        <groupId>io.metaloom.graph</groupId>
+        <artifactId>metaloom-graph</artifactId>
+        <version>0.1.0-alpha.1</version>
+    </parent>
+
+    <name>MetaLoom // Graph :: API Lock</name>
+    <description>Renders the public Java API of the library modules and compares it against committed baselines</description>
+
+    <!--
+        Build tooling, not product. graph-core, graph-cypher, graph-protocol and graph-client each depend on this in
+        TEST scope only, and run ApiLockTest against their own baseline in their own `mvn test`.
+
+        It is a module of its own, rather than living in graph-core's test-jar, because of graph-protocol and
+        graph-client: they must not see graph-core on any classpath, test scope included (ClientDependencyTest), and a
+        lock that could only run for them from graph-server's suite would let `mvn test -pl graph-client` pass over a
+        changed client API. So it depends on nothing but the JDK (the slf4j-api every module inherits from the parent
+        pom is never used here).
+
+        The accept tool (tools/api-lock.sh -> ApiLockTool) lives here too, beside the dumper the test uses: one
+        implementation, so the tool and the test cannot disagree about what the API is. See spec/API_LOCK.md.
+    -->
+
+    <properties>
+        <!-- Build tooling, never released: build.sh does not ship it, and nothing would deploy it to a repository. -->
+        <maven.deploy.skip>true</maven.deploy.skip>
+        <skipNexusStagingDeployMojo>true</skipNexusStagingDeployMojo>
+    </properties>
+</project>

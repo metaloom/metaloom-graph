@@ -1,0 +1,745 @@
+# MetaLoom // Graph: the locked public Java API of graph-core.
+#
+# Written by tools/api-lock.sh, never by hand and never by a test. The sha256 line covers every other
+# line of this file, so an edit anywhere fails ApiLockTest; so does any difference between this dump and
+# the compiled code. To change the API on purpose, read spec/API_LOCK.md section 4.
+# AI agents: never run the accept tool and never edit this file. See AGENTS.md.
+format: 1
+module: graph-core
+policy: alpha
+sha256: 139061b14811d526ec8bf350138f25d65a35a1eb86fdafff6d4118ff027d61f7
+
+scope module io.metaloom.graph.core exports io.metaloom.graph.core.api
+io.metaloom.graph.core.api.AuthException type public class AuthException extends io.metaloom.graph.core.api.GraphStoreException
+io.metaloom.graph.core.api.AuthException constructor public AuthException(java.lang.String)
+io.metaloom.graph.core.api.AuthException constructor public AuthException(java.lang.String, java.lang.Throwable)
+io.metaloom.graph.core.api.AuthFormatException type public class AuthFormatException extends io.metaloom.graph.core.api.AuthException
+io.metaloom.graph.core.api.AuthFormatException constructor public AuthFormatException(java.lang.String)
+io.metaloom.graph.core.api.AuthFormatException constructor public AuthFormatException(java.lang.String, java.lang.Throwable)
+io.metaloom.graph.core.api.AuthStore type public final class AuthStore implements java.lang.AutoCloseable
+io.metaloom.graph.core.api.AuthStore field public static final java.lang.String ADMIN = "admin"
+io.metaloom.graph.core.api.AuthStore field public static final java.lang.String DIRECTORY = ".auth"
+io.metaloom.graph.core.api.AuthStore field public static final java.lang.String FILE = "AUTH"
+io.metaloom.graph.core.api.AuthStore method public boolean bootstrap(char[]) throws java.io.IOException
+io.metaloom.graph.core.api.AuthStore method public boolean isEmpty()
+io.metaloom.graph.core.api.AuthStore method public boolean reloadIfChanged()
+io.metaloom.graph.core.api.AuthStore method public java.nio.file.Path path()
+io.metaloom.graph.core.api.AuthStore method public java.util.List<io.metaloom.graph.core.api.Grant> effectiveGrants(java.lang.String)
+io.metaloom.graph.core.api.AuthStore method public java.util.List<io.metaloom.graph.core.api.Role> roles()
+io.metaloom.graph.core.api.AuthStore method public java.util.List<io.metaloom.graph.core.api.User> users()
+io.metaloom.graph.core.api.AuthStore method public java.util.Optional<io.metaloom.graph.core.api.Principal> authenticate(java.lang.String, char[])
+io.metaloom.graph.core.api.AuthStore method public java.util.Optional<io.metaloom.graph.core.api.Principal> principal(java.lang.String)
+io.metaloom.graph.core.api.AuthStore method public java.util.Optional<io.metaloom.graph.core.api.Role> role(java.lang.String)
+io.metaloom.graph.core.api.AuthStore method public java.util.Optional<io.metaloom.graph.core.api.User> user(java.lang.String)
+io.metaloom.graph.core.api.AuthStore method public long generation()
+io.metaloom.graph.core.api.AuthStore method public static io.metaloom.graph.core.api.AuthStore open(java.nio.file.Path) throws java.io.IOException
+io.metaloom.graph.core.api.AuthStore method public void close()
+io.metaloom.graph.core.api.AuthStore method public void createRole(java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.AuthStore method public void createUser(java.lang.String, char[], java.util.List<java.lang.String>) throws java.io.IOException
+io.metaloom.graph.core.api.AuthStore method public void dropRole(java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.AuthStore method public void dropUser(java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.AuthStore method public void grantToRole(java.lang.String, io.metaloom.graph.core.api.Grant) throws java.io.IOException
+io.metaloom.graph.core.api.AuthStore method public void resetAdmin(char[]) throws java.io.IOException
+io.metaloom.graph.core.api.AuthStore method public void revokeFromRole(java.lang.String, io.metaloom.graph.core.api.Grant) throws java.io.IOException
+io.metaloom.graph.core.api.AuthStore method public void setEnabled(java.lang.String, boolean) throws java.io.IOException
+io.metaloom.graph.core.api.AuthStore method public void setPassword(java.lang.String, char[]) throws java.io.IOException
+io.metaloom.graph.core.api.AuthStore method public void setUserRoles(java.lang.String, java.util.List<java.lang.String>) throws java.io.IOException
+io.metaloom.graph.core.api.CompactionOptions type public final class CompactionOptions
+io.metaloom.graph.core.api.CompactionOptions field public static final java.util.Set<io.metaloom.graph.core.api.Kind> DEFAULT_KINDS
+io.metaloom.graph.core.api.CompactionOptions method public boolean defragmentAdjacency()
+io.metaloom.graph.core.api.CompactionOptions method public boolean retireEmptySegments()
+io.metaloom.graph.core.api.CompactionOptions method public double indexFillThreshold()
+io.metaloom.graph.core.api.CompactionOptions method public double livenessThreshold()
+io.metaloom.graph.core.api.CompactionOptions method public int adjacencyFillThreshold()
+io.metaloom.graph.core.api.CompactionOptions method public int maxRelocationsPerTransaction()
+io.metaloom.graph.core.api.CompactionOptions method public java.util.Set<io.metaloom.graph.core.api.Kind> kinds()
+io.metaloom.graph.core.api.CompactionOptions method public long pauseBetweenBatchesMillis()
+io.metaloom.graph.core.api.CompactionOptions method public static io.metaloom.graph.core.api.CompactionOptions always()
+io.metaloom.graph.core.api.CompactionOptions method public static io.metaloom.graph.core.api.CompactionOptions defaults()
+io.metaloom.graph.core.api.CompactionOptions method public static io.metaloom.graph.core.api.CompactionOptions$Builder builder()
+io.metaloom.graph.core.api.CompactionOptions$Builder type public static final class Builder
+io.metaloom.graph.core.api.CompactionOptions$Builder constructor public Builder()
+io.metaloom.graph.core.api.CompactionOptions$Builder method public io.metaloom.graph.core.api.CompactionOptions build()
+io.metaloom.graph.core.api.CompactionOptions$Builder method public io.metaloom.graph.core.api.CompactionOptions$Builder adjacencyFillThreshold(int)
+io.metaloom.graph.core.api.CompactionOptions$Builder method public io.metaloom.graph.core.api.CompactionOptions$Builder defragmentAdjacency(boolean)
+io.metaloom.graph.core.api.CompactionOptions$Builder method public io.metaloom.graph.core.api.CompactionOptions$Builder indexFillThreshold(double)
+io.metaloom.graph.core.api.CompactionOptions$Builder method public io.metaloom.graph.core.api.CompactionOptions$Builder kinds(io.metaloom.graph.core.api.Kind...)
+io.metaloom.graph.core.api.CompactionOptions$Builder method public io.metaloom.graph.core.api.CompactionOptions$Builder kinds(java.util.Set<io.metaloom.graph.core.api.Kind>)
+io.metaloom.graph.core.api.CompactionOptions$Builder method public io.metaloom.graph.core.api.CompactionOptions$Builder livenessThreshold(double)
+io.metaloom.graph.core.api.CompactionOptions$Builder method public io.metaloom.graph.core.api.CompactionOptions$Builder maxRelocationsPerTransaction(int)
+io.metaloom.graph.core.api.CompactionOptions$Builder method public io.metaloom.graph.core.api.CompactionOptions$Builder pauseBetweenBatchesMillis(long)
+io.metaloom.graph.core.api.CompactionOptions$Builder method public io.metaloom.graph.core.api.CompactionOptions$Builder retireEmptySegments(boolean)
+io.metaloom.graph.core.api.CompactionReport type public record CompactionReport
+io.metaloom.graph.core.api.CompactionReport components (java.util.Map<io.metaloom.graph.core.api.Kind, java.lang.Long> relocated, int batches, long adjacencyBlocksFreed, long indexPagesFreed, long slotsReclaimed, int segmentsRetired, int pagesPunched, double livenessBefore, double livenessAfter, long storageBytesBefore, long storageBytesAfter, long durationMillis)
+io.metaloom.graph.core.api.CompactionReport constructor public CompactionReport(java.util.Map<io.metaloom.graph.core.api.Kind, java.lang.Long>, int, long, long, long, int, int, double, double, long, long, long)
+io.metaloom.graph.core.api.CompactionReport method public double livenessAfter()
+io.metaloom.graph.core.api.CompactionReport method public double livenessBefore()
+io.metaloom.graph.core.api.CompactionReport method public final boolean equals(java.lang.Object)
+io.metaloom.graph.core.api.CompactionReport method public final int hashCode()
+io.metaloom.graph.core.api.CompactionReport method public int batches()
+io.metaloom.graph.core.api.CompactionReport method public int pagesPunched()
+io.metaloom.graph.core.api.CompactionReport method public int segmentsRetired()
+io.metaloom.graph.core.api.CompactionReport method public java.lang.String toString()
+io.metaloom.graph.core.api.CompactionReport method public java.util.Map<io.metaloom.graph.core.api.Kind, java.lang.Long> relocated()
+io.metaloom.graph.core.api.CompactionReport method public long adjacencyBlocksFreed()
+io.metaloom.graph.core.api.CompactionReport method public long durationMillis()
+io.metaloom.graph.core.api.CompactionReport method public long indexPagesFreed()
+io.metaloom.graph.core.api.CompactionReport method public long slotsReclaimed()
+io.metaloom.graph.core.api.CompactionReport method public long storageBytesAfter()
+io.metaloom.graph.core.api.CompactionReport method public long storageBytesBefore()
+io.metaloom.graph.core.api.CompactionReport method public long storageBytesReclaimed()
+io.metaloom.graph.core.api.CompactionReport method public long totalRelocated()
+io.metaloom.graph.core.api.CompositeIndex type public record CompositeIndex
+io.metaloom.graph.core.api.CompositeIndex components (java.lang.String label, java.lang.String key, boolean unique)
+io.metaloom.graph.core.api.CompositeIndex constructor public CompositeIndex(java.lang.String, java.lang.String, boolean)
+io.metaloom.graph.core.api.CompositeIndex method public boolean covers(java.lang.String, java.lang.String)
+io.metaloom.graph.core.api.CompositeIndex method public boolean unique()
+io.metaloom.graph.core.api.CompositeIndex method public final boolean equals(java.lang.Object)
+io.metaloom.graph.core.api.CompositeIndex method public final int hashCode()
+io.metaloom.graph.core.api.CompositeIndex method public java.lang.String key()
+io.metaloom.graph.core.api.CompositeIndex method public java.lang.String label()
+io.metaloom.graph.core.api.CompositeIndex method public java.lang.String toString()
+io.metaloom.graph.core.api.ConstraintViolationException type public class ConstraintViolationException extends io.metaloom.graph.core.api.GraphStoreException
+io.metaloom.graph.core.api.ConstraintViolationException constructor public ConstraintViolationException(java.lang.String, java.lang.Object, long)
+io.metaloom.graph.core.api.ConstraintViolationException constructor public ConstraintViolationException(java.lang.String, java.lang.String, java.lang.Object, long)
+io.metaloom.graph.core.api.ConstraintViolationException method public java.lang.Object value()
+io.metaloom.graph.core.api.ConstraintViolationException method public java.lang.String key()
+io.metaloom.graph.core.api.ConstraintViolationException method public java.lang.String label()
+io.metaloom.graph.core.api.ConstraintViolationException method public long existingId()
+io.metaloom.graph.core.api.Direction type public enum Direction
+io.metaloom.graph.core.api.Direction constant BOTH ordinal=2
+io.metaloom.graph.core.api.Direction constant IN ordinal=1
+io.metaloom.graph.core.api.Direction constant OUT ordinal=0
+io.metaloom.graph.core.api.Direction method public boolean matches(int)
+io.metaloom.graph.core.api.Direction method public int packedDir()
+io.metaloom.graph.core.api.Direction method public io.metaloom.graph.core.api.Direction opposite()
+io.metaloom.graph.core.api.Direction method public static io.metaloom.graph.core.api.Direction valueOf(java.lang.String)
+io.metaloom.graph.core.api.Direction method public static io.metaloom.graph.core.api.Direction[] values()
+io.metaloom.graph.core.api.Edge type public record Edge
+io.metaloom.graph.core.api.Edge components (long neighbourId, java.lang.String type, io.metaloom.graph.core.api.Direction direction, long relationshipId)
+io.metaloom.graph.core.api.Edge constructor public Edge(long, java.lang.String, io.metaloom.graph.core.api.Direction, long)
+io.metaloom.graph.core.api.Edge method public boolean isMaterialised()
+io.metaloom.graph.core.api.Edge method public final boolean equals(java.lang.Object)
+io.metaloom.graph.core.api.Edge method public final int hashCode()
+io.metaloom.graph.core.api.Edge method public io.metaloom.graph.core.api.Direction direction()
+io.metaloom.graph.core.api.Edge method public java.lang.String toString()
+io.metaloom.graph.core.api.Edge method public java.lang.String type()
+io.metaloom.graph.core.api.Edge method public long neighbourId()
+io.metaloom.graph.core.api.Edge method public long relationshipId()
+io.metaloom.graph.core.api.FormatVersionException type public class FormatVersionException extends io.metaloom.graph.core.api.GraphStoreException
+io.metaloom.graph.core.api.FormatVersionException constructor public FormatVersionException(java.lang.String)
+io.metaloom.graph.core.api.ForwardingGraphStore type public class ForwardingGraphStore implements io.metaloom.graph.core.api.GraphStore
+io.metaloom.graph.core.api.ForwardingGraphStore constructor public ForwardingGraphStore(io.metaloom.graph.core.api.GraphStore)
+io.metaloom.graph.core.api.ForwardingGraphStore method protected final io.metaloom.graph.core.api.GraphStore delegate()
+io.metaloom.graph.core.api.ForwardingGraphStore method public <T> T inOpenTransaction(io.metaloom.graph.core.api.GraphStore$TransactionalWork<T>) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public <T> T inStatement(io.metaloom.graph.core.api.GraphStore$TransactionalWork<T>) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public <T> T inTransaction(io.metaloom.graph.core.api.GraphStore$TransactionalWork<T>, int) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public <T> T inTransaction(io.metaloom.graph.core.api.GraphStore$TransactionalWork<T>, int, io.metaloom.graph.core.api.IsolationLevel) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public boolean addNodeLabel(long, java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public boolean deleteEdge(long, java.lang.String, long) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public boolean forEachNodeWhile(java.util.function.LongPredicate)
+io.metaloom.graph.core.api.ForwardingGraphStore method public boolean forEachNodeWhile(java.util.function.LongPredicate, io.metaloom.graph.core.api.ScanOptions)
+io.metaloom.graph.core.api.ForwardingGraphStore method public boolean hasEdge(long, long)
+io.metaloom.graph.core.api.ForwardingGraphStore method public boolean hasIndex(java.lang.String, java.lang.String)
+io.metaloom.graph.core.api.ForwardingGraphStore method public boolean hasReadTransaction()
+io.metaloom.graph.core.api.ForwardingGraphStore method public boolean hasWriteTransaction()
+io.metaloom.graph.core.api.ForwardingGraphStore method public boolean nodeExists(long)
+io.metaloom.graph.core.api.ForwardingGraphStore method public boolean nodeHasLabel(long, java.lang.String)
+io.metaloom.graph.core.api.ForwardingGraphStore method public boolean relationshipExists(long)
+io.metaloom.graph.core.api.ForwardingGraphStore method public boolean removeNodeLabel(long, java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public int degreeIn(long)
+io.metaloom.graph.core.api.ForwardingGraphStore method public int degreeOut(long)
+io.metaloom.graph.core.api.ForwardingGraphStore method public int reclaim() throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public io.metaloom.graph.core.api.CompactionReport compact() throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public io.metaloom.graph.core.api.CompactionReport compact(io.metaloom.graph.core.api.CompactionOptions) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public io.metaloom.graph.core.api.GraphStoreOptions options()
+io.metaloom.graph.core.api.ForwardingGraphStore method public io.metaloom.graph.core.api.NeighbourCursor neighbourCursor(long, io.metaloom.graph.core.api.Direction, java.util.Set<java.lang.String>)
+io.metaloom.graph.core.api.ForwardingGraphStore method public io.metaloom.graph.core.api.Properties nodeProperties(long)
+io.metaloom.graph.core.api.ForwardingGraphStore method public io.metaloom.graph.core.api.Properties relationshipProperties(long)
+io.metaloom.graph.core.api.ForwardingGraphStore method public io.metaloom.graph.core.api.ReadTransaction beginRead()
+io.metaloom.graph.core.api.ForwardingGraphStore method public io.metaloom.graph.core.api.ReadTransaction beginRead(io.metaloom.graph.core.api.IsolationLevel)
+io.metaloom.graph.core.api.ForwardingGraphStore method public io.metaloom.graph.core.api.SnapshotStats snapshotStats()
+io.metaloom.graph.core.api.ForwardingGraphStore method public io.metaloom.graph.core.api.StoreMetrics metrics()
+io.metaloom.graph.core.api.ForwardingGraphStore method public io.metaloom.graph.core.api.StoreStats stats()
+io.metaloom.graph.core.api.ForwardingGraphStore method public io.metaloom.graph.core.api.Transaction begin()
+io.metaloom.graph.core.api.ForwardingGraphStore method public io.metaloom.graph.core.api.Transaction begin(io.metaloom.graph.core.api.IsolationLevel)
+io.metaloom.graph.core.api.ForwardingGraphStore method public java.lang.Object nodeProperty(long, java.lang.String)
+io.metaloom.graph.core.api.ForwardingGraphStore method public java.lang.String nodeLabel(long)
+io.metaloom.graph.core.api.ForwardingGraphStore method public java.lang.String relationshipType(long)
+io.metaloom.graph.core.api.ForwardingGraphStore method public java.util.List<io.metaloom.graph.core.api.CompositeIndex> compositeIndexes()
+io.metaloom.graph.core.api.ForwardingGraphStore method public java.util.List<io.metaloom.graph.core.api.Edge> neighbours(long, io.metaloom.graph.core.api.Direction)
+io.metaloom.graph.core.api.ForwardingGraphStore method public java.util.List<io.metaloom.graph.core.api.Edge> neighbours(long, io.metaloom.graph.core.api.Direction, java.util.Set<java.lang.String>)
+io.metaloom.graph.core.api.ForwardingGraphStore method public java.util.List<io.metaloom.graph.core.api.Edge> traverse(long, io.metaloom.graph.core.api.Direction, java.util.Set<java.lang.String>, int)
+io.metaloom.graph.core.api.ForwardingGraphStore method public java.util.List<io.metaloom.graph.core.api.Neighbour> nearest(java.lang.String, java.lang.String, float[], int, java.util.function.LongPredicate) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public java.util.List<io.metaloom.graph.core.api.Neighbour> nearestByScan(java.lang.String, java.lang.String, float[], int, io.metaloom.graph.core.api.VectorMetric)
+io.metaloom.graph.core.api.ForwardingGraphStore method public java.util.List<io.metaloom.graph.core.api.VectorIndexDefinition> vectorIndexes()
+io.metaloom.graph.core.api.ForwardingGraphStore method public java.util.List<java.lang.Long> nodesByLabel(java.lang.String)
+io.metaloom.graph.core.api.ForwardingGraphStore method public java.util.List<java.lang.Long> nodesByLabelAndProperty(java.lang.String, java.lang.String, java.lang.Object)
+io.metaloom.graph.core.api.ForwardingGraphStore method public java.util.List<java.lang.Long> nodesByProperty(java.lang.String, java.lang.Object)
+io.metaloom.graph.core.api.ForwardingGraphStore method public java.util.List<java.lang.String> nodeLabels(long)
+io.metaloom.graph.core.api.ForwardingGraphStore method public java.util.List<java.lang.String> uniqueConstraints()
+io.metaloom.graph.core.api.ForwardingGraphStore method public long createNode(java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public long createNode(java.lang.String, io.metaloom.graph.core.api.Properties) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public long createNode(java.util.List<java.lang.String>) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public long createNode(java.util.List<java.lang.String>, io.metaloom.graph.core.api.Properties) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public long createRelationship(long, java.lang.String, long) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public long createRelationship(long, java.lang.String, long, io.metaloom.graph.core.api.Properties) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public long relationshipFrom(long)
+io.metaloom.graph.core.api.ForwardingGraphStore method public long relationshipTo(long)
+io.metaloom.graph.core.api.ForwardingGraphStore method public void buildVectorIndex(java.lang.String, java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public void checkpoint() throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public void close() throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public void createEdge(long, java.lang.String, long) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public void createIndex(java.lang.String, java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public void createUniqueConstraint(java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public void createUniqueConstraint(java.lang.String, java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public void createVectorIndex(io.metaloom.graph.core.api.VectorIndexDefinition) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public void deleteNode(long) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public void deleteRelationship(long) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public void dropIndex(java.lang.String, java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public void dropVectorIndex(java.lang.String, java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public void forEachNode(java.util.function.LongConsumer)
+io.metaloom.graph.core.api.ForwardingGraphStore method public void setNodeProperties(long, io.metaloom.graph.core.api.Properties) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public void setRelationshipProperties(long, io.metaloom.graph.core.api.Properties) throws java.io.IOException
+io.metaloom.graph.core.api.ForwardingGraphStore method public void verify()
+io.metaloom.graph.core.api.ForwardingGraphStore method public void verify(io.metaloom.graph.core.api.VerifyLevel)
+io.metaloom.graph.core.api.ForwardingGraphStore method public void verify(io.metaloom.graph.core.api.VerifyLevel, io.metaloom.graph.core.api.VerifyOptions)
+io.metaloom.graph.core.api.Grant type public record Grant
+io.metaloom.graph.core.api.Grant components (io.metaloom.graph.core.api.Privilege privilege, java.lang.String database)
+io.metaloom.graph.core.api.Grant field public static final java.lang.String ALL_DATABASES = "*"
+io.metaloom.graph.core.api.Grant constructor public Grant(io.metaloom.graph.core.api.Privilege, java.lang.String)
+io.metaloom.graph.core.api.Grant method public boolean isWildcard()
+io.metaloom.graph.core.api.Grant method public boolean permits(io.metaloom.graph.core.api.Privilege, java.lang.String)
+io.metaloom.graph.core.api.Grant method public final boolean equals(java.lang.Object)
+io.metaloom.graph.core.api.Grant method public final int hashCode()
+io.metaloom.graph.core.api.Grant method public io.metaloom.graph.core.api.Privilege privilege()
+io.metaloom.graph.core.api.Grant method public java.lang.String database()
+io.metaloom.graph.core.api.Grant method public java.lang.String toString()
+io.metaloom.graph.core.api.Grant method public static io.metaloom.graph.core.api.Grant on(io.metaloom.graph.core.api.Privilege)
+io.metaloom.graph.core.api.Grant method public static io.metaloom.graph.core.api.Grant parse(java.lang.String)
+io.metaloom.graph.core.api.GraphDatabases type public final class GraphDatabases implements java.lang.AutoCloseable
+io.metaloom.graph.core.api.GraphDatabases field public static final int MAX_NAME_LENGTH = 64
+io.metaloom.graph.core.api.GraphDatabases field public static final java.lang.String DEFAULT_NAME = "default"
+io.metaloom.graph.core.api.GraphDatabases method public boolean drop(java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.GraphDatabases method public boolean exists(java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.GraphDatabases method public boolean isOpen(java.lang.String)
+io.metaloom.graph.core.api.GraphDatabases method public io.metaloom.graph.core.api.GraphStore create(java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.GraphDatabases method public io.metaloom.graph.core.api.GraphStore create(java.lang.String, io.metaloom.graph.core.api.GraphStoreOptions) throws java.io.IOException
+io.metaloom.graph.core.api.GraphDatabases method public io.metaloom.graph.core.api.GraphStore database(java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.GraphDatabases method public io.metaloom.graph.core.api.GraphStore install(java.lang.String, io.metaloom.graph.core.api.GraphStoreOptions) throws java.io.IOException
+io.metaloom.graph.core.api.GraphDatabases method public io.metaloom.graph.core.api.GraphStore replace(java.lang.String, io.metaloom.graph.core.api.GraphStoreOptions) throws java.io.IOException
+io.metaloom.graph.core.api.GraphDatabases method public io.metaloom.graph.core.api.GraphStore stage(java.lang.String, io.metaloom.graph.core.api.GraphStoreOptions) throws java.io.IOException
+io.metaloom.graph.core.api.GraphDatabases method public java.nio.file.Path pathOf(java.lang.String)
+io.metaloom.graph.core.api.GraphDatabases method public java.nio.file.Path root()
+io.metaloom.graph.core.api.GraphDatabases method public java.util.List<io.metaloom.graph.core.api.GraphStore> openDatabases()
+io.metaloom.graph.core.api.GraphDatabases method public java.util.List<java.lang.String> names() throws java.io.IOException
+io.metaloom.graph.core.api.GraphDatabases method public static boolean isStoreDirectory(java.nio.file.Path)
+io.metaloom.graph.core.api.GraphDatabases method public static io.metaloom.graph.core.api.GraphDatabases open(java.nio.file.Path) throws java.io.IOException
+io.metaloom.graph.core.api.GraphDatabases method public static io.metaloom.graph.core.api.GraphDatabases open(java.nio.file.Path, io.metaloom.graph.core.api.GraphStoreOptions) throws java.io.IOException
+io.metaloom.graph.core.api.GraphDatabases method public static void validate(java.lang.String)
+io.metaloom.graph.core.api.GraphDatabases method public void close() throws java.io.IOException
+io.metaloom.graph.core.api.GraphDatabases method public void discardStaged(java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore type public sealed interface GraphStore extends java.lang.AutoCloseable permits io.metaloom.graph.core.api.ForwardingGraphStore, io.metaloom.graph.core.store.GraphStoreImpl
+io.metaloom.graph.core.api.GraphStore method public abstract <T> T inOpenTransaction(io.metaloom.graph.core.api.GraphStore$TransactionalWork<T>) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract <T> T inStatement(io.metaloom.graph.core.api.GraphStore$TransactionalWork<T>) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract <T> T inTransaction(io.metaloom.graph.core.api.GraphStore$TransactionalWork<T>, int) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract <T> T inTransaction(io.metaloom.graph.core.api.GraphStore$TransactionalWork<T>, int, io.metaloom.graph.core.api.IsolationLevel) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract boolean addNodeLabel(long, java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract boolean deleteEdge(long, java.lang.String, long) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract boolean forEachNodeWhile(java.util.function.LongPredicate)
+io.metaloom.graph.core.api.GraphStore method public abstract boolean forEachNodeWhile(java.util.function.LongPredicate, io.metaloom.graph.core.api.ScanOptions)
+io.metaloom.graph.core.api.GraphStore method public abstract boolean hasEdge(long, long)
+io.metaloom.graph.core.api.GraphStore method public abstract boolean hasIndex(java.lang.String, java.lang.String)
+io.metaloom.graph.core.api.GraphStore method public abstract boolean hasReadTransaction()
+io.metaloom.graph.core.api.GraphStore method public abstract boolean hasWriteTransaction()
+io.metaloom.graph.core.api.GraphStore method public abstract boolean nodeExists(long)
+io.metaloom.graph.core.api.GraphStore method public abstract boolean nodeHasLabel(long, java.lang.String)
+io.metaloom.graph.core.api.GraphStore method public abstract boolean relationshipExists(long)
+io.metaloom.graph.core.api.GraphStore method public abstract boolean removeNodeLabel(long, java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract int degreeIn(long)
+io.metaloom.graph.core.api.GraphStore method public abstract int degreeOut(long)
+io.metaloom.graph.core.api.GraphStore method public abstract int reclaim() throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract io.metaloom.graph.core.api.CompactionReport compact() throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract io.metaloom.graph.core.api.CompactionReport compact(io.metaloom.graph.core.api.CompactionOptions) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract io.metaloom.graph.core.api.GraphStoreOptions options()
+io.metaloom.graph.core.api.GraphStore method public abstract io.metaloom.graph.core.api.NeighbourCursor neighbourCursor(long, io.metaloom.graph.core.api.Direction, java.util.Set<java.lang.String>)
+io.metaloom.graph.core.api.GraphStore method public abstract io.metaloom.graph.core.api.Properties nodeProperties(long)
+io.metaloom.graph.core.api.GraphStore method public abstract io.metaloom.graph.core.api.Properties relationshipProperties(long)
+io.metaloom.graph.core.api.GraphStore method public abstract io.metaloom.graph.core.api.ReadTransaction beginRead()
+io.metaloom.graph.core.api.GraphStore method public abstract io.metaloom.graph.core.api.ReadTransaction beginRead(io.metaloom.graph.core.api.IsolationLevel)
+io.metaloom.graph.core.api.GraphStore method public abstract io.metaloom.graph.core.api.SnapshotStats snapshotStats()
+io.metaloom.graph.core.api.GraphStore method public abstract io.metaloom.graph.core.api.StoreMetrics metrics()
+io.metaloom.graph.core.api.GraphStore method public abstract io.metaloom.graph.core.api.StoreStats stats()
+io.metaloom.graph.core.api.GraphStore method public abstract io.metaloom.graph.core.api.Transaction begin()
+io.metaloom.graph.core.api.GraphStore method public abstract io.metaloom.graph.core.api.Transaction begin(io.metaloom.graph.core.api.IsolationLevel)
+io.metaloom.graph.core.api.GraphStore method public abstract java.lang.Object nodeProperty(long, java.lang.String)
+io.metaloom.graph.core.api.GraphStore method public abstract java.lang.String nodeLabel(long)
+io.metaloom.graph.core.api.GraphStore method public abstract java.lang.String relationshipType(long)
+io.metaloom.graph.core.api.GraphStore method public abstract java.util.List<io.metaloom.graph.core.api.CompositeIndex> compositeIndexes()
+io.metaloom.graph.core.api.GraphStore method public abstract java.util.List<io.metaloom.graph.core.api.Edge> neighbours(long, io.metaloom.graph.core.api.Direction)
+io.metaloom.graph.core.api.GraphStore method public abstract java.util.List<io.metaloom.graph.core.api.Edge> neighbours(long, io.metaloom.graph.core.api.Direction, java.util.Set<java.lang.String>)
+io.metaloom.graph.core.api.GraphStore method public abstract java.util.List<io.metaloom.graph.core.api.Edge> traverse(long, io.metaloom.graph.core.api.Direction, java.util.Set<java.lang.String>, int)
+io.metaloom.graph.core.api.GraphStore method public abstract java.util.List<io.metaloom.graph.core.api.Neighbour> nearest(java.lang.String, java.lang.String, float[], int, java.util.function.LongPredicate) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract java.util.List<io.metaloom.graph.core.api.Neighbour> nearestByScan(java.lang.String, java.lang.String, float[], int, io.metaloom.graph.core.api.VectorMetric)
+io.metaloom.graph.core.api.GraphStore method public abstract java.util.List<io.metaloom.graph.core.api.VectorIndexDefinition> vectorIndexes()
+io.metaloom.graph.core.api.GraphStore method public abstract java.util.List<java.lang.Long> nodesByLabel(java.lang.String)
+io.metaloom.graph.core.api.GraphStore method public abstract java.util.List<java.lang.Long> nodesByLabelAndProperty(java.lang.String, java.lang.String, java.lang.Object)
+io.metaloom.graph.core.api.GraphStore method public abstract java.util.List<java.lang.Long> nodesByProperty(java.lang.String, java.lang.Object)
+io.metaloom.graph.core.api.GraphStore method public abstract java.util.List<java.lang.String> nodeLabels(long)
+io.metaloom.graph.core.api.GraphStore method public abstract java.util.List<java.lang.String> uniqueConstraints()
+io.metaloom.graph.core.api.GraphStore method public abstract long createNode(java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract long createNode(java.lang.String, io.metaloom.graph.core.api.Properties) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract long createNode(java.util.List<java.lang.String>) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract long createNode(java.util.List<java.lang.String>, io.metaloom.graph.core.api.Properties) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract long createRelationship(long, java.lang.String, long) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract long createRelationship(long, java.lang.String, long, io.metaloom.graph.core.api.Properties) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract long relationshipFrom(long)
+io.metaloom.graph.core.api.GraphStore method public abstract long relationshipTo(long)
+io.metaloom.graph.core.api.GraphStore method public abstract void buildVectorIndex(java.lang.String, java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract void checkpoint() throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract void close() throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract void createEdge(long, java.lang.String, long) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract void createIndex(java.lang.String, java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract void createUniqueConstraint(java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract void createUniqueConstraint(java.lang.String, java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract void createVectorIndex(io.metaloom.graph.core.api.VectorIndexDefinition) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract void deleteNode(long) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract void deleteRelationship(long) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract void dropIndex(java.lang.String, java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract void dropVectorIndex(java.lang.String, java.lang.String) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract void forEachNode(java.util.function.LongConsumer)
+io.metaloom.graph.core.api.GraphStore method public abstract void setNodeProperties(long, io.metaloom.graph.core.api.Properties) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract void setRelationshipProperties(long, io.metaloom.graph.core.api.Properties) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public abstract void verify()
+io.metaloom.graph.core.api.GraphStore method public abstract void verify(io.metaloom.graph.core.api.VerifyLevel)
+io.metaloom.graph.core.api.GraphStore method public abstract void verify(io.metaloom.graph.core.api.VerifyLevel, io.metaloom.graph.core.api.VerifyOptions)
+io.metaloom.graph.core.api.GraphStore method public default <T> T inTransaction(io.metaloom.graph.core.api.GraphStore$TransactionalWork<T>) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public static io.metaloom.graph.core.api.GraphStore open(java.nio.file.Path) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore method public static io.metaloom.graph.core.api.GraphStore open(java.nio.file.Path, io.metaloom.graph.core.api.GraphStoreOptions) throws java.io.IOException
+io.metaloom.graph.core.api.GraphStore$TransactionalWork type public interface TransactionalWork<T>
+io.metaloom.graph.core.api.GraphStore$TransactionalWork annotation @java.lang.FunctionalInterface
+io.metaloom.graph.core.api.GraphStore$TransactionalWork method public abstract T run() throws java.io.IOException
+io.metaloom.graph.core.api.GraphStoreException type public class GraphStoreException extends java.lang.RuntimeException
+io.metaloom.graph.core.api.GraphStoreException constructor public GraphStoreException(java.lang.String)
+io.metaloom.graph.core.api.GraphStoreException constructor public GraphStoreException(java.lang.String, java.lang.Throwable)
+io.metaloom.graph.core.api.GraphStoreOptions type public final class GraphStoreOptions
+io.metaloom.graph.core.api.GraphStoreOptions field public static final long DEFAULT_RETAINED_VERSION_BYTES = 268435456L
+io.metaloom.graph.core.api.GraphStoreOptions field public static final long DEFAULT_WAL_SEGMENT_BYTES = 67108864L
+io.metaloom.graph.core.api.GraphStoreOptions method public int pageSize()
+io.metaloom.graph.core.api.GraphStoreOptions method public int vectorDimensions()
+io.metaloom.graph.core.api.GraphStoreOptions method public io.metaloom.graph.core.api.GraphStoreOptions$IoEngineKind ioEngine()
+io.metaloom.graph.core.api.GraphStoreOptions method public io.metaloom.graph.core.api.WalSyncMode walSyncMode()
+io.metaloom.graph.core.api.GraphStoreOptions method public long retainedVersionBytes()
+io.metaloom.graph.core.api.GraphStoreOptions method public long segmentCapacity()
+io.metaloom.graph.core.api.GraphStoreOptions method public long walSegmentBytes()
+io.metaloom.graph.core.api.GraphStoreOptions method public long walSyncIntervalMillis()
+io.metaloom.graph.core.api.GraphStoreOptions method public static io.metaloom.graph.core.api.GraphStoreOptions defaults()
+io.metaloom.graph.core.api.GraphStoreOptions method public static io.metaloom.graph.core.api.GraphStoreOptions$Builder builder()
+io.metaloom.graph.core.api.GraphStoreOptions$Builder type public static final class Builder
+io.metaloom.graph.core.api.GraphStoreOptions$Builder constructor public Builder()
+io.metaloom.graph.core.api.GraphStoreOptions$Builder method public io.metaloom.graph.core.api.GraphStoreOptions build()
+io.metaloom.graph.core.api.GraphStoreOptions$Builder method public io.metaloom.graph.core.api.GraphStoreOptions$Builder ioEngine(io.metaloom.graph.core.api.GraphStoreOptions$IoEngineKind)
+io.metaloom.graph.core.api.GraphStoreOptions$Builder method public io.metaloom.graph.core.api.GraphStoreOptions$Builder pageSize(int)
+io.metaloom.graph.core.api.GraphStoreOptions$Builder method public io.metaloom.graph.core.api.GraphStoreOptions$Builder retainedVersionBytes(long)
+io.metaloom.graph.core.api.GraphStoreOptions$Builder method public io.metaloom.graph.core.api.GraphStoreOptions$Builder segmentCapacity(long)
+io.metaloom.graph.core.api.GraphStoreOptions$Builder method public io.metaloom.graph.core.api.GraphStoreOptions$Builder vectorDimensions(int)
+io.metaloom.graph.core.api.GraphStoreOptions$Builder method public io.metaloom.graph.core.api.GraphStoreOptions$Builder walSegmentBytes(long)
+io.metaloom.graph.core.api.GraphStoreOptions$Builder method public io.metaloom.graph.core.api.GraphStoreOptions$Builder walSyncIntervalMillis(long)
+io.metaloom.graph.core.api.GraphStoreOptions$Builder method public io.metaloom.graph.core.api.GraphStoreOptions$Builder walSyncMode(io.metaloom.graph.core.api.WalSyncMode)
+io.metaloom.graph.core.api.GraphStoreOptions$IoEngineKind type public enum IoEngineKind
+io.metaloom.graph.core.api.GraphStoreOptions$IoEngineKind constant AUTO ordinal=2
+io.metaloom.graph.core.api.GraphStoreOptions$IoEngineKind constant DIRECT ordinal=1
+io.metaloom.graph.core.api.GraphStoreOptions$IoEngineKind constant MMAP ordinal=0
+io.metaloom.graph.core.api.GraphStoreOptions$IoEngineKind method public static io.metaloom.graph.core.api.GraphStoreOptions$IoEngineKind valueOf(java.lang.String)
+io.metaloom.graph.core.api.GraphStoreOptions$IoEngineKind method public static io.metaloom.graph.core.api.GraphStoreOptions$IoEngineKind[] values()
+io.metaloom.graph.core.api.IoStats type public record IoStats
+io.metaloom.graph.core.api.IoStats components (long[] recordReadsByKind, long[] recordWritesByKind, long pageApplies, long bytesApplied, long walBytesAppended, long walRecords, long walSyncs, long dataForces, long pagesPunched, long checkpoints, long checkpointNanos, long recoveryNanos, long recoveredPageImages, long compactions, long recordsRelocated, long adjacencyBlockDecodes, long adjacencyBlockSkips)
+io.metaloom.graph.core.api.IoStats constructor public IoStats(long[], long[], long, long, long, long, long, long, long, long, long, long, long, long, long, long, long)
+io.metaloom.graph.core.api.IoStats method public double writeAmplification(long)
+io.metaloom.graph.core.api.IoStats method public final boolean equals(java.lang.Object)
+io.metaloom.graph.core.api.IoStats method public final int hashCode()
+io.metaloom.graph.core.api.IoStats method public io.metaloom.graph.core.api.IoStats since(io.metaloom.graph.core.api.IoStats)
+io.metaloom.graph.core.api.IoStats method public java.lang.String toString()
+io.metaloom.graph.core.api.IoStats method public long adjacencyBlockDecodes()
+io.metaloom.graph.core.api.IoStats method public long adjacencyBlockSkips()
+io.metaloom.graph.core.api.IoStats method public long adjacencyBlocksDecoded()
+io.metaloom.graph.core.api.IoStats method public long adjacencyBlocksSkipped()
+io.metaloom.graph.core.api.IoStats method public long bytesApplied()
+io.metaloom.graph.core.api.IoStats method public long checkpointNanos()
+io.metaloom.graph.core.api.IoStats method public long checkpoints()
+io.metaloom.graph.core.api.IoStats method public long compactions()
+io.metaloom.graph.core.api.IoStats method public long dataForces()
+io.metaloom.graph.core.api.IoStats method public long pageApplies()
+io.metaloom.graph.core.api.IoStats method public long pagesPunched()
+io.metaloom.graph.core.api.IoStats method public long recordReads(io.metaloom.graph.core.api.Kind)
+io.metaloom.graph.core.api.IoStats method public long recordWrites(io.metaloom.graph.core.api.Kind)
+io.metaloom.graph.core.api.IoStats method public long recordsRelocated()
+io.metaloom.graph.core.api.IoStats method public long recoveredPageImages()
+io.metaloom.graph.core.api.IoStats method public long recoveryNanos()
+io.metaloom.graph.core.api.IoStats method public long totalRecordReads()
+io.metaloom.graph.core.api.IoStats method public long totalRecordWrites()
+io.metaloom.graph.core.api.IoStats method public long walBytesAppended()
+io.metaloom.graph.core.api.IoStats method public long walRecords()
+io.metaloom.graph.core.api.IoStats method public long walSyncs()
+io.metaloom.graph.core.api.IoStats method public long[] recordReadsByKind()
+io.metaloom.graph.core.api.IoStats method public long[] recordWritesByKind()
+io.metaloom.graph.core.api.IsolationLevel type public enum IsolationLevel
+io.metaloom.graph.core.api.IsolationLevel constant READ_COMMITTED ordinal=0
+io.metaloom.graph.core.api.IsolationLevel constant SERIALIZABLE ordinal=2
+io.metaloom.graph.core.api.IsolationLevel constant SNAPSHOT ordinal=1
+io.metaloom.graph.core.api.IsolationLevel method public static io.metaloom.graph.core.api.IsolationLevel valueOf(java.lang.String)
+io.metaloom.graph.core.api.IsolationLevel method public static io.metaloom.graph.core.api.IsolationLevel[] values()
+io.metaloom.graph.core.api.Kind type public enum Kind
+io.metaloom.graph.core.api.Kind constant ADJ ordinal=3
+io.metaloom.graph.core.api.Kind constant BLOB ordinal=5
+io.metaloom.graph.core.api.Kind constant INDEX ordinal=6
+io.metaloom.graph.core.api.Kind constant NODE ordinal=1
+io.metaloom.graph.core.api.Kind constant NULL ordinal=0
+io.metaloom.graph.core.api.Kind constant PROP ordinal=4
+io.metaloom.graph.core.api.Kind constant REL ordinal=2
+io.metaloom.graph.core.api.Kind constant UNDO ordinal=7
+io.metaloom.graph.core.api.Kind constant VEC ordinal=8
+io.metaloom.graph.core.api.Kind field public static final int ADJ_CELL_BYTES = 512
+io.metaloom.graph.core.api.Kind field public static final int DECLARED = -2
+io.metaloom.graph.core.api.Kind field public static final int MAX_KINDS = 16
+io.metaloom.graph.core.api.Kind field public static final int PAGE_SIZED = -1
+io.metaloom.graph.core.api.Kind method public int code()
+io.metaloom.graph.core.api.Kind method public int genOffset()
+io.metaloom.graph.core.api.Kind method public int strideSpec()
+io.metaloom.graph.core.api.Kind method public java.lang.String dirName()
+io.metaloom.graph.core.api.Kind method public static io.metaloom.graph.core.api.Kind byCode(int)
+io.metaloom.graph.core.api.Kind method public static io.metaloom.graph.core.api.Kind valueOf(java.lang.String)
+io.metaloom.graph.core.api.Kind method public static io.metaloom.graph.core.api.Kind[] values()
+io.metaloom.graph.core.api.MigrationException type public class MigrationException extends io.metaloom.graph.core.api.GraphStoreException
+io.metaloom.graph.core.api.MigrationException constructor public MigrationException(java.lang.String)
+io.metaloom.graph.core.api.MigrationException constructor public MigrationException(java.lang.String, java.lang.Throwable)
+io.metaloom.graph.core.api.MigrationRequiredException type public class MigrationRequiredException extends io.metaloom.graph.core.api.FormatVersionException
+io.metaloom.graph.core.api.MigrationRequiredException constructor public MigrationRequiredException(java.nio.file.Path, int, int, boolean)
+io.metaloom.graph.core.api.MigrationRequiredException method public boolean migratable()
+io.metaloom.graph.core.api.MigrationRequiredException method public int currentVersion()
+io.metaloom.graph.core.api.MigrationRequiredException method public int storeVersion()
+io.metaloom.graph.core.api.MigrationRequiredException method public java.nio.file.Path store()
+io.metaloom.graph.core.api.Neighbour type public record Neighbour
+io.metaloom.graph.core.api.Neighbour components (long nodeId, double score)
+io.metaloom.graph.core.api.Neighbour constructor public Neighbour(long, double)
+io.metaloom.graph.core.api.Neighbour method public double score()
+io.metaloom.graph.core.api.Neighbour method public final boolean equals(java.lang.Object)
+io.metaloom.graph.core.api.Neighbour method public final int hashCode()
+io.metaloom.graph.core.api.Neighbour method public final java.lang.String toString()
+io.metaloom.graph.core.api.Neighbour method public long nodeId()
+io.metaloom.graph.core.api.NeighbourCursor type public sealed interface NeighbourCursor extends java.lang.AutoCloseable permits io.metaloom.graph.core.store.GraphStoreImpl$NeighbourWalk
+io.metaloom.graph.core.api.NeighbourCursor method public abstract boolean next()
+io.metaloom.graph.core.api.NeighbourCursor method public abstract io.metaloom.graph.core.api.Edge edge()
+io.metaloom.graph.core.api.NeighbourCursor method public abstract void close()
+io.metaloom.graph.core.api.OutOfSegmentsException type public class OutOfSegmentsException extends io.metaloom.graph.core.api.GraphStoreException
+io.metaloom.graph.core.api.OutOfSegmentsException constructor public OutOfSegmentsException(io.metaloom.graph.core.api.Kind)
+io.metaloom.graph.core.api.PageCorruptException type public class PageCorruptException extends io.metaloom.graph.core.api.GraphStoreException
+io.metaloom.graph.core.api.PageCorruptException constructor public PageCorruptException(java.lang.String)
+io.metaloom.graph.core.api.Principal type public interface Principal
+io.metaloom.graph.core.api.Principal field public static final io.metaloom.graph.core.api.Principal ANONYMOUS
+io.metaloom.graph.core.api.Principal method public abstract boolean authenticated()
+io.metaloom.graph.core.api.Principal method public abstract boolean may(io.metaloom.graph.core.api.Privilege, java.lang.String)
+io.metaloom.graph.core.api.Principal method public abstract java.lang.String name()
+io.metaloom.graph.core.api.Principal method public abstract java.util.Collection<io.metaloom.graph.core.api.Grant> grants()
+io.metaloom.graph.core.api.Principal method public default boolean may(io.metaloom.graph.core.api.Privilege)
+io.metaloom.graph.core.api.Principal method public static io.metaloom.graph.core.api.Principal of(java.lang.String, java.util.Collection<io.metaloom.graph.core.api.Grant>)
+io.metaloom.graph.core.api.Privilege type public enum Privilege
+io.metaloom.graph.core.api.Privilege constant BACKUP ordinal=12
+io.metaloom.graph.core.api.Privilege constant CREATE ordinal=1
+io.metaloom.graph.core.api.Privilege constant CREATE_DATABASE ordinal=10
+io.metaloom.graph.core.api.Privilege constant CREATE_INDEX ordinal=7
+io.metaloom.graph.core.api.Privilege constant DELETE ordinal=5
+io.metaloom.graph.core.api.Privilege constant DROP_DATABASE ordinal=11
+io.metaloom.graph.core.api.Privilege constant DROP_INDEX ordinal=8
+io.metaloom.graph.core.api.Privilege constant INTROSPECT ordinal=9
+io.metaloom.graph.core.api.Privilege constant LOAD_CSV ordinal=6
+io.metaloom.graph.core.api.Privilege constant MANAGE_ROLES ordinal=14
+io.metaloom.graph.core.api.Privilege constant MANAGE_USERS ordinal=13
+io.metaloom.graph.core.api.Privilege constant MATCH ordinal=0
+io.metaloom.graph.core.api.Privilege constant MERGE ordinal=2
+io.metaloom.graph.core.api.Privilege constant REMOVE ordinal=4
+io.metaloom.graph.core.api.Privilege constant SET ordinal=3
+io.metaloom.graph.core.api.Privilege method public boolean isGlobalOnly()
+io.metaloom.graph.core.api.Privilege method public boolean isWrite()
+io.metaloom.graph.core.api.Privilege method public static io.metaloom.graph.core.api.Privilege parse(java.lang.String)
+io.metaloom.graph.core.api.Privilege method public static io.metaloom.graph.core.api.Privilege valueOf(java.lang.String)
+io.metaloom.graph.core.api.Privilege method public static io.metaloom.graph.core.api.Privilege[] values()
+io.metaloom.graph.core.api.Privilege method public static java.lang.String names()
+io.metaloom.graph.core.api.Properties type public final class Properties
+io.metaloom.graph.core.api.Properties constructor public Properties()
+io.metaloom.graph.core.api.Properties method public <T> T get(java.lang.String, java.lang.Class<T>)
+io.metaloom.graph.core.api.Properties method public <T> java.util.Optional<T> getOptional(java.lang.String, java.lang.Class<T>)
+io.metaloom.graph.core.api.Properties method public boolean getBoolean(java.lang.String)
+io.metaloom.graph.core.api.Properties method public boolean has(java.lang.String)
+io.metaloom.graph.core.api.Properties method public boolean isEmpty()
+io.metaloom.graph.core.api.Properties method public boolean isNull(java.lang.String)
+io.metaloom.graph.core.api.Properties method public byte[] getBytes(java.lang.String)
+io.metaloom.graph.core.api.Properties method public double getDouble(java.lang.String)
+io.metaloom.graph.core.api.Properties method public float[] getVector(java.lang.String)
+io.metaloom.graph.core.api.Properties method public int getInt(java.lang.String)
+io.metaloom.graph.core.api.Properties method public int size()
+io.metaloom.graph.core.api.Properties method public io.metaloom.graph.core.api.Properties remove(java.lang.String)
+io.metaloom.graph.core.api.Properties method public io.metaloom.graph.core.api.Properties set(java.lang.String, java.lang.Object)
+io.metaloom.graph.core.api.Properties method public io.metaloom.graph.core.api.Properties setNull(java.lang.String)
+io.metaloom.graph.core.api.Properties method public java.lang.Object get(java.lang.String)
+io.metaloom.graph.core.api.Properties method public java.lang.String getString(java.lang.String)
+io.metaloom.graph.core.api.Properties method public java.lang.String toString()
+io.metaloom.graph.core.api.Properties method public java.time.Instant getInstant(java.lang.String)
+io.metaloom.graph.core.api.Properties method public java.util.Map<java.lang.String, java.lang.Object> asMap()
+io.metaloom.graph.core.api.Properties method public java.util.Set<java.lang.String> keys()
+io.metaloom.graph.core.api.Properties method public java.util.UUID getUuid(java.lang.String)
+io.metaloom.graph.core.api.Properties method public long getLong(java.lang.String)
+io.metaloom.graph.core.api.Properties method public static io.metaloom.graph.core.api.Properties of()
+io.metaloom.graph.core.api.Properties method public static io.metaloom.graph.core.api.Properties wrap(java.util.Map<java.lang.String, java.lang.Object>)
+io.metaloom.graph.core.api.PropertyTypeException type public class PropertyTypeException extends io.metaloom.graph.core.api.GraphStoreException
+io.metaloom.graph.core.api.PropertyTypeException constructor public PropertyTypeException(java.lang.String, java.lang.Object, java.lang.Class<?>)
+io.metaloom.graph.core.api.ReadTransaction type public sealed interface ReadTransaction extends java.lang.AutoCloseable permits io.metaloom.graph.core.txn.Snapshot
+io.metaloom.graph.core.api.ReadTransaction method public abstract boolean isOpen()
+io.metaloom.graph.core.api.ReadTransaction method public abstract io.metaloom.graph.core.api.IsolationLevel level()
+io.metaloom.graph.core.api.ReadTransaction method public abstract long retainedBytes()
+io.metaloom.graph.core.api.ReadTransaction method public abstract long snapshotLsn()
+io.metaloom.graph.core.api.ReadTransaction method public abstract void close()
+io.metaloom.graph.core.api.Role type public record Role
+io.metaloom.graph.core.api.Role components (java.lang.String name, java.util.List<io.metaloom.graph.core.api.Grant> grants)
+io.metaloom.graph.core.api.Role field public static final java.lang.String ADMIN = "admin"
+io.metaloom.graph.core.api.Role constructor public Role(java.lang.String, java.util.List<io.metaloom.graph.core.api.Grant>)
+io.metaloom.graph.core.api.Role method public final boolean equals(java.lang.Object)
+io.metaloom.graph.core.api.Role method public final int hashCode()
+io.metaloom.graph.core.api.Role method public final java.lang.String toString()
+io.metaloom.graph.core.api.Role method public java.lang.String name()
+io.metaloom.graph.core.api.Role method public java.util.List<io.metaloom.graph.core.api.Grant> grants()
+io.metaloom.graph.core.api.ScanOptions type public final class ScanOptions
+io.metaloom.graph.core.api.ScanOptions field public static final int DEFAULT_BATCH_SIZE = 4096
+io.metaloom.graph.core.api.ScanOptions field public static final long DEFAULT_PAUSE_MICROS = 200L
+io.metaloom.graph.core.api.ScanOptions method public boolean isThrottled()
+io.metaloom.graph.core.api.ScanOptions method public int batchSize()
+io.metaloom.graph.core.api.ScanOptions method public long pauseMicrosPerBatch()
+io.metaloom.graph.core.api.ScanOptions method public static io.metaloom.graph.core.api.ScanOptions throttled()
+io.metaloom.graph.core.api.ScanOptions method public static io.metaloom.graph.core.api.ScanOptions uninterrupted()
+io.metaloom.graph.core.api.ScanOptions method public static io.metaloom.graph.core.api.ScanOptions$Builder builder()
+io.metaloom.graph.core.api.ScanOptions$Builder type public static final class Builder
+io.metaloom.graph.core.api.ScanOptions$Builder constructor public Builder()
+io.metaloom.graph.core.api.ScanOptions$Builder method public io.metaloom.graph.core.api.ScanOptions build()
+io.metaloom.graph.core.api.ScanOptions$Builder method public io.metaloom.graph.core.api.ScanOptions$Builder batchSize(int)
+io.metaloom.graph.core.api.ScanOptions$Builder method public io.metaloom.graph.core.api.ScanOptions$Builder pauseMicrosPerBatch(long)
+io.metaloom.graph.core.api.SnapshotStats type public record SnapshotStats
+io.metaloom.graph.core.api.SnapshotStats components (int openViews, long oldestOpenLsn, long oldestOpenAgeMillis, long retainedBytes, long retainedEntries, int versionedPages, long abandonedViews)
+io.metaloom.graph.core.api.SnapshotStats field public static final io.metaloom.graph.core.api.SnapshotStats NONE
+io.metaloom.graph.core.api.SnapshotStats constructor public SnapshotStats(int, long, long, long, long, int, long)
+io.metaloom.graph.core.api.SnapshotStats method public final boolean equals(java.lang.Object)
+io.metaloom.graph.core.api.SnapshotStats method public final int hashCode()
+io.metaloom.graph.core.api.SnapshotStats method public final java.lang.String toString()
+io.metaloom.graph.core.api.SnapshotStats method public int openViews()
+io.metaloom.graph.core.api.SnapshotStats method public int versionedPages()
+io.metaloom.graph.core.api.SnapshotStats method public long abandonedViews()
+io.metaloom.graph.core.api.SnapshotStats method public long oldestOpenAgeMillis()
+io.metaloom.graph.core.api.SnapshotStats method public long oldestOpenLsn()
+io.metaloom.graph.core.api.SnapshotStats method public long retainedBytes()
+io.metaloom.graph.core.api.SnapshotStats method public long retainedEntries()
+io.metaloom.graph.core.api.SnapshotTooOldException type public class SnapshotTooOldException extends io.metaloom.graph.core.api.GraphStoreException
+io.metaloom.graph.core.api.SnapshotTooOldException constructor public SnapshotTooOldException(long, long)
+io.metaloom.graph.core.api.SnapshotTooOldException method public long horizonLsn()
+io.metaloom.graph.core.api.SnapshotTooOldException method public long snapshotLsn()
+io.metaloom.graph.core.api.StoreClosedException type public class StoreClosedException extends io.metaloom.graph.core.api.GraphStoreException
+io.metaloom.graph.core.api.StoreClosedException constructor public StoreClosedException(java.lang.String)
+io.metaloom.graph.core.api.StoreFormat type public final class StoreFormat
+io.metaloom.graph.core.api.StoreFormat field public static final int CURRENT_VERSION = 4
+io.metaloom.graph.core.api.StoreFormat method public static io.metaloom.graph.core.api.StoreFormat$Info inspect(java.nio.file.Path) throws java.io.IOException
+io.metaloom.graph.core.api.StoreFormat$Info type public record Info
+io.metaloom.graph.core.api.StoreFormat$Info components (java.nio.file.Path path, int version, int versionField, int pageSize, long segmentCapacity, int vectorStride, int vectorDimensions, long featureFlags, long checkpointLsn, java.util.UUID storeUuid, long walSegmentBytes)
+io.metaloom.graph.core.api.StoreFormat$Info constructor public Info(java.nio.file.Path, int, int, int, long, int, int, long, long, java.util.UUID, long)
+io.metaloom.graph.core.api.StoreFormat$Info method public boolean isCurrent()
+io.metaloom.graph.core.api.StoreFormat$Info method public boolean isNewer()
+io.metaloom.graph.core.api.StoreFormat$Info method public boolean isOlder()
+io.metaloom.graph.core.api.StoreFormat$Info method public final boolean equals(java.lang.Object)
+io.metaloom.graph.core.api.StoreFormat$Info method public final int hashCode()
+io.metaloom.graph.core.api.StoreFormat$Info method public final java.lang.String toString()
+io.metaloom.graph.core.api.StoreFormat$Info method public int pageSize()
+io.metaloom.graph.core.api.StoreFormat$Info method public int vectorDimensions()
+io.metaloom.graph.core.api.StoreFormat$Info method public int vectorStride()
+io.metaloom.graph.core.api.StoreFormat$Info method public int version()
+io.metaloom.graph.core.api.StoreFormat$Info method public int versionField()
+io.metaloom.graph.core.api.StoreFormat$Info method public io.metaloom.graph.core.api.GraphStoreOptions options()
+io.metaloom.graph.core.api.StoreFormat$Info method public java.lang.String describeVersion()
+io.metaloom.graph.core.api.StoreFormat$Info method public java.nio.file.Path path()
+io.metaloom.graph.core.api.StoreFormat$Info method public java.util.UUID storeUuid()
+io.metaloom.graph.core.api.StoreFormat$Info method public long checkpointLsn()
+io.metaloom.graph.core.api.StoreFormat$Info method public long featureFlags()
+io.metaloom.graph.core.api.StoreFormat$Info method public long segmentCapacity()
+io.metaloom.graph.core.api.StoreFormat$Info method public long walSegmentBytes()
+io.metaloom.graph.core.api.StoreMetrics type public record StoreMetrics
+io.metaloom.graph.core.api.StoreMetrics components (io.metaloom.graph.core.api.IoStats io, long walLagBytes, long walBytesSinceCheckpoint, int unflushedPages, double averageCheckpointMillis, double lastRecoveryMillis, java.lang.String nativeLayer)
+io.metaloom.graph.core.api.StoreMetrics constructor public StoreMetrics(io.metaloom.graph.core.api.IoStats, long, long, int, double, double, java.lang.String)
+io.metaloom.graph.core.api.StoreMetrics method public double averageCheckpointMillis()
+io.metaloom.graph.core.api.StoreMetrics method public double lastRecoveryMillis()
+io.metaloom.graph.core.api.StoreMetrics method public double writeAmplification(long)
+io.metaloom.graph.core.api.StoreMetrics method public final boolean equals(java.lang.Object)
+io.metaloom.graph.core.api.StoreMetrics method public final int hashCode()
+io.metaloom.graph.core.api.StoreMetrics method public int unflushedPages()
+io.metaloom.graph.core.api.StoreMetrics method public io.metaloom.graph.core.api.IoStats io()
+io.metaloom.graph.core.api.StoreMetrics method public java.lang.String nativeLayer()
+io.metaloom.graph.core.api.StoreMetrics method public java.lang.String toString()
+io.metaloom.graph.core.api.StoreMetrics method public long walBytesSinceCheckpoint()
+io.metaloom.graph.core.api.StoreMetrics method public long walLagBytes()
+io.metaloom.graph.core.api.StoreMigration type public interface StoreMigration
+io.metaloom.graph.core.api.StoreMigration method public abstract int targetVersion()
+io.metaloom.graph.core.api.StoreMigration method public abstract io.metaloom.graph.core.api.StoreMigration$Plan plan(java.nio.file.Path) throws java.io.IOException
+io.metaloom.graph.core.api.StoreMigration method public abstract io.metaloom.graph.core.api.StoreMigration$Result migrate(java.nio.file.Path, io.metaloom.graph.core.api.StoreMigration$Listener) throws java.io.IOException
+io.metaloom.graph.core.api.StoreMigration method public default io.metaloom.graph.core.api.StoreMigration$Result migrate(java.nio.file.Path) throws java.io.IOException
+io.metaloom.graph.core.api.StoreMigration method public static io.metaloom.graph.core.api.StoreMigration standard()
+io.metaloom.graph.core.api.StoreMigration$Listener type public interface Listener
+io.metaloom.graph.core.api.StoreMigration$Listener annotation @java.lang.FunctionalInterface
+io.metaloom.graph.core.api.StoreMigration$Listener field public static final io.metaloom.graph.core.api.StoreMigration$Listener NONE
+io.metaloom.graph.core.api.StoreMigration$Listener method public abstract void event(java.lang.String)
+io.metaloom.graph.core.api.StoreMigration$Plan type public record Plan
+io.metaloom.graph.core.api.StoreMigration$Plan components (java.nio.file.Path store, int fromVersion, int toVersion, java.util.List<io.metaloom.graph.core.api.StoreMigration$Step> steps, java.util.List<java.lang.String> blockers, java.nio.file.Path workDirectory, java.nio.file.Path backupDirectory, java.lang.String interrupted, long bytesToCopy, long usableBytes)
+io.metaloom.graph.core.api.StoreMigration$Plan constructor public Plan(java.nio.file.Path, int, int, java.util.List<io.metaloom.graph.core.api.StoreMigration$Step>, java.util.List<java.lang.String>, java.nio.file.Path, java.nio.file.Path, java.lang.String, long, long)
+io.metaloom.graph.core.api.StoreMigration$Plan method public boolean canProceed()
+io.metaloom.graph.core.api.StoreMigration$Plan method public boolean upToDate()
+io.metaloom.graph.core.api.StoreMigration$Plan method public final boolean equals(java.lang.Object)
+io.metaloom.graph.core.api.StoreMigration$Plan method public final int hashCode()
+io.metaloom.graph.core.api.StoreMigration$Plan method public final java.lang.String toString()
+io.metaloom.graph.core.api.StoreMigration$Plan method public int fromVersion()
+io.metaloom.graph.core.api.StoreMigration$Plan method public int toVersion()
+io.metaloom.graph.core.api.StoreMigration$Plan method public java.lang.String interrupted()
+io.metaloom.graph.core.api.StoreMigration$Plan method public java.nio.file.Path backupDirectory()
+io.metaloom.graph.core.api.StoreMigration$Plan method public java.nio.file.Path store()
+io.metaloom.graph.core.api.StoreMigration$Plan method public java.nio.file.Path workDirectory()
+io.metaloom.graph.core.api.StoreMigration$Plan method public java.util.List<io.metaloom.graph.core.api.StoreMigration$Step> steps()
+io.metaloom.graph.core.api.StoreMigration$Plan method public java.util.List<java.lang.String> blockers()
+io.metaloom.graph.core.api.StoreMigration$Plan method public long bytesToCopy()
+io.metaloom.graph.core.api.StoreMigration$Plan method public long usableBytes()
+io.metaloom.graph.core.api.StoreMigration$Result type public record Result
+io.metaloom.graph.core.api.StoreMigration$Result components (java.nio.file.Path store, int fromVersion, int toVersion, java.util.List<io.metaloom.graph.core.api.StoreMigration$Step> applied, java.nio.file.Path backupDirectory, boolean resumed, java.time.Duration elapsed)
+io.metaloom.graph.core.api.StoreMigration$Result constructor public Result(java.nio.file.Path, int, int, java.util.List<io.metaloom.graph.core.api.StoreMigration$Step>, java.nio.file.Path, boolean, java.time.Duration)
+io.metaloom.graph.core.api.StoreMigration$Result method public boolean changed()
+io.metaloom.graph.core.api.StoreMigration$Result method public boolean resumed()
+io.metaloom.graph.core.api.StoreMigration$Result method public final boolean equals(java.lang.Object)
+io.metaloom.graph.core.api.StoreMigration$Result method public final int hashCode()
+io.metaloom.graph.core.api.StoreMigration$Result method public final java.lang.String toString()
+io.metaloom.graph.core.api.StoreMigration$Result method public int fromVersion()
+io.metaloom.graph.core.api.StoreMigration$Result method public int toVersion()
+io.metaloom.graph.core.api.StoreMigration$Result method public java.nio.file.Path backupDirectory()
+io.metaloom.graph.core.api.StoreMigration$Result method public java.nio.file.Path store()
+io.metaloom.graph.core.api.StoreMigration$Result method public java.time.Duration elapsed()
+io.metaloom.graph.core.api.StoreMigration$Result method public java.util.List<io.metaloom.graph.core.api.StoreMigration$Step> applied()
+io.metaloom.graph.core.api.StoreMigration$Step type public record Step
+io.metaloom.graph.core.api.StoreMigration$Step components (int from, int to, java.lang.String description)
+io.metaloom.graph.core.api.StoreMigration$Step constructor public Step(int, int, java.lang.String)
+io.metaloom.graph.core.api.StoreMigration$Step method public final boolean equals(java.lang.Object)
+io.metaloom.graph.core.api.StoreMigration$Step method public final int hashCode()
+io.metaloom.graph.core.api.StoreMigration$Step method public final java.lang.String toString()
+io.metaloom.graph.core.api.StoreMigration$Step method public int from()
+io.metaloom.graph.core.api.StoreMigration$Step method public int to()
+io.metaloom.graph.core.api.StoreMigration$Step method public java.lang.String description()
+io.metaloom.graph.core.api.StoreStats type public record StoreStats
+io.metaloom.graph.core.api.StoreStats components (long nodeCount, long relationshipCount, long adjacencyCellCount, long propertyCellCount, long blobExtentCount, long indexPageCount, int labelCount, int keyCount, int segmentFileCount, long recordBytes, long storageBytes)
+io.metaloom.graph.core.api.StoreStats constructor public StoreStats(long, long, long, long, long, long, int, int, int, long, long)
+io.metaloom.graph.core.api.StoreStats method public double bytesPerNode()
+io.metaloom.graph.core.api.StoreStats method public final boolean equals(java.lang.Object)
+io.metaloom.graph.core.api.StoreStats method public final int hashCode()
+io.metaloom.graph.core.api.StoreStats method public final java.lang.String toString()
+io.metaloom.graph.core.api.StoreStats method public int keyCount()
+io.metaloom.graph.core.api.StoreStats method public int labelCount()
+io.metaloom.graph.core.api.StoreStats method public int segmentFileCount()
+io.metaloom.graph.core.api.StoreStats method public long adjacencyCellCount()
+io.metaloom.graph.core.api.StoreStats method public long blobExtentCount()
+io.metaloom.graph.core.api.StoreStats method public long indexPageCount()
+io.metaloom.graph.core.api.StoreStats method public long nodeCount()
+io.metaloom.graph.core.api.StoreStats method public long propertyCellCount()
+io.metaloom.graph.core.api.StoreStats method public long recordBytes()
+io.metaloom.graph.core.api.StoreStats method public long relationshipCount()
+io.metaloom.graph.core.api.StoreStats method public long storageBytes()
+io.metaloom.graph.core.api.Transaction type public sealed interface Transaction extends java.lang.AutoCloseable permits io.metaloom.graph.core.txn.TransactionImpl
+io.metaloom.graph.core.api.Transaction method public abstract boolean isActive()
+io.metaloom.graph.core.api.Transaction method public abstract int touchedPages()
+io.metaloom.graph.core.api.Transaction method public abstract io.metaloom.graph.core.api.IsolationLevel level()
+io.metaloom.graph.core.api.Transaction method public abstract long commit() throws java.io.IOException
+io.metaloom.graph.core.api.Transaction method public abstract long id()
+io.metaloom.graph.core.api.Transaction method public abstract void close()
+io.metaloom.graph.core.api.Transaction method public abstract void rollback()
+io.metaloom.graph.core.api.TransactionConflictException type public class TransactionConflictException extends io.metaloom.graph.core.api.GraphStoreException
+io.metaloom.graph.core.api.TransactionConflictException constructor public TransactionConflictException(long, java.lang.String)
+io.metaloom.graph.core.api.TransactionConflictException constructor public TransactionConflictException(long, long, long, long, boolean, java.lang.String)
+io.metaloom.graph.core.api.TransactionConflictException method public boolean isReadConflict()
+io.metaloom.graph.core.api.TransactionConflictException method public long conflictingLsn()
+io.metaloom.graph.core.api.TransactionConflictException method public long pageKey()
+io.metaloom.graph.core.api.TransactionConflictException method public long snapshotLsn()
+io.metaloom.graph.core.api.TransactionConflictException method public long txnId()
+io.metaloom.graph.core.api.User type public record User
+io.metaloom.graph.core.api.User components (java.lang.String name, boolean enabled, long createdAtEpochMillis, long passwordChangedAtEpochMillis, java.util.List<java.lang.String> roles, java.util.List<io.metaloom.graph.core.api.Grant> grants)
+io.metaloom.graph.core.api.User constructor public User(java.lang.String, boolean, long, long, java.util.List<java.lang.String>, java.util.List<io.metaloom.graph.core.api.Grant>)
+io.metaloom.graph.core.api.User method public boolean enabled()
+io.metaloom.graph.core.api.User method public boolean hasRole(java.lang.String)
+io.metaloom.graph.core.api.User method public final boolean equals(java.lang.Object)
+io.metaloom.graph.core.api.User method public final int hashCode()
+io.metaloom.graph.core.api.User method public final java.lang.String toString()
+io.metaloom.graph.core.api.User method public java.lang.String name()
+io.metaloom.graph.core.api.User method public java.util.List<io.metaloom.graph.core.api.Grant> grants()
+io.metaloom.graph.core.api.User method public java.util.List<java.lang.String> roles()
+io.metaloom.graph.core.api.User method public long createdAtEpochMillis()
+io.metaloom.graph.core.api.User method public long passwordChangedAtEpochMillis()
+io.metaloom.graph.core.api.VectorIndexDefinition type public record VectorIndexDefinition
+io.metaloom.graph.core.api.VectorIndexDefinition components (java.lang.String label, java.lang.String key, int dimensions, io.metaloom.graph.core.api.VectorMetric metric, java.lang.String model, int m, int efConstruction, io.metaloom.graph.core.api.VectorIndexState state)
+io.metaloom.graph.core.api.VectorIndexDefinition field public static final int DEFAULT_EF_CONSTRUCTION = 200
+io.metaloom.graph.core.api.VectorIndexDefinition field public static final int DEFAULT_M = 16
+io.metaloom.graph.core.api.VectorIndexDefinition constructor public VectorIndexDefinition(java.lang.String, java.lang.String, int, io.metaloom.graph.core.api.VectorMetric, java.lang.String, int, int, io.metaloom.graph.core.api.VectorIndexState)
+io.metaloom.graph.core.api.VectorIndexDefinition method public boolean covers(java.lang.String, java.lang.String)
+io.metaloom.graph.core.api.VectorIndexDefinition method public final boolean equals(java.lang.Object)
+io.metaloom.graph.core.api.VectorIndexDefinition method public final int hashCode()
+io.metaloom.graph.core.api.VectorIndexDefinition method public final java.lang.String toString()
+io.metaloom.graph.core.api.VectorIndexDefinition method public int dimensions()
+io.metaloom.graph.core.api.VectorIndexDefinition method public int efConstruction()
+io.metaloom.graph.core.api.VectorIndexDefinition method public int m()
+io.metaloom.graph.core.api.VectorIndexDefinition method public io.metaloom.graph.core.api.VectorIndexState state()
+io.metaloom.graph.core.api.VectorIndexDefinition method public io.metaloom.graph.core.api.VectorMetric metric()
+io.metaloom.graph.core.api.VectorIndexDefinition method public java.lang.String key()
+io.metaloom.graph.core.api.VectorIndexDefinition method public java.lang.String label()
+io.metaloom.graph.core.api.VectorIndexDefinition method public java.lang.String model()
+io.metaloom.graph.core.api.VectorIndexDefinition method public static io.metaloom.graph.core.api.VectorIndexDefinition of(java.lang.String, java.lang.String, int, io.metaloom.graph.core.api.VectorMetric)
+io.metaloom.graph.core.api.VectorIndexState type public enum VectorIndexState
+io.metaloom.graph.core.api.VectorIndexState constant BUILDING ordinal=0
+io.metaloom.graph.core.api.VectorIndexState constant READY ordinal=1
+io.metaloom.graph.core.api.VectorIndexState method public static io.metaloom.graph.core.api.VectorIndexState valueOf(java.lang.String)
+io.metaloom.graph.core.api.VectorIndexState method public static io.metaloom.graph.core.api.VectorIndexState[] values()
+io.metaloom.graph.core.api.VectorMetric type public enum VectorMetric
+io.metaloom.graph.core.api.VectorMetric constant COSINE ordinal=0
+io.metaloom.graph.core.api.VectorMetric constant DOT ordinal=1
+io.metaloom.graph.core.api.VectorMetric constant EUCLIDEAN ordinal=2
+io.metaloom.graph.core.api.VectorMetric method public boolean higherIsNearer()
+io.metaloom.graph.core.api.VectorMetric method public double rank(float[], float[])
+io.metaloom.graph.core.api.VectorMetric method public double score(float[], float[])
+io.metaloom.graph.core.api.VectorMetric method public static io.metaloom.graph.core.api.VectorMetric valueOf(java.lang.String)
+io.metaloom.graph.core.api.VectorMetric method public static io.metaloom.graph.core.api.VectorMetric[] values()
+io.metaloom.graph.core.api.Vectors type public final class Vectors
+io.metaloom.graph.core.api.Vectors method public static double cosine(float[], float[])
+io.metaloom.graph.core.api.Vectors method public static double dot(float[], float[])
+io.metaloom.graph.core.api.Vectors method public static double euclidean(float[], float[])
+io.metaloom.graph.core.api.Vectors method public static double norm(float[])
+io.metaloom.graph.core.api.VerifyLevel type public enum VerifyLevel
+io.metaloom.graph.core.api.VerifyLevel constant CHECKSUMS ordinal=0
+io.metaloom.graph.core.api.VerifyLevel constant FULL ordinal=1
+io.metaloom.graph.core.api.VerifyLevel method public static io.metaloom.graph.core.api.VerifyLevel valueOf(java.lang.String)
+io.metaloom.graph.core.api.VerifyLevel method public static io.metaloom.graph.core.api.VerifyLevel[] values()
+io.metaloom.graph.core.api.VerifyOptions type public final class VerifyOptions
+io.metaloom.graph.core.api.VerifyOptions method public boolean isThrottled()
+io.metaloom.graph.core.api.VerifyOptions method public int batchSize()
+io.metaloom.graph.core.api.VerifyOptions method public int maxViolations()
+io.metaloom.graph.core.api.VerifyOptions method public java.time.Duration timeBudget()
+io.metaloom.graph.core.api.VerifyOptions method public long pauseMicrosPerBatch()
+io.metaloom.graph.core.api.VerifyOptions method public static io.metaloom.graph.core.api.VerifyOptions consistentSnapshot()
+io.metaloom.graph.core.api.VerifyOptions method public static io.metaloom.graph.core.api.VerifyOptions throttled()
+io.metaloom.graph.core.api.VerifyOptions method public static io.metaloom.graph.core.api.VerifyOptions$Builder builder()
+io.metaloom.graph.core.api.VerifyOptions$Builder type public static final class Builder
+io.metaloom.graph.core.api.VerifyOptions$Builder constructor public Builder()
+io.metaloom.graph.core.api.VerifyOptions$Builder method public io.metaloom.graph.core.api.VerifyOptions build()
+io.metaloom.graph.core.api.VerifyOptions$Builder method public io.metaloom.graph.core.api.VerifyOptions$Builder batchSize(int)
+io.metaloom.graph.core.api.VerifyOptions$Builder method public io.metaloom.graph.core.api.VerifyOptions$Builder maxViolations(int)
+io.metaloom.graph.core.api.VerifyOptions$Builder method public io.metaloom.graph.core.api.VerifyOptions$Builder pauseMicrosPerBatch(long)
+io.metaloom.graph.core.api.VerifyOptions$Builder method public io.metaloom.graph.core.api.VerifyOptions$Builder timeBudget(java.time.Duration)
+io.metaloom.graph.core.api.WalSyncMode type public enum WalSyncMode
+io.metaloom.graph.core.api.WalSyncMode constant ASYNC ordinal=2
+io.metaloom.graph.core.api.WalSyncMode constant FSYNC_ON_COMMIT ordinal=0
+io.metaloom.graph.core.api.WalSyncMode constant GROUP_COMMIT ordinal=1
+io.metaloom.graph.core.api.WalSyncMode method public static io.metaloom.graph.core.api.WalSyncMode valueOf(java.lang.String)
+io.metaloom.graph.core.api.WalSyncMode method public static io.metaloom.graph.core.api.WalSyncMode[] values()

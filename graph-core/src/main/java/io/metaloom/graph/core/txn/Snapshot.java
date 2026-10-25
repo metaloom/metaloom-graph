@@ -72,6 +72,19 @@ public final class Snapshot implements ReadTransaction {
 	private boolean open = true;
 
 	/**
+	 * Set by the retention budget when it gives up on this view, before the view leaves the active set.
+	 *
+	 * <p>
+	 * The horizon alone does not say so. It is the oldest <em>remaining</em> view's LSN, and a write transaction that
+	 * began before this view keeps it at or below this one's — while this view, out of the active set, has already
+	 * stopped being a reason for a commit to keep before-images. A commit by that older writer then kept nothing, and
+	 * until a later vacuum raised the horizon every check here passed and the view read that commit from the mapping.
+	 * Volatile, and written before vacuum cuts anything: a reader that sees a chain missing sees this set.
+	 * </p>
+	 */
+	private volatile boolean abandoned;
+
+	/**
 	 * How many nested scopes currently exclude the apply step.
 	 * <p>
 	 * A depth rather than a flag: the store's read wrapper is not reentrant today, but if a read ever ran inside
@@ -191,7 +204,22 @@ public final class Snapshot implements ReadTransaction {
 	 * </p>
 	 */
 	public boolean readsMapping() {
-		return versions.newestSupersededLsn() <= snapshotLsn;
+		// An abandoned view never reads the mapping unchecked: false here sends the caller to pageAsOf, which refuses.
+		return !abandoned && versions.newestSupersededLsn() <= snapshotLsn;
+	}
+
+	/** Marks the view abandoned by the retention budget; every read from here on raises SnapshotTooOldException. */
+	void abandon() {
+		abandoned = true;
+	}
+
+	/** Whether the versions this view depends on may be gone: abandoned outright, or passed by the horizon. */
+	private boolean tooOld() {
+		return abandoned || snapshotLsn < versions.horizonLsn();
+	}
+
+	private SnapshotTooOldException tooOldException() {
+		return new SnapshotTooOldException(snapshotLsn, Math.max(versions.horizonLsn(), snapshotLsn + 1));
 	}
 
 	/**
@@ -211,25 +239,28 @@ public final class Snapshot implements ReadTransaction {
 		if (readsMapping()) {
 			return null;
 		}
+		if (abandoned) {
+			throw tooOldException();
+		}
 		MemorySegment cached = reconstructed.get(pageKey);
 		if (cached != null) {
 			return cached;
 		}
 		PageVersions.Version head = versions.head(pageKey);
 		if (head == null || head.supersededAt() <= snapshotLsn) {
-			if (head == null && snapshotLsn < versions.horizonLsn()) {
+			if (head == null && tooOld()) {
 				// No chain can also mean vacuum just removed it, because the retention budget abandoned this view in
 				// the middle of an operation: vacuum takes no lock a reader holds, so a scan or a cursor holding the
 				// apply latch does not keep it out. The mapping is then newer than the view and must not be served.
 				// Vacuum raises the horizon before it cuts anything, so a chain seen missing here is a horizon seen
 				// raised. One volatile read, and only on the path that is about to return the mapping to a view.
-				throw new SnapshotTooOldException(snapshotLsn, versions.horizonLsn());
+				throw tooOldException();
 			}
 			// Nothing has superseded this page since the view began, so the mapping is already what it should see.
 			return null;
 		}
-		if (snapshotLsn < versions.horizonLsn()) {
-			throw new SnapshotTooOldException(snapshotLsn, versions.horizonLsn());
+		if (tooOld()) {
+			throw tooOldException();
 		}
 		if (exclusionDepth == 0) {
 			if (guard == null) {
@@ -242,10 +273,10 @@ public final class Snapshot implements ReadTransaction {
 
 	private MemorySegment rebuild(long pageKey, java.util.function.Supplier<MemorySegment> mappedPage, int pageSize) {
 		MemorySegment rebuilt = versions.reconstruct(pageKey, snapshotLsn, mappedPage.get(), pageSize);
-		if (snapshotLsn < versions.horizonLsn()) {
+		if (tooOld()) {
 			// Abandoned while the chain was being walked: vacuum may have truncated it under the walk, and a page
 			// rebuilt from part of its history is wrong and would be cached for the rest of the view.
-			throw new SnapshotTooOldException(snapshotLsn, versions.horizonLsn());
+			throw tooOldException();
 		}
 		if (rebuilt == null) {
 			return null;
@@ -268,8 +299,8 @@ public final class Snapshot implements ReadTransaction {
 		if (!open) {
 			throw new GraphStoreException("Read transaction " + id + " is closed");
 		}
-		if (isVersioned() && snapshotLsn < versions.horizonLsn()) {
-			throw new SnapshotTooOldException(snapshotLsn, versions.horizonLsn());
+		if (isVersioned() && tooOld()) {
+			throw tooOldException();
 		}
 	}
 

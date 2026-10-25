@@ -1,6 +1,5 @@
 package io.metaloom.graph.core.api;
 
-import io.metaloom.graph.core.id.Kind;
 
 /** A record kind exhausted its 2^24 segments. */
 public class OutOfSegmentsException extends GraphStoreException {

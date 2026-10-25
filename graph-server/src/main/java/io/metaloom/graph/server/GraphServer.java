@@ -20,6 +20,7 @@ import io.metaloom.graph.core.api.GraphStoreException;
 import io.metaloom.graph.core.api.AuthStore;
 import io.metaloom.graph.core.api.Principal;
 import io.metaloom.graph.core.api.Privilege;
+import io.metaloom.graph.core.api.StoreFormat;
 import io.metaloom.graph.core.api.StoreStats;
 import io.metaloom.graph.core.nativelib.NativeCapabilities;
 import io.metaloom.graph.cli.dump.GraphBackup;
@@ -78,8 +79,8 @@ import io.vertx.micrometer.MicrometerMetricsOptions;
  * An HTTP front end: a Cypher endpoint and the browser UI that uses it.
  *
  * <pre>
- * java -jar graph-server-0.0.1-SNAPSHOT.jar /path/to/store 8080          # the shaded jar, everything included
- * java -jar graph-server-0.0.1-SNAPSHOT.jar --demo /tmp/demo 8080        # with a graph to look at
+ * java -jar graph-server.jar /path/to/store 8080          # the shaded jar, everything included
+ * java -jar graph-server.jar --demo /tmp/demo 8080        # with a graph to look at
  * mvn -pl graph-server exec:java -Dexec.args="--demo /tmp/demo"          # from the reactor
  * </pre>
  *
@@ -845,6 +846,9 @@ public final class GraphServer implements AutoCloseable {
 				.put("propertyKeys", stats.keyCount())
 				.put("storageBytes", stats.storageBytes())
 				.put("openViews", store.snapshotStats().openViews())
+				// The store format version. A store this server has open is always at the one its build reads, so this
+				// is that build's number; `metaloom-graph-cli database info` reads it off a store without opening it.
+				.put("storeFormatVersion", StoreFormat.CURRENT_VERSION)
 				// Which of the two paths in spec/NATIVE_FFM.md section 4 this process is on: "ABI 2" when the Rust
 				// crate loaded, "not built" or "disabled" otherwise. The store works either way, which is exactly
 				// why it is worth being able to ask — and in a GraalVM binary it is the only way to find out.

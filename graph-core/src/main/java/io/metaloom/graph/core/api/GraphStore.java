@@ -23,9 +23,16 @@ import java.util.Set;
  * <b>Not present:</b> concurrent writers. The single writer is what makes the above true so cheaply, and the version
  * machinery that would replace it is described in spec/TRANSACTIONS.md.
  *
+ * <p>
+ * <b>Sealed</b>: the engine is the only implementation, and {@link ForwardingGraphStore} the only way to write a
+ * decorator. A method can therefore be added here without breaking a caller — it arrives with its forwarding
+ * implementation — which is what lets the API lock count such an addition as compatible (spec/API_LOCK.md).
+ * </p>
+ *
  * @see <a href="../../../../../../../../spec/API.md">spec/API.md</a>
  */
-public interface GraphStore extends AutoCloseable {
+public sealed interface GraphStore extends AutoCloseable
+	permits io.metaloom.graph.core.store.GraphStoreImpl, ForwardingGraphStore {
 
 	static GraphStore open(Path path) throws IOException {
 		return open(path, GraphStoreOptions.defaults());

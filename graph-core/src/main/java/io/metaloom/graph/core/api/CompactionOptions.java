@@ -3,7 +3,6 @@ package io.metaloom.graph.core.api;
 import java.util.EnumSet;
 import java.util.Set;
 
-import io.metaloom.graph.core.id.Kind;
 
 /**
  * What a compaction run is allowed to do.
