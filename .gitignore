@@ -2,6 +2,7 @@ target
 .project
 .classpath
 .settings
+.claude
 
 # cargo-fuzz keeps its corpus and crash artefacts here. Crashes are worth committing when they are
 # regressions; the corpus is regenerated and is not.
