@@ -65,8 +65,13 @@ public final class GraphAccess {
 	 * a torn-read symptom rather than a decision. Checking on this side of the call keeps it outside that machinery
 	 * entirely.
 	 * </p>
+	 *
+	 * <p>
+	 * Package-private so the executor can tick it where rows multiply without the store: UNWIND over a list already in
+	 * hand touches nothing here, and two of them make a square no other check reached.
+	 * </p>
 	 */
-	private void checkAbort() {
+	void checkAbort() {
 		if (abort == QueryAbort.NEVER) {
 			return;
 		}
@@ -99,7 +104,25 @@ public final class GraphAccess {
 	/** Materialises a node id into a value, reading its labels and properties once. */
 	public CypherNode node(long id) {
 		checkAbort();
-		return new CypherNode(id, List.copyOf(store.nodeLabels(id)), properties(store.nodeProperties(id)));
+		try {
+			return new CypherNode(id, List.copyOf(store.nodeLabels(id)), properties(store.nodeProperties(id)));
+		} catch (io.metaloom.graph.core.api.GraphStoreException e) {
+			throw deletedOr(id, e);
+		}
+	}
+
+	/**
+	 * A row can go on holding a node after a DELETE in the same query — RETURN n after DELETE n gives back what it was —
+	 * so the next clause can ask the store about a node that is gone. The engine's answer is a "No live node"
+	 * GraphStoreException, which a server reports as a store failure; it is the query's mistake, so it becomes a type
+	 * error. Only on the failure path: the check costs nothing while nodes are live.
+	 */
+	private RuntimeException deletedOr(long id, RuntimeException failure) {
+		if (!store.nodeExists(id)) {
+			return new CypherTypeException("Node " + id + " was deleted earlier in this query, so it can no longer be "
+				+ "read or expanded");
+		}
+		return failure;
 	}
 
 	public boolean exists(long id) {
@@ -174,11 +197,22 @@ public final class GraphAccess {
 	 */
 	public List<Expansion> expand(long nodeId, Direction direction, Set<String> types) {
 		checkAbort();
-		List<Edge> edges = types == null || types.isEmpty()
-			? store.neighbours(nodeId, direction)
-			: store.neighbours(nodeId, direction, types);
+		List<Edge> edges;
+		try {
+			edges = types == null || types.isEmpty()
+				? store.neighbours(nodeId, direction)
+				: store.neighbours(nodeId, direction, types);
+		} catch (io.metaloom.graph.core.api.GraphStoreException e) {
+			throw deletedOr(nodeId, e);
+		}
 		List<Expansion> out = new ArrayList<>(edges.size());
 		for (Edge edge : edges) {
+			// A self-loop is in the adjacency once per end, so BOTH lists it twice — once outgoing, once incoming. It
+			// is still one relationship, and an undirected pattern crosses it once, as openCypher has it; reporting it
+			// twice made `MATCH (a)-[r]-(a)` return every loop two times.
+			if (direction == Direction.BOTH && edge.direction() == Direction.IN && edge.neighbourId() == nodeId) {
+				continue;
+			}
 			out.add(expansion(nodeId, edge));
 		}
 		return out;
@@ -212,6 +246,26 @@ public final class GraphAccess {
 	 */
 	public List<Scored> nearest(String label, String key, float[] query, int k) {
 		checkAbort();
+		// The engine refuses each of these with an IllegalStateException or an IllegalArgumentException, which a server
+		// reports as its own failure. They are mistakes in the query, so they are refused here as type errors, with the
+		// same advice the engine would have given.
+		if (query.length == 0) {
+			throw new CypherTypeException("vector.query needs a query vector with at least one element");
+		}
+		io.metaloom.graph.core.api.VectorIndexDefinition index = null;
+		for (io.metaloom.graph.core.api.VectorIndexDefinition declared : store.vectorIndexes()) {
+			if (declared.covers(label, key)) {
+				index = declared;
+			}
+		}
+		if (index == null) {
+			throw new CypherTypeException("No vector index on :" + label + "." + key + ". Declare one with "
+				+ "createVectorIndex; vector.cosine() scores without one");
+		}
+		if (index.dimensions() != query.length) {
+			throw new CypherTypeException("The vector index on :" + label + "." + key + " holds " + index.dimensions()
+				+ " dimensions, and the query vector has " + query.length);
+		}
 		try {
 			List<Scored> scored = new ArrayList<>();
 			for (io.metaloom.graph.core.api.Neighbour neighbour : store.nearest(label, key, query, k, null)) {
@@ -369,7 +423,8 @@ public final class GraphAccess {
 		io.metaloom.graph.core.api.Properties properties = io.metaloom.graph.core.api.Properties.of();
 		if (values != null) {
 			for (Map.Entry<String, Object> entry : values.entrySet()) {
-				properties.set(entry.getKey(), storable(entry.getKey(), entry.getValue()));
+				properties.set(wholeCharacters(entry.getKey(), entry.getKey(), "name"),
+					storable(entry.getKey(), entry.getValue()));
 			}
 		}
 		return properties;
@@ -381,7 +436,7 @@ public final class GraphAccess {
 			case Boolean b -> b;
 			case Long l -> l;
 			case Double d -> d;
-			case String s -> s;
+			case String s -> wholeCharacters(s, key, "value");
 			case List<?> list -> {
 				List<Object> out = new ArrayList<>(list.size());
 				for (Object element : list) {
@@ -395,6 +450,28 @@ public final class GraphAccess {
 			default -> throw new CypherTypeException("The property '" + key + "' cannot hold a "
 				+ Values.typeName(value) + "; a property must be a number, a string, a boolean or a list of those");
 		};
+	}
+
+	/**
+	 * Refuses a string holding half of a surrogate pair, as a type error naming the property.
+	 *
+	 * <p>
+	 * Such a string has no UTF-8 form and the store refuses it — but with an {@code IllegalArgumentException}, which a
+	 * server reports as something other than a mistake in the query. The lexer refuses one written in a query; this is
+	 * the other way in, a parameter.
+	 * </p>
+	 */
+	private static String wholeCharacters(String text, String key, String what) {
+		for (int i = 0; i < text.length(); i++) {
+			char c = text.charAt(i);
+			if (Character.isHighSurrogate(c) && i + 1 < text.length() && Character.isLowSurrogate(text.charAt(i + 1))) {
+				i++;
+			} else if (Character.isSurrogate(c)) {
+				throw new CypherTypeException("The property " + what + " for '" + key + "' holds half of a surrogate "
+					+ "pair at index " + i + ", which is not a character and cannot be stored");
+			}
+		}
+		return text;
 	}
 
 	private static Map<String, Object> properties(io.metaloom.graph.core.api.Properties properties) {

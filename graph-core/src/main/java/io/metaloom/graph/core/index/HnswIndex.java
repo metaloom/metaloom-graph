@@ -1,6 +1,7 @@
 package io.metaloom.graph.core.index;
 
 import java.io.IOException;
+import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -327,10 +328,11 @@ public final class HnswIndex {
 		while (moved) {
 			moved = false;
 			for (long neighbour : vectors.links(current, layer, m)) {
-				if (!member(neighbour, ord)) {
+				MemorySegment record = vectors.memberRecord(neighbour, ord);
+				if (record == null) {
 					continue;
 				}
-				double d = distance(neighbour, query, queryNorm, metric);
+				double d = distance(record, neighbour, query, queryNorm, metric);
 				if (d < best) {
 					best = d;
 					current = neighbour;
@@ -359,10 +361,15 @@ public final class HnswIndex {
 				break;
 			}
 			for (long neighbour : vectors.links(nearest.vectorId(), layer, m)) {
-				if (!visited.add(neighbour) || !member(neighbour, ord)) {
+				if (!visited.add(neighbour)) {
 					continue;
 				}
-				double d = distance(neighbour, query, queryNorm, metric);
+				// The membership test and the record the distance is read from, in one resolve.
+				MemorySegment record = vectors.memberRecord(neighbour, ord);
+				if (record == null) {
+					continue;
+				}
+				double d = distance(record, neighbour, query, queryNorm, metric);
 				// Allocated only once it is admitted: most neighbours of a converged beam are not.
 				if (best.size() < ef || d < best.peek().distance()) {
 					Candidate candidate = new Candidate(neighbour, d);
@@ -399,20 +406,32 @@ public final class HnswIndex {
 		VectorMetric metric) {
 		List<Candidate> chosen = new ArrayList<>(Math.min(capacity, found.size()));
 		List<float[]> chosenVectors = new ArrayList<>(chosen.size());
+		// Cosine needs both norms of every pair, and the pairs are all-against-chosen: each chosen vector's squared
+		// norm is computed once here instead of once per comparison. See cosineDistance for why the result is the
+		// same to the bit.
+		boolean cosine = metric == VectorMetric.COSINE;
+		double[] chosenSquares = cosine ? new double[Math.max(1, Math.min(capacity, found.size()))] : null;
 		List<Candidate> discarded = new ArrayList<>();
 		for (Candidate candidate : found) {
 			if (candidate.vectorId() == excluding || chosen.size() == capacity) {
 				continue;
 			}
 			float[] vector = vectors.read(candidate.vectorId());
+			double squares = cosine ? sumOfSquares(vector) : 0;
 			boolean diverse = true;
-			for (float[] already : chosenVectors) {
-				if (distanceBetween(vector, already, metric) < candidate.distance()) {
+			for (int i = 0; i < chosenVectors.size(); i++) {
+				float[] already = chosenVectors.get(i);
+				double d = cosine ? cosineDistance(vector, squares, already, chosenSquares[i])
+					: distanceBetween(vector, already, metric);
+				if (d < candidate.distance()) {
 					diverse = false;
 					break;
 				}
 			}
 			if (diverse) {
+				if (cosine) {
+					chosenSquares[chosenVectors.size()] = squares;
+				}
 				chosen.add(candidate);
 				chosenVectors.add(vector);
 			} else {
@@ -435,6 +454,42 @@ public final class HnswIndex {
 		return metric.rank(a, b);
 	}
 
+	/** The sum of squares exactly as {@link io.metaloom.graph.core.api.Vectors#cosine} accumulates it. */
+	private static double sumOfSquares(float[] a) {
+		double sum = 0;
+		for (int i = 0; i < a.length; i++) {
+			double x = a[i];
+			sum += x * x;
+		}
+		return sum;
+	}
+
+	/**
+	 * {@code VectorMetric.COSINE.rank(a, b)} given both sums of squares, bit for bit.
+	 *
+	 * <p>
+	 * {@link io.metaloom.graph.core.api.Vectors#cosine} accumulates the product and the two sums of squares in one
+	 * loop, each in its own double in index order, so computing the sums separately — in the same order, from the same
+	 * widened values — produces the same three doubles, and the same quotient. Only the work changes: one
+	 * multiply-add per element instead of three, because the neighbour selection compares every candidate against
+	 * every neighbour already chosen and the chosen side's sums never change.
+	 * </p>
+	 */
+	private static double cosineDistance(float[] a, double aSquares, float[] b, double bSquares) {
+		if (a.length != b.length) {
+			// The slow path owns the error message.
+			return VectorMetric.COSINE.rank(a, b);
+		}
+		double sum = 0;
+		for (int i = 0; i < a.length; i++) {
+			sum += (double) a[i] * (double) b[i];
+		}
+		if (aSquares == 0 || bSquares == 0) {
+			return -0.0;
+		}
+		return -(sum / (Math.sqrt(aSquares) * Math.sqrt(bSquares)));
+	}
+
 	/**
 	 * Adds a back-link, pruning the neighbour's list to the nearest when it is full.
 	 * <p>
@@ -455,8 +510,9 @@ public final class HnswIndex {
 		double anchorNorm = queryNorm(anchor, metric);
 		List<Candidate> candidates = new ArrayList<>(existing.length + 1);
 		for (long link : existing) {
-			if (member(link, ord)) {
-				candidates.add(new Candidate(link, distance(link, anchor, anchorNorm, metric)));
+			MemorySegment record = vectors.memberRecord(link, ord);
+			if (record != null) {
+				candidates.add(new Candidate(link, distance(record, link, anchor, anchorNorm, metric)));
 			}
 		}
 		candidates.add(new Candidate(vectorId, distance(vectorId, anchor, anchorNorm, metric)));
@@ -479,14 +535,20 @@ public final class HnswIndex {
 	 * in hand and is the one that pays for it.
 	 */
 	private double distance(long vectorId, float[] query, double queryNorm, VectorMetric metric) {
+		return distance(vectors.record(vectorId), vectorId, query, queryNorm, metric);
+	}
+
+	/** {@link #distance(long, float[], double, VectorMetric)} from a record already resolved. */
+	private double distance(MemorySegment record, long vectorId, float[] query, double queryNorm,
+		VectorMetric metric) {
 		return switch (metric) {
-			case DOT -> -vectors.dot(vectorId, query);
+			case DOT -> -vectors.dot(record, vectorId, query);
 			case COSINE -> {
-				double storedNorm = vectors.norm(vectorId);
+				double storedNorm = VectorStore.norm(record);
 				yield storedNorm == 0 || queryNorm == 0 ? 0
-					: -(vectors.dot(vectorId, query) / (storedNorm * queryNorm));
+					: -(vectors.dot(record, vectorId, query) / (storedNorm * queryNorm));
 			}
-			case EUCLIDEAN -> io.metaloom.graph.core.api.Vectors.euclidean(vectors.read(vectorId), query);
+			case EUCLIDEAN -> io.metaloom.graph.core.api.Vectors.euclidean(vectors.read(record, vectorId), query);
 		};
 	}
 

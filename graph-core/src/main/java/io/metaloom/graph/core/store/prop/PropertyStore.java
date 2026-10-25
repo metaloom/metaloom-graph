@@ -132,6 +132,34 @@ public final class PropertyStore {
 		return result;
 	}
 
+	/** Receives each property of a block, in key id order. */
+	@FunctionalInterface
+	public interface PropertyVisitor {
+
+		void property(int keyId, Object value);
+	}
+
+	/**
+	 * Reads every property of a block into a visitor, for a caller building its own result.
+	 *
+	 * <p>
+	 * {@link #read(long)} builds a map keyed by boxed key ids that the API layer then copies into a second map keyed by
+	 * name. The intermediate map was a third of what a {@code nodeProperties} call allocated.
+	 * </p>
+	 */
+	public void read(long blockId, PropertyVisitor visitor) {
+		if (ElementId.isNull(blockId)) {
+			return;
+		}
+		MemorySegment block = segments.resolveRunToPageEnd(blockId);
+		byte[] payload = payloadOf(blockId, block);
+		ValueCodec.Reader reader = new ValueCodec.Reader(payload, 0, payload.length);
+		while (reader.hasRemaining()) {
+			int key = reader.u24();
+			visitor.property(key, ValueCodec.decode(reader, blobs, vectors, true, null));
+		}
+	}
+
 	/** Reads a single property without materialising the rest of the block. */
 	public Object read(long blockId, int keyId) {
 		if (ElementId.isNull(blockId)) {

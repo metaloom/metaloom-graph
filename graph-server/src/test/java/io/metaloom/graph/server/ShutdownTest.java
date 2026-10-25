@@ -106,6 +106,51 @@ public class ShutdownTest {
 		assertEquals(NODES, store.nodesByLabel("Person").size());
 	}
 
+	/**
+	 * A query that finishes inside the grace period gets its response.
+	 *
+	 * <p>
+	 * The other tests here are about the query that does <em>not</em> finish. This is the promise the grace period
+	 * makes to the one that does: closing the listener must not close the connection that query will answer on.
+	 * </p>
+	 */
+	@Test
+	public void testAQueryInFlightThatFinishesInsideTheGraceGetsItsAnswer() throws Exception {
+		GraphServer server = new GraphServer(databases, GraphDatabases.DEFAULT_NAME, 0, false);
+		int port = server.listen(0).toCompletionStage().toCompletableFuture().join();
+		String slow = "MATCH (a:Person) WHERE a.n < 40 MATCH (b:Person) RETURN count(*) AS pairs";
+
+		long began = System.nanoTime();
+		HttpResponse<String> warm = postForResponse(port, slow);
+		long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - began);
+		assertEquals(200, warm.statusCode(), warm.body());
+		assertTrue(millis >= 50, "the fixture query must take long enough to be caught in flight: " + millis + " ms");
+
+		java.util.concurrent.CompletableFuture<HttpResponse<String>> inFlight = java.util.concurrent.CompletableFuture
+			.supplyAsync(() -> {
+				try {
+					return postForResponse(port, slow);
+				} catch (Exception e) {
+					throw new java.util.concurrent.CompletionException(e);
+				}
+			});
+		Thread.sleep(Math.max(10, millis / 4));
+		server.shutdown(30_000);
+
+		HttpResponse<String> answered = inFlight.get(30, TimeUnit.SECONDS);
+		assertEquals(200, answered.statusCode(), answered.body());
+		assertTrue(answered.body().contains(String.valueOf(40L * NODES)), answered.body());
+	}
+
+	private HttpResponse<String> postForResponse(int port, String cypher) throws Exception {
+		HttpRequest request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/api/query"))
+			.header("content-type", "application/json")
+			.timeout(Duration.ofSeconds(30))
+			.POST(HttpRequest.BodyPublishers.ofString(new io.vertx.core.json.JsonObject().put("query", cypher).encode()))
+			.build();
+		return client.send(request, HttpResponse.BodyHandlers.ofString());
+	}
+
 	@Test
 	public void testAQueryInFlightIsAbandonedRatherThanHoldingShutdownOpen() throws Exception {
 		// No query timeout at all, so the only thing that can stop this query is the shutdown itself. Without the

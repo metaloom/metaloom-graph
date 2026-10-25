@@ -54,8 +54,40 @@ public final class Catalog implements AutoCloseable {
 		return labels.resolve(id);
 	}
 
+	/**
+	 * Told about every lookup that finds nothing.
+	 *
+	 * <p>
+	 * A miss is a read that touches no page: "no node carries this label" is answered by the dictionary alone, so a
+	 * page-granular read set never sees it, and a {@code SERIALIZABLE} transaction that decided something from it could
+	 * not be refused when another transaction later introduced the name. The store installs an observer that remembers
+	 * the miss for such a transaction, and the commit refuses if the name has since come to exist.
+	 * </p>
+	 */
+	public interface MissObserver {
+
+		void missed(boolean label, String name);
+	}
+
+	private volatile MissObserver missObserver;
+
+	public void observeMisses(MissObserver observer) {
+		this.missObserver = observer;
+	}
+
 	public int lookupLabel(String label) {
-		return labels.lookup(label);
+		int id = labels.lookup(label);
+		if (id == 0) {
+			missed(true, label);
+		}
+		return id;
+	}
+
+	private void missed(boolean label, String name) {
+		MissObserver observer = missObserver;
+		if (observer != null && name != null) {
+			observer.missed(label, name);
+		}
 	}
 
 	public int internKey(String key) {
@@ -66,7 +98,11 @@ public final class Catalog implements AutoCloseable {
 	}
 
 	public int lookupKey(String key) {
-		return keys.lookup(key);
+		int id = keys.lookup(key);
+		if (id == 0) {
+			missed(false, key);
+		}
+		return id;
 	}
 
 	public String key(int id) {

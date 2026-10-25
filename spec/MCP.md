@@ -113,6 +113,31 @@ has already been paid for.
 The response carries `truncated` and, when true, a note saying what to do about it. A model told it saw everything
 when it did not will draw a conclusion from half an answer, which is a worse outcome than a refusal.
 
+`limit` is clamped as a long. Read with `getInteger`, `Long.MAX_VALUE` became `-1` and was clamped to **one** row.
+
+**Elements come back as the HTTP table renders them** — a node as `{_type, id, labels, properties}`, a relationship
+with `relType`, `start` and `end`, a path as its length and text, ids and integers past 2^53 as strings —
+through `ResultJson.value`, the same function the HTTP route uses. The tool used to put the engine's own node objects
+into the `JsonObject`, which Vert.x's encoder has no mapping for, so `MATCH (n) RETURN n` — the first query anybody
+writes — came back as `graph_query failed`.
+
+### 4.2.1 Arguments of the wrong shape
+
+The caller is a model, and a model sends a string for an integer and an array for an object. Every such message gets an
+answer it can read, never silence:
+
+| Wrong | Answer |
+|---|---|
+| `method` not a string | JSON-RPC `-32600` invalid request |
+| `params` not an object; `name` not a string; `arguments` not an object | JSON-RPC `-32602` invalid params |
+| a tool argument of the wrong type (`limit: "10"`, `parameters: [1]`, `database: [..]`) | a tool result with `isError`, naming the argument problem — the model's to fix, like a syntax error |
+| anything else thrown while handling a request | JSON-RPC `-32603`, logged |
+
+The last row is the backstop that matters most on the WebSocket transport: an exception escaping a message handler
+there is logged by Vert.x and answered by nothing, and the client waits on that request id for ever. `getString` also
+used to turn a numeric `name` into its text and look it up; the types are now checked rather than coerced
+(`JsonRpcRequest.from`, `McpBadArgumentsTest`).
+
 ### 4.3 What is not exposed, and why
 
 - **Creating or dropping a database.** Dropping already has its own flag, `--allow-drop`, separate from
@@ -208,4 +233,5 @@ What the token does not buy is privacy: it crosses in cleartext like everything 
 
 ---
 
-_Last updated: 2026-08-18 (TLS on the binary port)_
+_Git HEAD revision: `f2b6d5f`_
+_Last updated: 2026-10-24 (MCP argument shapes, elements rendered as on HTTP, the limit clamp)_

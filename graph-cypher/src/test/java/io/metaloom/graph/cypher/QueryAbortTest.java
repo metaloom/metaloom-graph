@@ -130,6 +130,23 @@ public class QueryAbortTest {
 		assertTrue(thrown.getMessage().contains("30000 ms"), "the message names the budget: " + thrown.getMessage());
 	}
 
+	/**
+	 * A query can multiply rows without touching the store at all: two UNWINDs over one list are a square, and nothing
+	 * on that path consulted the signal. Aggregated, nothing reaches the sink either, so neither check could fire and
+	 * the deadline bounded nothing — on a server that is a worker thread held, and a heap filled, for as long as the
+	 * arithmetic takes. Filtered to nothing, the streaming form is the same loop.
+	 */
+	@Test
+	public void testAnExpiredDeadlineStopsAnUnwindThatNeverTouchesTheStore() throws Exception {
+		QueryAbort abort = QueryAbort.deadline(System.nanoTime() - 1, 30_000);
+		assertThrows(QueryAbortedException.class, () -> Cypher.stream(store,
+			Cypher.parse("WITH range(1, 300) AS l UNWIND l AS x UNWIND l AS y RETURN count(*) AS c"), Map.of(),
+			new Collecting(), abort));
+		assertThrows(QueryAbortedException.class, () -> Cypher.stream(store,
+			Cypher.parse("WITH range(1, 300) AS l UNWIND l AS x UNWIND l AS y WITH x WHERE x < 0 RETURN x"), Map.of(),
+			new Collecting(), abort));
+	}
+
 	@Test
 	public void testADeadlineThatHasNotPassedDoesNotInterfere() throws Exception {
 		QueryAbort abort = QueryAbort.deadline(System.nanoTime() + java.util.concurrent.TimeUnit.MINUTES.toNanos(5),

@@ -4,7 +4,9 @@ import java.io.IOException;
 
 import io.metaloom.graph.core.api.GraphStoreException;
 import io.metaloom.graph.core.api.IsolationLevel;
+import io.metaloom.graph.core.api.SnapshotTooOldException;
 import io.metaloom.graph.core.api.Transaction;
+import io.metaloom.graph.core.api.TransactionConflictException;
 import io.metaloom.graph.core.page.PageOverlay;
 
 /**
@@ -70,6 +72,19 @@ public final class TransactionImpl implements Transaction {
 			throw new GraphStoreException("Transaction " + id + " is no longer active");
 		}
 		checkOwner("commit");
+		Throwable failed = context.rollbackOnlyCause();
+		if (failed != null) {
+			// Rolled back here rather than left to close(), so the handle is over whichever way the caller goes on.
+			active = false;
+			completion.rollback(this);
+			if (failed instanceof TransactionConflictException || failed instanceof SnapshotTooOldException) {
+				// Already the answer a caller retries on, and still the true one: the statement lost a race.
+				throw (GraphStoreException) failed;
+			}
+			throw new GraphStoreException("Transaction " + id + " is rollback-only and was rolled back: a statement in "
+				+ "it failed after it had already changed the transaction (" + failed + "), and committing would have "
+				+ "made half of that statement durable. Retry the whole transaction.", failed);
+		}
 		try {
 			commitLsn = completion.commit(this);
 		} finally {

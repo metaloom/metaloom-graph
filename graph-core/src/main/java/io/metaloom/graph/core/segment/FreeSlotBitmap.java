@@ -53,12 +53,15 @@ public final class FreeSlotBitmap {
 
 	/** The word as the calling transaction sees it: its view, plus whatever it has allocated or freed itself. */
 	private long word(int wordIndex) {
-		long stored = file.readSlice(wordOffsetOf(wordIndex), 8).get(Layouts.LONG, 0);
-		MetaJournal journal = file.journal();
-		return journal == null ? stored : journal.bitmapWord(file.segmentKey(), wordIndex, stored);
+		return file.journalledBitmapWord(wordOffsetOf(wordIndex), wordIndex);
 	}
 
 	/** The word as it stands in the mapping, ignoring every transaction. The allocator's question. */
+	/** Sixty-four slots' bits as the calling transaction sees them, for a scan that walks a word at a time. */
+	long wordAt(int wordIndex) {
+		return word(wordIndex);
+	}
+
 	private long liveWord(int wordIndex) {
 		return file.mappedSlice(wordOffsetOf(wordIndex), 8).get(Layouts.LONG, 0);
 	}

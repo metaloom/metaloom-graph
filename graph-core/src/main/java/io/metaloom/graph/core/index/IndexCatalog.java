@@ -220,7 +220,17 @@ public final class IndexCatalog {
 		}
 	}
 
+	/**
+	 * Indexes one value. <b>An explicit null is not indexed</b>, as the composite tree and both unique constraints
+	 * already treated it: a null matches nothing in an equality lookup, and every null in the store would otherwise
+	 * share the one hash bucket. It used to be inserted here and nowhere else, which {@code verify(FULL)} then reported
+	 * as a dangling entry on a healthy store. Removal still goes through for a null, so an entry an older build wrote
+	 * is cleaned up when its node next changes.
+	 */
 	private void putProperty(int keyId, Object value, long nodeId) throws IOException {
+		if (value == null) {
+			return;
+		}
 		long root = propRoot();
 		long moved = tree.put(root, propertyKey(keyId, value), nodeId, nodeId);
 		if (moved != root) {
@@ -942,7 +952,7 @@ public final class IndexCatalog {
 
 	/** Candidate nodes for a property value. The caller verifies each against the stored property. */
 	public List<Long> nodesByProperty(String key, Object value) {
-		if (!initialised()) {
+		if (!initialised() || value == null) {
 			return List.of();
 		}
 		int keyId = catalog.lookupKey(key);

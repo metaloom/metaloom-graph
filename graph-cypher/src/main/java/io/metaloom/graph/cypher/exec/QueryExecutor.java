@@ -284,6 +284,9 @@ public final class QueryExecutor {
 		}
 		List<Row> out = new ArrayList<>();
 		for (Row row : rows) {
+			for (String name : call.yields()) {
+				refuseRebinding(row, name, "YIELD");
+			}
 			String label = text(evaluator.evaluate(call.arguments().get(0), row));
 			String key = text(evaluator.evaluate(call.arguments().get(1), row));
 			float[] query = Functions.vectorArgument(evaluator.evaluate(call.arguments().get(2), row),
@@ -301,6 +304,23 @@ public final class QueryExecutor {
 			}
 		}
 		return out;
+	}
+
+	/**
+	 * UNWIND, LOAD CSV and YIELD introduce a name, and one already in scope is refused rather than shadowed.
+	 *
+	 * <p>
+	 * Shadowing silently replaced the earlier binding for the rest of the query, so
+	 * {@code MATCH (n) UNWIND [1, 2] AS n RETURN n} returned the numbers and lost every node without a word. openCypher
+	 * makes it an error, and so does this — checked per row because the executor has no scope table, which costs one
+	 * hash lookup against a row that is about to be copied anyway.
+	 * </p>
+	 */
+	static void refuseRebinding(Row row, String name, String clause) {
+		if (row.has(name)) {
+			throw new CypherTypeException(clause + " cannot bind '" + name + "': that variable is already defined. "
+				+ "Choose another name, or drop the earlier one with WITH");
+		}
 	}
 
 	private static String text(Object value) {
@@ -368,6 +388,7 @@ public final class QueryExecutor {
 			case Ast.Match match -> matcher.match(match.pattern(), match.where(), row,
 				matched -> !keeps(matched, match.where()) || next.accept(matched));
 			case Ast.Unwind unwind -> {
+				refuseRebinding(row, unwind.variable(), "UNWIND");
 				Object value = evaluator.evaluate(unwind.expression(), row);
 				if (value == null) {
 					// UNWIND null produces no rows, which is not the same as producing one null row.
@@ -377,6 +398,8 @@ public final class QueryExecutor {
 					throw new CypherTypeException("UNWIND expects a list but got " + Values.typeName(value));
 				}
 				for (Object element : list) {
+					// The store is never touched here, so its abort checks never run: tick the same counter they use.
+					graph.checkAbort();
 					if (!next.accept(row.with(unwind.variable(), element))) {
 						yield false;
 					}
@@ -411,6 +434,7 @@ public final class QueryExecutor {
 	 * @return false if anything downstream had enough, which stops the read where it is
 	 */
 	private boolean forEachCsvRow(Ast.LoadCsv load, Row row, RowConsumer out) {
+		refuseRebinding(row, load.variable(), "LOAD CSV");
 		Object url = evaluator.evaluate(load.url(), row);
 		if (!(url instanceof String location)) {
 			throw new CypherTypeException("LOAD CSV needs a string URL but got " + Values.typeName(url));
@@ -513,9 +537,9 @@ public final class QueryExecutor {
 
 		// The projected items and nothing else: what a WITH leaves out is out of scope after it, which is what the
 		// list path does too. Only ORDER BY may see underneath a projection, and ORDER BY never streams.
-		Row projected = new Row();
+		Row projected = Row.withCapacity(projection.items().size());
 		for (Ast.ProjectionItem item : projection.items()) {
-			projected = projected.with(item.alias(), evaluator.evaluate(item.expression(), row));
+			projected.put(item.alias(), evaluator.evaluate(item.expression(), row));
 		}
 
 		// Before the counters: a row the WHERE drops was never one of the rows SKIP and LIMIT are counting.
@@ -573,6 +597,7 @@ public final class QueryExecutor {
 				case Ast.Unwind unwind -> {
 					List<Row> next = new ArrayList<>();
 					for (Row row : rows) {
+						refuseRebinding(row, unwind.variable(), "UNWIND");
 						Object value = evaluator.evaluate(unwind.expression(), row);
 						if (value == null) {
 							// UNWIND null produces no rows, which is not the same as producing one null row.
@@ -583,6 +608,7 @@ public final class QueryExecutor {
 								+ Values.typeName(value));
 						}
 						for (Object element : list) {
+							graph.checkAbort();
 							next.add(row.with(unwind.variable(), element));
 						}
 					}
@@ -603,10 +629,16 @@ public final class QueryExecutor {
 					Projected projected = project(rows, with.projection());
 					// The WHERE sees only what the WITH projects, and so does every clause after it. ORDER BY may
 					// still read underneath, as openCypher allows, so the source rows are dropped only after it.
-					rows = filter(projected.rows(), with.where(), projected.columns());
+					// Without an ORDER BY the projection kept no source row (projectRows), so each row already holds
+					// exactly its columns and narrowing it again would copy it twice for nothing.
+					boolean narrowed = with.projection().order().isEmpty();
+					rows = narrowed ? filter(projected.rows(), with.where())
+						: filter(projected.rows(), with.where(), projected.columns());
 					rows = order(rows, with.projection(), projected.columns());
 					rows = slice(rows, with.projection());
-					rows = only(rows, projected.columns());
+					if (!narrowed) {
+						rows = only(rows, projected.columns());
+					}
 					columns = projected.columns();
 				}
 				case Ast.Return returnClause -> {
@@ -706,29 +738,39 @@ public final class QueryExecutor {
 			}
 		}
 		for (Ast.ProjectionItem item : projection.items()) {
+			if (projection.star() && columns.contains(item.alias())) {
+				// The parser refuses a repeated alias among the items; this is the half it cannot see, a name that *
+				// already brings in. One of the two values would silently replace the other.
+				throw new CypherTypeException("'" + item.alias() + "' is already a column of *; give the item a "
+					+ "different name with AS");
+			}
 			columns.add(item.alias());
 			items.add(item);
 		}
 
 		List<Row> projected = hasAggregate(items)
 			? aggregate(rows, items)
-			: projectRows(rows, items);
+			: projectRows(rows, items, !projection.order().isEmpty());
 		if (projection.distinct()) {
 			projected = distinctBy(projected, columns);
 		}
 		return new Projected(columns, projected);
 	}
 
-	private List<Row> projectRows(List<Row> rows, List<Ast.ProjectionItem> items) {
+	/**
+	 * @param keepSource
+	 *            whether the source row stays reachable underneath, so that ORDER BY can sort on something not
+	 *            projected, which Cypher allows. Only ORDER BY reads it — the WHERE of a WITH sees the projection alone
+	 *            and everything after is scoped to it — so without one the copy of every source row is skipped
+	 */
+	private List<Row> projectRows(List<Row> rows, List<Ast.ProjectionItem> items, boolean keepSource) {
 		List<Row> out = new ArrayList<>(rows.size());
 		for (Row row : rows) {
-			Row projected = new Row();
+			Row projected = keepSource ? Row.copyOf(row, items.size()) : Row.withCapacity(items.size());
 			for (Ast.ProjectionItem item : items) {
-				projected = projected.with(item.alias(), evaluator.evaluate(item.expression(), row));
+				projected.put(item.alias(), evaluator.evaluate(item.expression(), row));
 			}
-			// The source row stays reachable underneath so that ORDER BY can sort on something not projected, which
-			// Cypher allows for RETURN.
-			out.add(row.merge(projected));
+			out.add(projected);
 		}
 		return out;
 	}
@@ -795,7 +837,13 @@ public final class QueryExecutor {
 		// The first row's values are what the group projects.
 		Map<Object, List<Object>> keyValues = new LinkedHashMap<>();
 		Map<Object, List<Row>> groups = new LinkedHashMap<>();
-		for (Row row : rows) {
+		if (keys.isEmpty()) {
+			// No grouping key — `RETURN count(*)` — is one group of every row, so nothing needs hashing. It also covers
+			// the empty input, which still produces its one row: `count(*)` of nothing is 0, not no answer at all.
+			groups.put(List.of(), rows);
+			keyValues.put(List.of(), List.of());
+		}
+		for (Row row : keys.isEmpty() ? List.<Row>of() : rows) {
 			List<Object> values = new ArrayList<>(keys.size());
 			for (Ast.ProjectionItem item : keys) {
 				values.add(evaluator.evaluate(item.expression(), row));
@@ -814,12 +862,12 @@ public final class QueryExecutor {
 		List<Row> out = new ArrayList<>(groups.size());
 		for (Map.Entry<Object, List<Row>> group : groups.entrySet()) {
 			List<Object> values = keyValues.get(group.getKey());
-			Row projected = new Row();
+			Row projected = Row.withCapacity(keys.size() + aggregates.size());
 			for (int i = 0; i < keys.size(); i++) {
-				projected = projected.with(keys.get(i).alias(), values.get(i));
+				projected.put(keys.get(i).alias(), values.get(i));
 			}
 			for (Ast.ProjectionItem item : aggregates) {
-				projected = projected.with(item.alias(), foldAggregate(item.expression(), group.getValue()));
+				projected.put(item.alias(), foldAggregate(item.expression(), group.getValue()));
 			}
 			out.add(projected);
 		}
@@ -855,15 +903,25 @@ public final class QueryExecutor {
 		// O(n log n) comparisons. The column name each item would resolve to is rendered once per item for the same
 		// reason.
 		List<Ast.SortItem> items = projection.order();
+		// A sort item written as the expression a projection item computes reads that item's column: after an
+		// aggregation `RETURN n.age AS age, count(*) ORDER BY n.age` has no n left, but it has the column that holds
+		// n.age, which is what was meant.
+		Map<String, String> projectedAs = new java.util.HashMap<>();
+		for (Ast.ProjectionItem item : projection.items()) {
+			projectedAs.putIfAbsent(io.metaloom.graph.cypher.ast.Rendering.text(item.expression()), item.alias());
+		}
 		List<String> names = new ArrayList<>(items.size());
+		List<String> aliases = new ArrayList<>(items.size());
 		for (Ast.SortItem item : items) {
-			names.add(io.metaloom.graph.cypher.ast.Rendering.text(item.expression()));
+			String name = io.metaloom.graph.cypher.ast.Rendering.text(item.expression());
+			names.add(name);
+			aliases.add(projectedAs.get(name));
 		}
 		List<Keyed> keyed = new ArrayList<>(rows.size());
 		for (Row row : rows) {
 			Object[] keys = new Object[items.size()];
 			for (int i = 0; i < keys.length; i++) {
-				keys[i] = sortKey(items.get(i).expression(), names.get(i), row);
+				keys[i] = sortKey(items.get(i).expression(), names.get(i), aliases.get(i), row);
 			}
 			keyed.add(new Keyed(row, keys));
 		}
@@ -895,9 +953,12 @@ public final class QueryExecutor {
 	 * a column called {@code n.city}, which is what the user meant and what Cypher orders by.
 	 * </p>
 	 */
-	private Object sortKey(Ast.Expr expression, String name, Row row) {
+	private Object sortKey(Ast.Expr expression, String name, String alias, Row row) {
 		if (row.has(name)) {
 			return row.get(name);
+		}
+		if (alias != null && row.has(alias)) {
+			return row.get(alias);
 		}
 		return evaluator.evaluate(expression, row);
 	}
@@ -917,7 +978,12 @@ public final class QueryExecutor {
 
 	private long positive(Ast.Expr expression, String clause) {
 		Object value = evaluator.evaluate(expression, new Row());
-		long number = Values.number(value, clause).longValue();
+		// An integer, not any number: LIMIT 1.5 was read as LIMIT 1, a row count nobody asked for.
+		if (!(value instanceof Number given) || !Values.isIntegral(given)) {
+			throw new CypherTypeException(clause + " needs a non-negative integer but got " + Values.typeName(value)
+				+ (value instanceof Number ? " " + value : ""));
+		}
+		long number = given.longValue();
 		if (number < 0) {
 			throw new CypherTypeException(clause + " must not be negative, got " + number);
 		}

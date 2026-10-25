@@ -239,7 +239,27 @@ public final class SegmentFile implements AutoCloseable {
 	 * already written to it, so a writer always sees its own uncommitted changes.
 	 */
 	public MemorySegment readSlice(long fileOffset, long length) {
+		return readSlice(context(), fileOffset, length);
+	}
+
+	/**
+	 * One word of metadata as the calling transaction sees it: the stored word, then the transaction's journal over it.
+	 *
+	 * <p>
+	 * The same answer as {@link #readSlice} followed by {@link #journal()}, with the thread's write context looked up
+	 * once instead of twice. Every resolve by id reads a bitmap word, so this is on the hottest path there is.
+	 * </p>
+	 */
+	long journalledBitmapWord(long fileOffset, int wordIndex) {
 		WriteContext context = context();
+		long stored = readSlice(context, fileOffset, 8).get(Layouts.LONG, 0);
+		if (context == null || context.isReplaying()) {
+			return stored;
+		}
+		return context.journal().bitmapWord(segmentKey(), wordIndex, stored);
+	}
+
+	private MemorySegment readSlice(WriteContext context, long fileOffset, long length) {
 		if (context != null) {
 			int pageIndex = pageIndexOf(fileOffset);
 			long key = PageOverlay.key(kind, segmentNumber, pageIndex);
@@ -267,7 +287,7 @@ public final class SegmentFile implements AutoCloseable {
 		}
 		// A view fixed before the last commit reads a reconstruction; everything else reads the mapping untouched.
 		Snapshot snapshot = snapshots == null ? null : snapshots.versioned();
-		if (snapshot != null) {
+		if (snapshot != null && !snapshot.readsMapping()) {
 			int pageIndex = pageIndexOf(fileOffset);
 			MemorySegment page = snapshot.pageAsOf(PageOverlay.key(kind, segmentNumber, pageIndex),
 				() -> mappedPage(pageIndex), pageSize);
@@ -280,7 +300,7 @@ public final class SegmentFile implements AutoCloseable {
 
 	/** The page as a write transaction's view shows it, or null when that is the mapped page itself. */
 	private MemorySegment viewOf(Snapshot snapshot, long key, int pageIndex) {
-		return snapshot == null || !snapshot.isVersioned()
+		return snapshot == null || !snapshot.isVersioned() || snapshot.readsMapping()
 			? null
 			: snapshot.pageAsOf(key, () -> mappedPage(pageIndex), pageSize);
 	}
@@ -293,13 +313,14 @@ public final class SegmentFile implements AutoCloseable {
 		int pageIndex = pageIndexOf(fileOffset);
 		WriteContext context = context();
 		if (context != null) {
+			context.mutated();
 			long key = PageOverlay.key(kind, segmentNumber, pageIndex);
 			PageOverlay overlay = context.overlay();
-			MemorySegment page;
+			PageOverlay.Page page;
 			if (context.isReplaying()) {
 				page = overlay.forWriteRebased(key, mappedPage(pageIndex));
 			} else {
-				MemorySegment existing = overlay.peek(key);
+				PageOverlay.Page existing = overlay.find(key);
 				if (existing != null) {
 					page = existing;
 				} else {
@@ -310,7 +331,7 @@ public final class SegmentFile implements AutoCloseable {
 					page = overlay.forWrite(key, viewed != null ? viewed : mappedPage(pageIndex));
 				}
 			}
-			return page.asSlice(fileOffset - (long) pageIndex * pageSize, length);
+			return page.writable(fileOffset - (long) pageIndex * pageSize, length);
 		}
 		markDirtyPage(pageIndex);
 		return mapped.asSlice(fileOffset, length);

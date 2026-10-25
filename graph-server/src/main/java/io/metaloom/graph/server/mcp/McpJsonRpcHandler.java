@@ -68,6 +68,12 @@ public final class McpJsonRpcHandler {
 		this.principal.set(principal);
 		try {
 			return handleAs(request);
+		} catch (RuntimeException e) {
+			// The backstop. Every request with an id gets an answer: an exception escaping to a WebSocket handler is
+			// logged by Vert.x and answered by nothing, and the client waits on that id for ever.
+			logger.warn("MCP request '{}' failed", request.method(), e);
+			return Future.succeededFuture(request.isNotification() ? null
+				: JsonRpcResponse.error(request.id(), McpConstants.INTERNAL_ERROR, String.valueOf(e.getMessage())));
 		} finally {
 			this.principal.remove();
 		}
@@ -134,12 +140,36 @@ public final class McpJsonRpcHandler {
 	}
 
 	private Future<JsonRpcResponse> callTool(JsonRpcRequest request) {
-		String name = request.params().getString("name");
-		JsonObject arguments = request.params().getJsonObject("arguments", new JsonObject());
-		if (name == null) {
+		if (request.params() == null) {
 			return Future.succeededFuture(JsonRpcResponse.error(request.id(), McpConstants.INVALID_PARAMS,
-				"tools/call needs a 'name'"));
+				"tools/call needs 'params' to be an object"));
 		}
+		// Types checked rather than trusted: getString turns a number into its text and getJsonObject throws on a
+		// string, and an exception escaping here is no answer at all on a WebSocket. See JsonRpcRequest.from.
+		Object rawName = request.params().getValue("name");
+		Object rawArguments = request.params().getValue("arguments");
+		if (!(rawName instanceof String name)) {
+			return Future.succeededFuture(JsonRpcResponse.error(request.id(), McpConstants.INVALID_PARAMS,
+				"tools/call needs a 'name', as a string"));
+		}
+		if (rawArguments != null && !(rawArguments instanceof JsonObject)) {
+			return Future.succeededFuture(JsonRpcResponse.error(request.id(), McpConstants.INVALID_PARAMS,
+				"tools/call needs 'arguments' to be an object"));
+		}
+		JsonObject arguments = rawArguments == null ? new JsonObject() : (JsonObject) rawArguments;
+		try {
+			return dispatch(request, name, arguments);
+		} catch (ClassCastException wrongType) {
+			// An argument of the wrong type, met by a tool reading it with getInteger or getJsonObject. A tool result
+			// rather than a JSON-RPC error, like every other mistake a model can correct: it is the model's to fix.
+			metrics.recordMcpToolCall(byName.containsKey(name) ? name : "unknown", "refused");
+			return Future.succeededFuture(JsonRpcResponse.ok(request.id(), GraphMcpToolResults.error(
+				"An argument to '" + name + "' has the wrong type. Check the tool's input schema and retry: "
+					+ wrongType.getMessage())));
+		}
+	}
+
+	private Future<JsonRpcResponse> dispatch(JsonRpcRequest request, String name, JsonObject arguments) {
 		GraphMcpTool tool = byName.get(name);
 		if (tool == null) {
 			// Not the name itself: it is client-chosen, and as a label it would be one new series per string sent.

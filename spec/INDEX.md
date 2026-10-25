@@ -178,6 +178,15 @@ as a list of doubles, and searching with that list is searching for a different 
 ([VECTOR.md §1.2](VECTOR.md)). None of this is nearest-neighbour search, and it does not become it by
 being tuned — that is a different structure, explored in [VECTOR.md](VECTOR.md).
 
+**An explicit null is not indexed**, here or in the composite tree, and `nodesByProperty(key, null)`
+answers with nothing: a null matches nothing in an equality lookup, and every null in the store would
+otherwise share the one bucket a null hashes to. The composite tree and both unique constraints always
+skipped it; this tree used to insert it, and `verify(FULL)` — which, like the composite check, treats an
+entry naming a node with no value as dangling — then reported corruption on any healthy store holding
+an explicit null (`StorageBoundaryTest#testAnExplicitNullIsStoredButNotIndexed`, found by
+`StorageModelTest`). Removal still runs for a null, so an entry an older build wrote is cleaned up the
+next time its node changes.
+
 **Hashing is why there are no range queries.** `n.age > 30` cannot use this index: the tree is ordered
 by hash, and a hash is deliberately not order-preserving. A range index would need the value's ordered
 bytes in the key, which is a different index and is not built.
@@ -497,6 +506,8 @@ with the numbers and routes what remains to two adjacency tasks, neither of whic
 | `UniqueConstraintRaceTest` | Two writers giving one unique value to nodes on either side of a stale separator (§6.1) |
 | `IndexLeafMergeTest` | Six writers updating disjoint nodes, then every node looked up by its value: the byte-level merge of shifted leaves (§2.2) |
 | `InvariantTest` | That `verify(FULL)`'s index check fires: a missing label entry, a dangling property entry, a vector entry point outside its index |
+| `StorageModelTest` | The second differential: multi-label nodes with label removal, one key cycling through every value type including an explicit null, a store-wide unique constraint violated on purpose inside transactions that then commit, a label-scoped one and composite indexes declared and dropped partway, the vector index's member set, snapshot views compared as of their LSN, and compaction repeated between writes |
+| `StatementAtomicityTest` | A caught unique violation inside a transaction leaves the node and every tree exactly as they were |
 
 **`verify(FULL)` checks the trees against the records** (`InvariantChecker.checkIndexes`), and until
 this revision it did not: the claim that `NoDanglingRefs` caught an index entry pointing at a freed slot

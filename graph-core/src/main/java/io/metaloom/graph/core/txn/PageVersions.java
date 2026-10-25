@@ -117,6 +117,14 @@ public final class PageVersions {
 	/** The oldest LSN any snapshot can still be reconstructed at; below this the before-images are gone. */
 	private volatile long horizonLsn;
 
+	/**
+	 * The newest commit LSN that has ever been recorded as superseding anything. Only ever rises — vacuum and clear
+	 * leave it alone — so a view whose LSN is at or past it knows, from one volatile read, that no chain can hold an
+	 * entry it would have to undo. That is the answer for nearly every page read a short transaction makes, and it
+	 * used to cost a boxed lookup in the chain map each time.
+	 */
+	private volatile long newestSupersededLsn;
+
 	/** The smallest {@code oldest} across every chain, so vacuum can decline in one comparison. */
 	private final AtomicLong oldestRetainedLsn = new AtomicLong(Long.MAX_VALUE);
 
@@ -128,6 +136,11 @@ public final class PageVersions {
 
 	public long horizonLsn() {
 		return horizonLsn;
+	}
+
+	/** See {@link #newestSupersededLsn}: no chain holds an entry superseded after this LSN. */
+	public long newestSupersededLsn() {
+		return newestSupersededLsn;
 	}
 
 	public long retainedBytes() {
@@ -162,6 +175,11 @@ public final class PageVersions {
 	 *            how many bytes it changes
 	 */
 	public void record(long pageKey, long commitLsn, MemorySegment mappedPage, int offset, int length) {
+		// Before the chain changes, so that nobody can see the entry without also seeing the mark. A plain volatile
+		// store is enough: record() runs under the apply write latch, one commit at a time.
+		if (commitLsn > newestSupersededLsn) {
+			newestSupersededLsn = commitLsn;
+		}
 		byte[] before = new byte[length];
 		MemorySegment.copy(mappedPage, offset, MemorySegment.ofArray(before), 0, length);
 		chains.compute(pageKey, (key, chain) -> {

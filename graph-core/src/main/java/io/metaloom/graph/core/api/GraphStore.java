@@ -147,6 +147,24 @@ public interface GraphStore extends AutoCloseable {
 	 */
 	<T> T inStatement(TransactionalWork<T> work) throws IOException;
 
+	/**
+	 * Runs work as <b>one statement of the calling thread's open write transaction</b>: the counterpart of
+	 * {@link #inStatement} for work that joins a unit of work somebody else is assembling.
+	 *
+	 * <p>
+	 * Nothing is committed or retried here; the caller's transaction owns both. What this adds is the statement
+	 * boundary. Work that fails before changing the transaction leaves it as it was and usable. Work that fails after
+	 * changing it — a query that deleted one node and was then refused on the next — has left part of itself in the
+	 * transaction, so the transaction is made <b>rollback-only</b> and its {@link Transaction#commit()} rolls back and
+	 * refuses, rather than making half a statement durable. This is the rule every mutating method already follows
+	 * inside a caller's transaction, extended to work made of several of them.
+	 * </p>
+	 *
+	 * @throws IllegalStateException
+	 *             if the calling thread has no open write transaction
+	 */
+	<T> T inOpenTransaction(TransactionalWork<T> work) throws IOException;
+
 	/** Work performed inside a transaction opened by {@link #inTransaction}. */
 	@FunctionalInterface
 	interface TransactionalWork<T> {
@@ -584,6 +602,13 @@ public interface GraphStore extends AutoCloseable {
 	 * array, which is never punched, before the punch destroys them.
 	 * </p>
 	 *
+	 * <p>
+	 * <b>It checkpoints first.</b> Punching, the generation floors and checksums that describe it, and the
+	 * superblock rewrite on the way are all written outside the log, and recovery replaying older records over them
+	 * puts back bytes no newer record restores — so the replay origin is moved past every record before the files are
+	 * touched.
+	 * </p>
+	 *
 	 * @return the number of pages reclaimed
 	 * @throws GraphStoreException
 	 *             if a read view is open
@@ -615,6 +640,16 @@ public interface GraphStore extends AutoCloseable {
 
 	CompactionReport compact(CompactionOptions options) throws IOException;
 
+	/**
+	 * Counts and sizes, from the segment headers.
+	 *
+	 * <p>
+	 * <b>Not versioned.</b> Inside a write transaction the counts include that transaction's own writes; inside a
+	 * {@link ReadTransaction} they are still the latest commit's, not the view's, because they are the headers' running
+	 * counters rather than something a view reconstructs. Count through the view — a label lookup, a scan — when the
+	 * number has to agree with what the view shows.
+	 * </p>
+	 */
 	StoreStats stats();
 
 	/** What open read views currently cost. Every field is zero when none is open. */

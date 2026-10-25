@@ -76,6 +76,7 @@ try (Transaction tx = store.begin()) {                 // SNAPSHOT by default
 | `store.begin(IsolationLevel)` | Per-transaction write isolation | **Yes** — `SNAPSHOT` or `SERIALIZABLE`; a writer at `READ_COMMITTED` is refused |
 | `store.inTransaction(work, attempts, IsolationLevel)` | The same, with the retry seam | **Yes** |
 | `store.inStatement(work)` | One statement, whose conflicts the engine absorbs | **Yes** — cannot end in a conflict: optimistic attempts, then one attempt with every other writer excluded. Refused inside an open transaction |
+| `store.inOpenTransaction(work)` | Work joined to the caller's open write transaction as one statement | **Yes** — never commits or retries; a failure after it wrote makes the transaction rollback-only. Refused without an open write transaction |
 | `SERIALIZABLE` | Serializable write transactions | **Yes**, by validating what the transaction read at commit rather than by SSI; see TRANSACTIONS.md §6.4 |
 | `TransactionConflictException` | The loser of a write-write or read-write conflict | **Yes** — a normal outcome; `inTransaction` retries it up to its attempt limit and then raises it, while auto-commit mutations and Cypher write queries go through `inStatement` and never raise it at all |
 
@@ -285,7 +286,7 @@ index.
 store.checkpoint();                       // force a fuzzy checkpoint
 store.vacuum(Duration.ofSeconds(5));      // bounded incremental vacuum
 store.verify(VerifyLevel.CHECKSUMS);      // scrub: CHECKSUMS or FULL
-StoreStats s = store.stats();             // per-kind live/dead counts and bytes
+StoreStats s = store.stats();             // per-kind live/dead counts and bytes; latest commit, even in a view
 StoreMetrics m = store.metrics();         // counters and gauges; subtract two snapshots to cost an interval
 // A whole-store reflink clone is still designed and unbuilt. What exists instead is a *logical* backup, outside
 // the engine and against this API: see spec/BACKUP.md and metaloom-graph-cli.
@@ -397,6 +398,17 @@ format.
   write transaction**, which they would otherwise wait on forever. **`close()` inside one rolls it
   back and closes.** `compact()` also refuses a read view opened while it runs, at the next batch
   rather than only at the start.
+- **A failed statement inside a transaction either left nothing or makes it rollback-only.** Catching a
+  `ConstraintViolationException` and carrying on is fine: every unique check runs before the write it
+  guards. A failure discovered after the statement had started writing — an unsupported value type or
+  an oversized property block, say — marks the transaction rollback-only, and its `commit()` rolls back
+  and raises `GraphStoreException` instead of making half a statement durable
+  ([TRANSACTIONS.md §8](TRANSACTIONS.md#8-conventions-and-gotchas)). `inOpenTransaction(work)` puts
+  the same boundary around work made of several calls inside the caller's transaction; Cypher
+  uses it for a write query that joins one.
+- **`reclaim()` checkpoints first**, so it costs a checkpoint on top of the punching. It writes the files
+  outside the log, and recovery replaying older log records over those writes was measured breaking a
+  store ([WAL.md §7](WAL.md#7-checkpoints)).
 - **Batch reads reorder.** `tx.nodes(ids)` does not guarantee cursor order matches the input array;
   use `c.id()`. An ordered variant costs a sort of the results.
 

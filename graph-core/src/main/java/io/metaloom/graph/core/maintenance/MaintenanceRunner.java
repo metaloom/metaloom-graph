@@ -47,6 +47,12 @@ public interface MaintenanceRunner {
 	 * are written to the mapping and forced in the order the unit chooses. A view is refused because a punched page is
 	 * the base its reconstruction would start from.
 	 * </p>
+	 *
+	 * <p>
+	 * <b>A checkpoint runs first</b>, under the same exclusion. Recovery replays byte-run differences, and replaying
+	 * one logged before an unlogged write over the file after it puts back bytes that no later record restores — so the
+	 * replay origin has to be past every record before the unit touches the file.
+	 * </p>
 	 */
 	void runUnlogged(Unit unit) throws IOException;
 

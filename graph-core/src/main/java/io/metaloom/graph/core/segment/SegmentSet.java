@@ -1230,6 +1230,34 @@ public final class SegmentSet implements AutoCloseable {
 		return (readGen(segment, slot) & ElementId.MAX_GEN) == ElementId.gen(id);
 	}
 
+	/**
+	 * The record slice for an id if it still names a live record, or null where {@link #isLive} would say false.
+	 *
+	 * <p>
+	 * {@link #isLive} followed by {@link #resolve} is the same answer for twice the work: two bitmap reads and two
+	 * record touches. A caller that tests liveness only in order to read the record — the vector index does it for
+	 * every neighbour it considers — asks once here instead. The generation is read out of the returned slice, as
+	 * {@link #resolve} does.
+	 * </p>
+	 */
+	public MemorySegment resolveIfLive(long id) {
+		if (ElementId.isNull(id) || ElementId.kindCode(id) != kind.code()) {
+			return null;
+		}
+		int segmentNumber = ElementId.segment(id);
+		if (segmentNumber >= segments.size()) {
+			return null;
+		}
+		SegmentFile segment = segments.get(segmentNumber);
+		int slot = ElementId.slot(id);
+		if (slot >= slotsPerSegment || !segment.freeSlots().isAllocated(slot)) {
+			return null;
+		}
+		MemorySegment record = segment.record(slot);
+		int stored = Short.toUnsignedInt(record.get(Layouts.SHORT, genOffset)) & ElementId.MAX_GEN;
+		return stored == ElementId.gen(id) ? record : null;
+	}
+
 	/** Calls the consumer with the id of every live slot. The bitmap is the authority on what is live. */
 	public void forEachLiveId(java.util.function.LongConsumer consumer) {
 		forEachLiveIdWhile(id -> {
@@ -1250,19 +1278,47 @@ public final class SegmentSet implements AutoCloseable {
 	 * @return false if the predicate stopped the scan, true if it ran to the end
 	 */
 	public boolean forEachLiveIdWhile(java.util.function.LongPredicate consumer) {
+		return scanLive(consumer, writing());
+	}
+
+	/**
+	 * @param consumerMayWrite
+	 *            whether the consumer can change this kind's bitmap during the scan, which only a consumer running
+	 *            inside a write transaction can
+	 */
+	private boolean scanLive(java.util.function.LongPredicate consumer, boolean consumerMayWrite) {
 		for (SegmentFile segment : segments) {
-			long high = segment.superblock().highWaterSlot();
+			int high = (int) Math.min(segment.superblock().highWaterSlot(), slotsPerSegment);
 			FreeSlotBitmap bitmap = segment.freeSlots();
-			for (int slot = 0; slot < high; slot++) {
-				if (bitmap.isAllocated(slot)) {
+			// A word at a time rather than a bit at a time: one bitmap read covers sixty-four slots, and only the set
+			// bits are visited. Reading the word once per slot was a third of a compaction, which lists every live id
+			// of every kind several times over.
+			for (int first = 0; first < high; first += 64) {
+				int wordIndex = first >>> 6;
+				long window = high - first >= 64 ? -1L : (1L << (high - first)) - 1;
+				long bits = bitmap.wordAt(wordIndex) & window;
+				while (bits != 0) {
+					int bit = Long.numberOfTrailingZeros(bits);
+					int slot = first + bit;
 					int gen = readGen(segment, slot) & ElementId.MAX_GEN;
 					if (!consumer.test(ElementId.encode(kind, segment.segmentNumber(), slot, gen))) {
 						return false;
 					}
+					// The slots above this one. A consumer inside a write transaction can allocate or free in this very
+					// word, and the bit-at-a-time walk this replaced saw that, so the word is read again for it. Any
+					// other change is another transaction's commit, which the scan's view either hides or — for a
+					// throttled scan of the live mapping — races with whichever way the bitmap is read.
+					long above = bit == 63 ? 0 : -1L << (bit + 1);
+					bits = (consumerMayWrite ? bitmap.wordAt(wordIndex) & window : bits) & above;
 				}
 			}
 		}
 		return true;
+	}
+
+	/** Whether the calling thread has a write transaction open, and so can change the bitmap mid-scan. */
+	private boolean writing() {
+		return contexts != null && contexts.current() != null;
 	}
 
 	/**
@@ -1274,12 +1330,14 @@ public final class SegmentSet implements AutoCloseable {
 	public long[] liveIds() {
 		long[][] buffer = { new long[Math.max(16, (int) Math.min(liveCount(), 1 << 20))] };
 		int[] written = { 0 };
-		forEachLiveId(id -> {
+		// The collector writes nothing to the store, so the scan need not re-read a word after each id it yields.
+		scanLive(id -> {
 			if (written[0] == buffer[0].length) {
 				buffer[0] = java.util.Arrays.copyOf(buffer[0], buffer[0].length * 2);
 			}
 			buffer[0][written[0]++] = id;
-		});
+			return true;
+		}, false);
 		return java.util.Arrays.copyOf(buffer[0], written[0]);
 	}
 

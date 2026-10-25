@@ -73,10 +73,12 @@ public final class CypherLexer {
 		char c = source.charAt(index);
 
 		if (c == '`') {
-			return new Token(Token.Type.IDENTIFIER, quotedIdentifier(), startLine, startColumn);
+			return new Token(Token.Type.IDENTIFIER, wholeCharacters(quotedIdentifier(), "name", startLine, startColumn),
+				startLine, startColumn);
 		}
 		if (c == '\'' || c == '"') {
-			return new Token(Token.Type.STRING, stringLiteral(c), startLine, startColumn);
+			return new Token(Token.Type.STRING, wholeCharacters(stringLiteral(c), "string", startLine, startColumn),
+				startLine, startColumn);
 		}
 		if (c == '$') {
 			advance();
@@ -92,8 +94,7 @@ public final class CypherLexer {
 			}
 			return new Token(Token.Type.PARAMETER, name.toString(), startLine, startColumn);
 		}
-		if (Character.isDigit(c) || (c == '.' && index + 1 < source.length()
-			&& Character.isDigit(source.charAt(index + 1)))) {
+		if (isDigit(c) || (c == '.' && index + 1 < source.length() && isDigit(source.charAt(index + 1)))) {
 			return number(startLine, startColumn);
 		}
 		if (isIdentifierStart(c)) {
@@ -122,7 +123,39 @@ public final class CypherLexer {
 			advance();
 			return new Token(Token.Type.SYMBOL, String.valueOf(c), startLine, startColumn);
 		}
-		throw error(startLine, startColumn, "Unexpected character '" + c + "'");
+		// The whole code point, so the message never holds half of a surrogate pair.
+		throw error(startLine, startColumn, "Unexpected character '" + Character.toString(source.codePointAt(index))
+			+ "'");
+	}
+
+	/**
+	 * Refuses a string or a quoted name holding half of a surrogate pair.
+	 *
+	 * <p>
+	 * Such a string is a valid Java string and not a valid Unicode one: it has no UTF-8 encoding, so the store refuses
+	 * it the moment it is written, with an {@code IllegalArgumentException} that names neither the query nor the
+	 * position. A {@code \\uD83D} escape is the usual way to write one by accident, while meaning the first half of a
+	 * pair whose second half was forgotten. Both halves written as two escapes are one character and pass.
+	 * </p>
+	 */
+	private String wholeCharacters(String text, String what, int atLine, int atColumn) {
+		for (int i = 0; i < text.length(); i++) {
+			char c = text.charAt(i);
+			if (Character.isHighSurrogate(c) && i + 1 < text.length() && Character.isLowSurrogate(text.charAt(i + 1))) {
+				i++;
+				continue;
+			}
+			if (Character.isSurrogate(c)) {
+				throw error(atLine, atColumn, "This " + what + " holds half of a surrogate pair (\\u"
+					+ String.format("%04X", (int) c) + "), which is not a character and has no UTF-8 encoding");
+			}
+		}
+		return text;
+	}
+
+	/** ASCII only: Character.isDigit also accepts every other script's digits, which Double.parseDouble does not. */
+	private static boolean isDigit(char c) {
+		return c >= '0' && c <= '9';
 	}
 
 	private Token number(int startLine, int startColumn) {
@@ -144,16 +177,16 @@ public final class CypherLexer {
 					: "The hex literal " + text + " does not fit in a 64-bit integer");
 			}
 		}
-		while (index < source.length() && Character.isDigit(source.charAt(index))) {
+		while (index < source.length() && isDigit(source.charAt(index))) {
 			advance();
 		}
 		// A '.' only continues the number when a digit follows: in `1..3` the dots are the range operator, and
 		// consuming the first of them would turn a variable-length pattern into a malformed float.
 		if (index < source.length() && source.charAt(index) == '.'
-			&& index + 1 < source.length() && Character.isDigit(source.charAt(index + 1))) {
+			&& index + 1 < source.length() && isDigit(source.charAt(index + 1))) {
 			isFloat = true;
 			advance();
-			while (index < source.length() && Character.isDigit(source.charAt(index))) {
+			while (index < source.length() && isDigit(source.charAt(index))) {
 				advance();
 			}
 		}
@@ -163,9 +196,9 @@ public final class CypherLexer {
 			if (index < source.length() && (source.charAt(index) == '+' || source.charAt(index) == '-')) {
 				advance();
 			}
-			if (index < source.length() && Character.isDigit(source.charAt(index))) {
+			if (index < source.length() && isDigit(source.charAt(index))) {
 				isFloat = true;
-				while (index < source.length() && Character.isDigit(source.charAt(index))) {
+				while (index < source.length() && isDigit(source.charAt(index))) {
 					advance();
 				}
 			} else {
@@ -314,6 +347,6 @@ public final class CypherLexer {
 	}
 
 	private static boolean isHex(char c) {
-		return Character.isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+		return isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 	}
 }

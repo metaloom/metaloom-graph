@@ -208,6 +208,22 @@ one level down, so a node or relationship at exactly depth 32 encoded and then f
 result the server could send and the client could not read
 (`WireValueCodecTest.testTheDepthLimitIsTheSameInBothDirections`).
 
+**Strict UTF-8, both ways.** A string holding a surrogate without its pair has no UTF-8 encoding, and
+`String.getBytes(UTF_8)` silently writes `?` for one — so `"\uD800"` and `"?"` left as the same bytes, and a
+parameter reached the server as a different string with nothing to say so. The encoder now refuses one with
+`WireValueCodec.UnpairedSurrogateException`, as the storage codec does; on the server a result value that holds one
+(`RETURN '\uD800'` makes one) fails its stream with `TYPE` rather than leaving as `?` — the embedded API and HTTP never
+answered `?`. The check is cheap on purpose: the JDK writes a lone surrogate as `?`, so only an encoding containing a
+`?` byte, found eight bytes at a time, is walked char by char; walking every string halved large-row throughput.
+The decoder refuses bytes that are not UTF-8 with `WireFormatException` instead of decoding them to U+FFFD, again only
+re-checking a result that contains a replacement character, and decodes straight out of the frame rather than copying
+the bytes first. Text the server writes *about* a failure goes through `WireValueCodec.wellFormed` instead, so an error
+message quoting a bad string still reaches the client. `WireCodecPropertyTest` round-trips thousands of random values
+through all of it.
+
+**A path is checked when it is made.** Only the hop count travels, so a `WirePath` that was not n+1 nodes and n
+relationships encoded into bytes the decoder read as something else; the record now refuses that shape.
+
 ### Two encoding decisions worth keeping
 
 **Element ids are fixed 8 bytes, not `T_INT`.** A real id is packed with a kind in the high bits and
@@ -261,6 +277,16 @@ the producer polls; the view is only ever closed by the thread that opened it, o
 
 Exactly one terminal frame per stream, guarded by a CAS — the deadline, the cancel handler and the
 producer's error path all race to end a stream.
+
+### What a client may reuse is given back before the frame that says so
+
+A stream's permit, its write gate and its stream id are all released **before** its terminal frame is written, not
+after. `socket.write` from the producer only queues the frame for the event loop, so anything released after it can
+still be held when a fast client has read the terminal and sent its next query: the permit came back in the
+completion callback, and a client with one stream open against a limit of one was answered `OVERLOADED`; the id came
+back just after the write, and a client reusing it at once — which §6 says it may — got "already running a query", a
+protocol error that closed the connection. Nothing still needs any of the three by then: the view was closed and the
+transaction ended on the way out of `Cypher.stream`. `WireClientEndToEndTest` reproduces both.
 
 ### Stopping a query that has not produced a row yet
 
@@ -346,6 +372,12 @@ the number rather than trusting it:
    against a client reading nothing while the write queue never once looked full. `SO_SNDBUF` is now
    set explicitly and is inside the product.
 
+And one that did not break the bound so much as double what sat behind it: **a frame was built by growing an
+eight-byte header buffer to fit its payload**, and Netty grows to the next power of two, so every 64 KiB batch was
+a 128 KiB allocation — twice the bytes the write budget counts as in flight, and twice the zeroing. `Frames` now
+allocates header plus payload exactly: 131,192 bytes per 64 KiB frame before, 65,744 after, and building one went
+from 8–12 µs to 3–7 µs.
+
 The client has the mirror of both: `readBufferBytes` (heap) and `socketReceiveBufferBytes` (kernel).
 Crossing them pauses the socket, which closes the receive window, which is what the server discovers
 as backpressure.
@@ -398,6 +430,15 @@ parent pom sets `forkedProcessTimeoutInSeconds`, so any hung fork anywhere becom
 earned their place immediately: the timeout is what turned the second defect from a stalled reactor
 into a 30 second failure naming the line.
 
+**A third, on the give-back side: closing a stream while its rows were arriving.** The event loop looks a stream up,
+counts a batch and then queues it; `close()` released what it found in the queue. A batch landing between the lookup and
+the queueing was counted and never released — up to a batch of budget gone for good each time, and once the leaked
+total sat above half of `readBufferBytes` the next pause had nothing that would ever lift it: the connection hung on
+its next large result. A `discarded` flag now closes the window from both sides — `close()` sets it before emptying the
+queue, the event loop checks it after queueing and gives the batch back itself.
+`GraphClientLifecycleTest.testClosingStreamsMidFlightLeaksNoBudget` hung on the old code and asserts the budget is
+back to zero on the new.
+
 **The rules this leaves.** A field written on the event loop and read off it is `volatile`, and a
 comment justifying otherwise has to account for the read as well as the write. And a value is added to
 a shared budget **before** it is published to another thread, never after — publishing first opens a
@@ -428,6 +469,10 @@ engine in it.
 | **No automatic reconnect** | Reconnecting mid-stream would silently resume against a *different* snapshot, so a result spanning the break would mix two points in time. Whether to run the query again is the caller's decision, and it is a real one |
 | **A dropped connection fails every later `query()` at once** | The streams open at the drop are failed by `connectionLost`; after it, `query()` throws `GraphClientException` rather than writing to a dead socket and leaving its caller in `hasNext()` for ever. The flag is set before the open streams are swept, so a query racing the drop is caught by one or the other. A `QUERY` whose write fails fails its stream too |
 | **A stream id is freed by the server's terminal frame, not by `close()`** | Frames for a cancelled stream are still in flight. Reusing the id early delivers one query's rows to another — a wrong answer rather than a crash, and therefore the worse bug |
+| **A closed stream answers at once** | `hasNext`, `next`, `summary` and an unanswered `columns` throw `IllegalStateException` after `close()` on a stream that had not finished. A closed stream is unregistered, so nothing the server sends reaches it again, and they used to park in `take()` for ever |
+| **A query that cannot be sent costs nothing** | It is encoded before a stream id is taken: a parameter with no wire type or a lone surrogate throws `IllegalArgumentException`, a query over the frame limit `GraphClientException`, and neither leaves a registered stream behind. They used to, and 65,535 of them made the connection refuse every query |
+| **The server's reason reaches the streams it ends** | A connection ended by an `ERROR` on stream 0 fails its open streams with that frame's code — `UNAUTHENTICATED` for a user disabled while connected — not `PROTOCOL`. A `COMPLETE` that does not decode now fails its stream with the rest instead of leaving it waiting for ever |
+| **Rows that arrived can be read after the connection ends** | Up to the point of the failure, which is then thrown. Reading them used to throw `RejectedExecutionException` once the client was closed, from a resume hop onto a Vert.x that was gone |
 | **Not thread-safe per stream** | One stream, one consuming thread. Several streams may be consumed by several threads |
 
 ---
@@ -543,6 +588,9 @@ make cleartext safe; neither substitutes for the other.
 | `WireTlsTest` | §7.1 end to end against a certificate generated per test: a query over the encrypted listener, both listeners serving one store at once, a login crossing the encrypted one, `close()` stopping both acceptors, and `--wire-tls-only` opening no plaintext listener. Weighted towards **refusal** — an untrusted certificate, a certificate for the wrong name, a plaintext client on the encrypted port and the reverse — because those are the paths where a mistake produces something that looks like it is working. Same class-level `@Timeout` and event-loop count as `WireServerTest`, for the same two reasons |
 | `ClientTlsTest` | What the client verifies, and that a copy method does not drop the transport. Cheap assertions that earn their place because the value they pin down — hostname verification on — is one Vert.x defaults the other way |
 | `ClientDependencyTest` | Fails if graph-core or graph-cypher ever reaches the client's classpath. Checked by **loading**, not by reading a pom, because a transitive arrival would pass a pom check |
+| `WireCodecPropertyTest` | Thousands of seeded random values — nested lists, maps, nodes, lightweight and materialised relationships and paths inside one another, every integer size-class edge, NaN and -0.0 by their bits, strings across all of Unicode — round-trip exactly and consume exactly their bytes, alone and back to back. Random frames of every type, 0 B to 1 MiB, survive random chunking; a frame of exactly 16 MiB is accepted and one byte more refused; the per-header ceiling is re-read between coalesced frames. Lone surrogates refused at every offset, malformed UTF-8 refused, an ill-shaped path refused |
+| `GraphClientLifecycleTest` (graph-client) | The client against `ScriptedServer`, a server that misbehaves on cue: a closed stream asked again, a connection dropped mid-result, an error after rows, a truncated `COMPLETE`, an undecodable batch, an unexpected frame, a silent server, a connection-level error's code, closing and interrupting a blocked consumer, rows for an unknown stream, an abandoned stream holding the budget, 65,536 unencodable queries, and 16 threads sharing one client. **`` in `SEPARATE_THREAD` mode**: `CompletableFuture.join` is not interruptible, so a same-thread timeout could not end two of the hangs this found |
+| `WireClientEndToEndTest` | The client against a real server: back-to-back queries at the stream limit never refused, a stream id reused the instant it ends, back-to-back writes, twelve threads on one client, every parameter type through `RETURN $p`, a lone surrogate answered `TYPE`, a write cut off by a disconnect all or nothing, a failed write rolled back whole, a database dropped under an open connection, and a query in flight at shutdown answered within the grace period |
 
 **Why a fuzz oracle and not only a differential test.** [TESTING.md](TESTING.md) §0 records the finding:
 a differential test compares two implementations and therefore finds only the mistakes they do not
@@ -575,5 +623,5 @@ decoder on corrupt input.
 
 ---
 
-_Git HEAD revision: `58cd33e`_
-_Last updated: 2026-08-18 (TLS on the binary port)_
+_Git HEAD revision: `f2b6d5f`_
+_Last updated: 2026-10-24 (client, server and CLI review: closed streams, budget leak, slot release order, shutdown grace, strict UTF-8, MCP argument shapes, atomic backups)_

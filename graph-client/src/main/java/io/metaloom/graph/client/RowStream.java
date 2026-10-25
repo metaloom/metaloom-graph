@@ -81,6 +81,20 @@ public final class RowStream implements AutoCloseable, Iterable<Row> {
 	private QuerySummary summary;
 	private boolean closed;
 
+	/**
+	 * Set by {@link #close()} before it empties the queue, read by the event loop after it adds a batch.
+	 *
+	 * <p>
+	 * The event loop looks a stream up, counts a batch against the connection's budget, and then queues it — and the
+	 * consumer can close the stream between the lookup and the queueing. Close released only what it found in the
+	 * queue, so the batch landing behind it stayed counted for ever. Each was up to a batch of budget gone, and once the
+	 * leaked total sat above half of {@link ClientOptions#readBufferBytes} the next pause had nothing to lift it: a
+	 * connection that hung on its next large result. With this flag one side or the other always sees the batch — the
+	 * consumer in the queue, or the event loop in the flag — and whichever does gives it back.
+	 * </p>
+	 */
+	private volatile boolean discarded;
+
 	RowStream(GraphClient client, int streamId) {
 		this.client = client;
 		this.streamId = streamId;
@@ -89,6 +103,10 @@ public final class RowStream implements AutoCloseable, Iterable<Row> {
 	/** The column names, in projection order. Blocks until the server has sent them, which it does before any row. */
 	public List<String> columns() {
 		if (columns == null) {
+			if (closed && !columnsArrived.isDone()) {
+				// Nothing will complete it: a closed stream is unregistered, so its COLUMNS frame is dropped on arrival.
+				throw closedBeforeFinishing();
+			}
 			try {
 				columns = columnsArrived.join();
 			} catch (CompletionException e) {
@@ -118,6 +136,9 @@ public final class RowStream implements AutoCloseable, Iterable<Row> {
 			if (finished) {
 				report();
 				return false;
+			}
+			if (closed) {
+				throw closedBeforeFinishing();
 			}
 			take();
 		}
@@ -164,6 +185,9 @@ public final class RowStream implements AutoCloseable, Iterable<Row> {
 	 */
 	public QuerySummary summary() {
 		while (!finished) {
+			if (closed) {
+				throw closedBeforeFinishing();
+			}
 			take();
 		}
 		report();
@@ -209,8 +233,27 @@ public final class RowStream implements AutoCloseable, Iterable<Row> {
 		if (!finished) {
 			client.cancel(streamId);
 		}
+		// Rows still in the current batch go with the stream: asking for them after close() is the same mistake as
+		// asking for rows that had not arrived yet, and is answered the same way.
+		rowsLeftInBatch = 0;
+		batch = null;
+		// Before the queue is emptied, so a batch the event loop queues behind the emptying is given back by it.
+		discarded = true;
 		client.discard(streamId, releaseQueued());
 		reportIfUnobserved();
+	}
+
+	/**
+	 * The answer to reading a stream that was closed before its result finished.
+	 *
+	 * <p>
+	 * An exception rather than a wait. A closed stream is unregistered, so nothing the server sends for it — rows or
+	 * terminal — reaches it again, and waiting used to mean parking in {@code take()} for ever.
+	 * </p>
+	 */
+	private IllegalStateException closedBeforeFinishing() {
+		return new IllegalStateException("Stream " + streamId + " was closed after " + rowsRead
+			+ " rows, before its result finished");
 	}
 
 	// ---------------------------------------------------------------- consumer plumbing
@@ -303,6 +346,14 @@ public final class RowStream implements AutoCloseable, Iterable<Row> {
 
 	void onRows(byte[] payload) {
 		queue.add(new Batch(payload));
+		if (discarded) {
+			// Closed while this batch was on its way in: the consumer has already emptied the queue and gone, so this
+			// side gives the bytes back. See discarded for why both sides look.
+			long released = releaseQueued();
+			if (released > 0) {
+				client.consumed(released);
+			}
+		}
 	}
 
 	void onComplete(QuerySummary summary) {

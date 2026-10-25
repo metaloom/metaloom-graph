@@ -32,6 +32,11 @@ public interface Transaction extends AutoCloseable {
 	 * @throws TransactionConflictException
 	 *             if another transaction changed something this one depended on. The transaction is over either way;
 	 *             retry it, which is what {@link GraphStore#inTransaction} does.
+	 * @throws GraphStoreException
+	 *             if the transaction is <b>rollback-only</b>: a statement in it failed after it had already started
+	 *             changing the transaction, so part of that statement is in it and nothing can take that part out
+	 *             again. The transaction is rolled back. A statement refused before it wrote anything — every unique
+	 *             constraint violation is — leaves the transaction usable instead.
 	 */
 	long commit() throws IOException;
 

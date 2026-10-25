@@ -116,7 +116,10 @@ RETURN node.name, score
 `YIELD` is required — a call whose results bind to nothing has nowhere to put them, and this build has
 no implicit result table, so accepting it would make a query that looks like it does something do
 nothing. An unknown procedure is refused by the executor rather than the grammar, because "no such
-procedure" is not a syntax error.
+procedure" is not a syntax error. So are a pair with no declared vector index, an empty query vector
+and one of the wrong length — as type errors, checked before the engine is asked. The engine's own
+refusals are an `IllegalStateException` and an `IllegalArgumentException`, which a server reports as its
+own failure rather than the query's.
 
 **The second line is the point.** `node` is already bound when the `MATCH` runs, so the pattern matcher
 takes its already-bound branch and *verifies* rather than scanning — a graph predicate applied to the
@@ -125,6 +128,18 @@ lives inside the engine instead of beside it ([VECTOR.md §4.5](VECTOR.md)).
 
 An unknown function names itself and lists what exists, rather than returning null — a typo that
 returns an empty result set is much worse than one that fails.
+
+**Strings are measured in characters, not UTF-16 units.** `size`, `length`, `substring` and `split`
+with an empty separator count code points, as Neo4j does: `size('😀')` is 1, and `substring` can never
+cut a character in half. In UTF-16 units it could, and the half it returned is a string with no UTF-8
+form, which the store then refuses to hold.
+
+**The coercions take what their names say and nothing Java's parsers add.** `toInteger('2.7')` is 2 —
+a float string truncates as the float would — and `toInteger('1e400')` is null, because no integer is
+that number. `toFloat` accepts decimal notation, `NaN` and `Infinity`, and nothing else: Java's parser
+also takes `'1.5f'` and hexadecimal floats, so they used to read as numbers. `toBoolean(0)` is false
+and any other integer true, as in Neo4j 5. `round` of NaN, an infinity or anything from 2^52 up is the
+value itself; it went through a `long` and came back as `0.0` or `9.2e18`.
 
 **The vector functions are the only namespaced names in the grammar, and the dot is not lexical.**
 `.` is deliberately not an identifier character — making it one breaks both `n.name` and the `*1..3`
@@ -179,7 +194,12 @@ for, or drops rows it did.
 | `[1, null] = [2, null]` | `false` | unless a known element already differs |
 | `{a: 1} = {a: 1.0}` | `true` | map values compare as Cypher values |
 | `-0.0 < 0.0`, `0.0/0.0 > 1` | `false` | `< <= > >=` on floats are IEEE, not `Double.compare`'s sort order |
+| `[1, null] IN [[1, 2]]` | `null` | `IN` compares each element with `=`, nested nulls included |
+| `CASE [1, null] WHEN [1, null] …` | the `ELSE` | the simple form uses `=` too |
+| `[1] < ['a']`, `[1, null] < [1, 2]` | `null` | lists compare element by element and inherit their elements' unknowns |
+| `[1, null] < [2, null]` | `true` | an earlier element that differs still decides |
 | `WHERE <null>` | row dropped | the one place the third value collapses |
+| `UNWIND [null] AS n MATCH (n)` | no rows | a variable bound to null matches nothing; it is not unbound |
 
 **The classic surprise**: `WHERE NOT n.age > 20` does not return the nodes with no age. `n.age > 20`
 is null, `NOT null` is null, and a null predicate drops the row. Use `IS NULL` for that.
@@ -192,6 +212,46 @@ DISTINCT, grouping and ORDER BY need two-valued answers, so they are the one pla
 treated as equal. DISTINCT and grouping use openCypher's *equivalence* — null ≡ null, NaN ≡ NaN, `1` ≡
 `1.0` — through one key function (`Values.groupingKey`), so `UNWIND [1, 1.0] AS x RETURN x, count(*)`
 is one group, as `RETURN DISTINCT x` is one row. Nulls sort **last** ascending.
+
+The last row of the table was a live defect: a pattern variable bound to null was treated as unbound,
+so the scan rebound it to every node in the store — a missing value turning into all of them. Bound to
+something that is not a node at all (`WITH 1 AS n MATCH (n)`), it is a type error. The rows above it
+were defects too: `IN` and the simple `CASE` used the two-valued equality DISTINCT needs rather than
+`=`, and list comparison borrowed the sort order, which orders every pair.
+
+### 2.1 Numbers, ordering, and `+`
+
+**An integer and a float compare exactly.** `9007199254740993 = 9007199254740992.0` is false: the
+integer has no double, and widening it first made the two equal. Grouping already keyed an integral
+float as the integer it equals, so `=` and DISTINCT disagreed about the same two values; and widening
+is not transitive near 2^53, which a sort comparator has to be.
+
+**Unlike types sort in openCypher's orderability**, the order Neo4j uses: map, node, relationship,
+list, path, string, boolean, number, and null last. Nodes and relationships order by identity, lists
+and maps element by element, numbers exactly across the two types with NaN above every number.
+`ORDER BY`, `min` and `max` all use it, so `min` over `[1, 'a', true, [1]]` is the list and `max` is
+the number. (The order used to be alphabetical by type name, and nodes did not order at all.)
+
+**A list on either side of `+` makes it list concatenation**, checked before strings:
+`[1, 2] + 'x'` is `[1, 2, 'x']` and `1 + [2]` is `[1, 2]`. The string test ran first, so the first
+rendered the list into `"[1, 2]x"` and the second was a type error.
+
+**Literals are ASCII.** Only `0`–`9` make a number — `Character.isDigit` also accepts every other
+script's digits, which `Long.parseLong` then read and `Double.parseDouble` threw on — and a float
+literal too large for a double, `1e999`, is a syntax error rather than Infinity. A string literal or a
+quoted name holding half of a surrogate pair (`'\uD83D'`) is a syntax error; a parameter holding one is
+a type error when it is written to the store. Such a string has no UTF-8 form, and the store's own
+refusal was an `IllegalArgumentException`, which a server reports as its own failure.
+
+**SKIP and LIMIT take an integer.** `LIMIT 1.5` was read as `LIMIT 1`, a row count nobody wrote.
+
+**A column name appears once.** A row is a map from name to value, so `RETURN 1 AS a, 2 AS a` — or
+`RETURN x, x`, or `RETURN *, 2 AS x` with an `x` in scope — kept the second value and reported it
+under both headers. The parser refuses the first two, the executor the third.
+
+**After an aggregation, ORDER BY may name a projected expression by its text** as well as by its
+alias: `RETURN n.age AS age, count(*) ORDER BY n.age` reads the `age` column, because `n` is no longer
+there to read.
 
 ---
 
@@ -233,6 +293,17 @@ On a diamond — two routes from A to D — `traverse` reports D once, Cypher re
 Relationship uniqueness is also what makes `-[*]-` terminate on a cycle. A relationship variable
 already bound by an earlier clause is a **join**, as a node variable is: `WITH r MATCH (a)-[r]->(b)`
 finds `r`'s own endpoints rather than rebinding `r` to every edge.
+
+**An undirected step crosses a self-loop once.** `neighbours(BOTH)` lists a self-loop from both of its
+ends, which are one node, so `MATCH (a)-[r]-(a)` returned every loop twice. It is one relationship,
+and openCypher — and Neo4j — return it once; `GraphAccess.expand` drops the second listing, for
+materialised and lightweight loops alike.
+
+**A name in scope is not silently rebound.** `UNWIND … AS x`, `LOAD CSV … AS x`, `YIELD x`, a path
+variable, and a relationship variable in `CREATE` or a created `MERGE` all introduce a name, and one
+already defined is refused: `MATCH (n) UNWIND [1, 2] AS n` used to replace every node with a number for
+the rest of the query, without a word. A node variable in a pattern is the exception, because naming a
+bound node is how a pattern joins to it.
 
 **`WITH` is a projection.** What it leaves out is out of scope afterwards, in its own `WHERE` and in
 every later clause, on both execution paths — `MATCH (a)-->(b) WITH a MATCH (a)-->(b)` binds a fresh
@@ -278,6 +349,14 @@ refuse to nest, and a nested transaction is not a caught mistake but a silent on
 one clears the published overlay, after which the outer transaction's writes go straight to the mapping,
 unlogged and past the point a rollback could take them back. `GraphStore.hasWriteTransaction()` was
 added for exactly this question.
+
+**A joined query is still one statement.** It runs through `GraphStore.inOpenTransaction`, so a
+query that fails after it has written — a plain `DELETE` that removed one node and was then refused on
+a connected one — makes the caller's transaction **rollback-only**: `commit()` rolls it back and
+raises `GraphStoreException` rather than making half the query durable. A query refused before it
+wrote anything (a syntax or type error up front, a unique violation) leaves the transaction usable
+([TRANSACTIONS.md §8](TRANSACTIONS.md#8-conventions-and-gotchas)). Before this a caller that caught
+the error and committed committed the half that ran.
 
 **The commit happens before the first row is delivered.** A sink that had already received rows when
 the commit failed would hold a result from a transaction that no longer exists — and on the far side of
@@ -366,7 +445,15 @@ before — a wrong answer that throws nothing. Each write clause re-reads what i
 bindings in every row, including inside lists and paths. **Within a `SET`, each row also sees what the
 rows before it wrote**: it is rebound against the elements already written before its items are
 evaluated, or `MATCH (:User)-[:VIEWED]->(p) SET p.views = p.views + 1` over three users would read the
-same stale value three times and lose two updates.
+same stale value three times and lose two updates. **And each item sees the items before it**, as if
+each were a `SET` of its own: `SET a.x = 1, a.y = a.x` gives `y` the 1, and `SET n:Done, n.done = n:Done`
+is true. The writes are still pending — one store write per element is the point of the next paragraph —
+so the row is rebound to a view of them rather than re-read.
+
+**A node this query deleted stays in its rows, and cannot be used.** `RETURN n` after `DELETE n` gives
+back the snapshot, as before; expanding from it, `startNode()` of a relationship that ended at it, or any
+other read of the store about it is a type error naming the node. The engine's own answer was a
+`GraphStoreException`, which a server reports as a store conflict.
 
 **`SET n += {k: null}` removes `k`**, exactly as `SET n.k = null` does; in `SET n = {…}` a null entry is
 simply not stored.
@@ -420,6 +507,13 @@ The rest:
 - **Undirected is allowed here and refused in `CREATE`**, because it means something: `MERGE (a)-[:R]-(b)`
   asks whether an edge exists *either way*, and creates one left to right if none does. `CREATE` has no
   question to ask, so an arrowless relationship there is an omission.
+- **A null property is refused.** `MERGE (n:P {k: null})` is an equality with null, which matches
+  nothing, so the match half always failed and the create half built a node without `k` — which the next
+  run could not match either. Every run of an idempotent-looking statement added a node. The usual cause
+  is a missing parameter or CSV column, and the error says so; Neo4j refuses it the same way.
+- **A list of numbers matches its float twins.** `[1, 2] = [1.0, 2.0]`, and the property index keys each
+  list by its own element types, so probing for the one written lost the other and MERGE created a
+  duplicate of a node that existed. Such a value is not probed (§7).
 
 **Why it is idempotent inside one query.** Rows are processed in order and each match reads the store as
 it is *now*, so a row merging a key an earlier row created finds it rather than creating a second. That
@@ -454,12 +548,15 @@ The simple form compares under Cypher equality, so `1` and `1.0` select the same
 |---|---|
 | `FOREACH` | `UNWIND` covers the common case |
 | `OPTIONAL MATCH` | Needs null-padding semantics through the rest of the pipeline |
-| List comprehensions, map projections, pattern comprehensions | Not built |
-| `ALL`/`ANY`/`NONE`/`SINGLE` predicates, `EXISTS` subqueries | Not built |
+| List comprehensions, map projections, pattern comprehensions | Not built. `[x IN list]` is refused too: in openCypher it is always a comprehension, so reading it as a one-element list of booleans would be a different answer rather than a refusal |
+| List slicing, `list[1..2]` | Not built; indexing one element is |
+| `ALL`/`ANY`/`NONE`/`SINGLE` predicates, `EXISTS` subqueries | Not built. `exists(n.prop)`, the function, is |
 | User-defined procedures | No procedure *registry* exists. `CALL` itself is built and there is exactly one procedure: `CALL vector.query(label, key, vector, k) YIELD node, score` — see [VECTOR.md](VECTOR.md). Any other name is refused at execution with that message |
 | Temporal and spatial types | The store has `Instant`; Cypher's temporal algebra is not implemented |
 
-**Each of these is refused at parse time, by name, with a caret.** The parser accepts only what the
+**Each of these is refused at parse time, by name, with a caret.** That claim was untrue for list
+comprehensions, map projections, `EXISTS { … }` and slicing — they failed as an unexpected `|`, `{` or
+`..` somewhere further on — until `CypherSemanticsTest` asserted it. The parser accepts only what the
 executor can run, so "this build cannot do that" and "you typed it wrong" are different messages:
 
 ```
@@ -642,6 +739,12 @@ so `30` and `30.0` hash apart there while `30 = 30.0` is true in Cypher, and an 
 with no scan behind it. `MATCH (n {age: 30.0})` found nothing and `MERGE` duplicated the node; both
 spellings are now probed and the results joined (exact below 2^53).
 
+**A list holding a number is not probed at all.** Each element has a twin, so a list has one spelling per
+combination of them — `[1, 2]` equals `[1.0, 2.0]` and `[1, 2.0]` — and probing two of them is no more
+right than probing one. Such an inline value takes the label scan (or the full one) and is checked with
+`=` per candidate; `CypherDifferentialTest` found the lost rows. A list of strings and booleans has one
+spelling and is probed as before.
+
 **The composite step is taken only when the pair has been declared** through
 `GraphStore.createIndex(label, key)` ([INDEX.md §3.3](INDEX.md)); an undeclared pair falls through to
 the property probe, which is what the planner did before. There is no Cypher DDL for a declaration —
@@ -667,6 +770,20 @@ the query language uses an index it cannot create.
   composite index is the way to say which pair matters, because without statistics the planner cannot
   work it out ([INDEX_TASKS.md IDX-8](INDEX_TASKS.md)).
 - **No join reordering.** A pattern is expanded left to right from its chosen seed.
+- **A node nothing can read is not read.** An anonymous `()` with no labels and no properties, in a part
+  with no path variable, only says where the next step starts, so the expansion binds its id and skips
+  the record and the property block; a path's intermediate nodes are read only when the path is bound.
+  On a two-hop anonymous count over 20,000 nodes and 60,000 edges, that and the next item took the query
+  from 336 ms to 210 ms (`CypherExecutionBenchmark`, median of five interleaved runs against the previous
+  build).
+- **A projection builds its row once.** Each item used to copy the whole row map (`Row.with`), so a row of
+  k columns cost k maps; and every projected row also carried a copy of its source row, which only an
+  `ORDER BY` reads. Without one it is no longer kept, nor narrowed away again after a `WITH`. On
+  `UNWIND range(1, 200000) … WITH x, x * 2 + 1 AS y, x % 7 AS z WHERE z = 3 RETURN sum(y)` that is 79 ms
+  to 22; on a two-`WITH` chain over 20,000 nodes, 20 ms to 15.
+- **One row copy per step, not one per binding**, and no path assembled for a part that does not name
+  one: the expansion used to copy the row map once for the relationship and again for the node, and
+  copy both path lists for every candidate whether or not anything would read them.
 - **A write query is materialised end to end**, and commits before its first row is delivered (§4.1).
   Nothing about a write streams, and `Cypher.stream` does not change that.
 - **Writers serialise on one lock per store**, engine-wide. A long write query blocks every other
@@ -785,6 +902,13 @@ query and the engine has no notion of a second store.
 | `POST /api/indexes` | `{"label": "...", "key": "...", "unique": false}` declares one, backfill included. `DELETE /api/indexes/{label}/{key}` drops it. Both need `--allow-write` |
 | `GET /` | The UI |
 
+**A request of the wrong shape is a 400, never a 500.** A body that is not JSON, JSON that is not an object, a `query`
+that is not a string, `parameters` that are not an object, an index `label`, `key` or `unique` of the wrong type — each
+is `400` with `error: "json"`, `"empty"` or `"parameters"` and a message saying what to send. They used to escape
+the handler as exceptions and reach the router as `500 Internal Server Error`, which tells a client to retry a request
+that can never succeed. A backup of a database that does not exist is `404`, like every other route, not a `409`
+"store" (`HttpRouteEdgeCaseTest`).
+
 One result serves both views: the table is the rows, and the graph is built by walking every value in
 every row and collecting whatever is renderable. A query returning only `n.name` gets a table and an
 empty canvas, which the UI says rather than showing blank space. A link is drawn only when **both**
@@ -803,6 +927,14 @@ default, 0 to disable — which is enforced by the engine consulting an abort si
 rather than by the route giving up waiting. `executeBlocking` cannot interrupt a task that has
 started, so a route that merely stopped waiting would abandon the answer while the scan kept its
 thread and its read view, which is the failure a timeout exists to prevent.
+
+The signal is consulted on store touches, on CSV rows and, since this was found missing, **on every row
+an `UNWIND` produces**. A query can multiply rows without touching the store at all —
+`WITH range(1, 300) AS l UNWIND l AS x UNWIND l AS y RETURN count(*)` is a square — and aggregated,
+nothing reaches the sink either, so neither existing check could fire and the deadline bounded nothing.
+One gap is left and stated: a single expression that builds a huge list or string in one step
+(`l + l`, doubled clause after clause) cannot be interrupted part way, because the work is one
+allocation; `range()` alone is capped (§1.1).
 
 ### 8.1 `/api/schema` is a scan
 
@@ -915,11 +1047,14 @@ together: both have to permit, and the flag can only subtract.
 | `io/CsvRowReaderTest` | 15 | RFC 4180: quoted newlines, the `""` escape, BOM, `\r\n`, a custom terminator, and a record straddling the buffer |
 | `LoadCsvTest` | 27 | §5.6 end to end: both row shapes, both execution paths, the reader closed on every exit including an early `LIMIT`, `DENY` by default, and periodic commit's partial-failure semantics |
 | `NullSemanticsTest` | 17 | §2, on its own |
+| `CypherSemanticsTest` | 28 | §2.1 and the rest of this round's semantic defects, one case each, every one failing on the code before it: list `+`, exact numeric comparison, orderability, code points, lone surrogates, null-bound pattern variables, rebinding, self-loops, MERGE on null and on a numeric list, SET item order, refusals by name |
+| `CypherDifferentialTest` | 5 | Random predicates, groupings, orderings and variable-length patterns against an evaluator written separately over the Java API, and one equality through every access path with and without a declared index. Found the numeric-list probe (§7) |
+| `integration/CypherFuzzTest` | 1 (+1 `fuzz`) | Grammar, mutated corpus and noise: every input ends in a documented outcome — a result or a classifiable exception — within its deadline; every successful read gives the same rows streamed and materialised; every rolled-back write leaves the graph as it was. Seeded, replayable by (seed, input), failures minimised. Found five defects |
 | `CypherExecutionTest` | 44 | Every clause, end to end |
 | `CypherVersusApiTest` | 12 | **The load-bearing one** — see below |
 | `CypherWriteVersusApiTest` | 7 | Its inverse, and the load-bearing one for writes: run a write in Cypher, verify with the Java API, then `verify(FULL)` |
 | `CypherWriteTest` | 37 | Every write clause end to end, each finishing with `verify(FULL)` |
-| `CypherWriteTransactionTest` | 8 | §4.1: the transaction joined, the read view refused, a failed query leaving the segment files byte-identical, and a concurrent reader's snapshot unmoved |
+| `CypherWriteTransactionTest` | 9 | §4.1: the transaction joined, the read view refused, a failed query leaving the segment files byte-identical, a failed query making the caller's transaction rollback-only, and a concurrent reader's snapshot unmoved |
 | `LazyExecutionTest` | 14 | §7.1: what stops the scan early — counted at the store rather than timed — what correctly does not, and the two paths agreeing cell by cell |
 | `integration/CypherCorpusTest` | 4 | The `test-data/` corpus: four openCypher dumps and 29 queries whose counts were derived elsewhere and proven against Neo4j. See §9.2 |
 | `VarLengthPathTest` | 8 | §3.2, against a graph where the difference shows |
@@ -944,6 +1079,27 @@ The query layer's version of that is: seed a random graph, and require every que
 what the Java API computes directly. The graph is seeded rather than chosen, so it contains the shapes
 an author would not have thought to write — nodes with several labels and none, missing properties,
 parallel edges, self-loops, and a mix of materialised and lightweight relationships.
+
+`CypherDifferentialTest` and `CypherFuzzTest` take the same idea one step further: the *queries* are
+drawn as well as the graph. The differential's oracle shares no code with `Values` — three-valued logic
+written out again, numbers compared as `BigDecimal` — because two implementations of one rule that agree
+on thousands of random inputs is evidence a hand-written case is not. The fuzzer's contract is the one a
+server depends on: the exceptions `GraphServer.respondToFailure` maps to a 4xx are the only ones a query
+may end in, so an `IllegalArgumentException` from the store, a `NullPointerException` or a
+`NumberFormatException` from a trusting parser is a finding whatever the input was.
+
+```bash
+mvn test -pl graph-cypher -am -Dtest=CypherFuzzTest -Dcypher.fuzz.seed=7 -Dcypher.fuzz.iterations=100000
+mvn test -Pall-tests -pl graph-cypher -am -Dtest=CypherFuzzTest   # the long run, fresh seed, printed
+```
+
+The four it found on its first run of 3,000 inputs: a refresh after a write switching over a binding
+that was null (`NullPointerException`); `vector.query` without an index and with an empty vector
+(the engine's `IllegalStateException` and `IllegalArgumentException`); and a node deleted earlier in
+the query expanded later (`GraphStoreException: No live node`). A longer run found a fifth on three
+seeds: `SET x = {…}` with `x` null (`NullPointerException`; it is now the no-op `SET x.k = …` already
+was, and so are `SET x:L` and `REMOVE x:L`). Since then 300,000 inputs over seeds 5 to 14 end in
+documented outcomes.
 
 ### 9.2 The external corpus
 
@@ -1015,5 +1171,5 @@ previous bundle. Every assertion in the first run failed against markup that no 
 
 ---
 
-_Git HEAD revision: `4f21a62`_
-_Last updated: 2026-10-24 (review fixes: WITH scope, SET read-your-writes, numeric equality in probes, overflow, depth limits)_
+_Git HEAD revision: `f2b6d5f`_
+_Last updated: 2026-10-24 (client, server and CLI review: closed streams, budget leak, slot release order, shutdown grace, strict UTF-8, MCP argument shapes, atomic backups)_

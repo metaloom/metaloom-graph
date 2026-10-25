@@ -133,9 +133,11 @@ public final class GraphCli {
 		// engine or off the wire: offline they are what was just written, online they are read back off the bytes as
 		// they go past. A summary that agreed with the walk but not with the file would be the wrong one.
 		GraphBackup.Summary summary;
-		try (OutputStream out = openOut()) {
+		Path partial = partialFile();
+		try (OutputStream out = partial == null ? new NonClosing(stdout)
+			: new java.io.BufferedOutputStream(Files.newOutputStream(partial))) {
 			if (options.offline()) {
-				try (GraphDatabases databases = GraphDatabases.open(options.path())) {
+				try (GraphDatabases databases = openExistingRoot()) {
 					GraphStore store = databases.database(options.database());
 					summary = GraphBackup.write(store, options.database(), out, System.currentTimeMillis(),
 						progress());
@@ -143,6 +145,17 @@ public final class GraphCli {
 			} else {
 				summary = RemoteGraph.backup(options.server(), options.token(), options.database(), out, progress());
 			}
+		} catch (IOException | RuntimeException failed) {
+			if (partial != null) {
+				Files.deleteIfExists(partial);
+			}
+			throw failed;
+		}
+		if (partial != null) {
+			// Only now does the dump take the name, in one rename: the file at --out is the previous good dump right up
+			// to the moment it is a complete new one.
+			Files.move(partial, Path.of(options.file()), java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+				java.nio.file.StandardCopyOption.ATOMIC_MOVE);
 		}
 		Duration elapsed = Duration.ofNanos(System.nanoTime() - started);
 		err.printf("Backed up '%s': %,d nodes, %,d relationships, %,d lightweight edges, %,d bytes in %s%n",
@@ -223,7 +236,7 @@ public final class GraphCli {
 
 	private void list() throws IOException {
 		if (options.offline()) {
-			try (GraphDatabases databases = GraphDatabases.open(options.path())) {
+			try (GraphDatabases databases = openExistingRoot()) {
 				for (String name : databases.names()) {
 					println(name);
 				}
@@ -451,11 +464,38 @@ public final class GraphCli {
 		}
 	}
 
-	private OutputStream openOut() throws IOException {
+	/**
+	 * Where a backup is written until it is complete, beside its final name; null when it goes to stdout.
+	 *
+	 * <p>
+	 * Beside rather than in a temporary directory, so the rename that puts it in place is within one file system and
+	 * therefore atomic. Opening {@code --out} itself truncated it before the database had even been opened, so a backup
+	 * that failed for any reason replaced the last good dump with an empty file.
+	 * </p>
+	 */
+	private Path partialFile() throws IOException {
 		if (options.streamed()) {
-			return new NonClosing(stdout);
+			return null;
 		}
-		return new java.io.BufferedOutputStream(Files.newOutputStream(Path.of(options.file())));
+		Path target = Path.of(options.file()).toAbsolutePath();
+		return Files.createTempFile(target.getParent(), target.getFileName() + ".", ".partial");
+	}
+
+	/**
+	 * The root at {@code --path}, which has to exist already.
+	 *
+	 * <p>
+	 * {@code GraphDatabases.open} makes a missing root, with an empty {@code default} database in it. That is right for
+	 * a restore and wrong for everything that only reads: a mistyped {@code --path} made {@code database backup} write a
+	 * valid, empty dump and exit 0 — a backup job that has never backed anything up, and says so to nobody.
+	 * </p>
+	 */
+	private GraphDatabases openExistingRoot() throws IOException {
+		if (!Files.isDirectory(options.path())) {
+			throw new GraphStoreException("There is no database root at " + options.path()
+				+ ". Check --path; a backup or a listing never creates one.");
+		}
+		return GraphDatabases.open(options.path());
 	}
 
 	private DumpReader openIn() throws IOException {

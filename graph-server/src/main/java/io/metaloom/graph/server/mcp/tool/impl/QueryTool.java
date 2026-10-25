@@ -14,6 +14,7 @@ import io.metaloom.graph.cypher.CypherStats;
 import io.metaloom.graph.cypher.QueryAbort;
 import io.metaloom.graph.cypher.RowSink;
 import io.metaloom.graph.cypher.ast.Ast;
+import io.metaloom.graph.server.ResultJson;
 import io.metaloom.graph.server.mcp.model.McpToolDescriptor;
 import io.metaloom.graph.server.mcp.model.McpToolDescriptor.McpToolParam;
 import io.metaloom.graph.server.mcp.tool.GraphMcpToolResults;
@@ -97,7 +98,8 @@ public final class QueryTool extends StoreTool {
 		if (queryText == null || queryText.isBlank()) {
 			return Future.succeededFuture(GraphMcpToolResults.error("A 'query' is required."));
 		}
-		int limit = Math.clamp(arguments.getInteger("limit", DEFAULT_LIMIT), 1, MAX_LIMIT);
+		// Clamped as a long: getInteger truncates first, so a limit of Long.MAX_VALUE became -1 and was clamped to one row.
+		int limit = (int) Math.clamp(arguments.getLong("limit", (long) DEFAULT_LIMIT), 1, MAX_LIMIT);
 		Map<String, Object> parameters = arguments.getJsonObject("parameters", new JsonObject()).getMap();
 		String database = databaseName(arguments);
 
@@ -144,7 +146,9 @@ public final class QueryTool extends StoreTool {
 			for (List<Object> values : sink.rows) {
 				JsonObject row = new JsonObject();
 				for (int i = 0; i < sink.columns.size() && i < values.size(); i++) {
-					row.put(sink.columns.get(i), values.get(i));
+					// As the HTTP route renders a cell. The engine's node, relationship and path objects have no JSON
+					// mapping, so putting them in as they are failed every query that returned an element.
+					row.put(sink.columns.get(i), ResultJson.value(values.get(i)));
 				}
 				rows.add(row);
 			}

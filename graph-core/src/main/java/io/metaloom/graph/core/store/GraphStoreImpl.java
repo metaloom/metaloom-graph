@@ -212,6 +212,111 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	private final StampedLock applyLock = new StampedLock();
 
 	/**
+	 * Commits waiting for {@link #applyLock} exclusively — at most one, because the wait happens under the commit lock.
+	 *
+	 * <p>
+	 * {@link StampedLock} has no writer preference: a reader acquires whenever the write bit is clear, whether or not a
+	 * writer is queued. That is harmless for the short read holds, and starvation for the long ones. A scan or a cursor
+	 * holds the latch through a {@link ReadLease} for its whole length, and with a few scanning threads their holds
+	 * overlap continuously, so the write bit is never clear for the committer to set: measured on 2,000 nodes, commits
+	 * fell from 127 a second to 3 with four threads looping {@code forEachNode}, with single commits waiting most of a
+	 * second — and every other writer queued behind the commit lock with it. A lease therefore yields to a waiting
+	 * apply before it takes the latch; see {@link #enterApplyShared(boolean)}.
+	 * </p>
+	 */
+	private final java.util.concurrent.atomic.AtomicInteger applyWaiters =
+		new java.util.concurrent.atomic.AtomicInteger();
+
+	/**
+	 * The longest a new lease defers to a waiting apply before taking the latch anyway. A backstop, not the expected
+	 * case: an apply copies a commit's runs and is over in microseconds once the readers ahead of it drain.
+	 */
+	private static final long LEASE_YIELD_MAX_NANOS = 50_000_000L;
+
+	/** The apply latch, exclusively, announced first so that new leases stand aside. */
+	private long applyWriteLock() {
+		applyWaiters.incrementAndGet();
+		try {
+			return applyLock.writeLock();
+		} finally {
+			applyWaiters.decrementAndGet();
+		}
+	}
+
+	/**
+	 * One thread's shared hold on {@link #applyLock}: how many scopes on the thread are inside it, and the single real
+	 * stamp under all of them.
+	 *
+	 * <p>
+	 * <b>The latch is taken once per thread, however deeply the scopes nest.</b> A {@link StampedLock} read hold is not
+	 * reentrant: a second {@code readLock()} from a thread that already holds one is an ordinary acquisition, and when
+	 * its fast path loses a race with another reader it queues — behind a commit already waiting for the latch
+	 * exclusively, which is waiting for the hold this same thread still has. Nesting is not exotic: a mutation calls the
+	 * store's own public reads ({@code setNodeProperties} on a vector-indexed node asks {@code nodeLabels}), a scan
+	 * callback reads, a cursor is opened while another is open, and {@code begin()} is called with a cursor open.
+	 * {@code NestedApplyLatchTest} wedged the store every run before this, with a commit parked in {@code writeLock} and
+	 * every other writer queued behind the commit lock.
+	 * </p>
+	 */
+	private static final class ApplyHold {
+
+		int depth;
+		long stamp;
+	}
+
+	private final ThreadLocal<ApplyHold> applyHold = ThreadLocal.withInitial(ApplyHold::new);
+
+	/**
+	 * Enters the calling thread's shared hold, acquiring the latch only for the outermost scope.
+	 *
+	 * @param yieldToApply
+	 *            whether a new outermost hold stands aside for a waiting apply first — true for the long holds of
+	 *            {@link ReadLease}, which are what starve a commit; see {@link #applyWaiters}. Never for a nested
+	 *            scope, whose thread already holds the latch the apply is waiting for
+	 * @return the hold, to be passed back to {@link #exitApplyShared}
+	 */
+	private ApplyHold enterApplyShared(boolean yieldToApply) {
+		ApplyHold hold = applyHold.get();
+		if (hold.depth == 0) {
+			if (yieldToApply) {
+				yieldToWaitingApply();
+			}
+			hold.stamp = applyLock.readLock();
+		}
+		hold.depth++;
+		return hold;
+	}
+
+	/** Leaves one scope of a shared hold, releasing the latch with the outermost. */
+	private void exitApplyShared(ApplyHold hold) {
+		if (--hold.depth == 0) {
+			long stamp = hold.stamp;
+			hold.stamp = 0;
+			applyLock.unlockRead(stamp);
+		}
+	}
+
+	/**
+	 * Waits, briefly, for a commit that is waiting for the apply latch. Bounded, so a waiting apply this thread cannot
+	 * see the end of costs latency rather than progress.
+	 */
+	private void yieldToWaitingApply() {
+		if (applyWaiters.get() == 0) {
+			return;
+		}
+		long deadline = System.nanoTime() + LEASE_YIELD_MAX_NANOS;
+		for (int spins = 0; applyWaiters.get() != 0; spins++) {
+			if (spins < 128) {
+				Thread.onSpinWait();
+			} else if (System.nanoTime() - deadline > 0) {
+				return;
+			} else {
+				java.util.concurrent.locks.LockSupport.parkNanos(10_000);
+			}
+		}
+	}
+
+	/**
 	 * The write transaction running on each thread, if any.
 	 *
 	 * <p>
@@ -287,6 +392,13 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			set.counters(counters);
 		}
 		wal.counters(counters);
+		// A miss is a read that touches no page; a SERIALIZABLE writer remembers it so the commit can validate it.
+		catalog.observeMisses((label, name) -> {
+			WriteContext context = contexts.current();
+			if (context != null) {
+				context.missed(label, name);
+			}
+		});
 	}
 
 	public static GraphStoreImpl open(Path path, GraphStoreOptions options) throws IOException {
@@ -420,11 +532,11 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			// must: a commit slipping between them would fix the writer at an LSN whose before-images — the input to
 			// its own conflict detection — nobody was asked to keep.
 			Snapshot snapshot;
-			long stamp = applyLock.readLock();
+			ApplyHold hold = enterApplyShared(false);
 			try {
 				snapshot = transactions.beginWrite(level, appliedLsn, System.nanoTime());
 			} finally {
-				applyLock.unlockRead(stamp);
+				exitApplyShared(hold);
 			}
 			snapshot.guard(this::underApplyReadLock);
 			TransactionImpl txn = new TransactionImpl(nextTxnId.getAndIncrement(), geometry.pageSize(), snapshot, level,
@@ -445,11 +557,11 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	 */
 	private java.lang.foreign.MemorySegment underApplyReadLock(
 		java.util.function.Supplier<java.lang.foreign.MemorySegment> work) {
-		long stamp = applyLock.readLock();
+		ApplyHold hold = enterApplyShared(false);
 		try {
 			return work.get();
 		} finally {
-			applyLock.unlockRead(stamp);
+			exitApplyShared(hold);
 		}
 	}
 
@@ -539,7 +651,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 					// Dictionary ids are embedded in the records being committed, so they must be durable first.
 					catalog.force();
 					WalManager.CommitBatch batch = wal.logCommit(txn.id(), diffs);
-					long stamp = applyLock.writeLock();
+					long stamp = applyWriteLock();
 					try {
 						retainVersions(batch, context);
 						wal.apply(batch);
@@ -589,17 +701,35 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	 */
 	private List<WalManager.PageDiff> diffPages(WriteContext context, boolean metadata) {
 		List<WalManager.PageDiff> diffs = new ArrayList<>();
-		for (Map.Entry<Long, PageOverlay.Page> entry : context.overlay().pages().entrySet()) {
-			if (isMetadataPage(entry.getKey()) != metadata) {
+		PageOverlay overlay = context.overlay();
+		for (int i = 0, n = overlay.size(); i < n; i++) {
+			long key = overlay.keyAt(i);
+			if (isMetadataPage(key) != metadata) {
 				continue;
 			}
-			PageOverlay.Page page = entry.getValue();
-			List<int[]> runs = WalManager.changedRuns(page.base(), page.copy());
+			PageOverlay.Page page = overlay.pageAt(i);
+			// Only the window the transaction was handed for writing can differ from the base.
+			List<int[]> runs = WalManager.changedRuns(page.base(), page.copy(), page.writtenFrom(), page.writtenTo());
+			assert sameRuns(runs, WalManager.changedRuns(page.base(), page.copy())) : "bytes of "
+				+ describe(key, -1, -1) + " were changed outside every slice handed out for writing";
 			if (!runs.isEmpty()) {
-				diffs.add(new WalManager.PageDiff(entry.getKey(), page, runs));
+				diffs.add(new WalManager.PageDiff(key, page, runs));
 			}
 		}
 		return diffs;
+	}
+
+	/** For the assertion in {@link #diffPages}: the windowed diff must find exactly what the whole-page diff finds. */
+	private static boolean sameRuns(List<int[]> a, List<int[]> b) {
+		if (a.size() != b.size()) {
+			return false;
+		}
+		for (int i = 0; i < a.size(); i++) {
+			if (!java.util.Arrays.equals(a.get(i), b.get(i))) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	/**
@@ -652,7 +782,9 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 	private Map<Long, long[]> captureHeaders(WriteContext context) {
 		Map<Long, long[]> captured = new HashMap<>();
-		for (long segmentKey : context.journal().segments().keySet()) {
+		MetaJournal journal = context.journal();
+		for (int i = 0, n = journal.segmentCount(); i < n; i++) {
+			long segmentKey = journal.segmentKeyAt(i);
 			SegmentFile segment = journalSegment(segmentKey);
 			if (segment != null) {
 				captured.put(segmentKey, segment.superblock().captureCounters());
@@ -718,6 +850,23 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			if (conflict > 0) {
 				throw new TransactionConflictException(txn.id(), key, since, conflict, true,
 					describe(key, -1, -1));
+			}
+		}
+		// The reads that touched no page: a name the dictionary did not have. Refused if it has it now, whoever added
+		// it. The dictionary is not versioned, so which commit introduced the name is not known and the newest applied
+		// LSN stands in for it. Coarse in one direction only — a transaction that missed a name and then introduced it
+		// itself is refused once, and its retry finds the name and validates normally — and never a wrong answer.
+		// Copies, because the lookups below report misses back into the same sets.
+		for (String label : List.copyOf(context.missedLabels())) {
+			if (catalog.lookupLabel(label) != 0) {
+				throw new TransactionConflictException(txn.id(), 0, since, appliedLsn, true,
+					"the label or relationship type '" + label + "', unknown when this transaction looked it up,");
+			}
+		}
+		for (String key : List.copyOf(context.missedKeys())) {
+			if (catalog.lookupKey(key) != 0) {
+				throw new TransactionConflictException(txn.id(), 0, since, appliedLsn, true,
+					"the property key '" + key + "', unknown when this transaction looked it up,");
 			}
 		}
 	}
@@ -903,11 +1052,11 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		// The read lock is what makes the pair (LSN, registration) atomic against a commit. Without it a commit could
 		// land between reading the LSN and joining the active set, and the view would be fixed at an LSN whose
 		// before-images nobody was asked to keep.
-		long stamp = applyLock.readLock();
+		ApplyHold hold = enterApplyShared(false);
 		try {
 			return transactions.begin(level, appliedLsn, System.nanoTime());
 		} finally {
-			applyLock.unlockRead(stamp);
+			exitApplyShared(hold);
 		}
 	}
 
@@ -1015,7 +1164,11 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		checkOpen();
 		TransactionImpl open = currentTransaction.get();
 		if (open != null) {
-			return underApply(open, op);
+			// Inside the caller's transaction a failed statement has no boundary of its own to roll back to. One that
+			// failed before changing anything — a refusal checked up front — leaves the transaction exactly as it was
+			// and usable. One that failed partway has left part of itself in the overlay, and the only safe thing left
+			// is to make sure that part is never committed.
+			return joined(open, () -> underApply(open, op));
 		}
 		// An auto-commit mutation retries its own conflicts rather than raising them.
 		//
@@ -1052,6 +1205,35 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				+ "absorbs belongs to whoever opened it. Call the work directly, or commit first.");
 		}
 		return asStatement(txn -> work.run());
+	}
+
+	@Override
+	public <T> T inOpenTransaction(TransactionalWork<T> work) throws IOException {
+		checkOpen();
+		TransactionImpl open = currentTransaction.get();
+		if (open == null) {
+			throw new IllegalStateException("inOpenTransaction() needs a write transaction open on this thread: it "
+				+ "joins one, and has none to join. Begin one, or use inStatement() for work that is its own statement.");
+		}
+		// No apply hold of its own: the work is made of public calls, and each of them takes one.
+		return joined(open, work::run);
+	}
+
+	/**
+	 * Runs one statement inside the caller's transaction, making the transaction rollback-only if the statement fails
+	 * after it has started changing it.
+	 */
+	private static <T> T joined(TransactionImpl open, WriteOp<T> op) throws IOException {
+		WriteContext context = open.context();
+		long before = context.mutations();
+		try {
+			return op.run();
+		} catch (RuntimeException | IOException | Error e) {
+			if (context.mutations() != before) {
+				context.rollbackOnly(e);
+			}
+			throw e;
+		}
 	}
 
 	/**
@@ -1152,22 +1334,31 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	 * <p>
 	 * The operation must be free of side effects, which is what {@code read} means; it can and does run twice.
 	 */
+	/**
+	 * The calling thread's write transaction, or null. The context holder is published and cleared together with
+	 * {@link #currentTransaction}, so when it says no thread is writing the thread-local need not be consulted: that is
+	 * one lookup saved on every read made while no transaction is open anywhere.
+	 */
+	private TransactionImpl openTransaction() {
+		return contexts.anyPublished() ? currentTransaction.get() : null;
+	}
+
 	private <T> T read(Supplier<T> op) {
 		checkOpen();
-		TransactionImpl open = currentTransaction.get();
+		TransactionImpl open = openTransaction();
 		if (open != null) {
 			// Inside a write transaction the overlay and the transaction's own view give the consistent answer, and the
 			// read must not be routed through a read view the same thread happens to also have open. Checked first, so
 			// a thread holding both is not made to answer for the reader's liveness while it is writing. The latch is
 			// taken for the same reason a mutation takes it — see underApply.
 			Snapshot writerView = open.snapshot();
-			long writerStamp = applyLock.readLock();
+			ApplyHold hold = enterApplyShared(false);
 			writerView.exclusionHeld(true);
 			try {
 				return op.get();
 			} finally {
 				writerView.exclusionHeld(false);
-				applyLock.unlockRead(writerStamp);
+				exitApplyShared(hold);
 			}
 		}
 		Snapshot snapshot = transactions.holder().current();
@@ -1194,7 +1385,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				}
 			}
 		}
-		long readStamp = applyLock.readLock();
+		ApplyHold hold = enterApplyShared(false);
 		try {
 			if (snapshot != null) {
 				snapshot.exclusionHeld(true);
@@ -1204,7 +1395,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			if (snapshot != null) {
 				snapshot.exclusionHeld(false);
 			}
-			applyLock.unlockRead(readStamp);
+			exitApplyShared(hold);
 		}
 	}
 
@@ -1248,7 +1439,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	 */
 	private <T> T underApply(TransactionImpl txn, WriteOp<T> op) throws IOException {
 		Snapshot snapshot = txn.snapshot();
-		long stamp = applyLock.readLock();
+		ApplyHold hold = enterApplyShared(false);
 		// Tells the snapshot the apply step is excluded, so a page it has to rebuild is rebuilt here rather than
 		// through the guard, which would take the same non-reentrant latch a second time.
 		snapshot.exclusionHeld(true);
@@ -1256,7 +1447,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			return op.run();
 		} finally {
 			snapshot.exclusionHeld(false);
-			applyLock.unlockRead(stamp);
+			exitApplyShared(hold);
 		}
 	}
 
@@ -1291,6 +1482,9 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			// Under the gate, and per unit rather than once per compaction: beginRead() does not take the gate, so a
 			// view can open at any point of a long run.
 			refuseWhileViewsAreOpen("compact()");
+			// An unlogged unit writes the data files outside the log, so the replay origin has to be past every
+			// record first. checkpointBeforeUnloggedWrites() explains why; reclaim() follows the same rule.
+			checkpoint();
 			uninterruptible(() -> {
 				unit.run();
 				return null;
@@ -1330,17 +1524,18 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	private final class ReadLease implements AutoCloseable {
 
 		private final Snapshot snapshot;
-		private final long stamp;
+		/** The opening thread's hold, kept so the lease releases what it took even if closed from elsewhere. */
+		private final ApplyHold hold;
 		private boolean held;
 
 		ReadLease() {
 			checkOpen();
-			TransactionImpl open = currentTransaction.get();
+			TransactionImpl open = openTransaction();
 			if (open != null) {
 				// The writer's own view, and the latch with it: a scan inside a write transaction is exposed to a
 				// concurrent commit's apply exactly as a single read is.
 				this.snapshot = open.snapshot();
-				this.stamp = applyLock.readLock();
+				this.hold = enterApplyShared(true);
 				this.held = true;
 				heldLeases.get()[0]++;
 				this.snapshot.exclusionHeld(true);
@@ -1351,7 +1546,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				current.checkAlive();
 			}
 			this.snapshot = current;
-			this.stamp = applyLock.readLock();
+			this.hold = enterApplyShared(true);
 			this.held = true;
 			heldLeases.get()[0]++;
 			if (snapshot != null) {
@@ -1371,7 +1566,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			if (snapshot != null) {
 				snapshot.exclusionHeld(false);
 			}
-			applyLock.unlockRead(stamp);
+			exitApplyShared(hold);
 		}
 	}
 
@@ -1533,6 +1728,21 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		if (properties == null || properties.isEmpty()) {
 			return;
 		}
+		// The check writes — it claims the index leaves its values would land in, so that two writers racing for one
+		// value conflict — and those claims are safe to commit. They must not count as the statement having changed
+		// the transaction, or every caught violation would leave it rollback-only (see write()).
+		TransactionImpl open = currentTransaction.get();
+		long mark = open == null ? 0 : open.context().mutations();
+		try {
+			checkUniqueClaimed(labelIds, properties, excluding);
+		} finally {
+			if (open != null) {
+				open.context().forgive(mark);
+			}
+		}
+	}
+
+	private void checkUniqueClaimed(int[] labelIds, Map<Integer, Object> properties, long excluding) {
 		for (Map.Entry<Integer, Object> entry : properties.entrySet()) {
 			if (entry.getValue() == null || !indexes.isUnique(entry.getKey())) {
 				continue;
@@ -1921,13 +2131,27 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		buildVectorIndex(definition.label(), definition.key());
 	}
 
+	/** A declared vector index's slot on the catalog page and its definition, read together. */
+	private record VectorIndexDeclared(int ordinal, VectorIndexDefinition definition) {
+	}
+
+	/** The declaration of the index on {@code (label, key)}, or null; read as of the caller's view. */
+	private VectorIndexDeclared vectorIndexDeclared(String label, String key) {
+		return read(() -> {
+			int ord = indexes.vectorIndexOrdinal(label, key);
+			return ord < 0 ? null : new VectorIndexDeclared(ord, indexes.vectorIndexes().get(ord));
+		});
+	}
+
 	@Override
 	public void buildVectorIndex(String label, String key) throws IOException {
-		int ord = indexes.vectorIndexOrdinal(label, key);
-		if (ord < 0) {
+		checkOpen();
+		VectorIndexDeclared declared = vectorIndexDeclared(label, key);
+		if (declared == null) {
 			throw new IllegalArgumentException("No vector index on :" + label + "." + key);
 		}
-		VectorIndexDefinition definition = indexes.vectorIndexes().get(ord);
+		int ord = declared.ordinal();
+		VectorIndexDefinition definition = declared.definition();
 		if (hnsw == null) {
 			return;
 		}
@@ -2201,12 +2425,16 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			throw new IllegalArgumentException("k must be positive, got " + k);
 		}
 		checkOpen();
-		int ord = indexes.vectorIndexOrdinal(label, key);
-		if (ord < 0) {
+		// Through read(), like every other read of a page: the declaration lives on the index catalog page, and read
+		// bare it was neither excluded from a commit's apply nor rebuildable for a view — inside a view whose catalog
+		// page had changed, the engine's internal retry signal escaped to the caller instead.
+		VectorIndexDeclared declared = vectorIndexDeclared(label, key);
+		if (declared == null) {
 			throw new IllegalStateException("No vector index on :" + label + "." + key
 				+ ". Declare one with createVectorIndex, or use nearestByScan for an exact answer without one.");
 		}
-		VectorIndexDefinition definition = indexes.vectorIndexes().get(ord);
+		int ord = declared.ordinal();
+		VectorIndexDefinition definition = declared.definition();
 		if (definition.state() != VectorIndexState.READY) {
 			throw new IllegalStateException("The vector index on :" + label + "." + key + " is "
 				+ definition.state() + " and cannot answer yet");
@@ -2276,7 +2504,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 	@Override
 	public Properties nodeProperties(long nodeId) {
-		return read(() -> fromKeyIds(properties.read(nodes.propBlockId(nodeId))));
+		return read(() -> propertiesOf(nodes.propBlockId(nodeId)));
 	}
 
 	@Override
@@ -2294,9 +2522,11 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			int[] labelIds = nodes.labels(nodeId);
 			Map<Integer, Object> before = properties.read(old);
 			Map<Integer, Object> after = toKeyIds(props);
+			// Before anything is written, as createNode and addNodeLabel do. Checked after the store, a caught
+			// violation inside a transaction committed the refused value with the indexes still describing the old one.
+			checkUnique(labelIds, after, nodeId);
 			nodes.propBlockId(nodeId, properties.store(after, nodeId));
 			properties.free(old);
-			checkUnique(labelIds, after, nodeId);
 			indexes.onPropertiesChanged(nodeId, labelIds, before, after);
 			maintainVectorMembership(nodeId);
 			return null;
@@ -2468,7 +2698,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 	@Override
 	public Properties relationshipProperties(long relationshipId) {
-		return read(() -> fromKeyIds(properties.read(rels.propBlockId(relationshipId))));
+		return read(() -> propertiesOf(rels.propBlockId(relationshipId)));
 	}
 
 	@Override
@@ -2946,14 +3176,15 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		return result;
 	}
 
-	private Properties fromKeyIds(Map<Integer, Object> values) {
+	/** A block's properties by name, decoded straight into the result rather than through a map keyed by id. */
+	private Properties propertiesOf(long blockId) {
 		Properties props = Properties.of();
-		for (Map.Entry<Integer, Object> entry : values.entrySet()) {
-			String key = catalog.key(entry.getKey());
+		properties.read(blockId, (keyId, value) -> {
+			String key = catalog.key(keyId);
 			if (key != null) {
-				props.set(key, entry.getValue());
+				props.set(key, value);
 			}
-		}
+		});
 		return props;
 	}
 
@@ -2981,6 +3212,33 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			counters.checkpointed(System.nanoTime() - started);
 			writeGate.writeLock().unlock();
 		}
+	}
+
+	/**
+	 * Moves the replay origin past every log record, before a maintenance step writes the data files outside the log.
+	 *
+	 * <p>
+	 * Redo recovery replays byte runs, and a run is a <em>difference</em>: the bytes a commit changed against the page
+	 * as it stood. Punching a page, raising its generation floor, fixing up its checksum and the superblock flip that
+	 * every {@code SegmentFile.force()} performs are all writes no record describes. A commit after one of them logs
+	 * its difference against a base that already contains it, so replaying the older records from before it puts back
+	 * bytes that the newer records, being differences, never mention again. That was measured: a live count that
+	 * disagreed with its bitmap after a crash, and a segment whose two superblock copies both came back with bad
+	 * checksums, which does not open at all — from three inserts, one {@code reclaim()} and two deletes.
+	 * </p>
+	 *
+	 * <p>
+	 * Checkpointing first leaves nothing older to replay: recovery starts after the unlogged writes, and every record
+	 * it does replay was computed against them. Called with the write gate held, so no commit can land in between. A
+	 * checkpoint forces every data file, which the punch was about to do anyway.
+	 * </p>
+	 */
+	private void checkpointBeforeUnloggedWrites() throws IOException {
+		if (!NativeLib.isAvailable()) {
+			// Nothing is punched without it, and the superblock flips happen only on the way to a punch.
+			return;
+		}
+		checkpoint();
 	}
 
 	/**
@@ -3023,6 +3281,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			// Under the gate rather than before it: with concurrent writers, checking first and taking the lock second
 			// leaves a window in which a view opens in between, which is exactly the case the refusal exists for.
 			refuseWhileViewsAreOpen("reclaim()");
+			checkpointBeforeUnloggedWrites();
 			int punched = 0;
 			for (SegmentSet set : segmentSets.values()) {
 				punched += set.reclaim();
@@ -3283,6 +3542,11 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 
 	public NodeStore nodeStore() {
 		return nodes;
+	}
+
+	/** The vector records, or null in a store created without vector storage. */
+	public VectorStore vectorStore() {
+		return vectors;
 	}
 
 	public RelStore relStore() {

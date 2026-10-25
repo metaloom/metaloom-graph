@@ -419,6 +419,20 @@ public final class GraphClient implements AutoCloseable {
 			throw new GraphClientException("This client is closed");
 		}
 		failIfLost();
+		java.util.Objects.requireNonNull(cypher, "cypher");
+
+		// Encoded before a stream id is taken. A parameter with no wire type, a lone surrogate or a query over the
+		// frame limit fails here, in the caller; encoded after registering, each one used to leave a registered stream
+		// that no server frame would ever end, and 65,535 of them made the connection refuse every query.
+		WireValueCodec.Writer payload = new WireValueCodec.Writer(cypher.length() + 64);
+		WireValueCodec.encode(payload, cypher);
+		WireValueCodec.encode(payload, parameters);
+		payload.i64(queryOptions.deadlineMillis());
+		if (payload.position() > Frames.MAX_FRAME_BYTES) {
+			throw new GraphClientException("This query and its parameters encode to " + payload.position()
+				+ " bytes, over the " + Frames.MAX_FRAME_BYTES + "-byte frame limit");
+		}
+
 		int streamId = allocateStreamId();
 		RowStream stream = new RowStream(this, streamId);
 		streams.put(streamId, stream);
@@ -428,11 +442,6 @@ public final class GraphClient implements AutoCloseable {
 			streams.remove(streamId);
 			failIfLost();
 		}
-
-		WireValueCodec.Writer payload = new WireValueCodec.Writer(cypher.length() + 64);
-		WireValueCodec.encode(payload, cypher);
-		WireValueCodec.encode(payload, parameters);
-		payload.i64(queryOptions.deadlineMillis());
 		socket.write(Frames.frame(Frames.QUERY, streamId, payload)).onFailure(failure -> {
 			// A write that never left: no server frame will ever answer it.
 			RowStream unanswered = streams.remove(streamId);
@@ -534,10 +543,14 @@ public final class GraphClient implements AutoCloseable {
 				}
 			}
 			case Frames.COMPLETE -> {
+				// Decoded before the stream is unregistered. A summary that does not decode ends the connection, and
+				// connectionLost fails every stream still registered — so a stream removed first was the one stream
+				// nothing would ever fail, and its consumer waited for ever on a query the server had finished.
+				QuerySummary summary = QuerySummary.read(new WireValueCodec.Reader(payload.getBytes()));
 				RowStream stream = streams.remove(streamId);
 				retired.remove(streamId);
 				if (stream != null) {
-					stream.onComplete(QuerySummary.read(new WireValueCodec.Reader(payload.getBytes())));
+					stream.onComplete(summary);
 				}
 			}
 			case Frames.ERROR -> onError(streamId, payload);
@@ -598,10 +611,15 @@ public final class GraphClient implements AutoCloseable {
 		// Every stream on this connection ends, and ends as a failure. A stream that simply stopped producing rows
 		// would look to its consumer exactly like one that had finished, which is a truncated result reported as a
 		// complete one.
+		//
+		// With the server's own code when it gave one. A connection ended by an ERROR on stream 0 — a user disabled
+		// while connected is UNAUTHENTICATED — used to fail its open streams as PROTOCOL, which tells the caller their
+		// client is broken when what changed was their account.
+		WireError code = cause instanceof QueryFailedException reported ? reported.error() : WireError.PROTOCOL;
 		for (Integer id : List.copyOf(streams.keySet())) {
 			RowStream stream = streams.remove(id);
 			if (stream != null) {
-				stream.onError(new QueryFailedException(WireError.PROTOCOL, cause.getMessage(), 0, 0));
+				stream.onError(new QueryFailedException(code, cause.getMessage(), 0, 0));
 			}
 		}
 		retired.clear();
@@ -645,6 +663,12 @@ public final class GraphClient implements AutoCloseable {
 	 */
 	void consumed(long bytes) {
 		long total = queuedBytes.addAndGet(-bytes);
+		if (lost != null) {
+			// Nothing left to resume. Reading rows that had already arrived is allowed after the connection ends, and
+			// hopping onto the loop of a client that has been closed — its Vert.x with it — threw
+			// RejectedExecutionException out of next() instead of handing out the row.
+			return;
+		}
 		Context loop = socketContext;
 		if (loop != null && readsPaused && total <= options.readBufferBytes() / 2) {
 			// Half, not the mark itself: resuming at the threshold makes the socket flap between paused and running
@@ -656,6 +680,23 @@ public final class GraphClient implements AutoCloseable {
 				}
 			});
 		}
+	}
+
+	/**
+	 * Row bytes handed to streams and not yet consumed or released, across this connection.
+	 *
+	 * <p>
+	 * Zero once every stream is drained or closed. A byte counted here that no stream will ever give back is a leak with
+	 * a delayed symptom: the budget only has to fill once for the socket to pause with nothing left to resume it.
+	 * </p>
+	 */
+	long queuedBytes() {
+		return queuedBytes.get();
+	}
+
+	/** Stream ids that may not be handed out now: open streams, and closed ones whose terminal has not arrived. */
+	int streamIdsInUse() {
+		return streams.size() + retired.size();
 	}
 
 	/** A stream the caller has closed: stop the query if it is still running. */
@@ -675,8 +716,12 @@ public final class GraphClient implements AutoCloseable {
 	 * </p>
 	 */
 	void discard(int streamId, long unreadBytes) {
-		if (streams.remove(streamId) != null) {
-			retired.add(streamId);
+		// Retired before it is unregistered, and un-retired if the terminal frame beat us to it. The other order let
+		// the event loop's terminal — remove from streams, remove from retired — run between our two steps, and the id
+		// was then retired after its last frame had come and gone: held back from reuse for the life of the connection.
+		retired.add(streamId);
+		if (streams.remove(streamId) == null) {
+			retired.remove(streamId);
 		}
 		if (unreadBytes > 0) {
 			consumed(unreadBytes);

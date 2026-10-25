@@ -88,7 +88,8 @@ public final class PatternMatcher {
 			Map<String, Ast.Expr> hints = index == 0 ? seedEqualities(part, where) : Map.of();
 			List<Bound> next = new ArrayList<>();
 			for (Bound bound : rows) {
-				next.addAll(expand(part, seed(part.nodes().get(0), hints, bound.row()), bound.used()));
+				next.addAll(expand(part, seed(part.nodes().get(0), hints, bound.row()), bound.used(),
+					index == pattern.size() - 1));
 			}
 			rows = next;
 			if (rows.isEmpty()) {
@@ -139,7 +140,7 @@ public final class PatternMatcher {
 		Ast.PatternPart part = pattern.get(index);
 		Map<String, Ast.Expr> hints = index == 0 ? seedEqualities(part, where) : Map.of();
 		return seed(part.nodes().get(0), hints, bound.row(), seeded -> {
-			for (Bound expanded : expand(part, List.of(seeded), bound.used())) {
+			for (Bound expanded : expand(part, List.of(seeded), bound.used(), index == pattern.size() - 1)) {
 				if (!matchFrom(pattern, where, index + 1, expanded, consumer)) {
 					return false;
 				}
@@ -153,8 +154,10 @@ public final class PatternMatcher {
 	 *
 	 * @param crossed
 	 *            the relationships earlier parts of the same MATCH crossed, which this part may not cross again
+	 * @param lastPart
+	 *            whether any part follows this one; if none does, nothing reads the crossed set this part returns
 	 */
-	private List<Bound> expand(Ast.PatternPart part, List<Row> seedRows, Set<Object> crossed) {
+	private List<Bound> expand(Ast.PatternPart part, List<Row> seedRows, Set<Object> crossed, boolean lastPart) {
 		if (part.selector() != Ast.PathSelector.ALL) {
 			return shortest(part, seedRows, crossed);
 		}
@@ -162,16 +165,24 @@ public final class PatternMatcher {
 		List<Ast.RelPattern> relationships = part.relationships();
 
 		List<Row> rows = seedRows;
+		// The path is only assembled when the pattern names one. Copying both lists for every candidate of every step
+		// was most of what an anonymous two-hop count allocated, to build paths nothing read.
+		boolean tracking = part.pathVariable() != null;
 		// Relationships bound so far, per row, so that a pattern cannot traverse the same edge twice.
 		List<Set<Object>> usedPerRow = new ArrayList<>();
 		List<List<CypherNode>> pathNodes = new ArrayList<>();
 		List<List<CypherRelationship>> pathRels = new ArrayList<>();
 		for (Row row : rows) {
 			usedPerRow.add(crossed);
-			List<CypherNode> starting = new ArrayList<>();
-			starting.add((CypherNode) row.get(anchorName(nodes.get(0))));
-			pathNodes.add(starting);
-			pathRels.add(new ArrayList<>());
+			if (tracking) {
+				List<CypherNode> starting = new ArrayList<>();
+				starting.add((CypherNode) row.get(anchorName(nodes.get(0))));
+				pathNodes.add(starting);
+				pathRels.add(new ArrayList<>());
+			} else {
+				pathNodes.add(null);
+				pathRels.add(null);
+			}
 		}
 
 		for (int step = 0; step < relationships.size(); step++) {
@@ -187,53 +198,73 @@ public final class PatternMatcher {
 				CypherNode from = (CypherNode) row.get(anchorName(nodes.get(step)));
 				List<Step> steps = relationship.range() == null
 					? singleHop(from, relationship, usedPerRow.get(i))
-					: variableHops(from, relationship, usedPerRow.get(i));
+					: variableHops(from, relationship, usedPerRow.get(i), tracking);
 
 				for (Step candidate : steps) {
-					CypherNode reached = graph.node(candidate.endId());
+					CypherNode reached = unread(target, tracking) ? new CypherNode(candidate.endId(), List.of(), Map.of())
+						: graph.node(candidate.endId());
 					if (!matches(target, reached, row)) {
 						continue;
 					}
-					Row bound = row;
-					// The relationship binds before the node it leads to, so that `RETURN *` lists variables in the
-					// order the pattern names them: (a)-[r]->(b) gives a, r, b.
+					Object relationshipValue = null;
 					if (relationship.variable() != null) {
-						Object value = relationship.range() == null
+						relationshipValue = relationship.range() == null
 							? candidate.relationships().get(0)
 							: new ArrayList<Object>(candidate.relationships());
 						// Bound by an earlier clause, it is a join, exactly as a reused node variable is.
 						if (row.has(relationship.variable())) {
 							Object already = row.get(relationship.variable());
-							if (already == null || !Values.equalKnown(already, value)) {
+							if (already == null || !Values.equalKnown(already, relationshipValue)) {
 								continue;
 							}
-						} else {
-							bound = bound.with(relationship.variable(), value);
+							relationshipValue = null;
 						}
 					}
 					// A node pattern that reuses a bound variable is a join, not a new binding.
 					String targetName = anchorName(target);
-					if (row.has(targetName) && row.get(targetName) instanceof CypherNode already) {
-						if (already.id() != reached.id()) {
+					boolean bindTarget = !row.has(targetName);
+					if (!bindTarget) {
+						CypherNode already = boundNode(row, targetName);
+						if (already == null || already.id() != reached.id()) {
 							continue;
 						}
-					} else {
-						bound = bound.with(targetName, reached);
+					}
+					// One copy of the row for both new bindings rather than one each. The relationship binds before the
+					// node it leads to, so that `RETURN *` lists variables in the order the pattern names them:
+					// (a)-[r]->(b) gives a, r, b.
+					Row bound = row;
+					if (relationshipValue != null || bindTarget) {
+						bound = Row.copyOf(row, 2);
+						if (relationshipValue != null) {
+							bound.put(relationship.variable(), relationshipValue);
+						}
+						if (bindTarget) {
+							bound.put(targetName, reached);
+						}
 					}
 					if (!propertiesMatch(relationship.properties(), candidate.relationships(), bound)) {
 						continue;
 					}
 
-					Set<Object> used = new HashSet<>(usedPerRow.get(i));
-					used.addAll(candidate.keys());
-					List<CypherNode> walkNodes = new ArrayList<>(pathNodes.get(i));
-					walkNodes.addAll(candidate.intermediateNodes());
-					// A zero-length step reaches the node the path already ends on, which must not be listed twice.
-					if (!candidate.relationships().isEmpty()) {
-						walkNodes.add(reached);
+					// What later steps and later parts may not cross again. After the last step of the last part
+					// nothing reads it, so it is not copied there.
+					Set<Object> used = usedPerRow.get(i);
+					if (!lastPart || step + 1 < relationships.size()) {
+						used = new HashSet<>(used);
+						used.addAll(candidate.keys());
 					}
-					List<CypherRelationship> walkRels = new ArrayList<>(pathRels.get(i));
-					walkRels.addAll(candidate.relationships());
+					List<CypherNode> walkNodes = null;
+					List<CypherRelationship> walkRels = null;
+					if (tracking) {
+						walkNodes = new ArrayList<>(pathNodes.get(i));
+						walkNodes.addAll(candidate.intermediateNodes());
+						// A zero-length step reaches the node the path already ends on, which must not be listed twice.
+						if (!candidate.relationships().isEmpty()) {
+							walkNodes.add(reached);
+						}
+						walkRels = new ArrayList<>(pathRels.get(i));
+						walkRels.addAll(candidate.relationships());
+					}
 
 					nextRows.add(bound);
 					nextUsed.add(used);
@@ -254,12 +285,24 @@ public final class PatternMatcher {
 		for (int i = 0; i < rows.size(); i++) {
 			Row row = rows.get(i);
 			if (part.pathVariable() != null) {
+				refusePathRebinding(row, part.pathVariable());
 				row = row.with(part.pathVariable(),
 					new CypherPath(List.copyOf(pathNodes.get(i)), List.copyOf(pathRels.get(i))));
 			}
 			out.add(new Bound(row, usedPerRow.get(i)));
 		}
 		return out;
+	}
+
+	/**
+	 * Whether a reached node will never be read: anonymous, so nothing can name it; no labels or properties to check;
+	 * and not part of a path being assembled. Such a node only has to say where the next step starts, which its id
+	 * does, so its labels and properties are not fetched — for {@code (a)-->()-->(c)} that was one record and property
+	 * block decoded per edge crossed, to bind a snapshot nothing could see.
+	 */
+	private static boolean unread(Ast.NodePattern pattern, boolean tracking) {
+		return !tracking && pattern.variable() == null && pattern.labels().isEmpty()
+			&& (pattern.properties() == null || pattern.properties().isEmpty());
 	}
 
 	// ---------------------------------------------------------------- shortest paths
@@ -292,8 +335,18 @@ public final class PatternMatcher {
 			CypherNode from = (CypherNode) row.get(anchorName(startPattern));
 			// An end already bound by an earlier clause narrows the search to one destination rather than filtering
 			// afterwards, which for allShortestPaths is the difference between enumerating one node's routes and
-			// every reachable node's.
-			Long endId = row.has(endName) && row.get(endName) instanceof CypherNode already ? already.id() : null;
+			// every reachable node's. Bound to null, there is no destination and so no path.
+			Long endId = null;
+			if (row.has(endName)) {
+				CypherNode already = boundNode(row, endName);
+				if (already == null) {
+					continue;
+				}
+				endId = already.id();
+			}
+			if (part.pathVariable() != null) {
+				refusePathRebinding(row, part.pathVariable());
+			}
 
 			for (CypherPath path : search(from, endPattern, endId, relationship, row, everyShortest)) {
 				Row bound = row;
@@ -453,12 +506,31 @@ public final class PatternMatcher {
 	// ---------------------------------------------------------------- seeding
 
 
+	/**
+	 * The node a pattern variable is already bound to, or null when it is bound to null.
+	 *
+	 * <p>
+	 * Bound to null is not unbound. Treating the two alike made {@code UNWIND [null] AS n MATCH (n)} scan and rebind
+	 * {@code n} to every node in the store, where a null can only ever match nothing — the rule that keeps a missing
+	 * value from turning into all of them. A value that is not a node at all cannot be used as one.
+	 * </p>
+	 */
+	private static CypherNode boundNode(Row row, String name) {
+		Object value = row.get(name);
+		if (value == null || value instanceof CypherNode) {
+			return (CypherNode) value;
+		}
+		throw new CypherTypeException("'" + name + "' is bound to " + Values.typeName(value)
+			+ ", so it cannot be used as a node in a pattern");
+	}
+
 	/** Every row the first node pattern can produce, choosing the cheapest access path available. */
 	private List<Row> seed(Ast.NodePattern pattern, Map<String, Ast.Expr> hints, Row input) {
 		String name = anchorName(pattern);
-		if (input.has(name) && input.get(name) instanceof CypherNode bound) {
+		if (input.has(name)) {
 			// Already bound by an earlier clause: verify rather than scan.
-			return matches(pattern, bound, input) ? List.of(input) : List.of();
+			CypherNode bound = boundNode(input, name);
+			return bound != null && matches(pattern, bound, input) ? List.of(input) : List.of();
 		}
 
 		List<Row> rows = new ArrayList<>();
@@ -498,8 +570,9 @@ public final class PatternMatcher {
 	 */
 	private boolean seed(Ast.NodePattern pattern, Map<String, Ast.Expr> hints, Row input, RowConsumer consumer) {
 		String name = anchorName(pattern);
-		if (input.has(name) && input.get(name) instanceof CypherNode bound) {
-			return !matches(pattern, bound, input) || consumer.accept(input);
+		if (input.has(name)) {
+			CypherNode bound = boundNode(input, name);
+			return bound == null || !matches(pattern, bound, input) || consumer.accept(input);
 		}
 
 		List<Long> candidates = candidates(pattern, hints, input);
@@ -612,8 +685,7 @@ public final class PatternMatcher {
 			} catch (RuntimeException e) {
 				continue;
 			}
-			if (value == null || i >= inline && !(value instanceof String || value instanceof Boolean
-				|| value instanceof Long || value instanceof Double)) {
+			if (value == null || !probeable(value) || i >= inline && value instanceof List) {
 				continue;
 			}
 			for (String label : pattern.labels()) {
@@ -635,6 +707,32 @@ public final class PatternMatcher {
 			return graph.nodesByLabel(pattern.labels().get(0));
 		}
 		return null;
+	}
+
+	/**
+	 * Whether every value Cypher calls equal to this one is found by probing for it, and its integer or float twin.
+	 *
+	 * <p>
+	 * A scalar is: {@link #probe} asks for the twin. A list of numbers is not, because each element has a twin and the
+	 * list has one spelling per combination of them — {@code [1, 2]} equals {@code [1.0, 2.0]} and {@code [1, 2.0]},
+	 * and the index keys each differently. Probing for the one written lost the rest, and MERGE then created the twin
+	 * it could not find. Such a value takes the label scan instead, and the equality is checked per candidate. A list
+	 * of strings and booleans has one spelling and is probed as before.
+	 * </p>
+	 */
+	private static boolean probeable(Object value) {
+		if (value instanceof String || value instanceof Boolean || value instanceof Long || value instanceof Double) {
+			return true;
+		}
+		if (value instanceof List<?> list) {
+			for (Object element : list) {
+				if (!(element instanceof String || element instanceof Boolean)) {
+					return false;
+				}
+			}
+			return true;
+		}
+		return false;
 	}
 
 	/**
@@ -681,7 +779,7 @@ public final class PatternMatcher {
 				Object actual = node.property(entry.getKey());
 				// An inline map entry is an equality predicate, so a null on either side fails the match rather
 				// than propagating: `{name: null}` matches nothing, as in Cypher.
-				if (expected == null || actual == null || !Values.equalKnown(expected, actual)) {
+				if (!Values.isTrue(Values.equal(expected, actual))) {
 					return false;
 				}
 			}
@@ -697,7 +795,7 @@ public final class PatternMatcher {
 			for (Map.Entry<String, Ast.Expr> entry : expected.entrySet()) {
 				Object want = evaluator.evaluate(entry.getValue(), row);
 				Object actual = relationship.property(entry.getKey());
-				if (want == null || actual == null || !Values.equalKnown(want, actual)) {
+				if (!Values.isTrue(Values.equal(want, actual))) {
 					return false;
 				}
 			}
@@ -734,14 +832,20 @@ public final class PatternMatcher {
 	 * {@code -[:KNOWS*]-} from looping forever on a cycle.
 	 * </p>
 	 */
-	private List<Step> variableHops(CypherNode from, Ast.RelPattern pattern, Set<Object> used) {
+	/**
+	 * @param tracking
+	 *            whether the nodes a path passes through are wanted, which is only when the pattern names the path.
+	 *            Otherwise they are not read: every intermediate node of every enumerated path was fetched in full
+	 */
+	private List<Step> variableHops(CypherNode from, Ast.RelPattern pattern, Set<Object> used, boolean tracking) {
 		List<Step> results = new ArrayList<>();
 		Ast.Range range = pattern.range();
 		if (range.min() == 0) {
 			// A zero-length match binds the start node to the end with no relationship at all.
 			results.add(new Step(from.id(), List.of(), List.of(), List.of()));
 		}
-		walk(from.id(), pattern, range, 1, new ArrayList<>(), new ArrayList<>(), new LinkedHashSet<>(used), results);
+		walk(from.id(), pattern, range, 1, new ArrayList<>(), tracking ? new ArrayList<>() : null,
+			new LinkedHashSet<>(used), results);
 		return results;
 	}
 
@@ -759,13 +863,17 @@ public final class PatternMatcher {
 			used.add(key);
 
 			if (depth >= range.min()) {
-				results.add(new Step(expansion.neighbourId(), List.copyOf(chain), List.copyOf(visitedNodes),
-					new ArrayList<>(used)));
+				results.add(new Step(expansion.neighbourId(), List.copyOf(chain),
+					visitedNodes == null ? List.of() : List.copyOf(visitedNodes), new ArrayList<>(used)));
 			}
 			if (depth < range.max()) {
-				visitedNodes.add(graph.node(expansion.neighbourId()));
+				if (visitedNodes != null) {
+					visitedNodes.add(graph.node(expansion.neighbourId()));
+				}
 				walk(expansion.neighbourId(), pattern, range, depth + 1, chain, visitedNodes, used, results);
-				visitedNodes.remove(visitedNodes.size() - 1);
+				if (visitedNodes != null) {
+					visitedNodes.remove(visitedNodes.size() - 1);
+				}
 			}
 
 			used.remove(key);
@@ -786,7 +894,13 @@ public final class PatternMatcher {
 		if (relationship.id() != null) {
 			return relationship.id();
 		}
-		return relationship.startId() + "/" + relationship.type() + "/" + relationship.endId();
+		// A record rather than a formatted string: this runs for every lightweight edge every step considers, and
+		// rendering two longs into a string per candidate was a visible share of an anonymous expansion.
+		return new EdgeKey(relationship.startId(), relationship.type(), relationship.endId());
+	}
+
+	/** The identity of a lightweight edge, which has no id: its endpoints, in their stored direction, and its type. */
+	private record EdgeKey(long startId, String type, long endId) {
 	}
 
 	private static Direction direction(Ast.RelPattern pattern) {
@@ -807,13 +921,34 @@ public final class PatternMatcher {
 	 * An anonymous node still needs a binding so the expansion can find where it is, so it gets a name no query could
 	 * write. The projection never sees these because {@code RETURN *} filters them out.
 	 */
-	private static String anchorName(Ast.NodePattern pattern) {
-		return pattern.variable() != null ? pattern.variable()
-			: "  anon@" + System.identityHashCode(pattern);
+	private String anchorName(Ast.NodePattern pattern) {
+		if (pattern.variable() != null) {
+			return pattern.variable();
+		}
+		// One name per pattern object for the life of the query, numbered rather than derived from
+		// System.identityHashCode: two patterns whose hashes collided shared a name, and the second was then joined
+		// to whatever the first had bound instead of matching freely. Cached, too — this runs once per row per step.
+		String name = anonymous.get(pattern);
+		if (name == null) {
+			name = ANONYMOUS + anonymous.size();
+			anonymous.put(pattern, name);
+		}
+		return name;
+	}
+
+	private static final String ANONYMOUS = "  anon@";
+
+	private final Map<Ast.NodePattern, String> anonymous = new java.util.IdentityHashMap<>();
+
+	/** A path variable names a new path; one already in scope is refused rather than overwritten. */
+	private static void refusePathRebinding(Row row, String name) {
+		if (row.has(name)) {
+			throw new CypherTypeException("'" + name + "' is already defined, so it cannot also name a path");
+		}
 	}
 
 	/** True for a binding this matcher invented rather than one the query named. */
 	public static boolean isAnonymous(String name) {
-		return name.startsWith("  anon@");
+		return name.startsWith(ANONYMOUS);
 	}
 }

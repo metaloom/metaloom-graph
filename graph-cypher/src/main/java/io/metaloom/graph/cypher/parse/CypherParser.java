@@ -291,19 +291,20 @@ public final class CypherParser {
 		}
 		boolean star = false;
 		List<Ast.ProjectionItem> items = new ArrayList<>();
+		java.util.Set<String> aliases = new java.util.HashSet<>();
 		if (peek().isSymbol("*")) {
 			take();
 			star = true;
 			// `RETURN *, x AS y` is legal Cypher, so a comma may still follow.
 			while (peek().isSymbol(",")) {
 				take();
-				items.add(projectionItem());
+				items.add(uniquelyNamed(projectionItem(), aliases));
 			}
 		} else {
-			items.add(projectionItem());
+			items.add(uniquelyNamed(projectionItem(), aliases));
 			while (peek().isSymbol(",")) {
 				take();
-				items.add(projectionItem());
+				items.add(uniquelyNamed(projectionItem(), aliases));
 			}
 		}
 
@@ -343,6 +344,18 @@ public final class CypherParser {
 			alias = sourceText(start, position);
 		}
 		return new Ast.ProjectionItem(expression, alias);
+	}
+
+	/**
+	 * Refuses a second column of the same name. A row is a map from name to value, so {@code RETURN 1 AS a, 2 AS a}
+	 * kept only the second value and reported it under both headers — a wrong answer that throws nothing.
+	 */
+	private Ast.ProjectionItem uniquelyNamed(Ast.ProjectionItem item, java.util.Set<String> aliases) {
+		if (!aliases.add(item.alias())) {
+			throw error(previous(), "Two columns are both named '" + item.alias() + "'; give one of them a "
+				+ "different name with AS");
+		}
+		return item;
 	}
 
 	private Ast.SortItem sortItem() {
@@ -1072,8 +1085,14 @@ public final class CypherParser {
 				continue;
 			}
 			if (peek().isSymbol("[")) {
-				take();
+				Token open = take();
+				if (peek().isSymbol("..")) {
+					throw error(open, "List slicing is not supported in this build; index one element, as in list[0]");
+				}
 				Expr index = expression();
+				if (peek().isSymbol("..")) {
+					throw error(open, "List slicing is not supported in this build; index one element, as in list[0]");
+				}
 				expectSymbol("]", "the end of an index");
 				expression = new Ast.Index(expression, index);
 				continue;
@@ -1096,7 +1115,12 @@ public final class CypherParser {
 			}
 			case FLOAT -> {
 				take();
-				return new Ast.Literal(Double.parseDouble(token.text()));
+				double value = Double.parseDouble(token.text());
+				if (Double.isInfinite(value)) {
+					// Read as Infinity otherwise, which is a value nobody wrote and every comparison then gets wrong.
+					throw error(token, "The float " + token.text() + " is too large to be represented");
+				}
+				return new Ast.Literal(value);
 			}
 			case STRING -> {
 				take();
@@ -1110,6 +1134,14 @@ public final class CypherParser {
 				take();
 				if (peek().isSymbol("(")) {
 					return functionCall(token.text());
+				}
+				if (peek().isSymbol("{")) {
+					// Nothing in this grammar puts a map after a name, so these two are refused by name here rather
+					// than left to fail at the clause with a message about a brace.
+					throw error(token, token.text().equalsIgnoreCase("exists")
+						? "EXISTS subqueries are not supported in this build; exists(n.property) is"
+						: "Map projections are not supported in this build: write a map literal, as in "
+							+ "{name: " + token.text() + ".name}");
 				}
 				return new Ast.Variable(token.text());
 			}
@@ -1144,6 +1176,12 @@ public final class CypherParser {
 					return grouped;
 				}
 				if (token.isSymbol("[")) {
+					if (peekAt(1).type() == Token.Type.IDENTIFIER && peekAt(2).isKeyword("IN")) {
+						// In openCypher `[x IN list]` is always a comprehension, even without `|` or WHERE, so
+						// reading it as a one-element list of booleans would be a different answer, not a refusal.
+						throw error(token, "List comprehensions are not supported in this build: use UNWIND, "
+							+ "then collect()");
+					}
 					take();
 					List<Expr> elements = new ArrayList<>();
 					if (!peek().isSymbol("]")) {

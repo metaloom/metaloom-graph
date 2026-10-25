@@ -22,6 +22,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
 import io.metaloom.graph.core.api.GraphStore;
+import io.metaloom.graph.core.api.GraphStoreException;
 import io.metaloom.graph.core.api.Properties;
 import io.metaloom.graph.core.api.ReadTransaction;
 import io.metaloom.graph.core.api.Transaction;
@@ -86,6 +87,34 @@ public class CypherWriteTransactionTest {
 			}
 			assertEquals(List.of(), store.nodesByLabel("Person"),
 				"the queries must not have committed anything of their own");
+			store.verify(VerifyLevel.FULL);
+		}
+	}
+
+	/**
+	 * A query that fails part way leaves nothing behind in the caller's transaction — statement atomicity, which an
+	 * explicit transaction in openCypher keeps by refusing to commit after a failed statement.
+	 *
+	 * <p>
+	 * The plain DELETE below deletes the isolated node, then refuses the connected one. On its own transaction the
+	 * query rolls back and nothing is lost ({@link #testAFailedWriteQueryLeavesTheSegmentFilesByteIdentical}). Joined
+	 * to the caller's, the first deletion used to stay in it, and a caller that caught the type error and committed
+	 * committed half a statement. The query now runs through {@code GraphStore.inOpenTransaction}, so the failure
+	 * makes the caller's transaction rollback-only and the commit refuses.
+	 * </p>
+	 */
+	@Test
+	public void testAFailedQueryLeavesNothingInTheCallersTransaction() throws Exception {
+		try (GraphStore store = stores.open()) {
+			Cypher.query(store, "CREATE (:Iso), (:Hub)-[:R]->(:Leaf)");
+			try (Transaction txn = store.begin()) {
+				// :Iso sorts first and is deleted; :Hub still has its relationship and is refused.
+				assertThrows(CypherTypeException.class, () -> Cypher.query(store,
+					"MATCH (n) WHERE n:Iso OR n:Hub WITH n ORDER BY labels(n)[0] DESC DELETE n"));
+				GraphStoreException refused = assertThrows(GraphStoreException.class, txn::commit);
+				assertTrue(refused.getMessage().contains("rollback-only"), refused.getMessage());
+			}
+			assertEquals(1, store.nodesByLabel("Iso").size(), "the failed DELETE must not have taken :Iso with it");
 			store.verify(VerifyLevel.FULL);
 		}
 	}

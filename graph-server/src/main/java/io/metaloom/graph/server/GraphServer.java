@@ -166,6 +166,16 @@ public final class GraphServer implements AutoCloseable {
 	private WireServer wire;
 	/** Set once shutdown begins: new queries are refused rather than accepted and then abandoned. */
 	private final java.util.concurrent.atomic.AtomicBoolean closing = new java.util.concurrent.atomic.AtomicBoolean();
+	/**
+	 * Set once the grace period has run out: from here a running query is told to stop.
+	 *
+	 * <p>
+	 * Its own flag rather than {@link #closing}. The abort signal composed into every query used to read {@code closing},
+	 * so every query in flight was abandoned the instant shutdown began and the grace period protected nobody — a
+	 * query a millisecond from its answer got a 503.
+	 * </p>
+	 */
+	private volatile boolean abandoning;
 	/** Queries on a worker thread right now. The store may not be closed while this is above zero. */
 	private final java.util.concurrent.atomic.AtomicInteger inFlight = new java.util.concurrent.atomic.AtomicInteger();
 	/**
@@ -461,6 +471,20 @@ public final class GraphServer implements AutoCloseable {
 
 	public Future<Integer> listen(int port) {
 		Router router = Router.router(vertx);
+		// First of all: once shutdown has begun every request is refused, because the listener now stays bound through
+		// the grace period so that the queries in flight can be answered (see shutdown). A backup or a drop started in
+		// that window would otherwise run against stores about to close.
+		router.route().handler(context -> {
+			if (!closing.get()) {
+				context.next();
+				return;
+			}
+			if ("/api/query".equals(context.normalizedPath())) {
+				metrics.recordQueryRejected("http", "shutdown");
+			}
+			context.response().putHeader("connection", "close");
+			fail(context, 503, "shutdown", "The server is shutting down and is not accepting requests");
+		});
 		router.route().handler(BodyHandler.create().setBodyLimit(1 << 20));
 
 		// The CSRF half that SameSite cannot cover: with --no-auth there is no cookie to withhold. A form can POST
@@ -516,13 +540,51 @@ public final class GraphServer implements AutoCloseable {
 
 	// ---------------------------------------------------------------- handlers
 
+	/**
+	 * The request body as a JSON object, or null after answering 400.
+	 *
+	 * <p>
+	 * {@code body().asJsonObject()} throws on text that is not JSON and on JSON that is not an object, and an exception
+	 * out of a handler is the router's 500 — "our fault, retry" for a request that can never succeed, logged as if
+	 * something had broken. Every route that reads a body reads it through this.
+	 * </p>
+	 */
+	private static JsonObject jsonBody(RoutingContext context, String example) {
+		Object parsed;
+		try {
+			io.vertx.core.buffer.Buffer raw = context.body().buffer();
+			parsed = raw == null || raw.length() == 0 ? null : io.vertx.core.json.Json.decodeValue(raw);
+		} catch (io.vertx.core.json.DecodeException malformed) {
+			fail(context, 400, "json", "The body is not JSON. Send " + example);
+			return null;
+		}
+		if (!(parsed instanceof JsonObject object)) {
+			fail(context, 400, "json", "The body has to be a JSON object. Send " + example);
+			return null;
+		}
+		return object;
+	}
+
 	private void query(RoutingContext context) {
-		JsonObject body = context.body().asJsonObject();
-		if (body == null || body.getString("query") == null || body.getString("query").isBlank()) {
-			fail(context, 400, "empty", "Send {\"query\": \"MATCH (n) RETURN n LIMIT 25\"}");
+		String example = "{\"query\": \"MATCH (n) RETURN n LIMIT 25\"}";
+		JsonObject body = jsonBody(context, example);
+		if (body == null) {
 			return;
 		}
-		Map<String, Object> parameters = body.getJsonObject("parameters", new JsonObject()).getMap();
+		// Types checked rather than trusted: getString turns a number into its text and getJsonObject throws on an
+		// array, which reached the router as a 500.
+		Object text = body.getValue("query");
+		Object rawParameters = body.getValue("parameters");
+		if (!(text instanceof String queryText) || queryText.isBlank()) {
+			fail(context, 400, "empty", "Send " + example);
+			return;
+		}
+		if (rawParameters != null && !(rawParameters instanceof JsonObject)) {
+			fail(context, 400, "parameters", "\"parameters\" has to be a JSON object of name to value, not "
+				+ rawParameters.getClass().getSimpleName());
+			return;
+		}
+		Map<String, Object> parameters = rawParameters == null ? Map.of() : ((JsonObject) rawParameters).getMap();
 
 		// Parsed here, on the event loop, because parsing is pure and cheap and running is neither. A syntax error is
 		// much the most common failure and now costs no worker thread and no read view.
@@ -630,14 +692,17 @@ public final class GraphServer implements AutoCloseable {
 					elapsed, 0, outcome, metrics);
 				throw failure;
 			}
-		}, false).onComplete(outcome -> inFlight.decrementAndGet())
+		}, false)
 			.onSuccess(json -> context.json(json))
-			.onFailure(error -> respondToFailure(context, error));
+			.onFailure(error -> respondToFailure(context, error))
+			// After the response is written, not before: shutdown closes the listener once this reaches zero, and a
+			// count that fell first could let it close the connection under an answer not yet handed to it.
+			.onComplete(outcome -> inFlight.decrementAndGet());
 	}
 
-	/** Why a running query should stop once shutdown has begun, or null while the server is up. */
+	/** Why a running query should stop: once shutdown has run out of grace, and null until then. */
 	private String shutdownReason() {
-		return closing.get() ? "the server is shutting down" : null;
+		return abandoning ? "the server is shutting down" : null;
 	}
 
 	/** Gathers a streamed result back into the materialised one this route answers with. */
@@ -1015,9 +1080,11 @@ public final class GraphServer implements AutoCloseable {
 		GraphStore store;
 		try {
 			GraphDatabases.validate(name);
-			store = databases.database(name);
-		} catch (RuntimeException | IOException e) {
-			respondToFailure(context, e instanceof IOException io ? new GraphStoreException(io.getMessage(), io) : e);
+			// Through lookup, like every other route: a missing database is 404. Opened directly it surfaced as the
+			// store's own GraphStoreException, a 409 "store" that invites a retry which can never succeed.
+			store = lookup(name);
+		} catch (RuntimeException e) {
+			respondToFailure(context, e);
 			return;
 		}
 
@@ -1173,11 +1240,17 @@ public final class GraphServer implements AutoCloseable {
 		if (!permit(context, Privilege.CREATE_INDEX)) {
 			return;
 		}
-		JsonObject body = context.body().asJsonObject();
-		String label = body == null ? null : body.getString("label");
-		String key = body == null ? null : body.getString("key");
-		if (label == null || label.isBlank() || key == null || key.isBlank()) {
-			fail(context, 400, "empty", "Send {\"label\": \"Person\", \"key\": \"email\", \"unique\": false}");
+		String example = "{\"label\": \"Person\", \"key\": \"email\", \"unique\": false}";
+		JsonObject body = jsonBody(context, example);
+		if (body == null) {
+			return;
+		}
+		Object rawLabel = body.getValue("label");
+		Object rawKey = body.getValue("key");
+		Object rawUnique = body.getValue("unique");
+		if (!(rawLabel instanceof String label) || label.isBlank() || !(rawKey instanceof String key) || key.isBlank()
+			|| rawUnique != null && !(rawUnique instanceof Boolean)) {
+			fail(context, 400, "empty", "Send " + example);
 			return;
 		}
 		if (!allowWrite) {
@@ -1185,7 +1258,7 @@ public final class GraphServer implements AutoCloseable {
 				+ " an index. Restart it with the flag.");
 			return;
 		}
-		boolean unique = body.getBoolean("unique", false);
+		boolean unique = Boolean.TRUE.equals(rawUnique);
 		GraphStore store;
 		try {
 			store = storeFor(context);
@@ -1339,14 +1412,15 @@ public final class GraphServer implements AutoCloseable {
 		if (!closing.compareAndSet(false, true)) {
 			return;
 		}
+		long graceEnds = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(graceMillis);
 		if (wire != null) {
 			// First, and with the same grace period: it holds worker threads of its own against the same stores.
 			wire.shutdown(graceMillis);
 		}
-		if (server != null) {
-			// After the flag, so anything accepted in between is refused with 503 rather than served and then cut off.
-			server.close().toCompletionStage().toCompletableFuture().join();
-		}
+		// The HTTP listener is NOT closed here. Closing a Vert.x HttpServer closes the connections of requests still
+		// being answered, so a query that finished inside the grace period had nobody left to answer: its client got
+		// an EOF. It stays bound until the queries are done; meanwhile the flag answers every new request 503 (see
+		// listen).
 		if (mcp != null) {
 			// With the other listeners: an agent mid-conversation should be told the server is going rather than
 			// have its stream cut when the stores close.
@@ -1364,15 +1438,21 @@ public final class GraphServer implements AutoCloseable {
 			monitoring.closeQuietly();
 		}
 
-		if (!awaitQuiet(graceMillis)) {
+		// What is left of the grace period after the binary port used its share: one deadline for the process, not one
+		// per front end.
+		if (!awaitQuiet(Math.max(0, TimeUnit.NANOSECONDS.toMillis(graceEnds - System.nanoTime())))) {
 			logger.warn("Shutting down with {} quer{} still running after {} ms; abandoning {}", inFlight.get(),
 				inFlight.get() == 1 ? "y" : "ies", graceMillis, inFlight.get() == 1 ? "it" : "them");
-			// The signal is already composed into every running query's abort. Give them a moment to notice it and
-			// unwind — each one closes its own read view or rolls back its own transaction on the way out.
+			// The signal is composed into every running query's abort, and only now does it say stop. Give them a moment
+			// to notice it and unwind — each one closes its own read view or rolls back its own transaction on the way out.
+			abandoning = true;
 			if (!awaitQuiet(ABORT_UNWIND_MILLIS)) {
 				logger.warn("{} quer{} did not unwind; closing the stores anyway", inFlight.get(),
 					inFlight.get() == 1 ? "y has" : "ies have");
 			}
+		}
+		if (server != null) {
+			server.close().toCompletionStage().toCompletableFuture().join();
 		}
 
 		vertx.close().toCompletionStage().toCompletableFuture().join();

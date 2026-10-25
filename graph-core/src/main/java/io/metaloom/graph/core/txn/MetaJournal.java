@@ -1,7 +1,6 @@
 package io.metaloom.graph.core.txn;
 
-import java.util.LinkedHashMap;
-import java.util.Map;
+import io.metaloom.graph.core.util.LongObjectMap;
 
 /**
  * A write transaction's pending changes to the segment metadata regions, held as operations rather than as bytes.
@@ -68,8 +67,9 @@ public final class MetaJournal {
 		long lastLsn = -1;
 		boolean headerTouched;
 
-		final Map<Integer, long[]> bitmapWords = new LinkedHashMap<>();
-		final Map<Integer, PageEntry> pages = new LinkedHashMap<>();
+		/** Keyed by word index and page index. Insertion ordered, so the replay is in the order the work was done. */
+		final LongObjectMap<long[]> bitmapWords = new LongObjectMap<>();
+		final LongObjectMap<PageEntry> pages = new LongObjectMap<>();
 
 		public boolean isEmpty() {
 			return liveDelta == 0 && freeDelta == 0 && freeAbsolute == Long.MIN_VALUE && sealedTo == null
@@ -96,11 +96,11 @@ public final class MetaJournal {
 			return lastLsn;
 		}
 
-		public Map<Integer, long[]> bitmapWords() {
+		public LongObjectMap<long[]> bitmapWords() {
 			return bitmapWords;
 		}
 
-		public Map<Integer, PageEntry> pages() {
+		public LongObjectMap<PageEntry> pages() {
 			return pages;
 		}
 	}
@@ -142,7 +142,17 @@ public final class MetaJournal {
 		void header(long segmentKey, SegmentEntry entry);
 	}
 
-	private final Map<Long, SegmentEntry> segments = new LinkedHashMap<>();
+	private final LongObjectMap<SegmentEntry> segments = new LongObjectMap<>();
+
+	/**
+	 * The segment the last lookup named. A transaction usually works in one or two segments per kind, and every
+	 * bitmap and page-metadata read inside it asks this journal first, so the common lookup is one comparison.
+	 */
+	private long lastSegmentKey;
+	private SegmentEntry lastSegment;
+
+	/** Operations recorded so far. Never reset by {@link #clear()}: it is compared, not read as a size. */
+	private long changes;
 
 	public static long segmentKey(int kindCode, int segmentNumber) {
 		return ((long) kindCode << 32) | (segmentNumber & 0xFFFFFFFFL);
@@ -160,24 +170,60 @@ public final class MetaJournal {
 		return segments.isEmpty();
 	}
 
-	public Map<Long, SegmentEntry> segments() {
-		return segments;
+	/** How many segments the journal has entries for. */
+	public int segmentCount() {
+		return segments.size();
+	}
+
+	/** The key of the {@code i}-th journalled segment, in the order the transaction first touched them. */
+	public long segmentKeyAt(int i) {
+		return segments.keyAt(i);
+	}
+
+	/** How many operations have been recorded, so a caller can tell whether a statement recorded any. */
+	public long changes() {
+		return changes;
 	}
 
 	public void clear() {
 		segments.clear();
+		lastSegment = null;
 	}
 
 	private SegmentEntry entry(long segmentKey) {
-		return segments.computeIfAbsent(segmentKey, k -> new SegmentEntry());
+		// Every recording operation comes through here, and no query does — they all peek.
+		changes++;
+		SegmentEntry segment = peek(segmentKey);
+		if (segment == null) {
+			segment = new SegmentEntry();
+			segments.put(segmentKey, segment);
+			lastSegmentKey = segmentKey;
+			lastSegment = segment;
+		}
+		return segment;
 	}
 
 	private SegmentEntry peek(long segmentKey) {
-		return segments.get(segmentKey);
+		SegmentEntry last = lastSegment;
+		if (last != null && lastSegmentKey == segmentKey) {
+			return last;
+		}
+		SegmentEntry segment = segments.get(segmentKey);
+		if (segment != null) {
+			lastSegmentKey = segmentKey;
+			lastSegment = segment;
+		}
+		return segment;
 	}
 
 	private PageEntry pageEntry(long segmentKey, int page) {
-		return entry(segmentKey).pages.computeIfAbsent(page, k -> new PageEntry());
+		LongObjectMap<PageEntry> pages = entry(segmentKey).pages;
+		PageEntry entry = pages.get(page);
+		if (entry == null) {
+			entry = new PageEntry();
+			pages.put(page, entry);
+		}
+		return entry;
 	}
 
 	private PageEntry peekPage(long segmentKey, int page) {
@@ -185,17 +231,26 @@ public final class MetaJournal {
 		return segment == null ? null : segment.pages.get(page);
 	}
 
+	private static long[] masks(SegmentEntry segment, int wordIndex) {
+		long[] masks = segment.bitmapWords.get(wordIndex);
+		if (masks == null) {
+			masks = new long[2];
+			segment.bitmapWords.put(wordIndex, masks);
+		}
+		return masks;
+	}
+
 	// ---------------------------------------------------------------- bitmap
 
 	public void bitmapSet(long segmentKey, int slot) {
-		long[] masks = entry(segmentKey).bitmapWords.computeIfAbsent(slot >>> 6, k -> new long[2]);
+		long[] masks = masks(entry(segmentKey), slot >>> 6);
 		long bit = 1L << (slot & 63);
 		masks[0] |= bit;
 		masks[1] &= ~bit;
 	}
 
 	public void bitmapClear(long segmentKey, int slot) {
-		long[] masks = entry(segmentKey).bitmapWords.computeIfAbsent(slot >>> 6, k -> new long[2]);
+		long[] masks = masks(entry(segmentKey), slot >>> 6);
 		long bit = 1L << (slot & 63);
 		masks[1] |= bit;
 		masks[0] &= ~bit;
@@ -350,17 +405,18 @@ public final class MetaJournal {
 	 * </p>
 	 */
 	public void replay(Target target) {
-		for (Map.Entry<Long, SegmentEntry> segment : segments.entrySet()) {
-			long segmentKey = segment.getKey();
-			SegmentEntry entry = segment.getValue();
+		for (int s = 0, segmentCount = segments.size(); s < segmentCount; s++) {
+			long segmentKey = segments.keyAt(s);
+			SegmentEntry entry = segments.valueAt(s);
 			if (entry.isEmpty() || !target.has(segmentKey)) {
 				// A missing segment was retired between the write and the commit. Only empty trailing segments are
 				// retired and only under exclusion, so there is nothing of this transaction's left to place.
 				continue;
 			}
-			for (Map.Entry<Integer, long[]> word : entry.bitmapWords.entrySet()) {
-				int firstSlot = word.getKey() << 6;
-				long[] masks = word.getValue();
+			LongObjectMap<long[]> words = entry.bitmapWords;
+			for (int w = 0, wordCount = words.size(); w < wordCount; w++) {
+				int firstSlot = (int) words.keyAt(w) << 6;
+				long[] masks = words.valueAt(w);
 				for (long bits = masks[0]; bits != 0; bits &= bits - 1) {
 					target.allocate(segmentKey, firstSlot + Long.numberOfTrailingZeros(bits));
 				}
@@ -368,9 +424,10 @@ public final class MetaJournal {
 					target.free(segmentKey, firstSlot + Long.numberOfTrailingZeros(bits));
 				}
 			}
-			for (Map.Entry<Integer, PageEntry> page : entry.pages.entrySet()) {
-				int index = page.getKey();
-				PageEntry pageEntry = page.getValue();
+			LongObjectMap<PageEntry> pages = entry.pages;
+			for (int p = 0, pageCount = pages.size(); p < pageCount; p++) {
+				int index = (int) pages.keyAt(p);
+				PageEntry pageEntry = pages.valueAt(p);
 				if (pageEntry.liveDelta != 0) {
 					target.pageLiveCountDelta(segmentKey, index, pageEntry.liveDelta);
 				}

@@ -351,5 +351,69 @@ write path where a blob is written once and read many times.
 
 ---
 
+## 11. Profiling Round 2026-10-25
+
+A JFR-driven pass over graph-core (1 ms execution sampling plus allocation sampling), on top of `f2b6d5f`.
+**Method:** a standalone harness, one JVM per run, each run reporting the median of its repetitions after the first;
+base (`f2b6d5f`, a detached worktree) and new runs **interleaved A B A B**, five pairs per row. The metric is
+**thread CPU time**, not wall time: the machine was shared with other builds (load average 4 to 22), and CPU time is
+what a change to code moves. Single writer, `ASYNC` WAL unless named, warm cache. Rows marked *hot* restrict the ids
+read to the first 4,096 so the working set sits in cache and per-call overhead is what is measured.
+
+| Workload | Base median | New median | Change | Spread (new / base) |
+|---|---|---|---|---|
+| Auto-commit `createNode`, 2 props, `ASYNC` (µs/commit) | 28.6 | **21.4** | -25% | 21.2-23.7 / 27.5-29.8 |
+| Small txn: 1 node, 1 edge, 1 property update (µs) | 55.3 | **41.3** | -25% | 39.6-46.9 / 53.7-63.6 |
+| Durable commit, `FSYNC_ON_COMMIT` (µs **CPU** per commit) | 158 | 113 | -29% CPU; wall time is the fsync | 85-234 / 116-228 |
+| Bulk `createNode`, 200k in one txn (ns/node) | 3,723 | **3,258** | -12% | 3,172-3,337 / 3,703-3,974 |
+| Bulk `createEdge`, 400k random (ns/edge) | 1,257 | 1,222 | within noise — memory bound | 1,108-1,325 / 1,231-1,556 |
+| Bulk `createRelationship` with props (ns) | 3,008 | 2,788 | -7% | 2,657-3,524 / 2,928-3,270 |
+| `nodeLabel`, random of 200k (ns) | 49.9 | 34.1 | noisy | 28-109 / 31-110 |
+| `nodeLabel`, *hot* (ns) | 23.1 | **16.6** | -28% | 16.3-17.1 / 19.8-27.1 |
+| `nodeProperties`, random (ns) | 214 | 195 | -9%, noisy | 140-239 / 178-229 |
+| `nodeProperties`, *hot* (ns) | 103.7 | **71.8** | -31% | 66-101 / 95-111 |
+| `nodeProperty(key)` (ns) | 213 | 184 | -13%, noisy | 112-245 / 177-387 |
+| `relationshipProperties` (ns) | 152 | 128 | -16% | 125-151 / 139-179 |
+| `neighbours(OUT)`, random (ns/call) | 1,110 | 912 | within noise (bimodal; 7 pairs) | 611-1,135 / 550-1,306 |
+| `neighbours(OUT)`, *hot* (ns/call) | 439 | 389 | -11% | 366-735 / 335-466 |
+| `traverse` depth 2 OUT (ns/edge) | 373 | 317 | -15% | 302-385 / 305-427 |
+| `traverse` depth 3 BOTH (ns/edge) | 137 | 133 | within noise | 115-144 / 127-180 |
+| `nodesByProperty` (ns) | 861 | 742 | -14% | 689-869 / 813-1,026 |
+| `nodesByLabel`, 100k ids (ns/id) | 4.74 | 4.66 | unchanged | 4.60-4.74 / 4.44-4.80 |
+| Supernode `neighbours`, degree 200k (ns/edge) | 34.0 | **24.4** | -28% | 23.7-25.4 / 33.0-40.2 |
+| Cypher `MATCH (n:Person) WHERE n.age > 45 RETURN …` (ns/row) | 1,012 | **703** | -31% | 674-790 / 853-1,028 |
+| Cypher `MATCH (n)-[:KNOWS]->(m) RETURN count(*)` (ns/edge) | 933 | 782 | -16% | 714-805 / 889-940 |
+| Cypher indexed point lookup (ns/query) | 4,204 | 3,749 | -11% | 3,529-3,839 / 4,041-4,446 |
+| Cypher one hop from an indexed node (ns/row) | 3,086 | 3,164 | unchanged — parse and plan dominate | 3,036-3,425 / 2,854-4,701 |
+| Cypher two hops with a filter (ns/row) | 7,133 | 6,924 | -3%, within noise | 6,532-7,194 / 7,093-7,618 |
+| HNSW `nearest`, k=10, 20k × 128-d cosine (µs/query) | 434 | **223** | **1.95x** | 211-241 / 426-438 |
+| HNSW incremental insert, 5k × 64-d (µs/insert) | 1,142 | **683** | **1.67x** | 682-702 / 1,130-1,143 |
+| `compact()`, 200k nodes churned to 10% (ms) | 352 | **223** | **1.57x** | 221-234 / 350-364 |
+| `deleteNode`, 50k with ~6 edges each (ns) | 7,154 | 7,118 | unchanged | 6,931-7,161 / 7,055-7,282 |
+| Recovery of 5,000 commits (ms CPU) | 44.2 | 40.4 | -9% | 39.5-55.3 / 41.3-47.9 |
+
+The HNSW search returns the same neighbours with the same scores, bit for bit: a checksum over every result of the
+query run is identical on both builds.
+
+### What the profiles showed, and what was changed
+
+| Hotspot (share of samples, before) | Change |
+|---|---|
+| `LinkedHashMap<Long,…>` lookups and `Long` boxing in the overlay, the metadata journal and a view's reconstructed pages — `HashMap.getNode` 12-40% of every bulk load, `Long` half of all bytes allocated | `util.LongObjectMap`: open addressing on primitive keys, insertion ordered like the map it replaces; plus a one-entry last-hit cache in `PageOverlay` and `MetaJournal` |
+| `Snapshot.pageAsOf` 15-30% inside every write transaction: a boxed chain lookup and a capturing lambda per record read | `PageVersions.newestSupersededLsn`, one volatile, only rises; a view at or past it reads the mapping without looking anything up (`Snapshot.readsMapping`) |
+| `PageOverlay.create` ~50% of a small commit: two fresh 8 KiB pages per touched page, thirteen pages per `createNode` | a rebased (metadata) page's base is the mapped page itself; data-page bases and rebased copies come from a 32-page per-thread pool. A fresh page costs ~1.4 µs of cache misses to fill, a reused one is in cache. Data-page copies are never pooled — reads hand out slices of them. See [TRANSACTIONS.md §6.1.1](TRANSACTIONS.md) |
+| `WalManager.changedRuns` 20-35% of commit: a whole-page diff to find eight changed bytes | the overlay records the window it handed out for writing and the diff runs inside it, asserting against the whole-page diff when assertions are on |
+| `ThreadLocal` lookups 36% of `nodeProperties`, three or four per record read | `WriteContextHolder` and `SnapshotHolder` count published contexts and skip the thread-local while the count is zero; one lookup instead of two per bitmap word |
+| `nodeProperties` built two maps — boxed key ids, then names | decoded straight into `Properties`; inline strings decoded in place |
+| HNSW: four resolves per neighbour visited (live, ordinal, norm, dot) and three passes per cosine in neighbour selection | one `resolveIfLive` per neighbour, distances from the record in hand, chosen-side sums of squares computed once |
+| Node scans read one bitmap word per slot — 35% of a compaction | a word per 64 slots; re-read after each id only when the consumer is inside a write transaction (`ScanWhileWritingTest`) |
+
+**Measured and left alone.** Random edge loads (`bulkEdges`) are bound by cache misses on a hundred megabytes of
+overlay pages, not by code. A traversal's `ArrayList` growth shows as 30% of `traverse` in JFR but is not reproducible
+as a win. The Cypher one-hop query spends its time in parsing and planning, which this round did not touch. A shared
+group-commit fsync and restructuring the Cypher executor stay out of scope, as before.
+
+---
+
 _Git HEAD revision: `364b5f7` plus the uncommitted cell-based adjacency, Phase 6/7 and benchmark changes_
-_Last updated: 2026-08-14_
+_Last updated: 2026-10-25 (section 11, on top of `f2b6d5f`); sections 1 to 10 were taken on 2026-08-14_

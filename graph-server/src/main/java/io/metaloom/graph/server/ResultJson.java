@@ -48,7 +48,7 @@ import io.vertx.core.json.JsonObject;
  * correct on a small store and quietly wrong on a large one, which is the worst way for a defect to behave.
  * </p>
  */
-final class ResultJson {
+public final class ResultJson {
 
 	/** Beyond this a JavaScript number stops being exact, so the value travels as a string instead. */
 	private static final long SAFE_INTEGER = 9007199254740991L;
@@ -202,6 +202,18 @@ final class ResultJson {
 		JsonObject out = new JsonObject();
 		properties.forEach((key, value) -> out.put(key, cell(value)));
 		return out;
+	}
+
+	/**
+	 * One result value as JSON, the same shape a table cell has on the HTTP route.
+	 *
+	 * <p>
+	 * Public for the MCP query tool, which put the engine's node and relationship objects into a {@code JsonObject}
+	 * directly — something Vert.x's encoder has no mapping for, so every {@code RETURN n} over MCP failed.
+	 * </p>
+	 */
+	public static Object value(Object value) {
+		return cell(value);
 	}
 
 	/**

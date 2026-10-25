@@ -194,6 +194,18 @@ public final class ValueCodec {
 			return result;
 		}
 
+		/**
+		 * {@code length} bytes decoded as UTF-8, straight out of the buffer. The same decoding as
+		 * {@code new String(bytes(length), UTF_8)} — malformed input is replaced, not rejected — without the
+		 * intermediate copy.
+		 */
+		public String utf8(int length) {
+			require(length);
+			String result = new String(buf, pos, length, StandardCharsets.UTF_8);
+			pos += length;
+			return result;
+		}
+
 		/** Advances past {@code n} bytes without materialising them. */
 		public void skip(int n) {
 			require(n);
@@ -407,6 +419,10 @@ public final class ValueCodec {
 					? (Object) Float.intBitsToFloat(r.i32())
 					: (Object) Double.longBitsToDouble(r.i64());
 			case T_STRING: {
+				if (sizeClass == 0 && materialise) {
+					// Inline: decode in place rather than copying the bytes out first and then into the String.
+					return r.utf8(r.u8());
+				}
 				byte[] data = readBytes(r, sizeClass, blobs, materialise, ownedIds);
 				return materialise && data != null ? new String(data, StandardCharsets.UTF_8) : null;
 			}

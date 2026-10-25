@@ -60,6 +60,14 @@ public enum IsolationLevel {
 	 * transaction opened at this level behaves as {@link #SNAPSHOT}, which is what serializability means for something
 	 * that writes nothing.
 	 * </p>
+	 *
+	 * <p>
+	 * <b>A lookup of a label, relationship type or property key the store has never seen is a read too</b>, though it
+	 * touches no page: {@code nodesByLabel("Doctor")} on a store without the label answers from the dictionary alone.
+	 * The commit refuses the transaction if any such name has come to exist since. The dictionary does not record who
+	 * introduced a name, so a transaction that looked a name up, found nothing and then introduced it itself is refused
+	 * once; its retry finds the name and validates as usual.
+	 * </p>
 	 */
 	SERIALIZABLE
 }

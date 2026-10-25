@@ -91,14 +91,7 @@ public final class VectorStore {
 
 	/** Materialises the vector. Prefer {@link #distanceTo} where only a distance is wanted. */
 	public float[] read(long vectorId) {
-		MemorySegment record = segments.resolve(vectorId);
-		int dim = checkedDimension(record, vectorId);
-		float[] vector = new float[dim];
-		int base = VectorRecord.vectorOffset();
-		for (int i = 0; i < dim; i++) {
-			vector[i] = record.get(Layouts.FLOAT, base + 4L * i);
-		}
-		return vector;
+		return read(segments.resolve(vectorId), vectorId);
 	}
 
 	/**
@@ -108,7 +101,42 @@ public final class VectorStore {
 	 * {@code float} lose enough of the tail that two vectors which should tie order by rounding error instead.
 	 */
 	public double dot(long vectorId, float[] query) {
-		MemorySegment record = segments.resolve(vectorId);
+		return dot(segments.resolve(vectorId), vectorId, query);
+	}
+
+	/** The stored vector's precomputed L2 norm, which makes cosine one dot product instead of three passes. */
+	public double norm(long vectorId) {
+		return segments.resolve(vectorId).get(Layouts.FLOAT, VectorRecord.OFF_NORM);
+	}
+
+	// ------------------------------------------------- record-level reads, for the ANN walk
+
+	/**
+	 * The record of a live vector claimed by index {@code ordinal}, or null for anything else — the membership test
+	 * and the record the distance is then computed from, in one resolve.
+	 *
+	 * <p>
+	 * The beam search used to ask "is it live", "which index claims it", "what is its norm" and "what is its dot
+	 * product" as four separate resolves of the same record, each a bitmap read and a record touch. The returned slice
+	 * is only good until the caller next writes: read from it straight away.
+	 * </p>
+	 */
+	public MemorySegment memberRecord(long vectorId, int ordinal) {
+		MemorySegment record = segments.resolveIfLive(vectorId);
+		if (record == null
+			|| Short.toUnsignedInt(record.get(Layouts.SHORT, VectorRecord.OFF_INDEX_ORD)) - 1 != ordinal) {
+			return null;
+		}
+		return record;
+	}
+
+	/** {@link #norm(long)}, from a record already in hand. */
+	public static double norm(MemorySegment record) {
+		return record.get(Layouts.FLOAT, VectorRecord.OFF_NORM);
+	}
+
+	/** {@link #dot(long, float[])}, from a record already in hand. */
+	public double dot(MemorySegment record, long vectorId, float[] query) {
 		int dim = checkedDimension(record, vectorId);
 		if (query.length != dim) {
 			throw new IllegalArgumentException("Query of " + query.length + " dimensions against a stored " + dim);
@@ -121,9 +149,15 @@ public final class VectorStore {
 		return sum;
 	}
 
-	/** The stored vector's precomputed L2 norm, which makes cosine one dot product instead of three passes. */
-	public double norm(long vectorId) {
-		return segments.resolve(vectorId).get(Layouts.FLOAT, VectorRecord.OFF_NORM);
+	/** {@link #read(long)}, from a record already in hand. */
+	public float[] read(MemorySegment record, long vectorId) {
+		int dim = checkedDimension(record, vectorId);
+		float[] vector = new float[dim];
+		int base = VectorRecord.vectorOffset();
+		for (int i = 0; i < dim; i++) {
+			vector[i] = record.get(Layouts.FLOAT, base + 4L * i);
+		}
+		return vector;
 	}
 
 	public long owner(long vectorId) {
@@ -188,8 +222,9 @@ public final class VectorStore {
 
 	/** The neighbours this record links to at one layer. */
 	public long[] links(long vectorId, int level, int m) {
-		int count = linkCount(vectorId, level);
+		// One resolve for the count and the links: they are the same record.
 		MemorySegment record = segments.resolve(vectorId);
+		int count = Short.toUnsignedInt(record.get(Layouts.SHORT, VectorRecord.OFF_LINK_COUNTS + 2L * level));
 		long base = linkBase(level, m);
 		long[] links = new long[count];
 		for (int i = 0; i < count; i++) {
@@ -253,6 +288,11 @@ public final class VectorStore {
 
 	public void free(long vectorId) {
 		segments.free(vectorId);
+	}
+
+	/** The record slice for a vector id, for the record-level reads. */
+	public MemorySegment record(long vectorId) {
+		return segments.resolve(vectorId);
 	}
 
 	public boolean exists(long vectorId) {

@@ -1,13 +1,12 @@
 package io.metaloom.graph.core.txn;
 
 import java.lang.foreign.MemorySegment;
-import java.util.HashMap;
-import java.util.Map;
 
 import io.metaloom.graph.core.api.GraphStoreException;
 import io.metaloom.graph.core.api.IsolationLevel;
 import io.metaloom.graph.core.api.ReadTransaction;
 import io.metaloom.graph.core.api.SnapshotTooOldException;
+import io.metaloom.graph.core.util.LongObjectMap;
 
 /**
  * One reader's fixed view: an LSN, plus the pages it has had to reconstruct to honour it.
@@ -67,7 +66,7 @@ public final class Snapshot implements ReadTransaction {
 	private final boolean writer;
 
 	/** Pages already rebuilt for this view. Valid for the life of the snapshot — see {@link #pageAsOf}. */
-	private final Map<Long, MemorySegment> reconstructed = new HashMap<>();
+	private final LongObjectMap<MemorySegment> reconstructed = new LongObjectMap<>();
 
 	private long reconstructedBytes;
 	private boolean open = true;
@@ -181,6 +180,21 @@ public final class Snapshot implements ReadTransaction {
 	}
 
 	/**
+	 * True when no commit since this view began has overwritten anything a chain retained, so every page this view
+	 * reads is the mapped page itself and {@link #pageAsOf} would return null for all of them.
+	 *
+	 * <p>
+	 * One volatile read, and the answer for nearly every read a short transaction makes. Callers test it before
+	 * {@link #pageAsOf} to skip building the supplier as well. It cannot be true while a reconstruction is cached:
+	 * one is only ever made for a page superseded after this view's LSN, and the mark it is tested against never
+	 * falls.
+	 * </p>
+	 */
+	public boolean readsMapping() {
+		return versions.newestSupersededLsn() <= snapshotLsn;
+	}
+
+	/**
 	 * The page as this view is entitled to see it, or null when that is the mapped page itself.
 	 *
 	 * <p>
@@ -194,12 +208,23 @@ public final class Snapshot implements ReadTransaction {
 	 *            supplied lazily, because on the common path it is not needed at all
 	 */
 	public MemorySegment pageAsOf(long pageKey, java.util.function.Supplier<MemorySegment> mappedPage, int pageSize) {
+		if (readsMapping()) {
+			return null;
+		}
 		MemorySegment cached = reconstructed.get(pageKey);
 		if (cached != null) {
 			return cached;
 		}
 		PageVersions.Version head = versions.head(pageKey);
 		if (head == null || head.supersededAt() <= snapshotLsn) {
+			if (head == null && snapshotLsn < versions.horizonLsn()) {
+				// No chain can also mean vacuum just removed it, because the retention budget abandoned this view in
+				// the middle of an operation: vacuum takes no lock a reader holds, so a scan or a cursor holding the
+				// apply latch does not keep it out. The mapping is then newer than the view and must not be served.
+				// Vacuum raises the horizon before it cuts anything, so a chain seen missing here is a horizon seen
+				// raised. One volatile read, and only on the path that is about to return the mapping to a view.
+				throw new SnapshotTooOldException(snapshotLsn, versions.horizonLsn());
+			}
 			// Nothing has superseded this page since the view began, so the mapping is already what it should see.
 			return null;
 		}
@@ -217,6 +242,11 @@ public final class Snapshot implements ReadTransaction {
 
 	private MemorySegment rebuild(long pageKey, java.util.function.Supplier<MemorySegment> mappedPage, int pageSize) {
 		MemorySegment rebuilt = versions.reconstruct(pageKey, snapshotLsn, mappedPage.get(), pageSize);
+		if (snapshotLsn < versions.horizonLsn()) {
+			// Abandoned while the chain was being walked: vacuum may have truncated it under the walk, and a page
+			// rebuilt from part of its history is wrong and would be cached for the rest of the view.
+			throw new SnapshotTooOldException(snapshotLsn, versions.horizonLsn());
+		}
 		if (rebuilt == null) {
 			return null;
 		}

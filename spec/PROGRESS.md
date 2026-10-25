@@ -232,6 +232,13 @@ that a steal policy cannot be made correct over a `MAP_SHARED` mapping.
       transaction threw `StaleIdException` on a healthy store, because the catalog page id was cached
       in memory while the allocation behind it was discarded
 - [x] CI workflow written (`.github/workflows/ci.yml`), including the cargo job
+- [x] Second profiling round (2026-10-25), JFR-driven, interleaved A/B against `f2b6d5f` on thread CPU time —
+      [GRAPH_BENCHMARK.md §11](GRAPH_BENCHMARK.md#11-profiling-round-2026-10-25): small commits **-25%**, hot point
+      and property reads **-28% / -31%**, supernode reads -28%, Cypher label scan -31%, HNSW search **1.95x** and
+      insert 1.67x (results bit-identical), compaction 1.57x. Primitive-keyed overlay and journal maps, a one-read
+      "nothing superseded" test for views, a diff confined to the written window, recycled commit-only page buffers,
+      a thread-local fast path, word-at-a-time node scans. New tests: `LongObjectMapTest`, `ScanWhileWritingTest`
+      (seen red against a scan that skipped the re-read), and two `ChangedRunsTest` cases for the window contract
 
 ### Phase 12 — GraalVM native image
 

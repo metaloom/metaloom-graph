@@ -108,13 +108,24 @@ public final class Frames {
 	}
 
 	public static Buffer header(int type, int streamId, int payloadLength) {
+		return header(type, streamId, payloadLength, HEADER_BYTES);
+	}
+
+	/**
+	 * @param capacity
+	 *            what the buffer is allocated with. A frame passes header plus payload, so the payload is appended into
+	 *            room that is already there: an eight-byte buffer grown to fit a 64 KiB batch is grown to the next power
+	 *            of two, which allocated 128 KiB for every batch — twice the bytes the write budget counts, and twice the
+	 *            zeroing
+	 */
+	private static Buffer header(int type, int streamId, int payloadLength, int capacity) {
 		if (payloadLength < 0 || payloadLength > MAX_FRAME_BYTES) {
 			throw new WireFormatException("Refusing to write a " + payloadLength + " byte frame");
 		}
 		if (streamId < 0 || streamId > 0xFFFF) {
 			throw new WireFormatException("Stream id " + streamId + " is outside 0..65535");
 		}
-		Buffer buffer = Buffer.buffer(HEADER_BYTES);
+		Buffer buffer = Buffer.buffer(capacity);
 		buffer.appendIntLE(payloadLength);
 		buffer.appendByte((byte) type);
 		buffer.appendByte((byte) 0);
@@ -124,11 +135,11 @@ public final class Frames {
 
 	/** Header and payload as one buffer, which is one write and therefore one chance to be interleaved. */
 	public static Buffer frame(int type, int streamId, Buffer payload) {
-		return header(type, streamId, payload.length()).appendBuffer(payload);
+		return header(type, streamId, payload.length(), HEADER_BYTES + payload.length()).appendBuffer(payload);
 	}
 
 	public static Buffer frame(int type, int streamId, WireValueCodec.Writer payload) {
-		return header(type, streamId, payload.position())
+		return header(type, streamId, payload.position(), HEADER_BYTES + payload.position())
 			.appendBytes(payload.array(), 0, payload.position());
 	}
 

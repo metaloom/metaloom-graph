@@ -375,6 +375,18 @@ public final class WireServer implements AutoCloseable {
 		}
 		NetServer bound = vertx.createNetServer(netOptions);
 		bound.connectHandler(socket -> {
+			if (closing.get()) {
+				// The listener is still bound during the shutdown grace period, so that the connections running
+				// queries are not cut off (see shutdown). A peer arriving now is told why rather than served.
+				WireValueCodec.Writer refusal = new WireValueCodec.Writer(96);
+				refusal.i32(WireError.OVERLOADED.code());
+				WireValueCodec.encodeString(refusal, "The server is shutting down and is not accepting connections");
+				refusal.i32(0);
+				refusal.i32(0);
+				socket.write(Frames.frame(Frames.ERROR, Frames.CONNECTION_STREAM, refusal))
+					.onComplete(ignored -> socket.close());
+				return;
+			}
 			socket.setWriteQueueMaxSize(options.writeQueueMaxBytes());
 			// Asked of the socket rather than closed over from this lambda, so the counter reports what the transport
 			// actually did rather than what this server intended.
@@ -537,16 +549,12 @@ public final class WireServer implements AutoCloseable {
 			return;
 		}
 		watchdog.shutdownNow();
-		if (server != null) {
-			// After the flag, so a query admitted between the two is still refused rather than half-served.
-			server.close().toCompletionStage().toCompletableFuture().join();
-		}
-		if (tlsServer != null) {
-			// The encrypted listener is a second acceptor over the same everything, so it has to stop accepting too.
-			// Leaving it open would keep the process reachable through a shutdown that had already been announced.
-			tlsServer.close().toCompletionStage().toCompletableFuture().join();
-		}
-
+		// The listeners stay up through the grace period, and that is deliberate. Closing a Vert.x NetServer closes every
+		// connection it accepted, at once — a graceful NetServer.shutdown does too, because a NetSocket has no shutdown
+		// behaviour of its own — so closing them first made every running query "the client disconnected" and handed
+		// its client a dropped connection: the grace period this method promises was never given to anybody. New
+		// work is refused by the flag instead: a QUERY is answered OVERLOADED, and a connection accepted from here on is
+		// told so and closed (see bind).
 		if (!awaitQuiet(graceMillis)) {
 			int remaining = running.size();
 			logger.warn("Shutting down with {} quer{} still running after {} ms; abandoning {}", remaining,
@@ -562,6 +570,14 @@ public final class WireServer implements AutoCloseable {
 			}
 		}
 
+		if (server != null) {
+			server.close().toCompletionStage().toCompletableFuture().join();
+		}
+		if (tlsServer != null) {
+			// The encrypted listener is a second acceptor over the same everything, so it has to stop accepting too.
+			// Leaving it open would keep the process reachable through a shutdown that had already been announced.
+			tlsServer.close().toCompletionStage().toCompletableFuture().join();
+		}
 		workers.close();
 		if (ownsVertx) {
 			vertx.close().toCompletionStage().toCompletableFuture().join();
@@ -1035,7 +1051,8 @@ public final class WireServer implements AutoCloseable {
 				running.remove(stream.key);
 				// Two-argument remove: by now the id may already belong to the client's next query.
 				streams.remove(streamId, stream);
-				permits.release();
+				// Normally already given back with the terminal frame; this is the backstop for a run that never sent one.
+				stream.releaseSlots();
 			});
 		}
 
@@ -1060,7 +1077,9 @@ public final class WireServer implements AutoCloseable {
 		void fail(int streamId, WireError error, String message, int line, int column) {
 			WireValueCodec.Writer payload = new WireValueCodec.Writer(128);
 			payload.i32(error.code());
-			WireValueCodec.encodeString(payload, message == null ? error.name() : message);
+			// Made encodable rather than refused: a message may quote the query that failed, and a lone surrogate in it
+			// would otherwise throw here, on the way to the one frame that ends the stream, and leave the client waiting.
+			WireValueCodec.encodeString(payload, WireValueCodec.wellFormed(message == null ? error.name() : message));
 			payload.i32(line);
 			payload.i32(column);
 			write(Frames.frame(Frames.ERROR, streamId, payload));
@@ -1117,6 +1136,11 @@ public final class WireServer implements AutoCloseable {
 		/** The deadline timer, the cancel handler and the producer's error path all race to end a stream. */
 		private final AtomicBoolean terminated = new AtomicBoolean();
 
+		/** Given back once, by whichever of the terminal frame or the completion callback gets there first. */
+		private final AtomicBoolean permitReleased = new AtomicBoolean();
+		/** The write gate while this stream holds it. Touched only by the producer thread. */
+		private Semaphore heldGate;
+
 		private volatile boolean cancelled;
 		private volatile String abortReason;
 		private volatile WireError abortCode = WireError.TIMEOUT;
@@ -1135,15 +1159,16 @@ public final class WireServer implements AutoCloseable {
 		void run(Ast.Query parsed, Map<String, Object> parameters) {
 			BatchingSink sink = new BatchingSink(this);
 			Semaphore gate = writing ? writeGate(connection.store) : null;
-			boolean held = false;
 			try {
 				if (gate != null) {
 					// The engine serialises writers on one lock with no deadline and no message, so a second writer
 					// would wait inside store.begin() past this stream's own budget with nothing to report. The
 					// semaphore does not add serialisation — it puts a bound and a name on the wait that already
 					// exists.
-					held = gate.tryAcquire(waitBudgetMillis(), TimeUnit.MILLISECONDS);
-					if (!held) {
+					boolean held = gate.tryAcquire(waitBudgetMillis(), TimeUnit.MILLISECONDS);
+					if (held) {
+						heldGate = gate;
+					} else {
 						error(WireError.OVERLOADED, "Another query is writing to database '" + connection.database
 							+ "'; this one gave up waiting for it", 0, 0);
 						return;
@@ -1176,9 +1201,32 @@ public final class WireServer implements AutoCloseable {
 				logger.error("Stream {} failed", streamId, e);
 				error(WireError.INTERNAL, String.valueOf(e.getMessage()), 0, 0);
 			} finally {
-				if (held) {
-					gate.release();
-				}
+				// Normally released already, with the terminal frame. Idempotent, so this only acts on a path that
+				// never sent one.
+				releaseSlots();
+			}
+		}
+
+		/**
+		 * Gives back the stream permit and, for a writer, the write gate — before the terminal frame is written.
+		 *
+		 * <p>
+		 * <b>Before, and that order is the fix.</b> The permit used to come back in the completion callback, which runs
+		 * on the event loop some time after the producer has written {@code COMPLETE}. A client that read it and sent
+		 * its next query straight away reached the server inside that window and was answered {@code OVERLOADED} with
+		 * a single stream open against a limit of one — a refusal a well-behaved client cannot avoid, only retry. The
+		 * write gate had the same window for back-to-back writes. Nothing still needs either by the time a terminal
+		 * frame goes out: the read view was closed and the transaction ended on the way out of {@code Cypher.stream}.
+		 * </p>
+		 */
+		void releaseSlots() {
+			Semaphore gate = heldGate;
+			if (gate != null) {
+				heldGate = null;
+				gate.release();
+			}
+			if (permitReleased.compareAndSet(false, true)) {
+				permits.release();
 			}
 		}
 
@@ -1227,6 +1275,10 @@ public final class WireServer implements AutoCloseable {
 				stats.nodesCreated(), stats.nodesDeleted(), stats.relationshipsCreated(),
 				stats.relationshipsDeleted(), stats.propertiesSet(), stats.labelsAdded(), stats.labelsRemoved())
 					.write(payload);
+			// Everything the client may reuse is given back before the frame that tells it it may. See releaseSlots and
+			// release.
+			releaseSlots();
+			release();
 			write(Frames.COMPLETE, payload);
 			// Recorded inside the CAS, so a stream ended twice by a race between the deadline timer and the producer
 			// is counted once. That guarantee already existed for the frame; the meters get it for free.
@@ -1234,7 +1286,6 @@ public final class WireServer implements AutoCloseable {
 			metrics.recordWriteStats(stats);
 			SlowQueryLog.maybeLog(slowQueryMillis, "wire", connection.database, text, parameters, elapsed, rows, "ok",
 				metrics);
-			release();
 		}
 
 		void error(WireError code, String message, int line, int column) {
@@ -1242,6 +1293,8 @@ public final class WireServer implements AutoCloseable {
 				return;
 			}
 			long elapsed = System.nanoTime() - startedNanos;
+			releaseSlots();
+			release();
 			connection.fail(streamId, code, message, line, column);
 			String outcome = outcomeOf(code);
 			metrics.recordQuery("wire", writing ? "write" : "read", outcome, elapsed, 0);
@@ -1249,16 +1302,18 @@ public final class WireServer implements AutoCloseable {
 			// nothing.
 			SlowQueryLog.maybeLog(slowQueryMillis, "wire", connection.database, text, parameters, elapsed, 0, outcome,
 				metrics);
-			release();
 		}
 
 		/**
-		 * Frees the stream id as the terminal frame goes out, not afterwards.
+		 * Frees the stream id before the terminal frame goes out, not afterwards.
 		 *
 		 * <p>
 		 * A client is entitled to reuse an id the moment it has seen that stream end. Releasing it in the completion
-		 * callback instead would leave a window in which the client's next query is refused as a duplicate — a race
-		 * that would show up as an occasional dropped connection under load and nowhere in a test.
+		 * callback would leave a window in which the client's next query is refused as a duplicate — and a duplicate is
+		 * a protocol error that closes the connection. Releasing it just <em>after</em> writing the frame, as this did,
+		 * left the same window narrower rather than shut: {@code socket.write} from the producer only queues the frame,
+		 * and a client fast enough to read it and reuse the id reached the event loop before the producer reached this
+		 * line. {@code WireClientEndToEndTest.testAStreamIdReusedTheMomentItEndsIsAccepted} is that client.
 		 * </p>
 		 */
 		private void release() {
@@ -1355,7 +1410,13 @@ public final class WireServer implements AutoCloseable {
 		@Override
 		public boolean row(List<Object> values) {
 			for (Object value : values) {
-				WireValueCodec.encode(writer, CypherWireValues.of(value));
+				try {
+					WireValueCodec.encode(writer, CypherWireValues.of(value));
+				} catch (WireValueCodec.UnpairedSurrogateException e) {
+					// A value the query made and the wire cannot carry: the query's problem, as a type error is, rather than
+					// the server's. It used to leave as '?', which the embedded API and HTTP do not answer.
+					throw new CypherTypeException("A result value cannot be sent: " + e.getMessage());
+				}
 			}
 			batched++;
 			boolean full = writer.position() >= options.rowBatchBytes();

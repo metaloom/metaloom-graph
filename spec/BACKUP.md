@@ -276,6 +276,14 @@ metaloom-graph-cli database inspect        --in=sales.dump
   needs one for offline mode. Pulling Vert.x in for a single request would be the wrong trade the other
   way.
 - **Exit codes**: 0 success, 1 failure, 2 a usage mistake.
+- **`--out` is replaced only by a complete dump.** It is written as `<out>.<random>.partial` in the same directory and
+  renamed over `--out` at the end; a failure deletes the partial file. Opening `--out` directly truncated the previous
+  dump before the database was even opened, so any failed backup destroyed the last good one.
+- **`backup` and `list` refuse a `--path` that does not exist** instead of creating it. `GraphDatabases.open` makes a
+  missing root with an empty `default` in it, which a restore wants and which turned a mistyped path into a valid,
+  empty dump and exit 0.
+- **`--password-stdin` reads one line**, without its `\n` or `\r\n`. It read the whole stream and trimmed only
+  trailing newlines, so a second line became part of the password.
 - `inspect` reads the header without opening any store, which is what makes a bad dump cheap to
   diagnose.
 
@@ -336,11 +344,12 @@ Two changes, both narrow:
 | | |
 |---|---|
 | `SnapshotScanTest` (graph-core) | **The foundation.** A scan under a view does not see nodes committed after it, still sees nodes deleted after it, and a paced scan sees the same set while a writer commits throughout |
-| `BackupRoundTripTest` | Dump, restore, compare. Multi-label and label-less nodes, lightweight edges, a self-loop, parallel edges, every property type including the four no other codec carries, and the declared schema. Ends in `verify(FULL)` |
+| `BackupRoundTripTest` | Dump, restore, compare. Multi-label and label-less nodes, lightweight edges, a self-loop, parallel edges, every property type including the four no other codec carries, and the declared schema. Ends in `verify(FULL)` — and a store after two thirds of it was deleted and it was compacted, vectors and a vector index included, whose restored copy still answers a nearest-neighbour query with a survivor |
 | `BackupUnderLoadTest` | A backup taken while a writer commits: every edge joins one generation and every generation is present whole, so the dump is one instant — **and** the writer made progress, so it was online |
 | `DumpHostileInputTest` | §3.4: every truncation, every single-byte corruption, 200 random inputs, a huge length, deep nesting, a non-terminating varint |
 | `CliOptionsTest` | The command line, both directions, and that every dispatched command is documented |
 | `GraphCliTest` | The commands as somebody runs them, through `run()` and its exit status. §7.2 lived here: neither of the two above goes through the CLI, so neither could see that a restore into a fresh root was impossible. Also that a truncated or corrupt dump restored with `--force` leaves the original untouched and no staging directory listed |
+| `GraphCliEdgeCaseTest` | A failed backup (missing database, locked store) leaves the previous dump byte for byte and no partial file; a mistyped root refused by `backup` and `list` without being created; usage errors and the 0/1/2 exit codes; `--password-stdin` reading one line; garbage and empty dumps refused by `inspect` |
 | `GraphDatabasesTest` (graph-core) | That the last database can be `replace`d though it cannot be `drop`ped, and that the root is never observed empty |
 | `GraphServerOptionsTest` | That `--allow-backup` is off by default and independent of `--allow-write` and `--allow-drop` |
 | `tools/native-image.sh`, `cli` | Not a unit test: the GraalVM binary doing the whole round against a real store. `-H:+SharedArenaSupport` fails on *close*, so only a round trip catches its absence — [GRAALVM.md §10.2](GRAALVM.md#102-its-smoke-test) |
@@ -369,5 +378,5 @@ Two changes, both narrow:
 
 ---
 
-_Git HEAD revision: `da8c93e`_
-_Last updated: 2026-08-17 (authentication and RBAC authorization)_
+_Git HEAD revision: `f2b6d5f`_
+_Last updated: 2026-10-24 (client, server and CLI review: closed streams, budget leak, slot release order, shutdown grace, strict UTF-8, MCP argument shapes, atomic backups)_

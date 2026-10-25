@@ -291,6 +291,21 @@ segments below the new checkpoint. `close()` used to delete first and force the 
 kill between the two left a manifest naming a checkpoint whose segment was gone (now refused at open,
 §6.1).
 
+**A write outside the log checkpoints first.** What is logged is a byte-run *difference* — the bytes a
+commit changed against the page as it stood — not an after-image of the page. Replaying such runs is
+only correct onto a file every byte of which some replayed run, or nothing at all, has touched since
+the replay origin. A maintenance step that writes the data files outside the log breaks that: the next
+commit logs its difference against a base that already contains the unlogged write, so replaying an
+*older* run over the file puts back bytes that no newer run mentions again. `reclaim()` does exactly
+that kind of writing — it punches pages, raises generation floors, fixes up page checksums and, through
+every `SegmentFile.force()`, flips the A/B superblock copies — and it used to do it with the replay
+origin wherever the last checkpoint had left it. Three inserts, one `reclaim()`, two deletes and a crash
+gave a live count that disagreed with its bitmap; in a search over short sequences one store came back
+with **both** superblock copies failing their CRC and would not open (`ReclaimCrashTest`). So
+`reclaim()` and every `MaintenanceRunner.runUnlogged` unit — compaction's punch phase — now
+checkpoint first, inside the same exclusive hold of the write gate, so no commit can land between the
+checkpoint and the unlogged writes and recovery never has anything older than them to replay.
+
 **WAL retention.** `wal_min_lsn` is the minimum of: the checkpoint's `min_recovery_lsn`, the oldest
 active transaction's begin LSN, and (if configured) a replication or backup retention floor. A log
 segment is deleted only when it is entirely below that.
@@ -301,6 +316,9 @@ segment is deleted only when it is entirely below that.
 
 - **The log is the only ordering authority.** If you find yourself reasoning "the page write happens
   before the other page write so it is fine", stop and add a log record.
+- **Never write a data file outside a transaction without checkpointing first.** The log holds
+  differences, not page images, and an older difference replayed over an unlogged write is silently
+  wrong (§7). A superblock flush counts: `SegmentFile.force()` performs one.
 - **Redo must be idempotent, undo must be logical.** A physical undo that assumes the page still
   looks the way it did will break under steal.
 - **Never log a Java object.** Payloads are byte-exact after-images or explicit field lists; a

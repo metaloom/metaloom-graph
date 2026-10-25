@@ -3,8 +3,8 @@
 A storage engine is only as good as its evidence. This file defines how the project proves that it
 does not lose data.
 
-The suite today is 1,010 tests across the six modules — 467 in `graph-core`, 304 in `graph-cypher`,
-22 in `graph-protocol`, 2 in `graph-client`, 35 in `graph-cli`, 180 in `graph-server` — running in a
+The suite today is 1,478 tests across the six modules — 631 in `graph-core`, 383 in `graph-cypher`,
+37 in `graph-protocol`, 33 in `graph-client`, 64 in `graph-cli`, 330 in `graph-server` — running in a
 few minutes, plus benchmarks, a soak, a scaling harness and a `kill -9` loop behind profiles and
 scripts. The PoC suite it replaced had one red test,
 three unbounded benchmarks living in the unit suite, and two tests that passed for reasons unrelated
@@ -34,6 +34,7 @@ to what they asserted ([CURRENT_STATE.md §5](CURRENT_STATE.md#5-test-reality-ch
 | `CrashMatrixTest` | 1 — recovery against data files older than its log threw a raw `IllegalStateException` rather than a typed store failure, so a caller could not distinguish "this store is damaged" from "this code has a bug". Found on the matrix's first meaningful run |
 | `RollbackTest` | **1, and it was a false alarm on healthy data** — `verify(FULL)` bounded a blob's extent-chain walk at `segmentCount() * slotsPerPage() + 1`. A BLOB extent is page sized, so that is 2 on a single-segment store: every blob past about 16 KiB was reported as a chain that "does not terminate", with its remaining extents reported as orphaned on top. Nothing caught it because no test had ever written a blob and then run `verify(FULL)`. Reporting corruption that is not there is worse than missing some: it sends somebody hunting, and it made full verification unusable on any store holding real blobs |
 | `CypherVersusApiTest` and running the UI | 2 — a `RETURN *` that listed pattern variables out of order, and, found only by opening the browser, **64-bit ids losing precision as JSON numbers**: an id near 2^60 arrives in JavaScript rounded, so two nodes could collapse into one circle. Ids now cross as strings |
+| `CypherFuzzTest`, `CypherDifferentialTest` | **6, four of them in the fuzzer's first 3,000 inputs.** The fuzzer's oracle is only the exception contract — every input ends in a result or an exception the server maps to a 4xx — and that was enough: a null binding crashing the refresh after a write, `vector.query` without an index or with an empty vector escaping as the engine's `IllegalStateException`/`IllegalArgumentException`, a node deleted earlier in the query escaping as a store failure, and — only at 30,000 inputs a seed — `SET x = {…}` on a null `x`. The differential found the sixth, which no exception would have shown: `{k: [1, 2]}` probed the index for that spelling only and lost the nodes holding `[1.0, 2.0]`, so MERGE duplicated them ([CYPHER.md §7](CYPHER.md)). The probing by hand that wrote `CypherSemanticsTest` found twenty more, every one a wrong answer that threw nothing — see that class |
 | `LongRunningReaderTest` | 1 — reclamation walked every version chain on every commit to discover there was nothing to cut, which is quadratic while a reader is pinned. The test did not fail, it *did not finish*, which is the failure mode a shorter test would have reported as merely slow |
 | A full `mvn test` hanging, plus a thread dump | **2, and no test could see either** — both in the client's flow control, both leaving a consumer blocked forever on a server that had already sent every row. `readsPaused` was not `volatile`, so a stale read could skip the socket resume; and the ROWS handler published a batch to the consuming thread *before* adding it to the budget, so a consumer could spend bytes that had not been counted and the pause that followed had no callback left to lift it. Green in isolation, hung the reactor under load. The dump named the area in one look — client parked in `LinkedBlockingQueue.take()`, server worker **idle in its pool**; an idle server, not a stuck one, puts the lost wakeup on the client — but **fixing only the first left it still hanging**, which is the lesson: a plausible cause that explains the symptom is not the same as the cause ([WIRE.md §5.1](WIRE.md)) |
 
@@ -45,6 +46,12 @@ to what they asserted ([CURRENT_STATE.md §5](CURRENT_STATE.md#5-test-reality-ch
 | `ReferenceModelTest` | 1, **single-threaded**, from a concurrency change. Restoring a rolled-back transaction's high water mark left free-ring entries naming slots above the new mark, so the same slot was handed out twice: once off the ring and once off the bump cursor on its way back up. The concurrent tests never saw it; the sequential model differential did |
 | `MultiStoreIsolationTest` | 2. Four writers racing to create the one index catalog page burned all sixty-four of their retry attempts inside the winner's first commit, because the retry yielded rather than backed off — a conflict against a transaction that is still running is resolved by that transaction *finishing*, and a durable commit takes milliseconds where a failed attempt takes microseconds. Behind it, the catalog page id was cached in a field shared across threads, so one thread cleared it while another was mid-lookup |
 | `SoakTest`, at 10 hours | 2, **both in the test itself, and it invalidated the measurement it existed to make.** The workload tracked its live edge count by subtracting `degreeOut + degreeIn` on every node deletion; a self-loop is one entry counted in both, so the tally lost one per self-loop deleted. It crossed zero at round 280,220 and reached -7,335 while the store held storage flat at 4.6 MB — and because bytes-per-element divides by `nodes + edges`, the leak detector's denominator was wrong and briefly negative, so the run would have reported either a false leak or a false all-clear and the final assertion would have failed for an accounting reason on a healthy engine. The second is the same shape one level up: creates and deletes are each 25 percent of the mix, so above the target they cancel exactly and the live node set performs an unbiased random walk — it left 4,000 for 20,549 and would have failed the closing bound on a healthy store. **Neither is an engine defect, and in 818 million operations there was none**: what a long run actually caught was a harness whose own arithmetic had never been checked, because nobody had run it long enough for the drift to show. Both numbers are now asserted at every sample rather than at the end |
+| `EverythingAtOnceStressTest` (`-Pslow`), then `NestedApplyLatchTest` | **1 deadlock, within seconds of the first run.** A thread that already held the apply latch shared asked for it again — `setNodeProperties` on a vector-indexed node calls the public `nodeLabels`, a scan callback reads, a cursor is opened inside another — and a `StampedLock` read acquisition that loses its fast-path race queues behind a waiting writer. The waiting writer was a commit, waiting for the hold that same thread still had, with every other writer queued behind the commit lock. The minimised test wedged 3 runs in 3 |
+| `IsolationAnomalyStressTest`, then `ViewCatalogReadTest` | 1. `nearest()` read the vector index declaration off the catalog page outside the read wrapper, so inside a view whose catalog page had changed the engine's internal `NeedsExclusionException` escaped to the caller — and without a view the same read was unprotected from a commit's apply |
+| `ScanWriterStarvationTest` | 1, **a liveness defect with no wrong answer anywhere.** `StampedLock` has no writer preference, and scans and cursors hold the apply latch for their whole length, so four threads looping `forEachNode` kept every commit out: 127 commits a second alone, 3 beside them, single commits waiting 900 ms |
+| `AbandonedViewScanTest` | 1. A view abandoned by the retention budget *during* a scan or cursor — vacuum takes no lock a reader holds — read every page it had not touched yet from the mapping, newer than its snapshot, with no exception: a deterministic schedule had a cursor return 10,840 edges where its snapshot had 12,000 |
+| `SerializablePhantomTest` | 1, in two shapes. A `SERIALIZABLE` lookup of a label the dictionary did not have — `nodesByLabel`, `nodeHasLabel` — touched no page, so a concurrent transaction that introduced the label and committed left nothing for read-set validation to find, and write skew committed |
+| `StorageModelTest` | **3, and the worst of them only once it ran with the native layer.** (1) A statement that failed inside an explicit transaction committed the part of itself it had already done: `setNodeProperties` wrote the new block before checking the unique constraint, so a caught violation — the ordinary way to use a constraint — committed the refused value with the indexes describing the old one; and a `createNode` whose second value could not be encoded committed a node with no index entries beside an orphaned blob. (2) `verify(FULL)` reported every explicit null property as a dangling index entry on a healthy store, because the property tree indexed nulls and nothing else did. (3) **`reclaim()` followed by a few commits and a crash corrupted the store**: reclaim writes the files outside the log — punches, generation floors, checksums, and a superblock flip in every `force()` — while recovery replays byte-run *differences* from the last checkpoint, so older runs replayed over the reclaimed files put back bytes the newer runs never mention. A live count disagreed with its bitmap; a search over short sequences (`ReclaimCrashTest`) produced a segment whose **both** superblock copies failed their CRC, which does not open. Runs with `-Dnative.skip=true` could not see it at all, because without the native layer `reclaim()` is a no-op — a randomised harness is only as wide as the build it runs in |
 | `SnapshotLinearizabilityTest` | 0 so far, and it is the one that generalises the anomaly matrix: because writers are serialised and the snapshot timestamp *is* the LSN, the state a view is entitled to see is computable rather than merely constrainable. So it asserts equality against a model history keyed by commit LSN, instead of asserting the absence of four named anomalies |
 
 The pattern is worth naming: **every one of these came from a test that compared the engine against
@@ -109,12 +116,25 @@ src/test/java/io/metaloom/graph/core/
   nativelib/     NativeCodecTest, IoEngineTest, UringIoEngineTest — the crate and the IO engines
                  ForeignDowncallMetadataTest — the GraalVM downcall registrations against the code
   txn/           snapshot isolation: visibility, the anomaly matrix, vacuum, rollback, long readers
+                 StatementAtomicityTest — a statement refused before it wrote leaves the transaction
+                 usable; one that failed after it had written makes it rollback-only
                  SnapshotLinearizabilityTest — the general form of the anomaly matrix: a view at LSN L
                  must show exactly the committed state at L, compared whole-graph against a model
                  history. NestedTransactionTest — begin() refusing to nest, inStatement() refused
                  inside a transaction for the same reason, and the open transaction surviving both
-                 refusals intact
+                 refusals intact. SerializablePhantomTest — write skew through predicate reads at
+                 SERIALIZABLE with disjoint writes, so only the read set can refuse it.
+                 AbandonedViewScanTest — a view abandoned mid-scan and mid-cursor, scheduled and
+                 under load, against an LSN-keyed model. ViewCatalogReadTest — the vector index
+                 lookup inside a view whose catalog page changed
   concurrency/   ScalingTest, plus the load and consistency harnesses:
+                 IsolationAnomalyStressTest — on-call write skew at SERIALIZABLE, indexes equal to a
+                 full scan in every snapshot, a supernode's two ends agreeing in every snapshot,
+                 vector searches answering from their snapshot, monotonic reads and read-your-writes
+                 NestedApplyLatchTest — nested shared holds of the apply latch beside commits
+                 ScanWriterStarvationTest — commit throughput beside continuous scans and cursors
+                 EverythingAtOnceStressTest (slow) — transfers at both levels, churn, vectors,
+                 audits, a paced backup-shaped scan, and checkpoint/reclaim/compact/verify, at once
                  VerifyUnderLoadTest — verification beside writers, a checkpointer and a second
                  verifier; the regression test for the accounting-mismatch false positive
                  ParallelConsistencyTest — a conserved total audited continuously under SNAPSHOT while
@@ -152,9 +172,21 @@ graph-cypher/src/test/java/io/metaloom/graph/cypher/
                  VectorFunctionTest — the three vector.* distance functions, and specifically the two
                  shapes a vector arrives in: a float[] parameter, and the list of doubles a *stored*
                  vector has already become on its way through GraphAccess.normalise
+                 CypherSemanticsTest — openCypher edge cases, one per defect found by probing
+                 CypherDifferentialTest — random predicates, groupings, orderings and variable-length
+                 patterns against an evaluator that shares no code with Values, and one equality
+                 through every access path with and without a declared index
+                 RandomQueries — the query generator, mutator and noise source the two above share
+  bench/         CypherExecutionBenchmark (tagged `bench`) — the executor's own per-row costs; uses
+                 only the public API, so the same class times an older build for before/after numbers
   integration/   CypherCorpusTest — the test-data/ corpus: four openCypher dumps and 29 queries whose
                  counts were derived elsewhere and proven against Neo4j, so its expectations are the
                  only ones in this repository that this project did not write
+                 CypherFuzzTest — grammar, mutated corpus and noise; every input must end in a
+                 documented outcome within its deadline, streamed and materialised reads must agree,
+                 and rolled-back writes must leave the graph as it was. Seeded, replayable by
+                 (seed, input), failures minimised; -Dcypher.fuzz.seed / -Dcypher.fuzz.iterations,
+                 and a `fuzz`-tagged long run under a fresh, printed seed
   integration/   ...and GraphDatabasesTest — several stores under one root, whose traversal cases are
                  the security test for the whole multi-database feature
 graph-protocol/src/test/java/io/metaloom/graph/protocol/
@@ -192,7 +224,13 @@ graph-server/src/main/frontend/e2e/
                  35 specs, including the index panel — the only place a composite index can be
                  declared, enforced and dropped through the surface a user actually has
   concurrency/   jcstress and custom harnesses
-  crash/         fault-injection recovery tests
+  crash/         fault-injection recovery tests, including ReclaimCrashTest — commits after a reclaim(),
+                 then a crash
+  property/      ReferenceModelTest and StorageModelTest, the two model differentials
+  integration/   ...and StorageBoundaryTest — a property block at exactly the page limit, a segment filled
+                 to its last slot and crashed, a rollback across the segment boundary, generations across
+                 a crash, empty values, explicit nulls, a multi-megabyte string through compaction, a
+                 punched page under a log replay, and dictionary growth across a crash
   invariant/     the checkers themselves plus their tests
   bench/         BulkBenchmark, CodecProfileBenchmark, SupernodeBenchmark and VectorBuildBenchmark
                  (tagged `bench`) — the last of these reports two numbers rather than one, because a
@@ -294,6 +332,22 @@ The **reference model** is built: `GraphModel` is a naive `HashMap`-based in-mem
 same semantics, and `ReferenceModelTest` applies a seeded random operation sequence to both, comparing
 labels, properties, degrees, neighbour multisets, both indexes and the live counts after every batch
 — across rolled-back transactions, simulated crashes and a compaction.
+
+`StorageModelTest` is the second one, over what the first does not reach: up to six labels per node
+(past the three inline ones) and removal of any of them; one key cycling through every value type —
+the empty string, strings either side of the 255 byte inline limit, multi-extent blobs, byte arrays,
+timestamps, UUIDs, lists with blobs and vectors inside them, element references, vectors that go to
+`VEC` records and vectors that go to blobs, and an explicit null; self-loops, parallel edges and a hub
+driven through the adjacency tiers and deleted with its edges materialised; a store-wide unique
+constraint violated on purpose inside transactions that then commit; a label-scoped one, composite
+indexes and the vector index declared and dropped partway, with the vector index's member set compared
+against the model; snapshot views opened on another thread and compared batches later against the
+model **as of the view**; clean reopens, crashes, `reclaim()`, crashes in the middle of a compaction,
+and compaction repeated between writes. The model is keyed by a `uid` property rather than by id, and
+the id map is rebuilt from the store after every compaction. A failure prints the seed and the last
+operations; `-Dstoragemodel.seed=`, `-Dstoragemodel.batches=` and `-Dstoragemodel.ops=` replay one, and
+`mvn test -Pslow -Dtest=StorageModelTest -Dstoragemodel.seeds=200` sweeps many. It needs the native
+layer to be worth running: without it `reclaim()` does nothing.
 
 Its property values are chosen for the paths they take rather than for variety: a long string that
 escapes the 255 byte inline limit into the blob store, and a `float[]` drawn from a small pool so that
@@ -484,6 +538,15 @@ randomised operation sequence lives inside `ReferenceModelTest` rather than in a
 deleted on success and **retained on failure** with its path printed — a corrupted store is the primary
 diagnostic artefact and deleting it on failure is the most frustrating thing a test suite can do.
 
+`StressRun` is the harness for concurrency tests with **roles** — writers, auditors, a maintenance thread,
+each with its own loop and oracle — on platform and virtual threads at once, which `Hammer`'s one
+weighted mix on identical threads cannot express. It prints its seed (`-Dgraph.stress.seed` replays the
+choices, `-Dgraph.stress.millis` lengthens the run) and **turns a hang into a failure**: engine lock waits
+are uninterruptible, so a JUnit timeout cannot free a deadlocked worker; the watchdog instead dumps
+every thread's stack, throws `StressRun.Hung`, and leaves the daemon workers behind.
+`StressRun.withStore` then skips `close()`, which would otherwise wait on the stuck worker's lock and
+turn a red test with a thread dump back into a hung build.
+
 ---
 
 ## 9. Conventions and Gotchas
@@ -508,6 +571,20 @@ diagnostic artefact and deleting it on failure is the most frustrating thing a t
     `READ_COMMITTED`. It immediately catches `has no matching in-edge`, which proves in one move both
     that the checker detects a genuinely half-applied write and that the snapshot level is what
     prevents it. A checker that stayed green under read-committed would be checking nothing.
+- **A stress oracle needs a schedule the engine cannot satisfy by accident.** Two transactions that
+  share a B+tree leaf or a free-slot bitmap page are refused by a write-write or metadata-page conflict
+  whatever the read set does, so a write-skew test built that way passes against a `SERIALIZABLE` that
+  validates nothing. `SerializablePhantomTest` makes each pair write disjoint kinds (a relationship
+  property against a node insert) and asserts the refusal is a *read* conflict. Its first drafts were
+  green for the wrong reason — the "decision" write shared a property page with the other transaction —
+  and once disjoint, two shapes (an unknown label in `nodesByLabel` and in `nodeHasLabel`) were real
+  phantoms; others stay caught by a read of a bitmap page however they are arranged, which is sound
+  and is asserted only as "both never commit". Likewise
+  `AbandonedViewScanTest` checks an absolute model keyed by commit LSN rather than repeatability — a view
+  caches what it first read, wrong or not, so a repeat agrees with itself.
+- **Use `ASYNC` for concurrency stress that is not about durability.** An fsync per commit caps a run at
+  a few hundred commits, and both the retention-budget race and the nested-latch deadlock needed tens of
+  thousands of interleavings to show. The ordering rules are the same in every sync mode.
 - **Crash tests must verify the acknowledgement, not the intent.** See §6 point 3.
 - **Benchmarks never run in the same JVM as correctness tests**, and never on a machine doing
   anything else.
@@ -672,5 +749,5 @@ diagnostic artefact and deleting it on failure is the most frustrating thing a t
 
 ---
 
-_Git HEAD revision: `9a607c9`_
-_Last updated: 2026-08-18 (the escalation assertion moved to its own test)_
+_Git HEAD revision: `f2b6d5f`_
+_Last updated: 2026-10-25 (second review round merged: StressRun and concurrency oracles, StorageModelTest, Cypher fuzz and differential, client lifecycle and wire codec properties; suite counts)_

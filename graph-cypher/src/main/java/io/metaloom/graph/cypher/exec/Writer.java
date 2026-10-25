@@ -93,6 +93,7 @@ final class Writer {
 	}
 
 	private Row createPart(Ast.PatternPart part, Row row, String clause) {
+		refuseRebinding(part, row, clause);
 		Row current = row;
 		List<CypherNode> nodes = new ArrayList<>(part.nodes().size());
 		for (Ast.NodePattern pattern : part.nodes()) {
@@ -129,6 +130,33 @@ final class Writer {
 			current = current.with(part.pathVariable(), new CypherPath(nodes, relationships));
 		}
 		return current;
+	}
+
+	/**
+	 * A node variable may name something already bound — that is how CREATE connects to it — but a relationship or a
+	 * path variable always names something this pattern makes, so one already in scope is refused before anything is
+	 * written. Overwriting it silently replaced, for the rest of the query, the relationship an earlier MATCH had bound.
+	 */
+	private static void refuseRebinding(Ast.PatternPart part, Row row, String clause) {
+		Set<String> nodeNames = new HashSet<>();
+		for (Ast.NodePattern node : part.nodes()) {
+			if (node.variable() != null) {
+				nodeNames.add(node.variable());
+			}
+		}
+		Set<String> introduced = new HashSet<>();
+		for (Ast.RelPattern relationship : part.relationships()) {
+			String name = relationship.variable();
+			if (name != null && (row.has(name) || nodeNames.contains(name) || !introduced.add(name))) {
+				throw new CypherTypeException(clause + " cannot bind the relationship '" + name + "': that variable "
+					+ "is already defined, and a relationship variable here always names a new relationship");
+			}
+		}
+		String path = part.pathVariable();
+		if (path != null && (row.has(path) || nodeNames.contains(path) || introduced.contains(path))) {
+			throw new CypherTypeException(clause + " cannot bind the path '" + path + "': that variable is already "
+				+ "defined");
+		}
 	}
 
 	/**
@@ -214,6 +242,7 @@ final class Writer {
 	List<Row> merge(Ast.Merge clause, List<Row> rows) {
 		List<Row> out = new ArrayList<>(rows.size());
 		for (Row row : rows) {
+			refuseNullProperties(clause.pattern(), row);
 			List<Row> matched = matcher.match(List.of(clause.pattern()), row);
 			if (!matched.isEmpty()) {
 				out.addAll(apply(clause.onMatch(), matched));
@@ -225,6 +254,38 @@ final class Writer {
 	}
 
 	/** {@code ON CREATE SET} / {@code ON MATCH SET}, which is an ordinary SET over just the rows of one branch. */
+	/**
+	 * Refuses a MERGE whose pattern holds a null property.
+	 *
+	 * <p>
+	 * {@code {k: null}} is an equality with null, which matches nothing, so the match half always fails — and the create
+	 * half then builds an element without the key, which the next run cannot match either. Every run of an
+	 * idempotent-looking statement added another node: a duplicate per execution, with nothing thrown. The usual cause is
+	 * a missing parameter or CSV column, which is worth naming.
+	 * </p>
+	 */
+	private void refuseNullProperties(Ast.PatternPart pattern, Row row) {
+		for (Ast.NodePattern node : pattern.nodes()) {
+			refuseNullProperties(node.properties(), row);
+		}
+		for (Ast.RelPattern relationship : pattern.relationships()) {
+			refuseNullProperties(relationship.properties(), row);
+		}
+	}
+
+	private void refuseNullProperties(Map<String, Ast.Expr> properties, Row row) {
+		if (properties == null) {
+			return;
+		}
+		for (Map.Entry<String, Ast.Expr> entry : properties.entrySet()) {
+			if (evaluator.evaluate(entry.getValue(), row) == null) {
+				throw new CypherTypeException("MERGE cannot match on a null value for '" + entry.getKey() + "': null "
+					+ "equals nothing, so the pattern could never be found again and every run would create another. "
+					+ "Check the parameter or column that supplies it");
+			}
+		}
+	}
+
 	private List<Row> apply(List<Ast.SetItem> items, List<Row> rows) {
 		return items.isEmpty() ? rows : set(new Ast.SetClause(items), rows);
 	}
@@ -270,7 +331,16 @@ final class Writer {
 				: rebindRow(source, freshNodes, freshRelationships);
 			Pending pending = new Pending();
 			Touched written = new Touched();
-			for (Ast.SetItem item : clause.items()) {
+			Map<Long, List<String>> labelled = new HashMap<>();
+			List<Ast.SetItem> items = clause.items();
+			for (int k = 0; k < items.size(); k++) {
+				Ast.SetItem item = items.get(k);
+				if (k > 0) {
+					// Each item sees the ones before it, as it would written as a SET clause of its own:
+					// `SET a.x = 1, a.y = a.x` gives y the 1. The writes are still pending — one store write per element
+					// is the point of Pending — so the row is rebound to a view of them rather than to a re-read.
+					row = pending.view(row, labelled);
+				}
 				switch (item) {
 					case Ast.SetProperty property -> {
 						Object value = evaluator.evaluate(property.value(), row);
@@ -278,6 +348,11 @@ final class Writer {
 					}
 					case Ast.SetPropertiesReplace replace -> {
 						Object target = binding(row, replace.variable());
+						if (target == null) {
+							// SET null = {…} is a no-op, as SET null.k and SET null += are. Pending.of switches over its
+							// target, and a switch over null throws.
+							continue;
+						}
 						Map<String, Object> map = asPropertyMap(evaluator.evaluate(replace.map(), row), "SET");
 						pending.of(target).clear();
 						map.forEach((key, value) -> {
@@ -293,11 +368,18 @@ final class Writer {
 							.forEach((key, value) -> assign(pending, target, key, value));
 					}
 					case Ast.SetLabels labels -> {
+						if (binding(row, labels.variable()) == null) {
+							continue;
+						}
 						CypherNode node = node(binding(row, labels.variable()), "SET");
 						refuseIfDeleted(node.id(), "labels");
+						List<String> now = labelled.computeIfAbsent(node.id(), id -> new ArrayList<>(node.labels()));
 						for (String label : labels.labels()) {
 							if (graph.addNodeLabel(node.id(), label)) {
 								labelsAdded++;
+							}
+							if (!now.contains(label)) {
+								now.add(label);
 							}
 						}
 						written.nodes.add(node.id());
@@ -326,6 +408,10 @@ final class Writer {
 					case Ast.RemoveProperty property ->
 						assign(pending, evaluator.evaluate(property.target(), row), property.key(), null);
 					case Ast.RemoveLabels labels -> {
+						if (binding(row, labels.variable()) == null) {
+							// REMOVE null:L is a no-op, like every other write to a null.
+							continue;
+						}
 						CypherNode node = node(binding(row, labels.variable()), "REMOVE");
 						refuseIfDeleted(node.id(), "labels");
 						for (String label : labels.labels()) {
@@ -395,6 +481,30 @@ final class Writer {
 				default -> throw new CypherTypeException("Only a node or a relationship has properties to set, but "
 					+ "this is " + Values.typeName(target));
 			};
+		}
+
+		/**
+		 * The row as it reads with these writes applied: every element with a pending write, wherever the row holds it,
+		 * becomes a snapshot with the pending properties and with {@code labelled}'s labels.
+		 */
+		Row view(Row row, Map<Long, List<String>> labelled) {
+			if (nodes.isEmpty() && relationships.isEmpty() && labelled.isEmpty()) {
+				return row;
+			}
+			return rebindRow(row, node -> {
+				Map<String, Object> properties = nodes.get(node.id());
+				List<String> labels = labelled.get(node.id());
+				if (properties == null && labels == null) {
+					return node;
+				}
+				return new CypherNode(node.id(), labels == null ? node.labels() : List.copyOf(labels),
+					properties == null ? node.properties() : new LinkedHashMap<>(properties));
+			}, relationship -> {
+				Map<String, Object> properties = relationship.isMaterialised()
+					? relationships.get(relationship.id()) : null;
+				return properties == null ? relationship : new CypherRelationship(relationship.id(),
+					relationship.type(), relationship.startId(), relationship.endId(), new LinkedHashMap<>(properties));
+			});
 		}
 
 		void flush(Touched touched) {
@@ -622,6 +732,14 @@ final class Writer {
 	}
 
 	private static Row rebindRow(Row row, Map<Long, CypherNode> nodes, Map<Long, CypherRelationship> relationships) {
+		return rebindRow(row, node -> nodes.getOrDefault(node.id(), node),
+			relationship -> relationship.isMaterialised()
+				? relationships.getOrDefault(relationship.id(), relationship)
+				: relationship);
+	}
+
+	private static Row rebindRow(Row row, java.util.function.UnaryOperator<CypherNode> nodes,
+		java.util.function.UnaryOperator<CypherRelationship> relationships) {
 		Row current = row;
 		for (String name : row.names()) {
 			Object value = row.get(name);
@@ -633,26 +751,24 @@ final class Writer {
 		return current;
 	}
 
-	private static Object rebind(Object value, Map<Long, CypherNode> nodes,
-		Map<Long, CypherRelationship> relationships) {
+	private static Object rebind(Object value, java.util.function.UnaryOperator<CypherNode> nodes,
+		java.util.function.UnaryOperator<CypherRelationship> relationships) {
 		return switch (value) {
-			case CypherNode node -> nodes.getOrDefault(node.id(), node);
-			case CypherRelationship relationship -> relationship.isMaterialised()
-				? relationships.getOrDefault(relationship.id(), relationship)
-				: relationship;
+			// A row may bind null, and a list may hold one; a switch over a null selector throws.
+			case null -> null;
+			case CypherNode node -> nodes.apply(node);
+			case CypherRelationship relationship -> relationships.apply(relationship);
 			case CypherPath path -> {
 				List<CypherNode> pathNodes = new ArrayList<>(path.nodes().size());
 				boolean changed = false;
 				for (CypherNode node : path.nodes()) {
-					CypherNode rebound = nodes.getOrDefault(node.id(), node);
+					CypherNode rebound = nodes.apply(node);
 					changed |= rebound != node;
 					pathNodes.add(rebound);
 				}
 				List<CypherRelationship> pathRelationships = new ArrayList<>(path.relationships().size());
 				for (CypherRelationship relationship : path.relationships()) {
-					CypherRelationship rebound = relationship.isMaterialised()
-						? relationships.getOrDefault(relationship.id(), relationship)
-						: relationship;
+					CypherRelationship rebound = relationships.apply(relationship);
 					changed |= rebound != relationship;
 					pathRelationships.add(rebound);
 				}

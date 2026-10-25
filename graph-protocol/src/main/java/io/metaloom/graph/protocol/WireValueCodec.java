@@ -1,5 +1,8 @@
 package io.metaloom.graph.protocol;
 
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -295,9 +298,26 @@ public final class WireValueCodec {
 		}
 	}
 
-	/** Public because the frame payloads are built out of the same self-describing values the rows are. */
+	/**
+	 * Public because the frame payloads are built out of the same self-describing values the rows are.
+	 *
+	 * @throws IllegalArgumentException
+	 *             for a string holding a surrogate without its pair. {@code String.getBytes(UTF_8)} writes {@code '?'}
+	 *             for one, so {@code "\uD800"} and {@code "?"} used to leave as the same bytes and a parameter arrived
+	 *             as a different string with nothing to say so. Refused, like a type with no tag, and for the reason
+	 *             the storage codec refuses it. {@link #wellFormed} is for text that must get through regardless
+	 */
 	public static void encodeString(Writer w, String value) {
 		byte[] utf8 = value.getBytes(StandardCharsets.UTF_8);
+		// The JDK writes a lone surrogate as '?', so an encoding with no '?' in it had none. Scanning the bytes for one
+		// is a tenth of the cost of walking the chars, and a 2 KiB string cell is common enough on this wire that the
+		// walk on every string halved large-row throughput. Only an encoding that does hold a '?' is walked.
+		if (holdsQuestionMark(utf8)) {
+			int lone = loneSurrogate(value);
+			if (lone >= 0) {
+				throw new UnpairedSurrogateException(lone);
+			}
+		}
 		if (utf8.length <= 0xFF) {
 			w.u8(tag(T_STRING, 0));
 			w.u8(utf8.length);
@@ -308,6 +328,96 @@ public final class WireValueCodec {
 			w.i32(utf8.length);
 		}
 		w.bytes(utf8);
+	}
+
+	/**
+	 * A string that has no UTF-8 encoding because it holds a surrogate without its pair.
+	 *
+	 * <p>
+	 * Its own type, beside the plain {@link IllegalArgumentException} for a type the wire has no tag for, because the
+	 * two have different authors: an untagged type is the server's own conversion missing a case, and a lone surrogate
+	 * is a value a query made — {@code RETURN '\\uD800'} does — and is the query's problem to fix.
+	 * </p>
+	 */
+	public static final class UnpairedSurrogateException extends IllegalArgumentException {
+
+		private static final long serialVersionUID = 1L;
+
+		UnpairedSurrogateException(int index) {
+			super("String holds a lone surrogate at index " + index + ", which has no UTF-8 encoding");
+		}
+	}
+
+	private static final java.lang.invoke.VarHandle LONGS = java.lang.invoke.MethodHandles
+		.byteArrayViewVarHandle(long[].class, java.nio.ByteOrder.LITTLE_ENDIAN);
+
+	private static final long QUESTION_MARKS = 0x3F3F3F3F3F3F3F3FL;
+	private static final long LOW_BITS = 0x0101010101010101L;
+	private static final long HIGH_BITS = 0x8080808080808080L;
+
+	/**
+	 * Whether any byte is {@code '?'}, eight bytes at a time.
+	 *
+	 * <p>
+	 * The usual has-zero-byte test on the bytes XORed with {@code '?'}: a byte that was {@code '?'} becomes zero, and
+	 * {@code (v - 0x01..) & ~v & 0x80..} is non-zero exactly when some byte of {@code v} is. A byte-at-a-time loop with
+	 * an early exit is not vectorised, and cost a measurable slice of large-row throughput on its own.
+	 * </p>
+	 */
+	private static boolean holdsQuestionMark(byte[] utf8) {
+		int i = 0;
+		for (int end = utf8.length - 7; i < end; i += 8) {
+			long v = (long) LONGS.get(utf8, i) ^ QUESTION_MARKS;
+			if (((v - LOW_BITS) & ~v & HIGH_BITS) != 0) {
+				return true;
+			}
+		}
+		for (; i < utf8.length; i++) {
+			if (utf8[i] == '?') {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** @return the index of the first surrogate without its pair, or -1 */
+	private static int loneSurrogate(String value) {
+		for (int i = 0; i < value.length(); i++) {
+			char c = value.charAt(i);
+			if (!Character.isSurrogate(c)) {
+				continue;
+			}
+			if (Character.isHighSurrogate(c) && i + 1 < value.length() && Character.isLowSurrogate(value.charAt(i + 1))) {
+				i++;
+				continue;
+			}
+			return i;
+		}
+		return -1;
+	}
+
+	/**
+	 * The string with every lone surrogate replaced by U+FFFD, so that it can be encoded.
+	 *
+	 * <p>
+	 * For text the server writes about a failure — an error message may quote the query that caused it — where refusing
+	 * to encode would leave a stream with no terminal frame and its client waiting for ever. Never for a value.
+	 * </p>
+	 */
+	public static String wellFormed(String value) {
+		if (loneSurrogate(value) < 0) {
+			return value;
+		}
+		StringBuilder out = new StringBuilder(value.length());
+		for (int i = 0; i < value.length(); i++) {
+			char c = value.charAt(i);
+			if (Character.isHighSurrogate(c) && i + 1 < value.length() && Character.isLowSurrogate(value.charAt(i + 1))) {
+				out.append(c).append(value.charAt(++i));
+			} else {
+				out.append(Character.isSurrogate(c) ? '�' : c);
+			}
+		}
+		return out.toString();
 	}
 
 	// ---------------------------------------------------------------- reading
@@ -387,6 +497,38 @@ public final class WireValueCodec {
 			System.arraycopy(buf, pos, out, 0, count);
 			pos += count;
 			return out;
+		}
+
+		/**
+		 * {@code count} bytes of strict UTF-8, decoded straight out of the frame.
+		 *
+		 * <p>
+		 * Straight out, rather than through {@link #bytes}: that copies the bytes only for the {@code String}
+		 * constructor to copy them again, which is two allocations per string cell on the client's hot path.
+		 * </p>
+		 *
+		 * <p>
+		 * Strict, because a malformed sequence is either corruption or a peer that is not this protocol, and decoding it
+		 * to U+FFFD hands the caller a different string than the one that was sent. The JDK's lenient decoder stays the
+		 * fast path; only a result that contains a replacement character — which is all a malformed input can produce,
+		 * and which real text almost never contains — is checked again by a decoder that reports.
+		 * </p>
+		 */
+		public String utf8(int count) {
+			need(count);
+			String decoded = new String(buf, pos, count, StandardCharsets.UTF_8);
+			if (decoded.indexOf('�') >= 0) {
+				try {
+					StandardCharsets.UTF_8.newDecoder()
+						.onMalformedInput(CodingErrorAction.REPORT)
+						.onUnmappableCharacter(CodingErrorAction.REPORT)
+						.decode(ByteBuffer.wrap(buf, pos, count));
+				} catch (CharacterCodingException e) {
+					throw new WireFormatException("A string of " + count + " bytes is not UTF-8");
+				}
+			}
+			pos += count;
+			return decoded;
 		}
 
 		public int remaining() {
@@ -560,6 +702,6 @@ public final class WireValueCodec {
 		if (length < 0) {
 			throw new WireFormatException("Negative string length " + length);
 		}
-		return new String(r.bytes(length), StandardCharsets.UTF_8);
+		return r.utf8(length);
 	}
 }

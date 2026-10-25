@@ -157,7 +157,10 @@ public class McpAuthTest {
 	@Test
 	public void testTheWebSocketIsClosedWithoutASession() throws Exception {
 		java.util.concurrent.CompletableFuture<String> outcome = new java.util.concurrent.CompletableFuture<>();
-		vertx.createWebSocketClient()
+		// Held, and closed at the end. A Vert.x 5 client nobody references is closed by a cleaner when it is collected,
+		// which ends its socket: a test that dropped the reference could pass because of a GC rather than the server.
+		io.vertx.core.http.WebSocketClient webSockets = vertx.createWebSocketClient();
+		webSockets
 			.connect(server.port(), "127.0.0.1", McpConstants.WEBSOCKET_PATH)
 			.onSuccess(socket -> {
 				socket.closeHandler(ignored -> outcome.complete("closed:" + socket.closeStatusCode()));
@@ -170,13 +173,17 @@ public class McpAuthTest {
 		String result = outcome.get(10, TimeUnit.SECONDS);
 		assertTrue(result.startsWith("failed:") || result.equals("closed:1008"),
 			"an unauthenticated MCP websocket must not end up usable, got " + result);
+		webSockets.close();
 	}
 
 	/** And with a token it does connect, so the refusal above is about the credential and not about the path. */
 	@Test
 	public void testTheWebSocketConnectsWithAToken() throws Exception {
 		java.util.concurrent.CompletableFuture<String> opened = new java.util.concurrent.CompletableFuture<>();
-		vertx.createWebSocketClient()
+		// Held, and closed at the end. A Vert.x 5 client nobody references is closed by a cleaner when it is collected,
+		// which ends its socket: a test that dropped the reference could pass because of a GC rather than the server.
+		io.vertx.core.http.WebSocketClient webSockets = vertx.createWebSocketClient();
+		webSockets
 			.connect(new io.vertx.core.http.WebSocketConnectOptions()
 				.setHost("127.0.0.1").setPort(server.port()).setURI(McpConstants.WEBSOCKET_PATH)
 				.addHeader("Authorization", "Bearer " + tokenFor("admin", "admin-pw")))
@@ -188,6 +195,7 @@ public class McpAuthTest {
 			.onFailure(t -> opened.completeExceptionally(t));
 
 		assertTrue(opened.get(10, TimeUnit.SECONDS).contains("graph_query"), "an authenticated websocket works");
+		webSockets.close();
 	}
 
 	/**
@@ -203,7 +211,10 @@ public class McpAuthTest {
 		java.util.concurrent.LinkedBlockingQueue<String> events = new java.util.concurrent.LinkedBlockingQueue<>();
 		java.util.concurrent.CompletableFuture<io.vertx.core.http.WebSocket> opened =
 			new java.util.concurrent.CompletableFuture<>();
-		vertx.createWebSocketClient()
+		// Held, and closed at the end. A Vert.x 5 client nobody references is closed by a cleaner when it is collected,
+		// which ends its socket: a test that dropped the reference could pass because of a GC rather than the server.
+		io.vertx.core.http.WebSocketClient webSockets = vertx.createWebSocketClient();
+		webSockets
 			.connect(new io.vertx.core.http.WebSocketConnectOptions()
 				.setHost("127.0.0.1").setPort(server.port()).setURI(McpConstants.WEBSOCKET_PATH)
 				.addHeader("Authorization", "Bearer " + tokenFor("reader", "reader-pw")))
@@ -224,6 +235,7 @@ public class McpAuthTest {
 		String after = events.poll(10, TimeUnit.SECONDS);
 		assertFalse(after == null || after.contains("graph_query"),
 			"a disabled user's websocket still answered: " + after);
+		webSockets.close();
 	}
 
 	// ---------------------------------------------------------------- both enforcement points

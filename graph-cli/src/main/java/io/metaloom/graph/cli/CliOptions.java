@@ -235,13 +235,13 @@ public record CliOptions(String command, String database, Path path, String serv
 	 */
 	private static String readPassword(java.io.InputStream stdin) {
 		try {
-			byte[] all = stdin.readAllBytes();
-			String text = new String(all, java.nio.charset.StandardCharsets.UTF_8);
-			int end = text.length();
-			while (end > 0 && (text.charAt(end - 1) == '\n' || text.charAt(end - 1) == '\r')) {
-				end--;
-			}
-			String password = text.substring(0, end);
+			// One line, as the help says, and not the whole stream: reading everything and trimming only trailing newlines
+			// made a second line part of the password, so a script that echoed it twice for a confirmation logged in
+			// with neither.
+			String text = new String(stdin.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+			int end = text.indexOf('\n');
+			String line = end < 0 ? text : text.substring(0, end);
+			String password = line.endsWith("\r") ? line.substring(0, line.length() - 1) : line;
 			if (password.isEmpty()) {
 				throw new IllegalArgumentException("--password-stdin read nothing");
 			}

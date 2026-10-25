@@ -191,14 +191,23 @@ public final class WalManager implements AutoCloseable {
 	 * are merged, because a record header costs more than a few unchanged bytes.
 	 */
 	public static List<int[]> changedRuns(MemorySegment original, MemorySegment modified) {
+		return changedRuns(original, modified, 0, (int) modified.byteSize());
+	}
+
+	/**
+	 * The changed byte runs within {@code [from, to)}, for a caller that knows nothing outside that window can differ —
+	 * the overlay records which bytes it handed out for writing. The window is widened to whole 8-byte chunks, so the
+	 * result is exactly what the whole-page diff returns whenever that knowledge is right.
+	 */
+	public static List<int[]> changedRuns(MemorySegment original, MemorySegment modified, int from, int to) {
 		List<int[]> runs = new ArrayList<>();
-		int size = (int) modified.byteSize();
+		int size = (int) Math.min(modified.byteSize(), ((long) to + 7) & ~7L);
 		int start = -1;
 		int lastDifferent = -1;
 		// The unit is still the 8-byte chunk, so the runs are exactly what a chunk-by-chunk loop produces. mismatch()
 		// only finds the next differing chunk faster: it is vectorised, and a commit usually changes a few dozen bytes
 		// of a page, so almost all of the page is skipped in one call rather than walked a long at a time.
-		int i = 0;
+		int i = Math.max(0, from) & ~7;
 		while (i < size) {
 			long found = MemorySegment.mismatch(original, i, size, modified, i, size);
 			if (found < 0) {

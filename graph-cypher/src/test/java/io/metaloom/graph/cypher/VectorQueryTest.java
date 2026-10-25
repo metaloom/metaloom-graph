@@ -139,9 +139,21 @@ public class VectorQueryTest {
 	/** An undeclared index fails by name rather than returning nothing, all the way up through the query layer. */
 	@Test
 	public void testQueryingAnUndeclaredIndexFails() {
-		assertTrue(assertThrows(IllegalStateException.class,
+		// A type error, not the engine's IllegalStateException: the server reports the latter as its own failure.
+		assertTrue(assertThrows(CypherTypeException.class,
 			() -> run("CALL vector.query('Doc', 'missing', $q, 2) YIELD node RETURN node")).getMessage()
 				.contains("No vector index"));
+	}
+
+	/** An empty vector, or one of the wrong length, is a mistake in the query and refused as one. */
+	@Test
+	public void testAQueryVectorTheIndexCannotTakeIsATypeError() {
+		assertTrue(assertThrows(CypherTypeException.class,
+			() -> run("CALL vector.query('Doc', 'embedding', [], 2) YIELD node RETURN node")).getMessage()
+				.contains("at least one element"));
+		assertTrue(assertThrows(CypherTypeException.class,
+			() -> run("CALL vector.query('Doc', 'embedding', [1.0], 2) YIELD node RETURN node")).getMessage()
+				.contains("dimensions"));
 	}
 
 	@Test

@@ -254,6 +254,13 @@ is in when a dump is being put onto it. The replacement is built beside the targ
 has been read to its end and verified, so a truncated or corrupt dump leaves the original untouched even with
 `--force`. Against a server with authentication on, `--server` needs `GRAPH_TOKEN` (a token from `POST /api/login`).
 
+**A failed backup never costs the previous one.** The dump is written to `<out>.<random>.partial` beside `--out` and
+renamed over it only once it is complete, so a nightly job writing to one fixed name keeps yesterday's dump when
+today's fails — the store locked by a server, the database name mistyped, a session expired. It used to open `--out`
+first, which truncated the last good dump before the database had even been opened. And a `--path` that is not there
+is an error for `backup` and `list` rather than a fresh root: opening a missing root creates an empty `default`, which
+is right for a restore and made a mistyped path into a valid, empty, successful backup.
+
 **What it costs while it runs.** Writers wait one batch at a time rather than for the whole walk; `reclaim()` and
 `compact()` are refused for the duration, because the backup holds a read view; and retention grows with write volume ×
 backup duration. Past `retainedVersionBytes` (256 MiB) the engine abandons the oldest view — usually the backup's — and
@@ -398,20 +405,29 @@ acknowledged commit is present.
 
 `SIGTERM`, or a `close()`, runs an ordered shutdown rather than stopping where it is:
 
-1. new queries are refused — **503** on HTTP, `OVERLOADED` on the wire — so the set of in-flight ones
-   can only shrink;
-2. the listeners close;
-3. running queries are given **5 seconds** to finish;
-4. whatever is left is **abandoned** through the same abort signal a query deadline uses, so each one
-   unwinds, closes its own read view or rolls back its own transaction, and tells its client why;
-5. two more seconds for those to unwind, and then the stores are closed — checkpointed, log trimmed,
-   `LOCK` released.
+1. new work is refused — **503** for every HTTP request, `OVERLOADED` for a wire query and for a wire
+   connection accepted from then on — so the set of in-flight queries can only shrink;
+2. running queries are given **5 seconds** to finish, **with the listeners still bound**, so that a query
+   that finishes in time is answered on the connection it came in on;
+3. whatever is still running is **abandoned** through the same abort signal a query deadline uses, so
+   each one unwinds, closes its own read view or rolls back its own transaction, and tells its client why;
+4. two more seconds for those to unwind; then the listeners close, and then the stores — checkpointed,
+   log trimmed, `LOCK` released.
 
 **The order is a safety property, not politeness.** Segment files are memory-mapped, so closing a store
 unmaps them; a worker still inside a query at that instant is reading an address the process no longer
 owns. Refusing, draining and aborting is what makes that impossible.
 
-**Step 4 is why a shutdown always completes.** A query with `--query-timeout=0`, or one whose client
+**The listeners close after the drain, not before it.** Closing a Vert.x listener closes every
+connection it accepted — for a binary-port `NetServer` even a "graceful" `shutdown(timeout)` does,
+because a `NetSocket` has no shutdown behaviour of its own — so closing first gave every in-flight
+query a dropped connection and the grace period protected nobody. The HTTP route had a second way to
+the same result: its abort signal read the shutdown flag itself, so every running query was abandoned
+the instant shutdown began. It now fires only once the grace period has run out.
+`ShutdownTest.testAQueryInFlightThatFinishesInsideTheGraceGetsItsAnswer` and
+`WireClientEndToEndTest.testAQueryInFlightAtShutdownFinishesWithinTheGracePeriod` are the two halves.
+
+**Step 3 is why a shutdown always completes.** A query with `--query-timeout=0`, or one whose client
 stopped reading, would otherwise hold the process open indefinitely — and a shutdown that does not
 finish is indistinguishable from a hang, which is what gets a server `kill -9`'d and loses the clean
 close entirely. `graph-server-shutdown` is the hook's thread name, so a thread dump during a slow one
@@ -571,5 +587,5 @@ Stated plainly, because an operations document that implies capabilities the sys
 
 ---
 
-_Git HEAD revision: `4f21a62`_
-_Last updated: 2026-10-24 (WAL failures stop commits until reopen; missing log segment refuses the open)_
+_Git HEAD revision: `f2b6d5f`_
+_Last updated: 2026-10-24 (client, server and CLI review: closed streams, budget leak, slot release order, shutdown grace, strict UTF-8, MCP argument shapes, atomic backups)_

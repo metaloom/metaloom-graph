@@ -165,10 +165,10 @@ public final class Evaluator {
 	 * </p>
 	 *
 	 * <p>
-	 * The simple form compares with {@link Values#equalKnown} under Cypher equality, so {@code 1} and {@code 1.0}
-	 * select the same branch. A null on either side selects <em>no</em> branch: null equals null is null rather than
-	 * true, so {@code CASE null WHEN null THEN 'a' ELSE 'b' END} is {@code 'b'} — which surprises people, and is the
-	 * same rule as everywhere else in §2.
+	 * The simple form compares with {@link Values#equal}, Cypher's {@code =}, so {@code 1} and {@code 1.0} select the
+	 * same branch. A null on either side selects <em>no</em> branch: null equals null is null rather than true, so
+	 * {@code CASE null WHEN null THEN 'a' ELSE 'b' END} is {@code 'b'} — which surprises people, and is the same rule
+	 * as everywhere else in §2. That includes a null nested in a list: {@code [1, null] = [1, null]} is null too.
 	 * </p>
 	 */
 	private Object caseValue(Ast.Case expression, Row row) {
@@ -177,7 +177,7 @@ public final class Evaluator {
 			Object when = evaluate(expression.whens().get(i), row);
 			boolean taken = expression.subject() == null
 				? Values.isTrue(when)
-				: subject != null && when != null && Values.equalKnown(subject, when);
+				: Values.isTrue(Values.equal(subject, when));
 			if (taken) {
 				return evaluate(expression.thens().get(i), row);
 			}

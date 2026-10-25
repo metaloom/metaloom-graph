@@ -159,18 +159,22 @@ public final class Compactor {
 		}
 
 		// Punching happens before the marks come down: an emptied page above the new mark would otherwise be skipped.
-		for (Kind kind : options.kinds()) {
-			SegmentSet set = sets.get(kind);
-			if (set != null) {
-				// Under the writer lock, like every other mutation here. Punching rewrites the file underneath a
-				// concurrent foreground writer that may be allocating into that very page, and the force() on the
-				// way through calls flushChecksums(), which clears the dirty-page marks that writer has set,
-				// leaving its pages with stale checksums. Both were reproduced as an intermittent failure.
-				int[] punched = new int[1];
-				runner.runUnlogged(() -> punched[0] = set.reclaim());
-				result.pagesPunched += punched[0];
+		//
+		// Under the writer lock, like every other mutation here. Punching rewrites the file underneath a concurrent
+		// foreground writer that may be allocating into that very page, and the force() on the way through calls
+		// flushChecksums(), which clears the dirty-page marks that writer has set, leaving its pages with stale
+		// checksums. Both were reproduced as an intermittent failure. One unit for every kind rather than one each,
+		// because an unlogged unit is preceded by a checkpoint and one is enough.
+		int[] punched = new int[1];
+		runner.runUnlogged(() -> {
+			for (Kind kind : options.kinds()) {
+				SegmentSet set = sets.get(kind);
+				if (set != null) {
+					punched[0] += set.reclaim();
+				}
 			}
-		}
+		});
+		result.pagesPunched += punched[0];
 		for (Kind kind : options.kinds()) {
 			SegmentSet set = sets.get(kind);
 			if (set == null) {

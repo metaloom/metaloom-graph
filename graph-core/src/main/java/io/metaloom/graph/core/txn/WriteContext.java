@@ -100,6 +100,19 @@ public final class WriteContext {
 	 */
 	private final Set<Long> readSet;
 
+	/**
+	 * How many times this transaction has changed something: a page written into the overlay, or a slot reserved or
+	 * freed. Together with {@link MetaJournal#changes()} it answers one question — did a statement that failed get as
+	 * far as changing the transaction? — and nothing else reads it.
+	 */
+	private long mutations;
+
+	/** Mutations {@link #forgive forgiven}, subtracted from the count. */
+	private long forgiven;
+
+	/** Why this transaction may no longer commit, or null while it still may. */
+	private Throwable rollbackOnly;
+
 	public WriteContext(long txnId, int pageSize, Snapshot snapshot, IsolationLevel level) {
 		this.txnId = txnId;
 		this.overlay = new PageOverlay(pageSize);
@@ -151,6 +164,45 @@ public final class WriteContext {
 		return readSet == null ? Set.of() : readSet;
 	}
 
+	/**
+	 * Labels (and relationship types, which share their dictionary) and property keys this transaction looked up and
+	 * did not find, tracked only for {@link IsolationLevel#SERIALIZABLE}.
+	 *
+	 * <p>
+	 * The other half of the read set. A lookup that misses answers "nothing carries this name" without reading any page
+	 * — {@code nodesByLabel}, {@code nodeProperty}, {@code nodeHasLabel} all return on the miss — so a concurrent
+	 * transaction that introduces the name and commits leaves no trace in {@link #readSet()}. The commit refuses the
+	 * transaction when any of these names has come to exist since.
+	 * </p>
+	 */
+	private Set<String> missedLabels;
+	private Set<String> missedKeys;
+
+	public void missed(boolean label, String name) {
+		if (readSet == null || replaying) {
+			return;
+		}
+		if (label) {
+			if (missedLabels == null) {
+				missedLabels = new HashSet<>();
+			}
+			missedLabels.add(name);
+		} else {
+			if (missedKeys == null) {
+				missedKeys = new HashSet<>();
+			}
+			missedKeys.add(name);
+		}
+	}
+
+	public Set<String> missedLabels() {
+		return missedLabels == null ? Set.of() : missedLabels;
+	}
+
+	public Set<String> missedKeys() {
+		return missedKeys == null ? Set.of() : missedKeys;
+	}
+
 	/** Records where the mark stood, the first time this transaction raises it for a segment. */
 	public void noteHighWater(long segmentKey, long before) {
 		highWaterBefore.putIfAbsent(segmentKey, before);
@@ -160,11 +212,60 @@ public final class WriteContext {
 		return highWaterBefore;
 	}
 
+	/** Called by the segment layer for every page slice handed out for writing. */
+	public void mutated() {
+		mutations++;
+	}
+
+	/**
+	 * A count that moves whenever the transaction changes. Compared before and after a statement, so it only has to be
+	 * monotonic — and it errs towards moving: a page slice taken for writing counts whether or not a byte of it changes.
+	 */
+	public long mutations() {
+		return mutations + journal.changes() - forgiven;
+	}
+
+	/**
+	 * Stops counting everything changed since {@code mark}, a value {@link #mutations()} returned.
+	 *
+	 * <p>
+	 * For writes a refusal makes on purpose before refusing. A unique check claims the index leaves its value would
+	 * land in — a version bump, so two writers racing for one value are certain to conflict — and then refuses; that
+	 * claim is harmless to commit and must not turn an up-front refusal into a rollback-only transaction.
+	 * </p>
+	 */
+	public void forgive(long mark) {
+		forgiven += mutations() - mark;
+	}
+
+	/**
+	 * Marks the transaction as unable to commit, because a statement failed after it had changed it.
+	 *
+	 * <p>
+	 * There is no statement-level undo — the overlay holds one copy of each page, not one per statement — so the part
+	 * of a failed statement that already ran cannot be taken out again. Committing it would make half a statement
+	 * durable: a node with no index entries, a blob nothing points at. Refusing the commit is the only safe answer
+	 * left, and the first cause is kept, because it is the one the caller needs to see.
+	 * </p>
+	 */
+	public void rollbackOnly(Throwable cause) {
+		if (rollbackOnly == null) {
+			rollbackOnly = cause;
+		}
+	}
+
+	/** Why this transaction is rollback-only, or null if it is not. */
+	public Throwable rollbackOnlyCause() {
+		return rollbackOnly;
+	}
+
 	public void reserved(long segmentKey, int slot, int count) {
+		mutations++;
 		reserved.add(new SlotRun(segmentKey, slot, count));
 	}
 
 	public void freed(long segmentKey, int slot, int count) {
+		mutations++;
 		SlotRun run = new SlotRun(segmentKey, slot, count);
 		freed.add(run);
 		reusable.computeIfAbsent(reuseKey(segmentKey, count), k -> new ArrayDeque<>()).addLast(run);

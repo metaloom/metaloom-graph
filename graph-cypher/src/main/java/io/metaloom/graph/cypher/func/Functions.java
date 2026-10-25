@@ -194,7 +194,7 @@ public final class Functions {
 					case null -> null;
 					// length() is hops for a path and characters for a string; size() is the general one.
 					case CypherPath path -> (long) path.length();
-					case String string -> (long) string.length();
+					case String string -> (long) codePoints(string);
 					case List<?> list -> (long) list.size();
 					default -> throw typeError("length", args.get(0));
 				};
@@ -203,7 +203,8 @@ public final class Functions {
 				expect(call, 1);
 				return switch (args.get(0)) {
 					case null -> null;
-					case String string -> (long) string.length();
+					// Characters, not UTF-16 units: an emoji is one, as it is in substring() and everywhere else.
+					case String string -> (long) codePoints(string);
 					case List<?> list -> (long) list.size();
 					case Map<?, ?> map -> (long) map.size();
 					default -> throw typeError("size", args.get(0));
@@ -304,17 +305,21 @@ public final class Functions {
 					return null;
 				}
 				String string = stringArg("substring", args.get(0));
+				// In code points, as size() counts them. In UTF-16 units, substring('😀x', 1) cut the emoji in half and
+				// returned a lone surrogate — a string with no UTF-8 form, which the store then refused to hold.
+				int characters = codePoints(string);
 				// Compared as longs and only then narrowed: an (int) cast first turns 4294967297 into 1.
 				long start = Values.number(args.get(1), "substring").longValue();
-				if (start < 0 || start > string.length()) {
+				if (start < 0 || start > characters) {
 					throw new CypherTypeException("substring() start " + start + " is outside the string");
 				}
-				if (args.size() < 3) {
-					return string.substring((int) start);
+				long end = characters;
+				if (args.size() >= 3) {
+					long length = Math.max(0, Values.number(args.get(2), "substring").longValue());
+					end = start + Math.min(length, characters - start);
 				}
-				long length = Math.max(0, Values.number(args.get(2), "substring").longValue());
-				return string.substring((int) start, (int) Math.min(string.length(), start + Math.min(length,
-					string.length())));
+				int from = string.offsetByCodePoints(0, (int) start);
+				return string.substring(from, string.offsetByCodePoints(from, (int) (end - start)));
 			}
 			case "replace" -> {
 				expect(call, 3);
@@ -329,8 +334,16 @@ public final class Functions {
 				if (args.get(0) == null || args.get(1) == null) {
 					return null;
 				}
-				String[] parts = stringArg("split", args.get(0))
-					.split(java.util.regex.Pattern.quote(stringArg("split", args.get(1))), -1);
+				String string = stringArg("split", args.get(0));
+				String separator = stringArg("split", args.get(1));
+				if (separator.isEmpty() && !string.isEmpty()) {
+					// One element per character. String.split on an empty pattern adds a trailing empty string, and
+					// splits between UTF-16 units rather than characters.
+					List<Object> characters = new ArrayList<>(string.length());
+					string.codePoints().forEach(c -> characters.add(Character.toString(c)));
+					return characters;
+				}
+				String[] parts = string.split(java.util.regex.Pattern.quote(separator), -1);
 				return new ArrayList<Object>(List.of(parts));
 			}
 			case "tointeger" -> {
@@ -358,6 +371,8 @@ public final class Functions {
 				return switch (args.get(0)) {
 					case null -> null;
 					case Boolean b -> b;
+					// As in Neo4j 5: zero is false and any other integer true. A float has no such convention.
+					case Number number when Values.isIntegral(number) -> number.longValue() != 0;
 					case String string -> switch (string.toLowerCase(Locale.ROOT)) {
 						case "true" -> Boolean.TRUE;
 						case "false" -> Boolean.FALSE;
@@ -385,8 +400,13 @@ public final class Functions {
 			}
 			case "round" -> {
 				expect(call, 1);
-				return args.get(0) == null ? null
-					: (double) Math.round(Values.number(args.get(0), "round").doubleValue());
+				if (args.get(0) == null) {
+					return null;
+				}
+				double value = Values.number(args.get(0), "round").doubleValue();
+				// Math.round answers in a long: NaN became 0.0 and 1e300 became 9.2e18. From 2^52 up every double is
+				// already a whole number, and NaN and the infinities round to themselves.
+				return Double.isNaN(value) || Math.abs(value) >= 0x1p52 ? value : (double) Math.round(value);
 			}
 			case "sqrt" -> {
 				expect(call, 1);
@@ -466,20 +486,47 @@ public final class Functions {
 		throw typeError(function, value);
 	}
 
+	/**
+	 * A string as an integer: an integer literal, or a float literal truncated toward zero exactly as
+	 * {@code toInteger(2.7)} would be — so {@code toInteger('2.7')} is 2 rather than null. A float outside the 64-bit
+	 * range is not a number this can return, and is null.
+	 */
 	private static Long parseLong(String value) {
+		String text = value.trim();
 		try {
-			return Long.valueOf(value.trim());
+			return Long.valueOf(text);
+		} catch (NumberFormatException e) {
+			Double floating = parseDouble(text);
+			if (floating == null || floating.isNaN() || floating >= 0x1p63 || floating < -0x1p63) {
+				return null;
+			}
+			return floating.longValue();
+		}
+	}
+
+	/**
+	 * Decimal notation, NaN and Infinity — which is what {@code toString} of a float can produce, so the round trip
+	 * holds. Java's own parser also takes a {@code d} or {@code f} suffix and hexadecimal floats, so without the check
+	 * {@code toFloat('1.5f')} was 1.5 rather than the null a string that is not a number gives.
+	 */
+	private static final java.util.regex.Pattern DECIMAL = java.util.regex.Pattern
+		.compile("[+-]?(\\d+\\.?\\d*|\\.\\d+)([eE][+-]?\\d+)?|[+-]?(NaN|Infinity)");
+
+	private static Double parseDouble(String value) {
+		String text = value.trim();
+		if (!DECIMAL.matcher(text).matches()) {
+			return null;
+		}
+		try {
+			return Double.valueOf(text);
 		} catch (NumberFormatException e) {
 			return null;
 		}
 	}
 
-	private static Double parseDouble(String value) {
-		try {
-			return Double.valueOf(value.trim());
-		} catch (NumberFormatException e) {
-			return null;
-		}
+	/** Characters rather than UTF-16 units. */
+	private static int codePoints(String string) {
+		return string.codePointCount(0, string.length());
 	}
 
 	private static List<?> listArg(String function, Object value) {

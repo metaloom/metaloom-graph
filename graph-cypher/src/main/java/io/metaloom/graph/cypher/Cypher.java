@@ -241,8 +241,17 @@ public final class Cypher {
 		}
 		if (store.hasWriteTransaction()) {
 			// The caller's transaction. Their commit, their conflict: this query is part of a unit of work somebody
-			// else is assembling, so it neither commits nor retries.
-			deliver(new QueryExecutor(new GraphAccess(store, abort), parameters, csv).run(parsed), sink, abort);
+			// else is assembling, so it neither commits nor retries. It is still one statement, though, and
+			// inOpenTransaction() is what keeps it one: a query that fails after it has written makes the caller's
+			// transaction rollback-only, so the caller cannot commit the half that ran.
+			QueryExecutor.Result result;
+			try {
+				result = store.inOpenTransaction(
+					() -> new QueryExecutor(new GraphAccess(store, abort), parameters, csv).run(parsed));
+			} catch (IOException e) {
+				throw new UncheckedIOException(e);
+			}
+			deliver(result, sink, abort);
 			return;
 		}
 		// Its own transaction, and therefore its own conflicts to absorb.

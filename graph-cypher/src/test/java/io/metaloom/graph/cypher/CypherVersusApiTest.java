@@ -201,13 +201,24 @@ public class CypherVersusApiTest {
 		Graph graph = seed(7);
 		try (GraphStore store = graph.store()) {
 			long total = 0;
+			long selfLoops = 0;
 			for (long id : graph.nodes()) {
 				if (store.nodeExists(id)) {
-					total += store.neighbours(id, Direction.BOTH).size();
+					for (Edge edge : store.neighbours(id, Direction.BOTH)) {
+						// neighbours(BOTH) lists a self-loop from both of its ends, which are one node. openCypher
+						// crosses it once: it is one relationship, and `MATCH (a)-[r]-(a)` returns it once.
+						if (edge.direction() == Direction.IN && edge.neighbourId() == id) {
+							selfLoops++;
+						} else {
+							total++;
+						}
+					}
 				}
 			}
+			assertTrue(selfLoops > 0, "the seeded graph must hold a self-loop, or this test asserts nothing about them");
 			assertEquals(total, Cypher.query(store, "MATCH (a)-[]-(b) RETURN count(*) AS c").row(0).longValue("c"),
-				"an undirected pattern reports each endpoint's view, exactly as neighbours(BOTH) does");
+				"an undirected pattern reports each endpoint's view, as neighbours(BOTH) does, except that a self-loop "
+					+ "has one");
 		}
 	}
 

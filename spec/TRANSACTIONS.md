@@ -270,6 +270,18 @@ default) the oldest views are abandoned, oldest first, and an abandoned view rai
 `SnapshotTooOldException` on its next operation. Giving a reader an error is the only honest
 alternative to giving it the wrong answer.
 
+**"Next operation" is not enough, and the page is where it is checked.** Vacuum runs after a commit
+and takes no lock a reader holds, so a view can be abandoned *in the middle of* an operation — a scan or
+a cursor holding the apply latch does not keep it out. The chains it needed are then cut under it, and a
+page whose whole chain went has no head at all: the view's next read of it would be the mapping, newer
+than its snapshot. `read()` re-checks the view after each operation, but a scan's callback or a cursor's
+`next()` has handed rows out by then, and `AbandonedViewScanTest` scheduled a cursor that returned
+10,840 edges where its snapshot had 12,000. So `Snapshot.pageAsOf` refuses at the page: a page with no
+chain, read by a view below the horizon, raises `SnapshotTooOldException`, and a rebuild re-checks the
+horizon before it is used or cached, since vacuum may have truncated the chain under the walk. Vacuum
+raises the horizon before it cuts anything, so a chain seen missing is a horizon seen raised. The cost
+is one volatile read on the path that is about to return the mapping to a view.
+
 **Measured** (`LongRunningReaderTest`), one view held across 60,000 property updates over 2,000 nodes:
 
 | | |
@@ -356,6 +368,31 @@ The same runs are the transaction's write set, so conflict detection comes out o
 `PageVersions` already records, per page, which byte ranges each commit overwrote and at which LSN.
 Asking "did anything change these bytes after my snapshot" is one walk of that chain, stopping at the
 first entry the transaction is entitled to see.
+
+### 6.1.1 What the diff costs, and what keeps it cheap
+
+The base is a second page per touched page, and the diff is a pass over it, so a small commit — a node
+with two properties touches about thirteen pages, nine of them metadata — was spending most of its CPU
+copying and comparing pages it changed eight bytes of. Three rules keep that down; none changes what is
+logged or what conflict detection sees.
+
+- **The diff is confined to the written window.** Every write into an overlay copy goes through
+  `PageOverlay.Page.writable(offset, length)`, which widens the page's window `[writtenFrom, writtenTo)`.
+  Nothing outside the window can differ from the base, so the commit diffs only inside it, widened to
+  whole 8-byte chunks — the result is the whole-page diff exactly. With assertions on (every test run)
+  `diffPages` also runs the whole-page diff and fails the commit if the two disagree, which is what
+  would catch a write that bypassed `writable`. `ChangedRunsTest` holds the contract from both sides.
+- **A rebased page's base is the mapping itself.** Metadata pages are rebased under the commit lock and
+  diffed straight after the fold, before anything is applied, so for the whole time the base is read
+  nothing can change the mapped page. Copying it was eight KiB per metadata page per commit.
+- **Buffers no caller can hold are recycled.** A data page's base and a rebased page's copy are read by
+  nothing but the commit, so they come from a small per-thread pool (32 pages) and go back when the
+  transaction ends. A data page's *copy* is never recycled: reads inside the transaction are slices of
+  it, and nothing bounds how long a caller keeps one. The pool matters because a freshly allocated page
+  is cold — measured at ~1.4 µs to allocate, fill and clone one — and a reused one is still in cache.
+
+Measured in [GRAPH_BENCHMARK.md §11](GRAPH_BENCHMARK.md#11-profiling-round-2026-10-25): a small
+auto-commit `createNode` went from 29.4 to 23.4 µs of CPU under `ASYNC`.
 
 ### 6.2 The part that is not byte-merged
 
@@ -498,6 +535,19 @@ paid in granularity: reads are tracked per page, not per record, so two transact
 unrelated records that share a page are a conflict. Sound, never a wrong answer, and a level to ask
 for where it is needed rather than to default to.
 
+**A dictionary miss is a read that touches no page**, and it is validated separately. `nodesByLabel`,
+`nodeHasLabel`, `nodeProperty`, the composite lookup and the type filters all return on the spot when the
+label, type or key is not in the dictionary, so a page read set records nothing — and a concurrent
+transaction that introduced the name and committed was invisible to validation.
+`SerializablePhantomTest` committed both halves of a write skew that way: "no doctor exists, so record
+the decision" against "the decision is not recorded, so create the first doctor". A `SERIALIZABLE`
+writer now remembers each name it looked up and did not find (`Catalog.MissObserver` into
+`WriteContext.missed`), and the commit refuses it as a read conflict if any of them resolves by then.
+The dictionary is not versioned and does not say who introduced a name, so this is coarse in one
+direction: a transaction that missed a name and then introduced it itself — create-if-absent on a new
+label — is refused **once**. Its retry finds the name, which outlives the rollback, and validates
+normally. It is never a wrong answer, and a name the transaction already knew costs nothing.
+
 **`LockTable` is not built and will not be.** Eager per-element intents fail fast and make the abort
 cheap, which is a real advantage; what they cost is a striped table on the write path of every
 statement, and a decision about lock granularity that the byte-ranged validation does not need to
@@ -569,8 +619,28 @@ the kind field already selects the addressing policy. Do not do this speculative
   before-image and copies its bytes in.
 - **`TransactionConflictException` is a normal outcome**, like `SnapshotTooOldException`. Retry it;
   `inTransaction` does. Auto-commit mutations and Cypher write queries retry it internally, so it only
-  reaches a caller who opened the transaction themselves. Progress is guaranteed: a conflict has a
-  winner, so each attempt runs with one fewer competitor.
+  reaches a caller who opened the transaction themselves. **Progress is guaranteed only on the statement
+  path** (`inStatement`, auto-commit, Cypher), by the exclusive fallback of §6.3. `inTransaction` is a
+  bounded optimistic retry and can run out: the "one fewer competitor" argument this line used to make
+  is the one §6.3 records as wrong. A batch of index inserts beside a stream of short transfers lost a
+  thousand attempts in a row in `EverythingAtOnceStressTest`, and backing off between attempts did not
+  change the rate — the losers queue on the commit lock behind the winner with a snapshot that is
+  already stale. Work that must finish and is safe to repeat belongs in `inStatement`.
+- **A thread holds the apply latch shared at most once.** `StampedLock` read holds are not reentrant: a
+  second `readLock()` from a thread that already has one is an ordinary acquisition, and when its fast
+  path loses a race with another reader it queues behind a waiting writer — a commit, waiting for the
+  hold this same thread still has, with every other writer queued behind the commit lock. Nesting is
+  ordinary: a mutation calling the store's own public reads (`setNodeProperties` on a vector-indexed node
+  asks `nodeLabels`), a read inside a scan callback, a cursor opened inside another, `begin()` with a
+  cursor open. Every shared acquisition therefore goes through a per-thread hold
+  (`GraphStoreImpl.ApplyHold`) that takes the latch for the outermost scope only.
+  `NestedApplyLatchTest` wedged the store in every run before it.
+- **Long read holds stand aside for a waiting apply.** `StampedLock` has no writer preference either, and
+  a scan or cursor holds the latch for its whole length, so a few scanning threads whose holds overlap
+  kept every commit out: 127 commits a second alone, 3 beside four scanners, single commits waiting
+  900 ms (`ScanWriterStarvationTest`). A commit announces itself before it waits for the latch
+  (`applyWaiters`), and a lease about to take a new outermost hold waits — bounded, 50 ms at most — for
+  that apply first. Short reads do not wait: they are optimistic or brief, and are not what starved it.
 - **Vacuum is serialised.** It runs outside every other lock, which was safe while one writer meant
   one commit meant one vacuum. Two of them cutting the same chains at different horizons truncate a
   tail the other is still walking, and what that looks like from outside is a page whose newest
@@ -584,6 +654,25 @@ the kind field already selects the addressing policy. Do not do this speculative
   open read view is refused rather than silently run outside it ([CYPHER.md §4.1](CYPHER.md)). When it
   owns the transaction it **retries its own conflicts**, because a query is a single statement with
   nothing for the caller to reconsider; when it joined the caller's, it neither commits nor retries.
+- **A statement that fails inside a transaction leaves it either untouched or rollback-only.** An
+  auto-commit statement is its own transaction, so a failure rolls all of it back. Inside a caller's
+  transaction there is no statement boundary to roll back to — the overlay holds one copy of each page,
+  not one per statement — so the engine sorts failures by whether the statement had already changed the
+  transaction. A refusal checked before anything is written (a unique-constraint violation, a stale id,
+  a null label) leaves the transaction exactly as it was, and the caller may catch it and carry on,
+  which is the ordinary way to use a constraint. A failure discovered partway — an unsupported value
+  type or an oversized property block after a blob was already written for an earlier value — marks
+  the transaction **rollback-only**: `commit()` rolls it back and raises `GraphStoreException` naming
+  the first failure, because committing would make half a statement durable. Both used to commit the
+  half: `setNodeProperties` wrote the new block before checking the unique constraint, so a caught
+  violation committed the refused value with the indexes still describing the old one; and a
+  `createNode` whose second property could not be encoded committed a node with no index entries and
+  an orphaned blob. Whether a statement "changed" the transaction is a counter in `WriteContext` that
+  moves on every page slice taken for writing, every slot reserved or freed and every journal
+  operation; the unique check's own leaf claims are deliberately not counted, since committing them is
+  harmless. `StatementAtomicityTest` holds down both halves; `StorageModelTest` found it. Work made of several
+  statements — a Cypher query joined to the caller's transaction — gets the same boundary through
+  `GraphStore.inOpenTransaction`.
 - **`begin()` refuses to nest**, as `beginRead()` does. It used not to, and nesting was silent: the
   inner commit cleared the published overlay, after which the outer transaction's writes went straight
   to the mapping — unlogged, and past any rollback. `hasWriteTransaction()` exists so a library can ask
@@ -644,6 +733,9 @@ Built, in `io.metaloom.graph.core.txn`:
 | `LongRunningReaderTest` | 2 | `@Tag("slow")`. A view held across 60,000 commits; and the same run against a budget too small, abandoned cleanly with the store unharmed |
 | `SnapshotLinearizabilityTest` | 2 | The general form of the anomaly matrix: a view at LSN `L` must show **exactly** the committed state at `L`, whole-graph, checked against a model history keyed by commit LSN. Around 5,000 views per run |
 | `NestedTransactionTest` | 5 | `begin()` refusing to nest; the open transaction surviving the refusal; writes after it still rollback-able; the write gate not leaked |
+| `SerializablePhantomTest` | 9 | Write skew through predicate and point reads at `SERIALIZABLE`, with the two transactions writing disjoint kinds so only the read set can refuse either: unknown labels, keys and composite lookups, a known label, a full scan, a read from the overlay after a blind write; and the one-retry cost of create-if-absent on a new name |
+| `AbandonedViewScanTest` | 2 | A view abandoned by the budget mid-scan and mid-cursor either raises or answers as of its snapshot: scheduled deterministically, and under load against a model keyed by commit LSN |
+| `ViewCatalogReadTest` | 2 | `nearest()` and `buildVectorIndex()` inside a view whose index catalog page has changed |
 
 And in `io.metaloom.graph.core.concurrency`:
 
@@ -660,6 +752,10 @@ And in `io.metaloom.graph.core.concurrency`:
 | `AutoCommitAtomicityTest` | 1 | A single `createRelationship` writes a REL, two adjacency entries and two degree counters; no view may catch that half done |
 | `SnapshotBudgetUnderLoadTest` | 1 | Six views of different ages against a budget too small: abandonment follows age, and the survivors are still *right* rather than merely alive |
 | `CatalogDurabilityWindowTest` | 2 | The dictionary is forced before the commit that introduced it, so a rolled-back or crashed label outlives its transaction — pinned as harmless and reusable |
+| `IsolationAnomalyStressTest` | 5 | Under load on platform and virtual threads: an on-call invariant only `SERIALIZABLE` keeps; every index equal to a full scan in every snapshot; a supernode's degree counters, adjacency, cursor and every leaf agreeing in every snapshot, and with the writers' model at the end; vector searches scoring each result as its snapshot does; monotonic reads and read-your-writes |
+| `NestedApplyLatchTest` | 1 | Nested shared holds of the apply latch — a mutation's own public reads, reads inside scan callbacks, cursors inside cursors — beside committing writers, never wedging |
+| `ScanWriterStarvationTest` | 1 | Commits keep at least a quarter of their solo rate beside four threads scanning and walking cursors back to back |
+| `EverythingAtOnceStressTest` | 1 | `@Tag("slow")`. Transfers at both levels, churn, vectors, audits, a paced backup-shaped scan, and checkpoint, reclaim, compaction and verification, together; then the model, `verify(FULL)` and a final compaction |
 
 And at the layers above the engine:
 
@@ -687,6 +783,11 @@ rather than in a test of their own, which is `SnapshotIsolationTest` for the lev
 | The high water mark restored on rollback under a stale free-ring entry | `ReferenceModelTest`, single-threaded — the same slot handed out twice |
 | A retry loop spinning through all its attempts inside the winner's first commit | `MultiStoreIsolationTest` — four writers racing to create one index catalog page |
 | The index catalog page cached in a field shared across threads | `MultiStoreIsolationTest` — `Stale id NULL` mid-lookup |
+| A thread re-acquiring the apply latch it already held shared, queued behind a waiting commit | `EverythingAtOnceStressTest` — a hang; minimised in `NestedApplyLatchTest` |
+| Scans and cursors starving every commit, the latch having no writer preference | `ScanWriterStarvationTest` — 3 commits a second instead of 127 |
+| A view abandoned mid-scan reading uncut-and-untouched pages from the mapping | `AbandonedViewScanTest` — a cursor short by the edges deleted after its snapshot |
+| A `SERIALIZABLE` dictionary miss recorded nowhere | `SerializablePhantomTest` — both halves of a write skew committed |
+| `nearest()` reading the catalog page outside the read wrapper | `IsolationAnomalyStressTest` — `NeedsExclusionException` reaching the caller |
 
 ---
 
@@ -726,12 +827,12 @@ rather than in a test of their own, which is `SnapshotIsolationTest` for the lev
 |-------|---------|---------|
 | `TransactionManager` | `io.metaloom.graph.core.txn` | Active views, the reclamation horizon, the retention budget |
 | `Snapshot` | `io.metaloom.graph.core.txn` | One view: its LSN, its visibility rule, its reconstruction cache |
-| `SnapshotHolder` | `io.metaloom.graph.core.txn` | Thread-local publication of a view to the segment layer |
+| `SnapshotHolder` | `io.metaloom.graph.core.txn` | Thread-local publication of a view to the segment layer, behind a count of published views so a read made while none is open skips the thread-local |
 | `PageVersions` | `io.metaloom.graph.core.txn` | Per-page before-image chains, reconstruction and reclamation |
 | `Transaction` | `io.metaloom.graph.core.api` | Per-transaction write state |
-| `WriteContext`, `WriteContextHolder` | `io.metaloom.graph.core.txn` | Everything one in-flight writer owns — overlay, view, journal, reservations — published to its own thread |
+| `WriteContext`, `WriteContextHolder` | `io.metaloom.graph.core.txn` | Everything one in-flight writer owns — overlay, view, journal, reservations — published to its own thread, behind the same published-count fast path as `SnapshotHolder` |
 | `MetaJournal` | `io.metaloom.graph.core.txn` | Metadata changes as operations rather than bytes, folded onto the live state at commit (§6.2) |
-| `PageOverlay.Page` | `io.metaloom.graph.core.page` | A private page copy **and the image it was copied from**, which is what makes two writers on one page compose (§6.1) |
+| `PageOverlay.Page` | `io.metaloom.graph.core.page` | A private page copy **and the image it was copied from**, which is what makes two writers on one page compose (§6.1), plus the written window the commit diffs inside (§6.1.1) |
 | `TransactionConflictException` | `io.metaloom.graph.core.api` | The loser of a conflict, with the page and byte range it lost on |
 | `ReadTransaction` | `io.metaloom.graph.core.api` | The public view handle; `Snapshot` implements it |
 | `IsolationLevel`, `SnapshotStats`, `SnapshotTooOldException` | `io.metaloom.graph.core.api` | The level, what a view costs, and what happens when it costs too much |
@@ -743,5 +844,5 @@ replaced by a shared/exclusive write gate plus a commit lock; and `OverlayHolder
 
 ---
 
-_Git HEAD revision: `9a607c9`_
-_Last updated: 2026-08-18 (auto-commit retry vs escalation counters)_
+_Git HEAD revision: `f2b6d5f`_
+_Last updated: 2026-10-24 (dictionary misses at SERIALIZABLE, mid-operation abandonment, per-thread apply hold, lease yield)_

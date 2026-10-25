@@ -288,6 +288,78 @@ public class BackupRoundTripTest {
 		}
 	}
 
+	/**
+	 * A store that has had most of itself deleted and then been compacted dumps exactly what is left.
+	 *
+	 * <p>
+	 * Compaction relocates records and rewrites every reference to them, and deletion leaves free slots, reused
+	 * generations and holes in the adjacency. A dump walks whatever the store says is live, so this is the shape most
+	 * likely to show a walk that trusts a stale reference — and a restore that reproduces it, which would put the
+	 * defect into the copy too. Vectors are in it on purpose: compaction remaps their links and entry points.
+	 * </p>
+	 */
+	@Test
+	public void testAStoreAfterDeletesAndCompactionRoundTrips() throws Exception {
+		byte[] dump;
+		Map<String, NodeShape> sourceNodes;
+		List<EdgeShape> sourceEdges;
+		List<String> sourceSchema;
+		try (GraphStore source = GraphStore.open(tmp.resolve("source"), options())) {
+			seed(source);
+			List<Long> ring = new ArrayList<>();
+			try (Transaction txn = source.begin()) {
+				for (int i = 0; i < 600; i++) {
+					ring.add(source.createNode(List.of("Item"), Properties.of().set("key", "item" + i)
+						.set("n", (long) i).set("embedding", vector(i))));
+				}
+				for (int i = 0; i < ring.size(); i++) {
+					long next = ring.get((i + 1) % ring.size());
+					if (i % 2 == 0) {
+						source.createRelationship(ring.get(i), "NEXT", next, Properties.of().set("i", (long) i));
+					} else {
+						source.createEdge(ring.get(i), "NEXT", next);
+					}
+					source.createEdge(ring.get(i), "SKIP", ring.get((i + 7) % ring.size()));
+				}
+				txn.commit();
+			}
+			source.createVectorIndex(VectorIndexDefinition.of("Item", "embedding", DIMENSIONS, VectorMetric.EUCLIDEAN));
+			try (Transaction txn = source.begin()) {
+				// Two of every three go, edges with them, so the survivors sit in relocatable holes.
+				for (int i = 0; i < ring.size(); i++) {
+					if (i % 3 != 0) {
+						// Its relationships and both kinds of adjacency entry go with it.
+						source.deleteNode(ring.get(i));
+					}
+				}
+				txn.commit();
+			}
+			source.compact();
+			source.verify(VerifyLevel.FULL);
+			sourceNodes = nodesOf(source);
+			sourceEdges = edgesOf(source);
+			sourceSchema = schemaOf(source);
+			assertEquals(4 + 200, sourceNodes.size(), "the fixture's own count after the deletes");
+
+			ByteArrayOutputStream out = new ByteArrayOutputStream();
+			GraphBackup.write(source, "source", out, 0);
+			dump = out.toByteArray();
+		}
+		try (GraphStore target = GraphStore.open(tmp.resolve("target"), options())) {
+			try (DumpReader in = new DumpReader(new ByteArrayInputStream(dump), dump.length)) {
+				GraphRestore.read(target, in);
+			}
+			target.verify(VerifyLevel.FULL);
+			assertEquals(sourceNodes, nodesOf(target));
+			assertEquals(sourceEdges, edgesOf(target));
+			assertEquals(sourceSchema, schemaOf(target));
+			// The restored vector index answers, and answers with a survivor.
+			var nearest = target.nearestByScan("Item", "embedding", vector(300), 1, VectorMetric.EUCLIDEAN);
+			assertEquals(1, nearest.size());
+			assertEquals("item300", target.nodeProperties(nearest.get(0).nodeId()).getString("key"));
+		}
+	}
+
 	/** An empty database dumps and restores to an empty database rather than to a failure. */
 	@Test
 	public void testAnEmptyDatabase() throws Exception {

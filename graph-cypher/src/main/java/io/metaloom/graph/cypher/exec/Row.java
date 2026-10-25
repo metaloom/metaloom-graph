@@ -40,6 +40,35 @@ public final class Row {
 		return new Row(copy);
 	}
 
+	/**
+	 * An empty row sized for {@code names} bindings, to be filled with {@link #put} before anything else sees it.
+	 *
+	 * <p>
+	 * A projection of k items built with {@link #with} copies the map k times, so building one row was quadratic in its
+	 * width and allocated k maps to keep one. These two and {@code put} are the builder form: package-private, and
+	 * only ever applied to a row nobody else holds yet, so the immutability every operator relies on is unchanged.
+	 * </p>
+	 */
+	static Row withCapacity(int names) {
+		return new Row(new LinkedHashMap<>(capacity(names)));
+	}
+
+	/** A private copy of {@code source} with room for {@code extra} more bindings, to be filled with {@link #put}. */
+	static Row copyOf(Row source, int extra) {
+		Map<String, Object> copy = new LinkedHashMap<>(capacity(source.values.size() + extra));
+		copy.putAll(source.values);
+		return new Row(copy);
+	}
+
+	/** Binds in place. Only for a row from {@link #withCapacity} or {@link #copyOf} that has not been shared yet. */
+	void put(String name, Object value) {
+		values.put(name, value);
+	}
+
+	private static int capacity(int entries) {
+		return (int) Math.ceil(entries / 0.75) + 1;
+	}
+
 	public Row merge(Row other) {
 		Map<String, Object> copy = new LinkedHashMap<>(values);
 		copy.putAll(other.values);
