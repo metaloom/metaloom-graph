@@ -46,7 +46,7 @@ public final class StoreFormat {
 	 * fixture kept. {@code GoldenFixtureTest} fails until all three are there. spec/MIGRATION.md section 6.
 	 * </p>
 	 */
-	public static final int CURRENT_VERSION = 5;
+	public static final int CURRENT_VERSION = 4;
 
 	private StoreFormat() {
 	}

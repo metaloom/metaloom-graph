@@ -59,7 +59,8 @@ public final class ValueCodec {
 	 */
 	public static final int T_VECTOR_REF = 11;
 	/**
-	 * A Cypher temporal value; the size class is the kind ({@code K_*}). From store format version 5 on.
+	 * A Cypher temporal value; the size class is the kind ({@code K_*}). Part of store format version 4: it was added without a version bump while no store
+	 * existed outside tests, so a build without the tag fails on the value instead of refusing the store.
 	 * <ul>
 	 * <li>{@link #K_DATE}: {@code i64 epochDay}</li>
 	 * <li>{@link #K_LOCAL_TIME}: {@code i64 nanoOfDay}</li>

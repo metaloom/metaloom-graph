@@ -24,7 +24,7 @@ not**, in one place.
 |-------|-------|----------|
 | 0 — Baseline and harness | **Done** except attaching a CI runner; every job has been run locally | [reports/BASELINE.md](reports/BASELINE.md) |
 | 1 — Addressing and segments | **Done** | `ElementIdTest`, `GeometryTest`, `SegmentLifecycleTest` |
-| 2 — Record stores and catalog | **Done** except the `MAP` value type; temporal values since format version 5 | `ValueCodecTest`, `PropertyRoundTripTest` |
+| 2 — Record stores and catalog | **Done** except the `MAP` value type; temporal values (tag 12) are in | `ValueCodecTest`, `PropertyRoundTripTest` |
 | 3 — Adjacency and traversal | **Done** except a streaming `traverse`; neighbour enumeration streams (IDX-4) | `AdjacencyTierTest`, `EdgeCodecTest`, `SpaceEfficiencyTest`, `NeighbourCursorTest` |
 | 4 — WAL, recovery, checkpoints | **Done**, as no-steal redo rather than ARIES | `RecoveryTest` |
 | 5 — Transactions | **Done** — ACID, **concurrent writers**, snapshot isolation for readers and writers, `SERIALIZABLE`, commit-time conflict detection | `VisibilityTest`, `SnapshotIsolationTest`, `VacuumTest`, `ConcurrentReaderTest`, `RollbackTest`, `ParallelConsistencyTest`, `HammerTest`, `ConcurrentWriterTest` |
@@ -40,7 +40,7 @@ not**, in one place.
 | 18 — Operability | **Done** — environment-variable configuration, Prometheus metrics on their own port with `/health` and `/ready`, and a slow query log on every front end | [METRICS.md](METRICS.md), [OPERATIONS.md §3.1, §4](OPERATIONS.md); `MetricsCatalogScrapeTest`, `MetricsServerTest`, `SlowQueryLogTest`, `GraphServerOptionsTest` |
 | 19 — MCP | **Done** — eight tools over HTTP+SSE and WebSocket, off by default and loopback when on, write-gated at two points | [MCP.md](MCP.md); `McpProtocolTest`, `McpServerTest`, `CypherGuideToolTest` |
 | 20 — Deployment | **Done** — JVM and GraalVM container images, a Helm chart, and a k3d harness that runs a real pipeline against them | [DEPLOYMENT.md](DEPLOYMENT.md); `helm/test/run.sh` — 35 assertions across nine phases |
-| 21 — Format migration | **Done**. Store format version 4 is the 0.1.0-alpha.1 baseline; 5 (temporal property values) is current, reached by the first step, `V4ToV5`. One version number for the whole layout, older stores refused with the command that migrates them, a copy-on-write runner with resume, `database migrate` and `database info`, and a committed golden fixture that fails the build on an undeclared format change | [MIGRATION.md](MIGRATION.md); `MigrationRunnerTest`, `GoldenFixtureTest`, `GoldenFixtureMigrationTest`, `MigrateCliTest` |
+| 21 — Format migration | **Done**. Store format version 4 is the 0.1.0-alpha.1 baseline and current; the temporal tag was added to it without a bump (no store existed yet). One version number for the whole layout, older stores refused with the command that migrates them, a copy-on-write runner with resume, `database migrate` and `database info`, and a committed golden fixture that fails the build on an undeclared format change | [MIGRATION.md](MIGRATION.md); `MigrationRunnerTest`, `GoldenFixtureTest`, `GoldenFixtureMigrationTest`, `MigrateCliTest` |
 
 **The engine is usable today** for an embedded workload with concurrent writers: durable, crash-safe,
 transactional, indexed, compacting, with snapshot isolation for readers, a Cypher query

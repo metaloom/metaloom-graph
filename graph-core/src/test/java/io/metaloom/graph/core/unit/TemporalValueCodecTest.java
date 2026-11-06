@@ -30,7 +30,7 @@ import io.metaloom.graph.core.store.prop.StoredDuration;
 import io.metaloom.graph.core.store.prop.ValueCodec;
 
 /**
- * The temporal tag ({@code T_TEMPORAL}, format version 5): every kind round trips, the skip path and the id remapper
+ * The temporal tag ({@code T_TEMPORAL}): every kind round trips, the skip path and the id remapper
  * step over exactly the bytes the decoder reads, and an untrusted payload out of range is corruption rather than a
  * {@code DateTimeException}.
  *

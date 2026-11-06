@@ -30,7 +30,8 @@ less than SemVer's `1.0`; see *Compatibility* below. How a release is cut: [spec
 
 ### Changed
 
-- **Temporal property values** are stored natively: store format version 5; a version 4 store needs `database migrate`, which rewrites no data.
+- **Temporal property values** are stored natively in store format version 4, as a hard change without a migration.
+- **The binary protocol is version 5** for the temporal value tag; a version 4 client is refused at connect.
 - **The HTTP body limit is configurable** — `--max-body-bytes` / `GRAPH_MAX_BODY_BYTES`, default unchanged at
   one MiB. A body over it is refused with `413` and `error: "too_large"` in the documented JSON error shape,
   naming the limit and the flag, instead of Vert.x's plain-text page.

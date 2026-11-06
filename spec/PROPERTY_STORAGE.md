@@ -152,7 +152,7 @@ text.
 | `VECTOR_F32` | 9 | — | 4 B dim + 8 B `BLOB` id | done — a vector the store has no fixed record for |
 | `VECTOR_REF` | 11 | — | 4 B dim + 8 B `VEC` id | done — a vector of the store's own declared dimension |
 | `LIST` | 10 | — | varint count + encoded elements | done, recursive |
-| `TEMPORAL` | 12 | 0..6, the kind (§4.2) | 8 to 28 B, or 13 B + zone id | done, store format version 5 — Cypher's dates, times, date-times and durations |
+| `TEMPORAL` | 12 | 0..6, the kind (§4.2) | 8 to 28 B, or 13 B + zone id | done, store format version 4 — Cypher's dates, times, date-times and durations |
 | `MAP` | — | — | varint count + (key_id, value) pairs | not implemented; no tag assigned |
 
 **The zig-zag comparison must be unsigned.** `Long.MAX_VALUE` zig-zag encodes to `0xFFFFFFFFFFFFFFFE`,
@@ -217,9 +217,10 @@ One tag, `TEMPORAL` = 12, with the size class naming the kind. All integers litt
   equals another that denotes the same instant, whatever the zone, and never an `Instant`; a time with an offset
   equals one with the same UTC time of day; a duration equals any `TemporalAmount` with the same four components.
   The hashes are spelled out per type rather than taken from the `java.time` classes, because index keys persist.
-- **Why a format bump for a new tag.** A store that holds tag 12 must not be opened by a build whose codec throws on
-  it half way through a read; the version refuses it up front. A version 4 store cannot hold the tag, so the step
-  from 4 to 5 rewrites nothing ([MIGRATION.md](MIGRATION.md)).
+- **No format bump for this tag, deliberately.** The rule ([MIGRATION.md §6](MIGRATION.md)) is a bump, so that a
+  build whose codec does not know a tag refuses the store up front instead of failing half way through a read. Tag
+  12 was added to version 4 as a hard change instead, because no store existed outside tests: a build from before
+  it opens a store holding the tag and throws on the first temporal value. The next tag follows the rule again.
 
 ---
 
@@ -317,7 +318,7 @@ Compression (lz4 by default above 4 KiB) is applied per blob, in native code.
       backing arrives in Phase 7)
 - [x] `PropertyStore` block encoder/decoder with entries sorted by key id
 - [x] Single-property read that stops at the first key past the target
-- [x] Value type tags per §4, all except `MAP`; temporal values (§4.2) since store format version 5
+- [x] Value type tags per §4, all except `MAP`; temporal values (§4.2)
 - [x] Segregated free lists for cell runs, page-straddle avoidance
 - [x] `BlobStore` with extent chaining and a whole-blob CRC
 - [x] `VECTOR_F32` support, and `VECTOR_REF` for a store with fixed-size vector records
@@ -346,4 +347,4 @@ Compression (lz4 by default above 4 KiB) is applied per blob, in native code.
 ---
 
 _Git HEAD revision: `8f178b4`_
-_Last updated: 2026-11-06 (temporal values, store format version 5)_
+_Last updated: 2026-11-06 (temporal values, tag 12, added to store format version 4)_

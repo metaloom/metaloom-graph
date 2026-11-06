@@ -192,7 +192,7 @@ something usable without a conversion layer and the store keeps them without kno
 | `DATETIME` (zoned) | `ZonedDateTime` — an offset or a region | `datetime('2015-07-21T21:40[Europe/Vienna]')` |
 | `DURATION` | `CypherDuration` (months, days, seconds, nanos) | `duration('P1Y2M10DT12H')` |
 
-**They are stored natively** — store format 5 ([MIGRATION.md](MIGRATION.md)) — so a date property compares,
+**They are stored natively** ([PROPERTY_STORAGE.md §4.2](PROPERTY_STORAGE.md#42-temporal-values)), so a date property compares,
 sorts and indexes as a date. Before, the only way to keep one was a string, which orders as text and makes
 every temporal predicate a string comparison. A region zone survives storage (`Europe/Vienna` comes back as
 `Europe/Vienna`, not `+02:00`), and so do a duration's four separate parts.

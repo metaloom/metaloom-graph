@@ -41,10 +41,9 @@ public final class Manifest implements AutoCloseable {
 	 * cell-based adjacency block, 3 for multi-label nodes, and 4 — written <em>only</em> by a store that has vector
 	 * storage — for the {@code VEC} kind. So the field said two things at once, the layout and whether vectors were
 	 * present. Both 3 and 4 describe the same layout, which is store format version 4; the vector question is answered
-	 * by {@code vec_stride} and {@link #FEATURE_VECTORS}. While {@link StoreFormat#CURRENT_VERSION} was 4, a store with no
-	 * vectors kept being written as 3 so that a build from before this definition still opened it. From version 5 on
-	 * the field is the version and nothing else; 3 and 4 are only read, as the version 4 a migration starts from. See
-	 * spec/MIGRATION.md section 2.
+	 * by {@code vec_stride} and {@link #FEATURE_VECTORS}. While {@link StoreFormat#CURRENT_VERSION} is 4, a store with no
+	 * vectors keeps being written as 3 so that a build from before this definition still opens it. From version 5 on
+	 * the field is the version and nothing else. See spec/MIGRATION.md section 2.
 	 */
 	static final int LEGACY_VERSION_NO_VECTORS = 3;
 
@@ -224,17 +223,11 @@ public final class Manifest implements AutoCloseable {
 		return field;
 	}
 
-	/**
-	 * The {@code format_version} field to write for a store format version: the version itself, for every store.
-	 *
-	 * <p>
-	 * Until version 4 was current, a store without vectors was written as {@link #LEGACY_VERSION_NO_VECTORS} so that
-	 * builds from before the version had a definition could still open it. That ended with version 5, which no such
-	 * build accepts anyway. {@link #decodeVersion} keeps reading 3 and 4 as version 4 for as long as a migration step
-	 * from 4 exists. See spec/MIGRATION.md section 2.2.
-	 * </p>
-	 */
-	public static int encodeVersion(int version) {
+	/** The {@code format_version} field to write for a store format version. The inverse of {@link #decodeVersion}. */
+	public static int encodeVersion(int version, int vectorStride) {
+		if (version == LEGACY_VERSION_VECTORS && vectorStride == 0) {
+			return LEGACY_VERSION_NO_VECTORS;
+		}
 		return version;
 	}
 
@@ -328,7 +321,7 @@ public final class Manifest implements AutoCloseable {
 	public static void stampVersion(Path storePath, int version) throws IOException {
 		Path path = storePath.resolve("MANIFEST");
 		Header header = read(storePath);
-		int field = encodeVersion(version);
+		int field = encodeVersion(version, header.vectorStride());
 		try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
 			java.nio.ByteBuffer buffer = java.nio.ByteBuffer.allocate(2 * COPY_BYTES);
 			while (buffer.hasRemaining() && channel.read(buffer, buffer.position()) > 0) {
@@ -384,7 +377,7 @@ public final class Manifest implements AutoCloseable {
 		MemorySegment copy = mapped.asSlice(target, COPY_BYTES);
 		copy.fill((byte) 0);
 		copy.set(Layouts.LONG, OFF_MAGIC, MAGIC);
-		copy.set(Layouts.INT, OFF_FORMAT_VERSION, encodeVersion(StoreFormat.CURRENT_VERSION));
+		copy.set(Layouts.INT, OFF_FORMAT_VERSION, encodeVersion(StoreFormat.CURRENT_VERSION, vectorStride));
 		copy.set(Layouts.INT, OFF_VEC_STRIDE, vectorStride);
 		copy.set(Layouts.INT, OFF_VEC_DIMENSIONS, vectorDimensions);
 		copy.set(Layouts.LONG, OFF_FEATURE_FLAGS, vectorStride == 0 ? 0L : FEATURE_VECTORS);

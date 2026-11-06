@@ -5,7 +5,7 @@ record layouts. Adjacency internals are in [RELATIONSHIP_STORAGE.md](RELATIONSHI
 property internals are in [PROPERTY_STORAGE.md](PROPERTY_STORAGE.md); the WAL is in
 [WAL.md](WAL.md).
 
-Store format version described here: **5** (`StoreFormat.CURRENT_VERSION`). What that number covers, the other
+Store format version described here: **4** (`StoreFormat.CURRENT_VERSION`). What that number covers, the other
 version fields in the store, and how a store moves from one version to the next are in [MIGRATION.md](MIGRATION.md).
 
 ---
@@ -216,7 +216,7 @@ writes it:
 ```
 offset size field
 0      8    magic            "MLGSMAN\0"                 frozen in every version (MIGRATION.md §2.3)
-8      4    format_version   the store format version     frozen; a v4 store may say 3 (MIGRATION.md §2.2)
+8      4    format_version   the store format version     frozen; 3 means 4 without vectors (MIGRATION.md §2.2)
 12     4    page_size
 16     8    segment_capacity
 24     16   store_uuid       hi, then lo
@@ -508,10 +508,8 @@ records returns wrong answers rather than slow ones.
 The whole procedure is [MIGRATION.md](MIGRATION.md). In short:
 
 - **The store format version** lives in the manifest at offset 8 and names the whole layout of the store directory —
-  every region, record and codec in this file, the dictionaries and the log. It is **5**, written as itself in
-  every store; a version 4 store without vectors says 3, which is still read as 4 for the migration
-  ([MIGRATION.md §2.2](MIGRATION.md#22-the-legacy-encoding-and-its-end)). 5 added the `TEMPORAL` property value
-  tag ([PROPERTY_STORAGE.md §4.2](PROPERTY_STORAGE.md#42-temporal-values)); nothing in this file's layouts moved.
+  every region, record and codec in this file, the dictionaries and the log. It is **4**; a store without vectors
+  still writes it as 3 ([MIGRATION.md §2.2](MIGRATION.md#22-the-legacy-encoding-and-its-end)).
 - **A reader accepts exactly one version.** `GraphStore.open` refuses an older store with a
   `MigrationRequiredException` naming `metaloom-graph-cli database migrate`, and a newer one outright. Nothing is
   upgraded on open.
@@ -620,4 +618,4 @@ The whole procedure is [MIGRATION.md](MIGRATION.md). In short:
 ---
 
 _Git HEAD revision: `8f8caad`_
-_Last updated: 2026-11-06 (store format version 5: the temporal property value tag)_
+_Last updated: 2026-10-25 (store format version 4 defined, manifest layout corrected to the code, versioning moved to MIGRATION.md)_

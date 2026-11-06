@@ -1,4 +1,0 @@
-# golden identity file, canonical form 1
-user analyst roles=[readers] grants=[]
-role readers grants=[MATCH ON golden, INTROSPECT ON *]
-authenticate analyst -> true

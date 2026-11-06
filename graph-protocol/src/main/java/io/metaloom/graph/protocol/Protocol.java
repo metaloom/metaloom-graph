@@ -34,12 +34,13 @@ package io.metaloom.graph.protocol;
 public final class Protocol {
 
 	/**
-	 * Version 4: the connection says who it is.
+	 * Version 5: temporal values. Tag 15 in {@link WireValueCodec} carries dates, times, date-times and durations, and
+	 * a version 4 peer, which would fail on the first temporal cell, is refused at the handshake instead.
 	 *
 	 * <p>
-	 * A server that wants a credential answers {@link Frames#HELLO} with {@link Frames#AUTH_REQUIRED} instead of
-	 * {@link Frames#WELCOME}, and the client replies with {@link Frames#AUTH}. {@code WELCOME} then also carries the
-	 * principal's name and its grants.
+	 * Version 4 made the connection say who it is: a server that wants a credential answers {@link Frames#HELLO} with
+	 * {@link Frames#AUTH_REQUIRED} instead of {@link Frames#WELCOME}, and the client replies with {@link Frames#AUTH}.
+	 * {@code WELCOME} then also carries the principal's name and its grants.
 	 * </p>
 	 *
 	 * <p>
@@ -60,15 +61,8 @@ public final class Protocol {
 	 * {@link WireError#UNSUPPORTED_VERSION} naming both numbers instead of a stream of frames it cannot read. Nothing
 	 * has shipped on any version, so there is no range to accept — when there is, this is where it goes.
 	 * </p>
-	 *
-	 * <p>
-	 * <b>Owed: version 5, for the temporal value tag.</b> Tag 15 was added to {@link WireValueCodec} at version 4,
-	 * because this constant's value is part of the locked API and changing it is a person's decision
-	 * (spec/API_LOCK.md). Until then a version-4 peer without the tag fails on the first temporal cell with a
-	 * {@link WireFormatException} rather than at the handshake.
-	 * </p>
 	 */
-	public static final int VERSION = 4;
+	public static final int VERSION = 5;
 
 	/** Not 8080, so the binary port and the HTTP port can both run over one store without an argument about it. */
 	public static final int DEFAULT_PORT = 8081;

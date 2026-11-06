@@ -27,7 +27,7 @@ to the framing; it also names the one thing the losing arm did better, which sha
 | **Default port** | 8081, bound to **127.0.0.1**, unencrypted. **8084 for the TLS listener**, off until a certificate is given; §7.1. HTTP stays on 8080 |
 | **Surface** | Cypher, reads and writes. **Writes off unless the server has `--allow-write`**; §4.1. No schema call |
 | **Security** | **Authentication, yes. Transport security, optional and off by default.** An `AUTH` frame during the handshake ([AUTH.md](AUTH.md)); on port 8081 the password crosses in cleartext, on the TLS listener it does not. §7 and §7.1 |
-| **Protocol version** | 4. Negotiated on connect; a mismatch is an error, not a hang, and it happens *before* any credential is asked for. **TLS did not change it** — the frames are identical on both listeners. Temporal values (tag 15, §2) were added without the bump to 5 they call for, which waits on an API-lock decision |
+| **Protocol version** | 5. Negotiated on connect; a mismatch is an error, not a hang, and it happens *before* any credential is asked for. **TLS did not change it** — the frames are identical on both listeners. Version 5 added temporal values (tag 15, §2) |
 | **Database** | Chosen per connection at `HELLO` — see [DATABASES.md](DATABASES.md) |
 | **Client dependencies** | `graph-protocol` and vertx-core. **Not** graph-core, **not** graph-cypher, no FFM, no native library — asserted by `ClientDependencyTest` |
 
@@ -222,12 +222,9 @@ public APIs and the client must not depend on graph-cypher, so the client sees a
 `IllegalArgumentException`. On the server a duration **parameter** is turned into a `CypherDuration`
 before the engine sees it (`CypherWireValues.parameters`).
 
-**The protocol version was not bumped, and should be.** This protocol's rule is a bump for a new tag,
-so a version-4 peer meets a clean `UNSUPPORTED_VERSION` instead of a `WireFormatException` ("Unknown or
-reserved value tag 15") on the first temporal cell. But `Protocol.VERSION` is a public constant whose
-value is in graph-protocol's locked API, so changing it to 5 is an API change a person has to accept
-([API_LOCK.md](API_LOCK.md)). Until then the version stays 4 and tag 15 is understood by every build
-that has it.
+**The tag bumped the protocol to version 5.** This protocol's rule is a bump for a new tag, so a
+version 4 peer meets a clean `UNSUPPORTED_VERSION` at the handshake instead of a `WireFormatException`
+("Unknown or reserved value tag 15") on the first temporal cell.
 
 ### Why this is not `ValueCodec`
 
@@ -674,4 +671,4 @@ decoder on corrupt input.
 ---
 
 _Git HEAD revision: `f2b6d5f`_
-_Last updated: 2026-11-06 (temporal values, tag 15; protocol version bump pending an API-lock decision)_
+_Last updated: 2026-11-06 (temporal values, tag 15; protocol version 5)_
