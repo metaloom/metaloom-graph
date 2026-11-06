@@ -1,5 +1,12 @@
 package io.metaloom.graph.server;
 
+import java.time.DateTimeException;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.OffsetTime;
+import java.time.ZonedDateTime;
+import java.time.temporal.TemporalAmount;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -9,6 +16,7 @@ import java.util.Set;
 import io.metaloom.graph.cypher.CypherResult;
 import io.metaloom.graph.cypher.CypherRow;
 import io.metaloom.graph.cypher.CypherStats;
+import io.metaloom.graph.cypher.value.CypherDuration;
 import io.metaloom.graph.cypher.value.CypherNode;
 import io.metaloom.graph.cypher.value.CypherPath;
 import io.metaloom.graph.cypher.value.CypherRelationship;
@@ -263,7 +271,27 @@ public final class ResultJson {
 			case Long l -> Math.abs(l) > SAFE_INTEGER ? String.valueOf(l) : (Object) l;
 			case Number n -> n;
 			case Boolean b -> b;
+			// Temporal values travel as their ISO-8601 strings, as Neo4j's HTTP API sends them. java.time's toString
+			// is that form already — a region datetime as 2020-01-01T10:00+01:00[Europe/Vienna] — and listing them
+			// here makes it a decision rather than the fallback's accident.
+			case LocalDate date -> date.toString();
+			case LocalTime time -> time.toString();
+			case OffsetTime time -> time.toString();
+			case LocalDateTime dateTime -> dateTime.toString();
+			case ZonedDateTime dateTime -> dateTime.toString();
+			// Any amount, not only CypherDuration: the store may hand a duration back as some other TemporalAmount,
+			// whose own toString (Period's, say) would print only half of it.
+			case TemporalAmount amount -> isoDuration(amount);
 			default -> String.valueOf(value);
 		};
+	}
+
+	private static String isoDuration(TemporalAmount amount) {
+		try {
+			return CypherDuration.from(amount).toString();
+		} catch (DateTimeException | ArithmeticException e) {
+			// A unit a duration does not have. Shown as the amount describes itself rather than failing the result.
+			return String.valueOf(amount);
+		}
 	}
 }

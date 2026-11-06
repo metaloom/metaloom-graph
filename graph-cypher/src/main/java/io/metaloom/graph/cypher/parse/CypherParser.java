@@ -54,22 +54,68 @@ public final class CypherParser {
 	// ---------------------------------------------------------------- query
 
 	public Ast.Query query() {
+		Ast.Query query = union(true);
+		expectEnd();
+		return query;
+	}
+
+	/**
+	 * One or more parts joined by UNION — a whole query, or the body of a subquery, which may be a union too.
+	 *
+	 * @param requireReturn
+	 *            false for the body of an {@code EXISTS}, {@code COUNT} or {@code COLLECT}, which may end at a MATCH:
+	 *            its rows are the answer, so it has somewhere to put them without a RETURN
+	 */
+	private Ast.Query union(boolean requireReturn) {
 		List<Ast.SingleQuery> parts = new ArrayList<>();
 		List<Boolean> unionAll = new ArrayList<>();
-		parts.add(singleQuery());
+		parts.add(singleQuery(requireReturn));
 		while (peek().isKeyword("UNION")) {
 			take();
 			unionAll.add(peek().isKeyword("ALL"));
 			if (peek().isKeyword("ALL")) {
 				take();
 			}
-			parts.add(singleQuery());
+			parts.add(singleQuery(requireReturn));
 		}
-		expectEnd();
 		return new Ast.Query(parts, unionAll);
 	}
 
-	private Ast.SingleQuery singleQuery() {
+	/**
+	 * How many subqueries the current position is nested in.
+	 *
+	 * <p>
+	 * Bounded, and it shrinks the expression depth allowed inside: each level is a fresh executor pass whose
+	 * expressions are walked recursively, so {@link #MAX_DEPTH} per level would multiply rather than add. Halving it
+	 * per level keeps the sum under twice the top-level limit.
+	 * </p>
+	 */
+	private int subqueryDepth;
+
+	/** The {@link #nesting} at which an expression is the root of its own tree, for the depth check. */
+	private int rootNesting = 1;
+
+	/** Nested subqueries beyond this are refused; no written query needs eight. */
+	public static final int MAX_SUBQUERY_NESTING = 8;
+
+	private <T> T inSubquery(Token at, java.util.function.Supplier<T> body) {
+		if (subqueryDepth >= MAX_SUBQUERY_NESTING) {
+			throw error(at, "Subqueries are nested more than " + MAX_SUBQUERY_NESTING + " deep");
+		}
+		descend(at);
+		int savedRoot = rootNesting;
+		subqueryDepth++;
+		rootNesting = nesting + 1;
+		try {
+			return body.get();
+		} finally {
+			subqueryDepth--;
+			rootNesting = savedRoot;
+			nesting--;
+		}
+	}
+
+	private Ast.SingleQuery singleQuery(boolean requireReturn) {
 		List<Ast.Clause> clauses = new ArrayList<>();
 		boolean returned = false;
 		// Read before the loop, because it is not a clause: it qualifies the part as a whole and may appear only at
@@ -77,7 +123,8 @@ public final class CypherParser {
 		int periodicCommit = periodicCommitPrefix();
 		while (true) {
 			Token token = peek();
-			if (token.type() == Token.Type.EOF || token.isKeyword("UNION")) {
+			if (token.type() == Token.Type.EOF || token.isKeyword("UNION")
+				|| subqueryDepth > 0 && token.isSymbol("}")) {
 				break;
 			}
 			if (returned) {
@@ -101,6 +148,8 @@ public final class CypherParser {
 				clauses.add(removeClause());
 			} else if (token.isKeyword("DELETE") || token.isKeyword("DETACH")) {
 				clauses.add(deleteClause());
+			} else if (token.isKeyword("CALL") && (peekAt(1).isSymbol("{") || peekAt(1).isSymbol("("))) {
+				clauses.add(callSubquery());
 			} else if (token.isKeyword("CALL")) {
 				clauses.add(callClause());
 			} else if (token.isKeyword("LOAD")) {
@@ -124,7 +173,7 @@ public final class CypherParser {
 			throw error(peek(), "USING PERIODIC COMMIT requires LOAD CSV to be the first clause of the query, "
 				+ "because the batches it commits are batches of CSV rows");
 		}
-		if (!returned && !part.isWrite()) {
+		if (requireReturn && !returned && !part.isWrite()) {
 			// A read with nowhere to put its answer. Refused rather than run, because it looks like a query whose
 			// RETURN was forgotten and running it would report success having produced nothing.
 			throw error(peek(), "A query that does not write must end in RETURN; this one would compute a result "
@@ -154,11 +203,12 @@ public final class CypherParser {
 	private Ast.Match matchClause() {
 		boolean optional = false;
 		if (peek().isKeyword("OPTIONAL")) {
-			Token at = take();
-			expectKeyword("MATCH");
-			// Parsed rather than lexed away, so the message can be about the feature instead of about the word.
-			throw error(at, "OPTIONAL MATCH is not supported: it needs null-padding semantics this build "
-				+ "does not implement");
+			take();
+			if (peek().isKeyword("CALL")) {
+				throw error(peek(), "OPTIONAL CALL is not supported in this build; use CALL { … } with an "
+					+ "OPTIONAL MATCH inside");
+			}
+			optional = true;
 		}
 		expectKeyword("MATCH");
 		List<Ast.PatternPart> pattern = new ArrayList<>();
@@ -840,8 +890,9 @@ public final class CypherParser {
 		descend(start);
 		try {
 			Expr expression = or();
-			if (nesting == 1 && depth(expression) > MAX_DEPTH) {
-				throw error(start, "This expression is nested more than " + MAX_DEPTH + " levels deep");
+			int limit = MAX_DEPTH >> subqueryDepth;
+			if (nesting == rootNesting && depth(expression, limit) > limit) {
+				throw error(start, "This expression is nested more than " + limit + " levels deep");
 			}
 			return expression;
 		} finally {
@@ -866,7 +917,7 @@ public final class CypherParser {
 	}
 
 	/** The depth of a tree, walked with an explicit stack: recursing here would be the overflow being guarded. */
-	private static int depth(Expr root) {
+	private static int depth(Expr root, int limit) {
 		int deepest = 0;
 		java.util.ArrayDeque<Object[]> stack = new java.util.ArrayDeque<>();
 		stack.push(new Object[] { root, 1 });
@@ -874,7 +925,7 @@ public final class CypherParser {
 			Object[] entry = stack.pop();
 			int level = (Integer) entry[1];
 			deepest = Math.max(deepest, level);
-			if (deepest > MAX_DEPTH) {
+			if (deepest > limit) {
 				return deepest;
 			}
 			for (Expr child : children((Expr) entry[0])) {
@@ -908,6 +959,11 @@ public final class CypherParser {
 				all.add(branch.otherwise());
 				yield all;
 			}
+			case Ast.ListComprehension comprehension -> java.util.Arrays.asList(comprehension.list(),
+				comprehension.where(), comprehension.projection());
+			case Ast.Quantifier quantifier -> java.util.Arrays.asList(quantifier.list(), quantifier.where());
+			// Its expressions were checked as roots of their own when the body was parsed.
+			case Ast.Subquery ignored -> List.of();
 		};
 	}
 
@@ -1136,12 +1192,19 @@ public final class CypherParser {
 					return functionCall(token.text());
 				}
 				if (peek().isSymbol("{")) {
-					// Nothing in this grammar puts a map after a name, so these two are refused by name here rather
-					// than left to fail at the clause with a message about a brace.
-					throw error(token, token.text().equalsIgnoreCase("exists")
-						? "EXISTS subqueries are not supported in this build; exists(n.property) is"
-						: "Map projections are not supported in this build: write a map literal, as in "
-							+ "{name: " + token.text() + ".name}");
+					Ast.SubqueryKind kind = switch (token.text().toUpperCase(java.util.Locale.ROOT)) {
+						case "EXISTS" -> Ast.SubqueryKind.EXISTS;
+						case "COUNT" -> Ast.SubqueryKind.COUNT;
+						case "COLLECT" -> Ast.SubqueryKind.COLLECT;
+						default -> null;
+					};
+					if (kind != null) {
+						return subqueryExpression(token, kind);
+					}
+					// Nothing else in this grammar puts a map after a name, so this is refused by name here rather than
+					// left to fail at the clause with a message about a brace.
+					throw error(token, "Map projections are not supported in this build: write a map literal, as in "
+						+ "{name: " + token.text() + ".name}");
 				}
 				return new Ast.Variable(token.text());
 			}
@@ -1162,8 +1225,9 @@ public final class CypherParser {
 					case "CASE" -> {
 						return caseExpression();
 					}
-					case "ALL", "ANY", "NONE", "SINGLE" -> {
-						throw error(token, token.text() + " predicates are not supported in this build");
+					case "ALL" -> {
+						take();
+						return quantifier(token, Ast.QuantifierKind.ALL);
 					}
 					default -> throw error(token, "Unexpected keyword " + token.text() + " in an expression");
 				}
@@ -1177,10 +1241,9 @@ public final class CypherParser {
 				}
 				if (token.isSymbol("[")) {
 					if (peekAt(1).type() == Token.Type.IDENTIFIER && peekAt(2).isKeyword("IN")) {
-						// In openCypher `[x IN list]` is always a comprehension, even without `|` or WHERE, so
-						// reading it as a one-element list of booleans would be a different answer, not a refusal.
-						throw error(token, "List comprehensions are not supported in this build: use UNWIND, "
-							+ "then collect()");
+						// In openCypher `[x IN list]` is always a comprehension, even without `|` or WHERE, so it
+						// must not be read as a one-element list of booleans.
+						return listComprehension();
 					}
 					take();
 					List<Expr> elements = new ArrayList<>();
@@ -1243,6 +1306,196 @@ public final class CypherParser {
 	}
 
 	/**
+	 * {@code [x IN list WHERE predicate | projection]}, with the opening bracket still to be taken.
+	 */
+	private Expr listComprehension() {
+		Token open = take();
+		String variable = identifier("a variable name in a list comprehension");
+		expectKeyword("IN");
+		Expr list = expression();
+		Expr where = null;
+		if (peek().isKeyword("WHERE")) {
+			take();
+			where = expression();
+		}
+		Expr projection = null;
+		if (peek().isSymbol("|")) {
+			take();
+			projection = expression();
+		}
+		if (!peek().isSymbol("]")) {
+			throw error(peek(), "Expected WHERE, '|' or ']' in the list comprehension opened at " + open.line() + ":"
+				+ open.column() + " but found " + describe(peek()));
+		}
+		take();
+		return new Ast.ListComprehension(variable, list, where, projection);
+	}
+
+	/**
+	 * {@code all(x IN list WHERE predicate)}, and {@code any}, {@code none}, {@code single}, with the name taken.
+	 *
+	 * <p>
+	 * The WHERE is required, as in openCypher: without it there is no predicate to quantify, and reading
+	 * {@code any(x IN list)} as "the list is not empty" would be guessing.
+	 * </p>
+	 */
+	private Expr quantifier(Token at, Ast.QuantifierKind kind) {
+		String name = kind.name().toLowerCase(java.util.Locale.ROOT);
+		expectSymbol("(", name + "(x IN list WHERE …)");
+		String variable = identifier("a variable name in " + name + "()");
+		expectKeyword("IN");
+		Expr list = expression();
+		if (!peek().isKeyword("WHERE")) {
+			throw error(peek(), name + "() needs a predicate, as in " + name + "(x IN list WHERE x > 0), but found "
+				+ describe(peek()));
+		}
+		take();
+		Expr where = expression();
+		expectSymbol(")", "the end of " + name + "()");
+		return new Ast.Quantifier(kind, variable, list, where);
+	}
+
+	/**
+	 * {@code EXISTS { … }}, {@code COUNT { … }}, {@code COLLECT { … }}, with the name taken and the brace next.
+	 *
+	 * <p>
+	 * The body is a query, or only a pattern with an optional WHERE — {@code EXISTS { (a)-[:KNOWS]->(b) }} — which is
+	 * read as the MATCH it abbreviates. It may not write and may not read a file: it is evaluated as a value, possibly
+	 * many times per row, and a value with side effects would make the number of times observable.
+	 * </p>
+	 */
+	private Expr subqueryExpression(Token at, Ast.SubqueryKind kind) {
+		Token open = take();
+		Ast.Query body = inSubquery(open, () -> {
+			Ast.Query parsed;
+			if (peek().isSymbol("(") || peek().type() == Token.Type.IDENTIFIER && peekAt(1).isSymbol("=")) {
+				List<Ast.PatternPart> pattern = new ArrayList<>();
+				pattern.add(patternPart());
+				while (peek().isSymbol(",")) {
+					take();
+					pattern.add(patternPart());
+				}
+				Expr where = null;
+				if (peek().isKeyword("WHERE")) {
+					take();
+					where = expression();
+				}
+				parsed = new Ast.Query(List.of(new Ast.SingleQuery(List.of(new Ast.Match(pattern, where, false)))),
+					List.of());
+			} else {
+				parsed = union(false);
+			}
+			return parsed;
+		});
+		expectSymbol("}", "the end of " + kind + " { … }");
+		if (body.isWrite() || body.readsFiles()) {
+			throw error(at, kind + " { … } cannot write or load a file: it is evaluated as a value. Use CALL { … } "
+				+ "for a subquery that writes");
+		}
+		if (kind == Ast.SubqueryKind.COLLECT) {
+			for (Ast.SingleQuery part : body.parts()) {
+				Ast.Clause last = part.clauses().get(part.clauses().size() - 1);
+				if (!(last instanceof Ast.Return returning) || returning.projection().star()
+					|| returning.projection().items().size() != 1) {
+					throw error(at, "COLLECT { … } must end in a RETURN of exactly one column, which is what it "
+						+ "collects");
+				}
+			}
+		}
+		return new Ast.Subquery(kind, body);
+	}
+
+	/**
+	 * {@code CALL { … }} or {@code CALL (a, b) { … }} — a subquery run once per incoming row.
+	 *
+	 * <p>
+	 * Imports are resolved here, once, into a list of names. The scope clause states them; the older form states them
+	 * in a leading {@code WITH} of bare variables, which stays in the body and runs as the ordinary projection it is.
+	 * {@code IN TRANSACTIONS} is refused by name: batching a write needs the transaction control that only
+	 * {@code USING PERIODIC COMMIT} has here.
+	 * </p>
+	 */
+	private Ast.CallSubquery callSubquery() {
+		Token call = take();
+		List<String> imports = new ArrayList<>();
+		boolean importAll = false;
+		boolean scoped = false;
+		if (peek().isSymbol("(")) {
+			take();
+			scoped = true;
+			if (peek().isSymbol("*")) {
+				take();
+				importAll = true;
+			} else if (!peek().isSymbol(")")) {
+				imports.add(identifier("a variable to import"));
+				while (peek().isSymbol(",")) {
+					take();
+					imports.add(identifier("a variable to import"));
+				}
+			}
+			expectSymbol(")", "the end of the imported variables");
+		}
+		Token open = peek();
+		expectSymbol("{", "the body of CALL { … }");
+		Ast.Query body = inSubquery(open, () -> union(true));
+		expectSymbol("}", "the end of CALL { … }");
+		if (peek().isKeyword("IN") || peek().is(Token.Type.IDENTIFIER, "transactions")) {
+			throw error(peek(), "CALL { … } IN TRANSACTIONS is not supported in this build; USING PERIODIC COMMIT "
+				+ "with LOAD CSV is how a load is batched here");
+		}
+		if (!scoped) {
+			// The leading WITH of each union part, when it is nothing but bare variables, is the import list.
+			java.util.Set<String> names = new java.util.LinkedHashSet<>();
+			for (Ast.SingleQuery part : body.parts()) {
+				if (part.clauses().get(0) instanceof Ast.With with && importing(with)) {
+					if (with.projection().star()) {
+						importAll = true;
+					}
+					for (Ast.ProjectionItem item : with.projection().items()) {
+						names.add(((Ast.Variable) item.expression()).name());
+					}
+				}
+			}
+			imports.addAll(names);
+		} else {
+			for (Ast.SingleQuery part : body.parts()) {
+				if (part.clauses().get(0) instanceof Ast.With with && importing(with)) {
+					throw error(call, "CALL (…) { … } states its imports in the parentheses, so the body cannot also "
+						+ "begin with an importing WITH");
+				}
+			}
+		}
+		Ast.CallSubquery clause = new Ast.CallSubquery(body, imports, importAll);
+		boolean returns = body.parts().get(0).clauses()
+			.get(body.parts().get(0).clauses().size() - 1) instanceof Ast.Return;
+		for (Ast.SingleQuery part : body.parts()) {
+			boolean partReturns = part.clauses().get(part.clauses().size() - 1) instanceof Ast.Return;
+			if (partReturns != returns) {
+				throw error(call, "Every part of a UNION inside CALL { … } must end in RETURN, or none may");
+			}
+		}
+		return clause;
+	}
+
+	/**
+	 * A WITH that only passes variables through under their own names — {@code WITH a, b} or {@code WITH *} — with
+	 * nothing that filters, orders or pages. That is the shape openCypher reads as an import list.
+	 */
+	private static boolean importing(Ast.With with) {
+		Ast.Projection projection = with.projection();
+		if (with.where() != null || projection.distinct() || !projection.order().isEmpty() || projection.skip() != null
+			|| projection.limit() != null) {
+			return false;
+		}
+		for (Ast.ProjectionItem item : projection.items()) {
+			if (!(item.expression() instanceof Ast.Variable variable) || !variable.name().equals(item.alias())) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/**
 	 * {@code CALL namespace.procedure(args) YIELD a, b}.
 	 * <p>
 	 * {@code YIELD} is required rather than optional. A call whose results are not bound to anything has nowhere to
@@ -1281,10 +1534,11 @@ public final class CypherParser {
 
 	private Expr functionCall(String name) {
 		String upper = name.toUpperCase(java.util.Locale.ROOT);
-		if (upper.equals("ANY") || upper.equals("NONE") || upper.equals("SINGLE")) {
-			// ALL is a keyword and is refused in primary(); these three are not, so they arrive as a function name and
-			// would otherwise fail at the WHERE inside them.
-			throw error(previous(), upper + " predicates are not supported in this build");
+		if ((upper.equals("ANY") || upper.equals("NONE") || upper.equals("SINGLE"))
+			&& peekAt(1).type() == Token.Type.IDENTIFIER && peekAt(2).isKeyword("IN")) {
+			// ALL is a keyword and reaches quantifier() from primary(); these three are ordinary names, so they arrive
+			// here and are told apart from a call by the `x IN` that only a quantifier has.
+			return quantifier(previous(), Ast.QuantifierKind.valueOf(upper));
 		}
 		if (name.equals("shortestPath") || name.equals("allShortestPaths")) {
 			// It parses as a function call here and its argument is a pattern, so the error would otherwise be about

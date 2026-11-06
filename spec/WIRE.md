@@ -27,7 +27,7 @@ to the framing; it also names the one thing the losing arm did better, which sha
 | **Default port** | 8081, bound to **127.0.0.1**, unencrypted. **8084 for the TLS listener**, off until a certificate is given; §7.1. HTTP stays on 8080 |
 | **Surface** | Cypher, reads and writes. **Writes off unless the server has `--allow-write`**; §4.1. No schema call |
 | **Security** | **Authentication, yes. Transport security, optional and off by default.** An `AUTH` frame during the handshake ([AUTH.md](AUTH.md)); on port 8081 the password crosses in cleartext, on the TLS listener it does not. §7 and §7.1 |
-| **Protocol version** | 4. Negotiated on connect; a mismatch is an error, not a hang, and it happens *before* any credential is asked for. **TLS did not change it** — the frames are identical on both listeners |
+| **Protocol version** | 4. Negotiated on connect; a mismatch is an error, not a hang, and it happens *before* any credential is asked for. **TLS did not change it** — the frames are identical on both listeners. Temporal values (tag 15, §2) were added without the bump to 5 they call for, which waits on an API-lock decision |
 | **Database** | Chosen per connection at `HELLO` — see [DATABASES.md](DATABASES.md) |
 | **Client dependencies** | `graph-protocol` and vertx-core. **Not** graph-core, **not** graph-cypher, no FFM, no native library — asserted by `ClientDependencyTest` |
 
@@ -181,10 +181,53 @@ encoding is **byte-identical**, so a reader of one can be checked against the ot
 |---|---|---|---|---|
 | 0 `NULL` | 1 `BOOL` | 2 `INT` (zigzag) | 3 `FLOAT` | 4 `STRING` |
 | 10 `LIST` | 11 `MAP` | 12 `NODE` | 13 `REL` | 14 `PATH` |
+| 15 `TEMPORAL` | | | | |
 
 **Tags 5 to 9 are reserved and rejected, not skipped.** They are the storage codec's `BYTES`,
 `TIMESTAMP`, `UUID`, `ELEMENT_REF` and `VECTOR_F32`, none of which can reach a query result. Meeting
 one means corruption or a version mismatch, and both deserve an error rather than a shrug.
+
+### Temporal values: one tag, the size class is the kind
+
+| Size class | Cypher type | Java value | Payload |
+|---|---|---|---|
+| 0 | `DATE` | `LocalDate` | `i64` epoch day |
+| 1 | `LOCAL TIME` | `LocalTime` | `i64` nano of day |
+| 2 | `TIME` | `OffsetTime` | `i64` nano of day, `i32` offset seconds |
+| 3 | `LOCAL DATETIME` | `LocalDateTime` | `i64` epoch second read as UTC, `i32` nano |
+| 4 | `DATETIME` at a fixed offset | `ZonedDateTime` whose zone is a `ZoneOffset` | `i64` instant epoch second, `i32` nano, `i32` offset seconds |
+| 5 | `DATETIME` in a region | `ZonedDateTime` with a region such as `Europe/Vienna` | `i64` instant epoch second, `i32` nano, the zone id as a string value |
+| 6 | `DURATION` | any `TemporalAmount` in years, months, days, seconds, nanos | `i64` months, `i64` days, `i64` seconds, `i32` nanos in `[0, 1e9)` |
+
+**Fifteen** because it is the first number free in this codec, the storage codec and the dump codec
+alike ([BACKUP.md §3.3](BACKUP.md)), so the three can agree on it; one tag rather than seven because
+the size class carries the kind for free, and seven of the 32 type numbers spent on one family would
+leave the three codecs little room to stay aligned.
+
+**A region datetime carries its instant and its zone, not its offset.** The offset follows from the
+zone's rules; if the two ends' time-zone data disagree, keeping the instant is keeping the value.
+
+**Decoding is strict**, so one value has exactly one encoding and hostile bytes fail as
+`WireFormatException`: every field is range-checked (`java.time`'s `DateTimeException` is turned into
+the codec's exception), a nanosecond field outside `[0, 1e9)` is refused rather than carried into the
+seconds, and a zone id must be a known region **in its canonical spelling** — a fixed offset spelt as a
+region (`+01:00`, `Z`) or a non-canonical id (`UTC+1` for `UTC+01:00`) is refused. Size class 7 is refused.
+
+**A duration decodes to a non-public `TemporalAmount`.** graph-protocol and graph-client have locked
+public APIs and the client must not depend on graph-cypher, so the client sees a `TemporalAmount` in
+`MONTHS`, `DAYS`, `SECONDS` and `NANOS` with an ISO-8601 `toString` identical to `CypherDuration`'s
+(`P1Y2M3DT4H5M6.5S`, `PT-1.5S`, `PT0S`) and equality over the four fields. The encoder takes **any**
+`TemporalAmount` whose units are among years, months, days, seconds and nanos — `CypherDuration`,
+`Period`, `Duration`, or whatever the store hands back — and refuses any other unit with
+`IllegalArgumentException`. On the server a duration **parameter** is turned into a `CypherDuration`
+before the engine sees it (`CypherWireValues.parameters`).
+
+**The protocol version was not bumped, and should be.** This protocol's rule is a bump for a new tag,
+so a version-4 peer meets a clean `UNSUPPORTED_VERSION` instead of a `WireFormatException` ("Unknown or
+reserved value tag 15") on the first temporal cell. But `Protocol.VERSION` is a public constant whose
+value is in graph-protocol's locked API, so changing it to 5 is an API change a person has to accept
+([API_LOCK.md](API_LOCK.md)). Until then the version stays 4 and tag 15 is understood by every build
+that has it.
 
 ### Why this is not `ValueCodec`
 
@@ -463,6 +506,12 @@ in-process to over-the-wire is a change of import rather than of style. The elem
 converts at its edge, which costs one small record per element and buys a client jar with no storage
 engine in it.
 
+Temporal cells come back as `java.time` values — `LocalDate`, `LocalTime`, `OffsetTime`,
+`LocalDateTime`, `ZonedDateTime` — and a duration as a `TemporalAmount` whose `toString` is its ISO-8601
+form (§2). `row.get` returns them; `row.string` and `Row.toString` print the ISO form. There is no typed
+accessor for them, since adding one is a change to the locked API; `row.get(...)` with a cast is the way.
+They can be sent as parameters the same way.
+
 | Rule | Why |
 |---|---|
 | **Rows already sent before an error are not a result** | The stream throws at exactly the row where the `ERROR` arrived, and `close()` reports one nothing else observed. Returning them as if the stream had merely ended is truncated data with no way to tell |
@@ -576,6 +625,7 @@ make cleartext safe; neither substitutes for the other.
 |---|---|
 | `WireVersusEmbeddedTest` | **The load-bearing one.** 27 queries, in process and over the wire, compared **cell by cell** — nodes, materialised *and* lightweight relationships, paths, lists, maps, nulls, and a string over 255 bytes. The comparison is written out field by field rather than calling the server's own converter, because a test that used the code under test to decide the answer would agree with it however wrong it was |
 | `WireDecoderHostileInputTest` | `@Tag("fuzz")`. Random bytes, every truncation offset, every single-byte corruption, a list claiming 2^31−1 elements in twelve bytes, nesting a million deep. The oracle knows nothing about the format: decode or raise `WireFormatException`, never OOM, never `StackOverflowError`, always terminate, **allocation proportional to input** |
+| `WireTemporalCodecTest` | Tag 15: all seven kinds round-trip exactly, at `MIN`/`MAX`, an offset staying an offset and a region a region; `Period`, `Duration` and a hand-made amount encoded by their units, an `HOURS` unit refused; temporal values inside lists, maps and node properties; out-of-range fields, unknown, malformed, offset-spelt and non-canonical zone ids, kind 7 and every truncation refused with `WireFormatException`. `WireDecoderHostileInputTest`'s rich value carries one of each kind, so its truncations and corruptions reach them too |
 | `FrameReaderTest` | Reassembly against the delivery patterns TCP actually produces: a frame split at every byte boundary, three frames in one chunk, a header claiming two gigabytes |
 | `WireServerTest` | The mechanics — overload, cancel, deadline against a client that stopped reading, an oversized frame taking one connection and not the server, and `openViews() == 0` after every test. **Class-level `@Timeout(30s)`**: these tests block on a socket, so a flow-control defect presents as a parked thread rather than a failed assertion, and without a deadline it stalls the whole build instead of failing (§5.1) |
 | `WireServerTest` (writes) | A write refused without the flag and accepted with it; the counters in `COMPLETE`; a failed write rolled back with the writer lock returned; two connections writing to one database both finishing; and no view *and no held lock* left behind |
@@ -590,7 +640,7 @@ make cleartext safe; neither substitutes for the other.
 | `ClientDependencyTest` | Fails if graph-core or graph-cypher ever reaches the client's classpath. Checked by **loading**, not by reading a pom, because a transitive arrival would pass a pom check |
 | `WireCodecPropertyTest` | Thousands of seeded random values — nested lists, maps, nodes, lightweight and materialised relationships and paths inside one another, every integer size-class edge, NaN and -0.0 by their bits, strings across all of Unicode — round-trip exactly and consume exactly their bytes, alone and back to back. Random frames of every type, 0 B to 1 MiB, survive random chunking; a frame of exactly 16 MiB is accepted and one byte more refused; the per-header ceiling is re-read between coalesced frames. Lone surrogates refused at every offset, malformed UTF-8 refused, an ill-shaped path refused |
 | `GraphClientLifecycleTest` (graph-client) | The client against `ScriptedServer`, a server that misbehaves on cue: a closed stream asked again, a connection dropped mid-result, an error after rows, a truncated `COMPLETE`, an undecodable batch, an unexpected frame, a silent server, a connection-level error's code, closing and interrupting a blocked consumer, rows for an unknown stream, an abandoned stream holding the budget, 65,536 unencodable queries, and 16 threads sharing one client. **`` in `SEPARATE_THREAD` mode**: `CompletableFuture.join` is not interruptible, so a same-thread timeout could not end two of the hangs this found |
-| `WireClientEndToEndTest` | The client against a real server: back-to-back queries at the stream limit never refused, a stream id reused the instant it ends, back-to-back writes, twelve threads on one client, every parameter type through `RETURN $p`, a lone surrogate answered `TYPE`, a write cut off by a disconnect all or nothing, a failed write rolled back whole, a database dropped under an open connection, and a query in flight at shutdown answered within the grace period |
+| `WireClientEndToEndTest` | The client against a real server: back-to-back queries at the stream limit never refused, a stream id reused the instant it ends, back-to-back writes, twelve threads on one client, every parameter type through `RETURN $p` — the six temporal kinds included, a duration sent as `CypherDuration`, `Period` and `Duration` — a lone surrogate answered `TYPE`, a write cut off by a disconnect all or nothing, a failed write rolled back whole, a database dropped under an open connection, and a query in flight at shutdown answered within the grace period |
 
 **Why a fuzz oracle and not only a differential test.** [TESTING.md](TESTING.md) §0 records the finding:
 a differential test compares two implementations and therefore finds only the mistakes they do not
@@ -624,4 +674,4 @@ decoder on corrupt input.
 ---
 
 _Git HEAD revision: `f2b6d5f`_
-_Last updated: 2026-10-24 (client, server and CLI review: closed streams, budget leak, slot release order, shutdown grace, strict UTF-8, MCP argument shapes, atomic backups)_
+_Last updated: 2026-11-06 (temporal values, tag 15; protocol version bump pending an API-lock decision)_

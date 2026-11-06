@@ -239,16 +239,25 @@ public class CypherParserTest {
 	@Test
 	public void testUnsupportedFeaturesAreNamedRatherThanCalledSyntaxErrors() {
 		assertTrue(assertThrows(CypherSyntaxException.class,
-			() -> CypherParser.parse("OPTIONAL MATCH (n) RETURN n")).getMessage().contains("OPTIONAL MATCH"));
-		assertTrue(assertThrows(CypherSyntaxException.class,
-			() -> CypherParser.parse("MATCH (n) WHERE ALL(x IN n.xs WHERE x > 0) RETURN n")).getMessage()
-				.contains("ALL predicates are not supported"));
-		// The other three are not keywords, so they reach the parser as function names; they must still be named.
+			() -> CypherParser.parse("OPTIONAL CALL { RETURN 1 AS x } RETURN x")).getMessage()
+				.contains("OPTIONAL CALL is not supported"));
+	}
+
+	/** OPTIONAL MATCH and the quantifiers used to be refused here; they parse into what they are now. */
+	@Test
+	public void testOptionalMatchAndQuantifiersParse() {
+		Ast.Match optional = (Ast.Match) CypherParser.parse("OPTIONAL MATCH (n) RETURN n").parts().get(0).clauses()
+			.get(0);
+		assertTrue(optional.optional());
+		Ast.Match where = (Ast.Match) CypherParser.parse("MATCH (n) WHERE ALL(x IN n.xs WHERE x > 0) RETURN n")
+			.parts().get(0).clauses().get(0);
+		assertEquals(Ast.QuantifierKind.ALL, ((Ast.Quantifier) where.where()).kind());
+		// The other three are not keywords, so they reach the parser as function names and are recognised by `x IN`.
 		for (String predicate : List.of("ANY", "none", "Single")) {
-			assertTrue(assertThrows(CypherSyntaxException.class,
-				() -> CypherParser.parse("MATCH (n) WHERE " + predicate + "(x IN n.xs WHERE x > 0) RETURN n"))
-				.getMessage().contains(predicate.toUpperCase(java.util.Locale.ROOT) + " predicates are not supported"),
-				predicate);
+			Ast.Match match = (Ast.Match) CypherParser.parse("MATCH (n) WHERE " + predicate
+				+ "(x IN n.xs WHERE x > 0) RETURN n").parts().get(0).clauses().get(0);
+			assertEquals(Ast.QuantifierKind.valueOf(predicate.toUpperCase(java.util.Locale.ROOT)),
+				((Ast.Quantifier) match.where()).kind(), predicate);
 		}
 	}
 

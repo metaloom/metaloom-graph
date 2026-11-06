@@ -152,8 +152,8 @@ text.
 | `VECTOR_F32` | 9 | — | 4 B dim + 8 B `BLOB` id | done — a vector the store has no fixed record for |
 | `VECTOR_REF` | 11 | — | 4 B dim + 8 B `VEC` id | done — a vector of the store's own declared dimension |
 | `LIST` | 10 | — | varint count + encoded elements | done, recursive |
-| `MAP` | 11 | — | varint count + (key_id, value) pairs | not implemented |
-| `DURATION` | 12 | — | 8 B | not implemented |
+| `TEMPORAL` | 12 | 0..6, the kind (§4.2) | 8 to 28 B, or 13 B + zone id | done, store format version 5 — Cypher's dates, times, date-times and durations |
+| `MAP` | — | — | varint count + (key_id, value) pairs | not implemented; no tag assigned |
 
 **The zig-zag comparison must be unsigned.** `Long.MAX_VALUE` zig-zag encodes to `0xFFFFFFFFFFFFFFFE`,
 which is negative as a signed `long`; a signed `<=` test classifies it as a one-byte value and
@@ -190,6 +190,36 @@ stores an 8-byte `STRING_REF` instead of the bytes, with a reference count.
 
 Worth it for stores with heavy value repetition (categories, tags, enum-like fields), a net loss for
 stores with unique values. Off by default; measurable with the benchmark harness.
+
+### 4.2 Temporal values
+
+One tag, `TEMPORAL` = 12, with the size class naming the kind. All integers little-endian.
+
+| Kind | Java value written | Payload | Reads back as |
+|------|--------------------|---------|---------------|
+| 0 date | `LocalDate` | `i64` epoch day | `LocalDate` |
+| 1 local time | `LocalTime` | `i64` nano of day | `LocalTime` |
+| 2 time | `OffsetTime` | `i64` nano of day, `i32` offset seconds | `OffsetTime` |
+| 3 local date-time | `LocalDateTime` | `i64` epoch second as if UTC, `i32` nano | `LocalDateTime` |
+| 4 date-time, fixed offset | `ZonedDateTime` whose zone is a `ZoneOffset`, or `OffsetDateTime` | `i64` epoch second, `i32` nano, `i32` offset seconds | `ZonedDateTime` with that offset as its zone |
+| 5 date-time, region zone | `ZonedDateTime` with a region (`Europe/Vienna`) | `i64` epoch second, `i32` nano, `u8` length + UTF-8 zone id | `ZonedDateTime` in that region; the instant fixes the offset, so both readings of an autumn overlap survive |
+| 6 duration | any `TemporalAmount` whose units are among years, months, days, seconds, nanos (`Period`, `Duration`, graph-cypher's `CypherDuration`) | `i64` months, `i64` days, `i64` seconds, `i32` nanos | `StoredDuration` (internal, `store.prop`), a `TemporalAmount` with units months, days, seconds, nanos and an ISO-8601 `toString` |
+
+- **A duration keeps four components**, as Cypher defines one: years fold into months (`years * 12 + months`),
+  and nanos are normalised into `[0, 1e9)` with the carry in seconds (floor division, so -0.5 s is `-1 s +
+  500,000,000 ns`). Nothing else converts: a month is not a number of days, a day is not 86,400 seconds. An
+  amount with another unit (hours, weeks) or one that overflows a `long` is refused with
+  `IllegalArgumentException`.
+- **Decoding validates.** The bytes come off a page: a nano, a nano of day or an offset out of range, an
+  epoch value `java.time` cannot represent, an unknown zone id or kind 7 is a `PageCorruptException`, never a
+  `DateTimeException`. A zone id the running JDK's tzdb does not know reads as corruption too.
+- **Index equality** ([INDEX.md](INDEX.md), `IndexCatalog.valueHash`/`valueEquals`): a zoned or offset date-time
+  equals another that denotes the same instant, whatever the zone, and never an `Instant`; a time with an offset
+  equals one with the same UTC time of day; a duration equals any `TemporalAmount` with the same four components.
+  The hashes are spelled out per type rather than taken from the `java.time` classes, because index keys persist.
+- **Why a format bump for a new tag.** A store that holds tag 12 must not be opened by a build whose codec throws on
+  it half way through a read; the version refuses it up front. A version 4 store cannot hold the tag, so the step
+  from 4 to 5 rewrites nothing ([MIGRATION.md](MIGRATION.md)).
 
 ---
 
@@ -271,6 +301,11 @@ Compression (lz4 by default above 4 KiB) is applied per blob, in native code.
   the CRC is validated; corrupt one extent and assert the read fails loudly.
 - `PropertyUpdateTest`: grow a block through every size class and shrink it back, asserting no leaked
   cells (compare the FSB before and after).
+- `TemporalValueCodecTest`: every temporal kind round trips at its extremes (min/max dates, a pre-epoch
+  date-time with nanos, a region zone at an overlap, an offset date-time read back as zoned, `Period`,
+  `Duration` and a custom amount); the skip path and the id remapper consume exactly the decoder's bytes;
+  corrupt payloads are `PageCorruptException`. `TemporalIndexTest`: index and scan lookups by instant,
+  UTC time and duration components, and a unique constraint across zones.
 - `DedupTest`: with dedup enabled, store the same 1 KB string 10^5 times; assert the blob store holds
   one copy with refcount 10^5, and that deleting all but one leaves the blob live.
 
@@ -282,14 +317,14 @@ Compression (lz4 by default above 4 KiB) is applied per blob, in native code.
       backing arrives in Phase 7)
 - [x] `PropertyStore` block encoder/decoder with entries sorted by key id
 - [x] Single-property read that stops at the first key past the target
-- [x] Value type tags per §4, all except `MAP` and `DURATION`
+- [x] Value type tags per §4, all except `MAP`; temporal values (§4.2) since store format version 5
 - [x] Segregated free lists for cell runs, page-straddle avoidance
 - [x] `BlobStore` with extent chaining and a whole-blob CRC
 - [x] `VECTOR_F32` support, and `VECTOR_REF` for a store with fixed-size vector records
 - [x] Cascade: freeing an element frees its property block and every blob it references (the D12
       regression)
 - [x] Tests: every value type, blob escape, type mismatch, grow-and-shrink without leaking cells
-- [ ] `MAP` and `DURATION` types
+- [ ] `MAP` type
 - [ ] lz4 compression for blobs (Phase 6, native)
 - [ ] Optional string deduplication with refcounts
 - [ ] WAL-logged interning (Phase 4)
@@ -303,6 +338,7 @@ Compression (lz4 by default above 4 KiB) is applied per blob, in native code.
 | `PropertyStore` | `io.metaloom.graph.core.store.prop` | Read, write, free property blocks |
 | `PropertyBlock` | `io.metaloom.graph.core.store.prop` | Encode/decode, binary search by `key_id` |
 | `ValueCodec` | `io.metaloom.graph.core.store.prop` | Type tags and payload encoding |
+| `StoredDuration` | `io.metaloom.graph.core.store.prop` | What a duration property reads back as (§4.2); internal, not exported |
 | `BlobStore` | `io.metaloom.graph.core.store.blob` | Extent allocation, chaining, compression |
 | `Catalog` | `io.metaloom.graph.core.catalog` | Key and label interning |
 | `Dictionary` | `io.metaloom.graph.core.catalog` | One string <-> id mapping, persistent |
@@ -310,4 +346,4 @@ Compression (lz4 by default above 4 KiB) is applied per blob, in native code.
 ---
 
 _Git HEAD revision: `8f178b4`_
-_Last updated: 2026-08-14_
+_Last updated: 2026-11-06 (temporal values, store format version 5)_

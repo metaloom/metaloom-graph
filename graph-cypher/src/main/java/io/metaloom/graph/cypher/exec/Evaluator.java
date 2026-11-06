@@ -30,16 +30,46 @@ public final class Evaluator {
 	/** Null except in an evaluator made by {@link #folding}, where it answers each aggregating call. */
 	private final Function<Ast.FunctionCall, Object> aggregates;
 
+	/**
+	 * Runs {@code EXISTS}, {@code COUNT} and {@code COLLECT} bodies. The executor owns the clause pipeline, so it plugs
+	 * itself in here once it exists; an evaluator without one refuses a subquery rather than guessing.
+	 */
+	private Subqueries subqueries;
+
+	/**
+	 * The clock reading every temporal function without an argument uses, taken once per query: {@code datetime()}
+	 * twice in one statement is the same instant, as in Neo4j's default statement clock.
+	 */
+	private final java.time.Instant statementTime;
+
+	/** The executor's half of a subquery expression: the rows of {@code body} seeded with {@code row}. */
+	public interface Subqueries {
+
+		Object evaluate(Ast.Subquery subquery, Row row);
+	}
+
 	public Evaluator(GraphAccess graph, Map<String, Object> parameters) {
 		this.graph = graph;
 		this.parameters = parameters == null ? Map.of() : normalisedParameters(parameters);
 		this.aggregates = null;
+		this.statementTime = java.time.Instant.now();
 	}
 
 	private Evaluator(Evaluator base, Function<Ast.FunctionCall, Object> aggregates) {
 		this.graph = base.graph;
 		this.parameters = base.parameters;
 		this.aggregates = aggregates;
+		this.subqueries = base.subqueries;
+		this.statementTime = base.statementTime;
+	}
+
+	void subqueries(Subqueries subqueries) {
+		this.subqueries = subqueries;
+	}
+
+	/** See {@link #statementTime}. */
+	public java.time.Instant statementTime() {
+		return statementTime;
 	}
 
 	/**
@@ -93,8 +123,9 @@ public final class Evaluator {
 				}
 				yield out;
 			}
-			// A float[] stays one: it is how a query vector is passed, and the vector functions take it as it is.
-			default -> value;
+			// A float[] stays one: it is how a query vector is passed, and the vector functions take it as it is. An
+			// Instant, an OffsetDateTime or a Period becomes the temporal type this module computes with.
+			default -> io.metaloom.graph.cypher.func.Temporals.normalise(value);
 		};
 	}
 
@@ -152,6 +183,105 @@ public final class Evaluator {
 				? aggregates.apply(call)
 				: Functions.call(this, call, row);
 			case Ast.Case caseExpression -> caseValue(caseExpression, row);
+			case Ast.ListComprehension comprehension -> comprehension(comprehension, row);
+			case Ast.Quantifier quantifier -> quantifier(quantifier, row);
+			case Ast.Subquery subquery -> {
+				if (subqueries == null) {
+					throw new CypherTypeException(subquery.kind() + " { … } cannot be evaluated here");
+				}
+				yield subqueries.evaluate(subquery, row);
+			}
+		};
+	}
+
+	/**
+	 * The list a comprehension or quantifier ranges over, or null for null.
+	 */
+	private List<?> rangedList(Expr expression, Row row, String what) {
+		Object value = evaluate(expression, row);
+		if (value == null) {
+			return null;
+		}
+		if (value instanceof List<?> list) {
+			return list;
+		}
+		throw new CypherTypeException(what + " needs a list after IN but got " + Values.typeName(value));
+	}
+
+	/**
+	 * {@code [x IN list WHERE p | e]}. The variable binds in a copy of the row, so it shadows an outer one of the same
+	 * name for the brackets only. An element whose predicate is null is dropped, as WHERE drops a row.
+	 */
+	private Object comprehension(Ast.ListComprehension comprehension, Row row) {
+		List<?> list = rangedList(comprehension.list(), row, "A list comprehension");
+		if (list == null) {
+			return null;
+		}
+		List<Object> out = new ArrayList<>(list.size());
+		long seen = 0;
+		for (Object element : list) {
+			if ((++seen & 1023) == 0) {
+				graph.checkAbortNow();
+			}
+			Row scoped = row.with(comprehension.variable(), element);
+			if (comprehension.where() != null && !Values.isTrue(evaluate(comprehension.where(), scoped))) {
+				continue;
+			}
+			out.add(comprehension.projection() == null ? element : evaluate(comprehension.projection(), scoped));
+		}
+		return out;
+	}
+
+	/**
+	 * {@code all}, {@code any}, {@code none} and {@code single}, under three-valued logic.
+	 *
+	 * <p>
+	 * A null predicate is an unknown element. It makes the answer null unless the known elements already decide it:
+	 * {@code any} is true at the first true element, {@code all} false at the first false one, and {@code single} false
+	 * at the second true one. A null list is null; an empty one is vacuously true for {@code all} and {@code none} and
+	 * false for the other two.
+	 * </p>
+	 */
+	private Object quantifier(Ast.Quantifier quantifier, Row row) {
+		String name = quantifier.kind().name().toLowerCase(java.util.Locale.ROOT) + "()";
+		List<?> list = rangedList(quantifier.list(), row, name);
+		if (list == null) {
+			return null;
+		}
+		long trues = 0;
+		boolean unknown = false;
+		for (Object element : list) {
+			Object verdict = evaluate(quantifier.where(), row.with(quantifier.variable(), element));
+			if (verdict == null) {
+				unknown = true;
+				continue;
+			}
+			if (!(verdict instanceof Boolean known)) {
+				throw new CypherTypeException(name + " needs a boolean predicate but got "
+					+ Values.typeName(verdict));
+			}
+			if (known) {
+				trues++;
+				if (quantifier.kind() == Ast.QuantifierKind.ANY) {
+					return Boolean.TRUE;
+				}
+				if (quantifier.kind() == Ast.QuantifierKind.NONE) {
+					return Boolean.FALSE;
+				}
+				if (quantifier.kind() == Ast.QuantifierKind.SINGLE && trues > 1) {
+					return Boolean.FALSE;
+				}
+			} else if (quantifier.kind() == Ast.QuantifierKind.ALL) {
+				return Boolean.FALSE;
+			}
+		}
+		if (unknown) {
+			return null;
+		}
+		return switch (quantifier.kind()) {
+			case ALL, NONE -> Boolean.TRUE;
+			case ANY -> Boolean.FALSE;
+			case SINGLE -> trues == 1;
 		};
 	}
 
@@ -248,6 +378,9 @@ public final class Evaluator {
 			case CypherNode node -> node.property(key);
 			case CypherRelationship relationship -> relationship.property(key);
 			case Map<?, ?> map -> map.get(key);
+			// d.year, dt.timezone, dur.days. A component the value lacks is an error rather than null.
+			case Object temporal when io.metaloom.graph.cypher.func.Temporals.isTemporal(temporal) ->
+				io.metaloom.graph.cypher.func.Temporals.component(temporal, key);
 			default -> throw new CypherTypeException(
 				"Cannot read property '" + key + "' of " + Values.typeName(target));
 		};

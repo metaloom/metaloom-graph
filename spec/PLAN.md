@@ -145,7 +145,7 @@ Specs: [FILE_FORMAT.md §5–§6](FILE_FORMAT.md#5-node-record),
 - [x] Cascade rules: freeing an element frees its property block and every blob it references
 - [x] Typed `Properties` at the API boundary, with absent versus null distinguished
 - [x] Tests: `ValueCodecTest`, `PropertyRoundTripTest`, `SpaceEfficiencyTest`
-- [ ] `MAP` and `DURATION` value types
+- [ ] `MAP` value type (`DURATION` and the other temporal types: done, store format version 5)
 - [ ] `NoOrphanBlocks` and `DictionaryIntegrity` invariant checkers
 
 **Exit criteria**: the fixed 100k-node / 500k-edge fixture occupies less than one twelfth of the

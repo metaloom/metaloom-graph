@@ -1,10 +1,12 @@
 package io.metaloom.graph.server.wire;
 
+import java.time.temporal.TemporalAmount;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import io.metaloom.graph.cypher.value.CypherDuration;
 import io.metaloom.graph.cypher.value.CypherNode;
 import io.metaloom.graph.cypher.value.CypherPath;
 import io.metaloom.graph.cypher.value.CypherRelationship;
@@ -36,7 +38,15 @@ import io.metaloom.graph.protocol.WireRelationship;
  * Cypher's type system — {@code byte[]} to a hex string, {@code float[]} to a list of doubles, {@code Integer} to
  * {@code Long} — so a scalar arriving here is already something the codec has a tag for. Anything that is not is
  * refused by the codec rather than stringified, which is how a gap between the two type systems becomes a loud failure
- * instead of a quietly wrong value.
+ * instead of a quietly wrong value. The six temporal types are among the things the codec knows: dates, times and
+ * datetimes are {@code java.time} values on both ends, and a duration is any {@link TemporalAmount} in months, days,
+ * seconds and nanos — a {@code CypherDuration} or whatever the store hands back.
+ * </p>
+ *
+ * <p>
+ * <b>The other direction is {@link #parameters}.</b> The codec decodes a duration into a package-private
+ * {@code TemporalAmount} of graph-protocol's, because a locked API cannot gain a public type for it; a parameter
+ * holding one is turned into a {@link CypherDuration} here, so the query engine sees its own type.
  * </p>
  */
 final class CypherWireValues {
@@ -56,6 +66,54 @@ final class CypherWireValues {
 			case CypherPath path -> path(path);
 			case List<?> list -> list(list);
 			case Map<?, ?> map -> map(map);
+			default -> value;
+		};
+	}
+
+	/**
+	 * Decoded query parameters in the query engine's types: every duration, at any depth, a {@link CypherDuration}.
+	 *
+	 * @return {@code parameters} itself when nothing needed converting
+	 */
+	@SuppressWarnings("unchecked")
+	static Map<String, Object> parameters(Map<String, Object> parameters) {
+		return (Map<String, Object>) parameter(parameters);
+	}
+
+	private static Object parameter(Object value) {
+		return switch (value) {
+			case null -> null;
+			case CypherDuration duration -> duration;
+			case TemporalAmount amount -> CypherDuration.from(amount);
+			case List<?> list -> {
+				List<Object> converted = null;
+				for (int i = 0; i < list.size(); i++) {
+					Object element = parameter(list.get(i));
+					if (element != list.get(i) && converted == null) {
+						converted = new ArrayList<>(list);
+					}
+					if (converted != null) {
+						converted.set(i, element);
+					}
+				}
+				yield converted == null ? list : converted;
+			}
+			case Map<?, ?> map -> {
+				Map<String, Object> converted = null;
+				for (Map.Entry<?, ?> entry : map.entrySet()) {
+					Object element = parameter(entry.getValue());
+					if (element != entry.getValue() && converted == null) {
+						converted = new LinkedHashMap<>();
+						for (Map.Entry<?, ?> copy : map.entrySet()) {
+							converted.put(String.valueOf(copy.getKey()), copy.getValue());
+						}
+					}
+					if (converted != null) {
+						converted.put(String.valueOf(entry.getKey()), element);
+					}
+				}
+				yield converted == null ? map : converted;
+			}
 			default -> value;
 		};
 	}

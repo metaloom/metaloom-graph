@@ -124,6 +124,9 @@ public final class Ast {
 					|| clause instanceof Remove || clause instanceof Delete) {
 					return true;
 				}
+				if (clause instanceof CallSubquery subquery && subquery.body().isWrite()) {
+					return true;
+				}
 			}
 			return false;
 		}
@@ -132,6 +135,9 @@ public final class Ast {
 		public boolean readsFiles() {
 			for (Clause clause : clauses) {
 				if (clause instanceof LoadCsv) {
+					return true;
+				}
+				if (clause instanceof CallSubquery subquery && subquery.body().readsFiles()) {
 					return true;
 				}
 			}
@@ -181,6 +187,12 @@ public final class Ast {
 					case Remove _ -> required.add(Privilege.REMOVE);
 					case Delete _ -> required.add(Privilege.DELETE);
 					case LoadCsv _ -> required.add(Privilege.LOAD_CSV);
+					// Whatever the body needs, because running the clause runs the body. MATCH as well, as for WITH: a
+					// subquery that only computes still occupies a worker thread.
+					case CallSubquery subquery -> {
+						required.add(Privilege.MATCH);
+						required.addAll(subquery.body().requiredPrivileges());
+					}
 				}
 			}
 			return required;
@@ -188,7 +200,28 @@ public final class Ast {
 	}
 
 	public sealed interface Clause permits Match, Unwind, With, Return, Create, Merge, SetClause, Remove, Delete,
-		Call, LoadCsv {
+		Call, LoadCsv, CallSubquery {
+	}
+
+	/**
+	 * {@code CALL { … }}, a query run once per incoming row.
+	 *
+	 * <p>
+	 * The body sees only what it imports, which is openCypher's scoping rule and the reason this is not just a list of
+	 * clauses spliced into the outer query: {@code MATCH (n)} inside the body binds a new {@code n} unless {@code n} was
+	 * imported. Two spellings import, and both end up here: a leading {@code WITH a, b} of bare variables in the body
+	 * (Neo4j 4), and the scope clause {@code CALL (a, b) { … }} (Neo4j 5). {@code CALL (*)} imports everything.
+	 * </p>
+	 *
+	 * <p>
+	 * A body that ends in {@code RETURN} multiplies the outer row by its result rows, and its columns join the outer row;
+	 * one that does not is a <em>unit</em> subquery, run for what it writes, and every outer row passes through once.
+	 * </p>
+	 *
+	 * @param imports
+	 *            the outer variables the body may read; ignored when {@code importAll}
+	 */
+	public record CallSubquery(Query body, List<String> imports, boolean importAll) implements Clause {
 	}
 
 	/**
@@ -215,8 +248,8 @@ public final class Ast {
 
 	/**
 	 * @param optional
-	 *            parsed so the error can name it; rejected by the planner, because OPTIONAL MATCH needs null-padding
-	 *            semantics this subset does not implement
+	 *            {@code OPTIONAL MATCH}: a row the pattern (and its WHERE) cannot extend is kept once, with every
+	 *            variable the pattern introduces bound to null, rather than dropped
 	 */
 	public record Match(List<PatternPart> pattern, Expr where, boolean optional) implements Clause {
 	}
@@ -430,7 +463,62 @@ public final class Ast {
 	// ---------------------------------------------------------------- expressions
 
 	public sealed interface Expr permits Literal, ListLiteral, MapLiteral, Variable, Parameter, Property, Index,
-		Binary, Unary, Comparison, LabelPredicate, IsNull, FunctionCall, Case {
+		Binary, Unary, Comparison, LabelPredicate, IsNull, FunctionCall, Case, ListComprehension, Quantifier,
+		Subquery {
+	}
+
+	/**
+	 * {@code [x IN list WHERE x > 1 | x * 2]}. Both the {@code WHERE} and the {@code | projection} are optional.
+	 *
+	 * <p>
+	 * The variable is local to the brackets and may shadow an outer one of the same name, as in openCypher: it is a new
+	 * scope, not a binding in the row, so nothing after the expression sees it.
+	 * </p>
+	 *
+	 * @param where
+	 *            null when absent; an element whose predicate is null is dropped, as a WHERE drops a row
+	 * @param projection
+	 *            null when absent, which keeps each element as it is
+	 */
+	public record ListComprehension(String variable, Expr list, Expr where, Expr projection) implements Expr {
+	}
+
+	/**
+	 * {@code all(x IN list WHERE …)}, and {@code any}, {@code none} and {@code single}.
+	 *
+	 * <p>
+	 * Three-valued, as everything else is: a predicate that is null for some element makes the answer null unless the
+	 * known elements already decide it — {@code any} is true as soon as one element is true, {@code all} false as soon
+	 * as one is false.
+	 * </p>
+	 */
+	public record Quantifier(QuantifierKind kind, String variable, Expr list, Expr where) implements Expr {
+	}
+
+	public enum QuantifierKind {
+		ALL, ANY, NONE, SINGLE
+	}
+
+	/**
+	 * {@code EXISTS { … }}, {@code COUNT { … }} and {@code COLLECT { … }}: a read-only query evaluated as a value.
+	 *
+	 * <p>
+	 * Unlike {@link CallSubquery}, every outer variable is visible inside, which is openCypher's rule for these: they
+	 * are predicates and values over the current row, and a pattern inside one that names an outer node is a join on
+	 * it. The body is either a whole query or just a pattern with an optional WHERE, which the parser turns into a
+	 * {@link Match} with no {@code RETURN}.
+	 * </p>
+	 *
+	 * <p>
+	 * {@code EXISTS} is true when the body produces a row, and stops at the first. {@code COUNT} counts the rows.
+	 * {@code COLLECT} needs a body that returns exactly one column, and is the list of it.
+	 * </p>
+	 */
+	public record Subquery(SubqueryKind kind, Query body) implements Expr {
+	}
+
+	public enum SubqueryKind {
+		EXISTS, COUNT, COLLECT
 	}
 
 	/** A number, string, boolean or null. */

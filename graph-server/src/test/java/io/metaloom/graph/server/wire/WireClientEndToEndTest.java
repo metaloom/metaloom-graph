@@ -2,6 +2,7 @@ package io.metaloom.graph.server.wire;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -330,6 +331,50 @@ public class WireClientEndToEndTest {
 				try (RowStream rows = client.query("RETURN $p AS p", parameters)) {
 					Object back = rows.next().get("p");
 					assertEquals(normalised(value), back, "value " + i + ": " + value);
+				}
+			}
+		}
+		awaitIdle();
+	}
+
+	/**
+	 * The six temporal kinds through the engine and back, as parameters, since nothing in this tree makes one in a
+	 * query yet.
+	 *
+	 * <p>
+	 * A duration leaves the client as any {@code TemporalAmount}, reaches the engine as a {@code CypherDuration} and
+	 * comes back as the client's own non-public amount: equal in its four components and in its ISO string.
+	 * </p>
+	 */
+	@Test
+	public void testTemporalParametersComeBackUnchanged() {
+		listen(WireServerOptions.defaults(), false);
+		List<Object> values = List.of(java.time.LocalDate.of(2024, 2, 29), java.time.LocalTime.of(10, 15, 30, 5),
+			java.time.OffsetTime.of(10, 0, 0, 0, java.time.ZoneOffset.ofHours(-5)),
+			java.time.LocalDateTime.of(2020, 1, 1, 10, 0),
+			java.time.ZonedDateTime.of(2020, 1, 1, 10, 0, 0, 0, java.time.ZoneOffset.ofHours(1)),
+			java.time.ZonedDateTime.of(2020, 1, 1, 10, 0, 0, 0, java.time.ZoneId.of("Europe/Vienna")),
+			List.of(java.time.LocalDate.EPOCH, Map.of("at", java.time.LocalTime.NOON)));
+		try (GraphClient client = connect()) {
+			for (Object value : values) {
+				try (RowStream rows = client.query("RETURN $p AS p", Map.of("p", value))) {
+					assertEquals(value, rows.next().get("p"), String.valueOf(value));
+				}
+			}
+			Map<String, java.time.temporal.TemporalAmount> durations = Map.of(
+				"P1Y2M3DT4H5M6.5S", new io.metaloom.graph.cypher.value.CypherDuration(14, 3, 14_706, 500_000_000),
+				"P1M3D", java.time.Period.of(0, 1, 3),
+				"PT-1.5S", java.time.Duration.ofMillis(-1_500));
+			for (Map.Entry<String, java.time.temporal.TemporalAmount> entry : durations.entrySet()) {
+				try (RowStream rows = client.query("RETURN $p AS p", Map.of("p", entry.getValue()))) {
+					Row row = rows.next();
+					java.time.temporal.TemporalAmount back = assertInstanceOf(java.time.temporal.TemporalAmount.class,
+						row.get("p"));
+					assertEquals(entry.getKey(), back.toString());
+					assertEquals(entry.getKey(), row.string("p"));
+					io.metaloom.graph.cypher.value.CypherDuration expected = io.metaloom.graph.cypher.value.CypherDuration
+						.from(entry.getValue());
+					assertEquals(expected, io.metaloom.graph.cypher.value.CypherDuration.from(back));
 				}
 			}
 		}

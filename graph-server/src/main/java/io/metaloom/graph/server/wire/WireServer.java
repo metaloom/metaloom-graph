@@ -1091,7 +1091,8 @@ public final class WireServer implements AutoCloseable {
 		if (decoded == null) {
 			return Map.of();
 		}
-		return WireValueCodec.expect(decoded, Map.class, "the parameter map");
+		// A duration decodes to graph-protocol's own TemporalAmount; the query engine is handed a CypherDuration.
+		return CypherWireValues.parameters(WireValueCodec.expect(decoded, Map.class, "the parameter map"));
 	}
 
 	/**

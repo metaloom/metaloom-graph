@@ -4,6 +4,16 @@ import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
+import java.time.DateTimeException;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.OffsetTime;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
+import java.time.temporal.TemporalAmount;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -46,7 +56,32 @@ import java.util.Map;
  * <caption>Tags</caption>
  * <tr><td>0 NULL</td><td>1 BOOL</td><td>2 INT (zigzag)</td><td>3 FLOAT</td><td>4 STRING</td></tr>
  * <tr><td>10 LIST</td><td>11 MAP</td><td>12 NODE</td><td>13 REL</td><td>14 PATH</td></tr>
+ * <tr><td>15 TEMPORAL</td><td colspan="4">the size class says which of the seven kinds</td></tr>
  * </table>
+ *
+ * <h2>Temporal values: one tag, the size class is the kind</h2>
+ *
+ * <table>
+ * <caption>Tag 15</caption>
+ * <tr><td>0 DATE</td><td>{@code LocalDate}: i64 epoch day</td></tr>
+ * <tr><td>1 LOCAL TIME</td><td>{@code LocalTime}: i64 nano of day</td></tr>
+ * <tr><td>2 TIME</td><td>{@code OffsetTime}: i64 nano of day, i32 offset seconds</td></tr>
+ * <tr><td>3 LOCAL DATETIME</td><td>{@code LocalDateTime}: i64 epoch second read as UTC, i32 nano</td></tr>
+ * <tr><td>4 DATETIME, offset</td><td>{@code ZonedDateTime} whose zone is a {@code ZoneOffset}: i64 instant epoch
+ * second, i32 nano, i32 offset seconds</td></tr>
+ * <tr><td>5 DATETIME, region</td><td>{@code ZonedDateTime} with a region zone: i64 instant epoch second, i32 nano,
+ * the zone id as a string value</td></tr>
+ * <tr><td>6 DURATION</td><td>any {@code TemporalAmount} in months, days, seconds and nanos: i64, i64, i64, i32</td></tr>
+ * </table>
+ *
+ * <p>
+ * Fifteen because it is the first number free in this codec, the storage codec and the dump codec alike. A region
+ * datetime carries its instant and its zone and no offset: the offset follows from the zone's rules, and if the two
+ * ends' time-zone data disagree, keeping the instant is keeping the value. Decoding checks every field's range and
+ * refuses a zone id that is unknown, is a fixed offset (kind 4 is the one spelling of that), or is not in its canonical
+ * form, so one value has one encoding. A decoded duration is a package-private {@link TemporalAmount} with an
+ * ISO-8601 {@code toString}.
+ * </p>
  *
  * <p>
  * <b>Element ids are fixed 8 bytes, not {@code INT}.</b> A real id is packed with a kind in the high bits and lands
@@ -73,6 +108,16 @@ public final class WireValueCodec {
 	public static final int T_NODE = 12;
 	public static final int T_REL = 13;
 	public static final int T_PATH = 14;
+	/** Not public: the API is locked, and a constant is API. */
+	static final int T_TEMPORAL = 15;
+
+	static final int K_DATE = 0;
+	static final int K_LOCAL_TIME = 1;
+	static final int K_TIME = 2;
+	static final int K_LOCAL_DATETIME = 3;
+	static final int K_DATETIME_OFFSET = 4;
+	static final int K_DATETIME_REGION = 5;
+	static final int K_DURATION = 6;
 
 	/**
 	 * How deep a value may nest before the decoder refuses.
@@ -245,6 +290,43 @@ public final class WireValueCodec {
 				encodeProperties(w, node.properties(), depth);
 			}
 			case WireRelationship rel -> encodeRelationship(w, rel, depth);
+			case LocalDate date -> {
+				w.u8(tag(T_TEMPORAL, K_DATE));
+				w.i64(date.toEpochDay());
+			}
+			case LocalTime time -> {
+				w.u8(tag(T_TEMPORAL, K_LOCAL_TIME));
+				w.i64(time.toNanoOfDay());
+			}
+			case OffsetTime time -> {
+				w.u8(tag(T_TEMPORAL, K_TIME));
+				w.i64(time.toLocalTime().toNanoOfDay());
+				w.i32(time.getOffset().getTotalSeconds());
+			}
+			case LocalDateTime dateTime -> {
+				w.u8(tag(T_TEMPORAL, K_LOCAL_DATETIME));
+				w.i64(dateTime.toEpochSecond(ZoneOffset.UTC));
+				w.i32(dateTime.getNano());
+			}
+			case ZonedDateTime dateTime -> {
+				boolean offset = dateTime.getZone() instanceof ZoneOffset;
+				w.u8(tag(T_TEMPORAL, offset ? K_DATETIME_OFFSET : K_DATETIME_REGION));
+				w.i64(dateTime.toEpochSecond());
+				w.i32(dateTime.getNano());
+				if (offset) {
+					w.i32(dateTime.getOffset().getTotalSeconds());
+				} else {
+					encodeString(w, dateTime.getZone().getId());
+				}
+			}
+			case TemporalAmount amount -> {
+				WireDuration duration = WireDuration.from(amount);
+				w.u8(tag(T_TEMPORAL, K_DURATION));
+				w.i64(duration.months());
+				w.i64(duration.days());
+				w.i64(duration.seconds());
+				w.i32(duration.nanos());
+			}
 			case WirePath path -> {
 				w.u8(tag(T_PATH, 0));
 				w.varint(path.relationships().size());
@@ -621,6 +703,8 @@ public final class WireValueCodec {
 				}
 				return new WirePath(nodes, rels);
 			}
+			case T_TEMPORAL:
+				return decodeTemporal(r, sizeClass);
 			default:
 				// Includes tags 5 to 9, which are reserved. Meeting one means corruption or a version mismatch.
 				throw new WireFormatException("Unknown or reserved value tag " + type);
@@ -681,6 +765,73 @@ public final class WireValueCodec {
 			throw new WireFormatException("Expected String for " + where + " but found value tag " + (tag & 0x1F));
 		}
 		return decodeString(r, tag >>> 5);
+	}
+
+	/**
+	 * One temporal value, every field checked.
+	 *
+	 * <p>
+	 * {@code java.time} already refuses most out-of-range fields with a {@link DateTimeException}; that is turned into
+	 * the codec's own exception so a caller sees one failure type for hostile input. The nanosecond fields are
+	 * checked here rather than left to {@code Instant.ofEpochSecond}, which would quietly carry an out-of-range one into
+	 * the seconds and give one value two encodings.
+	 * </p>
+	 */
+	private static Object decodeTemporal(Reader r, int kind) {
+		try {
+			return switch (kind) {
+				case K_DATE -> LocalDate.ofEpochDay(r.i64());
+				case K_LOCAL_TIME -> LocalTime.ofNanoOfDay(r.i64());
+				case K_TIME -> {
+					LocalTime time = LocalTime.ofNanoOfDay(r.i64());
+					yield OffsetTime.of(time, ZoneOffset.ofTotalSeconds(r.i32()));
+				}
+				case K_LOCAL_DATETIME -> {
+					long seconds = r.i64();
+					yield LocalDateTime.ofEpochSecond(seconds, nanoOfSecond(r.i32()), ZoneOffset.UTC);
+				}
+				case K_DATETIME_OFFSET -> {
+					Instant instant = instant(r);
+					yield ZonedDateTime.ofInstant(instant, ZoneOffset.ofTotalSeconds(r.i32()));
+				}
+				case K_DATETIME_REGION -> {
+					Instant instant = instant(r);
+					yield ZonedDateTime.ofInstant(instant, region(decodeKey(r, "a time zone")));
+				}
+				case K_DURATION -> {
+					long months = r.i64();
+					long days = r.i64();
+					long seconds = r.i64();
+					yield new WireDuration(months, days, seconds, nanoOfSecond(r.i32()));
+				}
+				default -> throw new WireFormatException("Unknown temporal kind " + kind);
+			};
+		} catch (DateTimeException e) {
+			throw new WireFormatException("Temporal value out of range: " + e.getMessage());
+		}
+	}
+
+	private static Instant instant(Reader r) {
+		long seconds = r.i64();
+		return Instant.ofEpochSecond(seconds, nanoOfSecond(r.i32()));
+	}
+
+	private static int nanoOfSecond(int nanos) {
+		if (nanos < 0 || nanos >= 1_000_000_000) {
+			throw new WireFormatException("Nanosecond field " + nanos + " outside [0, 999999999]");
+		}
+		return nanos;
+	}
+
+	private static ZoneId region(String id) {
+		ZoneId zone = ZoneId.of(id);
+		if (zone instanceof ZoneOffset) {
+			throw new WireFormatException("Zone id '" + id + "' is a fixed offset, which has its own kind");
+		}
+		if (!zone.getId().equals(id)) {
+			throw new WireFormatException("Zone id '" + id + "' is not in its canonical form '" + zone.getId() + "'");
+		}
+		return zone;
 	}
 
 	private static Long decodeInt(Reader r, int sizeClass) {

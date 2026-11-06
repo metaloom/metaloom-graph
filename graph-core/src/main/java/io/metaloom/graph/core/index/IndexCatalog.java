@@ -4,6 +4,14 @@ import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.time.OffsetTime;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
+import java.time.temporal.TemporalAmount;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -16,6 +24,7 @@ import io.metaloom.graph.core.catalog.Catalog;
 import io.metaloom.graph.core.api.TransactionConflictException;
 import io.metaloom.graph.core.id.ElementId;
 import io.metaloom.graph.core.segment.SegmentSet;
+import io.metaloom.graph.core.store.prop.StoredDuration;
 import io.metaloom.graph.core.util.Layouts;
 
 /**
@@ -1137,6 +1146,17 @@ public final class IndexCatalog {
 			case Double d -> Double.hashCode(d);
 			case Instant i -> Long.hashCode(i.getEpochSecond() * 1_000_000L + i.getNano() / 1000L);
 			case UUID u -> Long.hashCode(u.getMostSignificantBits() ^ u.getLeastSignificantBits());
+			// The temporal hashes are spelled out rather than left to the java.time classes' hashCode: an entry's key
+			// is persisted, so the hash has to be the same on every JDK. Each one hashes exactly what valueEquals
+			// compares after widen — the instant for a date-time (zone ignored), the UTC time for a time with an
+			// offset, the four components for a duration of any class.
+			case LocalDate d -> Long.hashCode(d.toEpochDay());
+			case LocalTime t -> Long.hashCode(t.toNanoOfDay());
+			case OffsetTime t -> Long.hashCode(utcNanos(t));
+			case LocalDateTime t -> 31 * Long.hashCode(t.toEpochSecond(ZoneOffset.UTC)) + t.getNano();
+			case ZonedDateTime t -> instantHash(t.toEpochSecond(), t.getNano());
+			case OffsetDateTime t -> instantHash(t.toEpochSecond(), t.getNano());
+			case TemporalAmount amount -> widen(amount) instanceof StoredDuration d ? durationHash(d) : amount.hashCode();
 			// Arrays.hashCode(float[]) compares the same bits Arrays.equals does, so it agrees with the
 			// Objects.deepEquals verification the caller applies to every candidate.
 			case float[] v -> Arrays.hashCode(v);
@@ -1201,11 +1221,54 @@ public final class IndexCatalog {
 		}
 	}
 
+	/**
+	 * The value in the form equality is decided on. Integer widths become a {@code long}; a date-time with a zone or
+	 * an offset becomes the instant it denotes, so {@code 12:00+01:00} and {@code 11:00Z} on the same day are one
+	 * value (and stay distinct from a plain {@link Instant}); a time with an offset becomes its UTC time of day; and
+	 * any duration becomes a {@link StoredDuration}, so a {@code Period} probe finds what the store reads back.
+	 */
 	private static Object widen(Object value) {
-		if (value instanceof Byte || value instanceof Short || value instanceof Integer) {
-			return ((Number) value).longValue();
-		}
-		return value;
+		return switch (value) {
+			case Byte b -> b.longValue();
+			case Short s -> s.longValue();
+			case Integer i -> i.longValue();
+			case ZonedDateTime t -> new InstantKey(t.toEpochSecond(), t.getNano());
+			case OffsetDateTime t -> new InstantKey(t.toEpochSecond(), t.getNano());
+			case OffsetTime t -> new UtcTimeKey(utcNanos(t));
+			case StoredDuration d -> d;
+			case TemporalAmount amount -> {
+				try {
+					yield StoredDuration.of(amount);
+				} catch (IllegalArgumentException | ArithmeticException e) {
+					// A unit the store cannot hold: nothing stored can equal it, so its own equality is as good as any.
+					yield amount;
+				}
+			}
+			case null, default -> value;
+		};
+	}
+
+	/** A zoned or offset date-time as the instant it denotes: what two such values are compared on. */
+	private record InstantKey(long epochSecond, int nano) {
+	}
+
+	/** A time with an offset as its time of day in UTC, unbounded: {@code 00:30+01:00} is -30 minutes. */
+	private record UtcTimeKey(long nanos) {
+	}
+
+	private static long utcNanos(OffsetTime time) {
+		return time.toLocalTime().toNanoOfDay() - time.getOffset().getTotalSeconds() * 1_000_000_000L;
+	}
+
+	private static int instantHash(long epochSecond, int nano) {
+		return 31 * Long.hashCode(epochSecond) + nano;
+	}
+
+	private static int durationHash(StoredDuration d) {
+		int h = Long.hashCode(d.months());
+		h = 31 * h + Long.hashCode(d.days());
+		h = 31 * h + Long.hashCode(d.seconds());
+		return 31 * h + d.nanos();
 	}
 
 	/** {@code List::hashCode}'s mixing, with every element routed back through {@link #valueHash}. */

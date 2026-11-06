@@ -6,8 +6,8 @@ probably is not, and unsupported syntax is **refused at parse time by name**, so
 
 ## Read this first
 
-- **`OPTIONAL MATCH` does not exist.** There is no left-join. To find nodes that lack a relationship,
-  match them and filter, or run two queries.
+- **Map projections (`n {.name}`) do not exist.** Write a map literal: `{name: n.name}`.
+- **Pattern predicates (`WHERE (a)-->(b)`) do not exist.** Write `WHERE EXISTS { (a)-->(b) }`.
 - **A missing label is not an error.** `MATCH (n:Persno)` returns zero rows rather than complaining.
   Call `graph_schema` first and use the label names it gives you.
 - **Writes may be off.** If `graph_query` refuses a `CREATE`, the server was started without
@@ -18,6 +18,8 @@ probably is not, and unsupported syntax is **refused at parse time by name**, so
 
 ```
 MATCH (a:Label {key: $value})-[r:TYPE]->(b) WHERE a.n > 1 RETURN a, r, b
+MATCH (a:Label) OPTIONAL MATCH (a)-[:TYPE]->(b) RETURN a, b        -- b is null where nothing matched
+MATCH (a) CALL (a) { MATCH (a)-->(f) RETURN count(f) AS c } RETURN a, c   -- also CALL { WITH a ... }
 WITH a, count(*) AS c WHERE c > 2 RETURN a.name AS name, c ORDER BY c DESC SKIP 0 LIMIT 10
 UNWIND $list AS x RETURN x
 CREATE (a:Label {key: 'v'})-[:TYPE]->(b:Other)
@@ -49,6 +51,20 @@ Operators, loosest binding first: `OR`, `XOR`, `AND`, `NOT`, comparison
 
 `CASE WHEN ... THEN ... ELSE ... END` is available, in both forms.
 
+- List comprehensions: `[x IN list WHERE x > 0 | x * 2]`.
+- Quantifiers: `all(x IN list WHERE ...)`, `any`, `none`, `single`.
+- Subquery expressions: `EXISTS { (a)-[:T]->() }`, `COUNT { MATCH (a)-->(b) WHERE ... }`,
+  `COLLECT { MATCH (a)-->(b) RETURN b.name }`. Read-only; outer variables are visible inside.
+
+## Temporal values
+
+`date('2020-01-31')`, `localtime('12:00')`, `time('12:00+01:00')`, `localdatetime('2020-01-31T12:00')`,
+`datetime('2020-01-31T12:00[Europe/Vienna]')`, `duration('P1M2DT3H')`, also from maps
+(`date({year: 2020, month: 1})`) and with no argument for now. Components: `d.year`, `d.month`, `dt.hour`,
+`dur.days`. Arithmetic: temporal ± duration; difference with `duration.between(a, b)`. Truncation:
+`date.truncate('month', d)`. They are stored as typed values, so `WHERE n.at >= date('2020-01-01')` compares
+dates. A datetime without a zone is UTC.
+
 Comments are `//` and `/* */`. Backticks quote a name with spaces. Keywords are case-insensitive;
 identifiers are not.
 
@@ -64,9 +80,8 @@ Comparison with `null` yields `null`, not false. `WHERE` keeps a row only when t
 
 ## Not implemented
 
-`OPTIONAL MATCH`, `FOREACH`, list comprehensions, map projections, pattern comprehensions,
-`ALL` / `ANY` / `NONE` / `SINGLE` predicates, `EXISTS` subqueries, user-defined procedures,
-temporal and spatial types.
+`FOREACH`, map projections, pattern comprehensions, pattern predicates, list slicing,
+`CALL { … } IN TRANSACTIONS`, `OPTIONAL CALL`, user-defined procedures, spatial types.
 
 `LOAD CSV` is implemented, but **not over this port**: it names a file rather than anything in the
 graph, and loading one is an operator action. It is refused here whatever the server was started

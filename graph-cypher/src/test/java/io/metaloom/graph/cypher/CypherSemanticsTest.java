@@ -313,11 +313,11 @@ public class CypherSemanticsTest {
 	@Test
 	public void testUnbuiltExpressionsAreRefusedByName() throws Exception {
 		try (GraphStore store = stores.open()) {
-			assertRefusedNaming(store, "RETURN [x IN [1, 2] | x * 2] AS v", "List comprehensions");
-			assertRefusedNaming(store, "RETURN [x IN [1, 2] WHERE x > 1] AS v", "List comprehensions");
 			assertRefusedNaming(store, "MATCH (n) RETURN n {.name} AS v", "Map projections");
-			assertRefusedNaming(store, "MATCH (n) WHERE EXISTS { MATCH (n)-->() } RETURN n", "EXISTS subqueries");
 			assertRefusedNaming(store, "RETURN [1, 2, 3][1..2] AS v", "List slicing");
+			// List comprehensions and EXISTS { … } were on this list; they are built now and read as what they are.
+			assertEquals(List.of(2L, 4L), value(store, "[x IN [1, 2] | x * 2]"));
+			assertEquals(false, value(store, "EXISTS { MATCH (n)-->() }"));
 			// The ordinary readings of the same tokens still parse.
 			assertEquals(List.of(true), value(store, "[1 IN [1, 2]]"));
 			assertEquals(true, value(store, "exists(1)"));

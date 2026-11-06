@@ -60,6 +60,13 @@ public final class Protocol {
 	 * {@link WireError#UNSUPPORTED_VERSION} naming both numbers instead of a stream of frames it cannot read. Nothing
 	 * has shipped on any version, so there is no range to accept — when there is, this is where it goes.
 	 * </p>
+	 *
+	 * <p>
+	 * <b>Owed: version 5, for the temporal value tag.</b> Tag 15 was added to {@link WireValueCodec} at version 4,
+	 * because this constant's value is part of the locked API and changing it is a person's decision
+	 * (spec/API_LOCK.md). Until then a version-4 peer without the tag fails on the first temporal cell with a
+	 * {@link WireFormatException} rather than at the handshake.
+	 * </p>
 	 */
 	public static final int VERSION = 4;
 

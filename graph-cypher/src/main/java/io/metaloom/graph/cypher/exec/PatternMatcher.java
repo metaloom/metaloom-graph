@@ -724,6 +724,11 @@ public final class PatternMatcher {
 		if (value instanceof String || value instanceof Boolean || value instanceof Long || value instanceof Double) {
 			return true;
 		}
+		// The index compares temporal values as Cypher does — a zoned one by its instant, a duration by its four
+		// components — so each has exactly one spelling there.
+		if (io.metaloom.graph.cypher.func.Temporals.isTemporal(value)) {
+			return true;
+		}
 		if (value instanceof List<?> list) {
 			for (Object element : list) {
 				if (!(element instanceof String || element instanceof Boolean)) {
@@ -751,6 +756,9 @@ public final class PatternMatcher {
 		Object twin = switch (value) {
 			case Long l -> (double) l;
 			case Double d when d == Math.rint(d) && d >= -0x1p63 && d < 0x1p63 -> (long) (double) d;
+			// The Java API stores an Instant, which reads as a datetime in UTC: = calls the two equal, and the index,
+			// keyed on the stored type, does not.
+			case java.time.ZonedDateTime zoned -> zoned.toInstant();
 			default -> null;
 		};
 		if (twin == null) {

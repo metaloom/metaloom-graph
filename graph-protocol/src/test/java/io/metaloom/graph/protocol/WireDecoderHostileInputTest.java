@@ -185,6 +185,14 @@ public class WireDecoderHostileInputTest {
 		properties.put("latitude", 51.47d);
 		properties.put("closed", null);
 		properties.put("tags", List.of("intl", "hub"));
+		properties.put("opened", java.time.LocalDate.of(1946, 5, 31));
+		properties.put("curfew", java.time.LocalTime.of(23, 30));
+		properties.put("checkIn", java.time.OffsetTime.of(6, 0, 0, 0, java.time.ZoneOffset.UTC));
+		properties.put("built", java.time.LocalDateTime.of(1946, 1, 1, 12, 0, 0, 5));
+		properties.put("atOffset", java.time.ZonedDateTime.of(2020, 1, 1, 10, 0, 0, 0, java.time.ZoneOffset.ofHours(1)));
+		properties.put("inRegion",
+			java.time.ZonedDateTime.of(2020, 1, 1, 10, 0, 0, 0, java.time.ZoneId.of("Europe/London")));
+		properties.put("slot", new WireDuration(14, 3, -2, 500_000_000));
 
 		WireNode from = new WireNode(1L << 60, List.of("Airport", "Hub"), properties);
 		WireNode to = new WireNode((1L << 60) + 1, List.of("Airport"), Map.of("code", "CDG"));

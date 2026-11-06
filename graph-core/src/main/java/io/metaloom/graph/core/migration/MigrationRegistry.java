@@ -24,17 +24,11 @@ import io.metaloom.graph.core.api.StoreFormat;
 public final class MigrationRegistry {
 
 	/**
-	 * Every step this build ships, oldest first.
-	 *
-	 * <p>
-	 * <b>Empty</b>, because version 4 is the first one with a migration process at all — the 0.1.0-alpha.1 baseline.
-	 * When the format changes, the step from 4 to 5 goes here in the same change that sets
-	 * {@link StoreFormat#CURRENT_VERSION} to 5.
-	 * </p>
+	 * Every step this build ships, oldest first. Version 4 is the first one with a migration process at all — the
+	 * 0.1.0-alpha.1 baseline — so the chain starts at the step from 4 to 5.
 	 */
 	private static final MigrationRegistry STANDARD = new MigrationRegistry(StoreFormat.CURRENT_VERSION, List.of(
-	// new V4ToV5(),
-	));
+		new V4ToV5()));
 
 	private final int target;
 	private final Map<Integer, FormatMigration> byFrom = new TreeMap<>();

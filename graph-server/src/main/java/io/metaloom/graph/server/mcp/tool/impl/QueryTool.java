@@ -64,7 +64,7 @@ public final class QueryTool extends StoreTool {
 		return new McpToolDescriptor("graph_query",
 			"Run an openCypher query against the graph and return the rows. This engine implements a SUBSET of "
 				+ "openCypher — call graph_cypher_guide before writing anything non-trivial, and note that "
-				+ "OPTIONAL MATCH is not supported. Results are capped at " + DEFAULT_LIMIT + " rows by default.",
+				+ "FOREACH and map projections are not supported. Results are capped at " + DEFAULT_LIMIT + " rows by default.",
 			McpToolDescriptor.buildInputSchema(List.of(
 				new McpToolParam("query", "string", "The Cypher query. Use $name placeholders for values rather "
 					+ "than interpolating them.", true),

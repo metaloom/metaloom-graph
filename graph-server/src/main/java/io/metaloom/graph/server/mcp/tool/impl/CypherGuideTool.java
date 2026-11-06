@@ -17,7 +17,7 @@ import io.vertx.core.json.JsonObject;
  *
  * <p>
  * <b>The highest-value tool here, and the least obvious one.</b> A model that has seen Neo4j will write
- * {@code OPTIONAL MATCH} within two turns. This engine refuses it at parse time, which is the right behaviour and
+ * {@code FOREACH} or a map projection within two turns. This engine refuses those at parse time, which is the right behaviour and
  * still leaves the model with an error it cannot reason its way out of — so it tries a synonym, and then another. One
  * call to this replaces that whole loop.
  * </p>
@@ -38,7 +38,7 @@ public final class CypherGuideTool implements GraphMcpTool {
 	public McpToolDescriptor descriptor() {
 		return new McpToolDescriptor("graph_cypher_guide",
 			"Describes the openCypher SUBSET this engine implements: which clauses, patterns, functions and "
-				+ "operators exist, what is deliberately not built (OPTIONAL MATCH among it), and the null and "
+				+ "operators exist, what is deliberately not built (FOREACH and map projections among it), and the null and "
 				+ "performance rules. Call this before writing any non-trivial query.",
 			McpToolDescriptor.buildInputSchema(List.of()), false);
 	}

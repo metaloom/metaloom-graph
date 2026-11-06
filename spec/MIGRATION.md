@@ -16,14 +16,14 @@ golden fixtures that make an undeclared format change fail the build.
 
 | | |
 |---|---|
-| **Store format version** | **4** (`StoreFormat.CURRENT_VERSION`). The 0.1.0-alpha.1 baseline: the first version with a migration process |
-| **Where** | `MANIFEST`, offset 8 of each 4 KiB copy. Still written as **3** in a store without vector storage (§2.2) |
+| **Store format version** | **5** (`StoreFormat.CURRENT_VERSION`): the temporal property value tag. 4 is the 0.1.0-alpha.1 baseline, the first version with a migration process |
+| **Where** | `MANIFEST`, offset 8 of each 4 KiB copy, written as the version itself. A version 4 store without vector storage says **3** (§2.2) |
 | **Older store** | Refused by `GraphStore.open` with `MigrationRequiredException`, which names the command to run. **No automatic upgrade** (§2.5) |
 | **Newer store** | Refused with `FormatVersionException`. There is no downgrade |
-| **Migration steps shipped** | **None.** 4 is the first version; the registry is empty and the chain starts at the step from 4 to 5 |
+| **Migration steps shipped** | **4 → 5** (`V4ToV5`), a stamp: a version 4 store cannot hold the new tag, so no data is rewritten |
 | **Runner** | `MigrationRunner` behind the public `StoreMigration`: copy, steps, `verify(FULL)`, swap, original kept (§4) |
 | **CLI** | `metaloom-graph-cli database migrate <db> --path=<root> [--dry-run]`, `database info <db> --path=<root>` (§5) |
-| **Golden fixture** | `graph-core/src/test/resources/format/v4/`, 71 KB zipped. `GoldenFixtureTest`, `GoldenFixtureMigrationTest` (§6) |
+| **Golden fixtures** | `graph-core/src/test/resources/format/v4/` and `v5/`, about 72 KB zipped each. `GoldenFixtureTest`, `GoldenFixtureMigrationTest` (§6) |
 | **Alpha policy** | From 0.1.0-alpha.1 on, **every** format change goes through §6. No "breaking, dump and restore" releases (§7) |
 
 ---
@@ -44,7 +44,7 @@ marked *covered* is a change to the store format.
 | Segment superblock | first 8 KiB of every `.seg`, A/B | `format_version` = **2**, offset 8 | `Superblock.validateGeometry`: `!=` 2 is refused, and kind, segment number, page size, stride, slot capacity and the three region offsets are each compared with `Geometry` | yes |
 | Free slot bitmap, page metadata array | segment regions after the superblocks | — | region offsets are in the superblock check; PMA checksums by `verify` | yes |
 | Record layouts | `NODE` 64, `REL` 64, `PROP` 32-byte cells, `ADJ` 512-byte cells, `BLOB` and `INDEX` page-sized, `VEC` declared | — | strides are in the superblock check; contents are not versioned | yes |
-| Property value codec | inside `PROP` blocks and blobs | — | tag numbers 0..11 are frozen (`ValueCodec.T_*`) | yes |
+| Property value codec | inside `PROP` blocks and blobs | — | tag numbers 0..12 are frozen (`ValueCodec.T_*`), and the kinds of tag 12 (`ValueCodec.K_*`) | yes |
 | Adjacency block and edge codec | `ADJ` cells | — | none beyond the stride | yes |
 | B+tree page | `INDEX` pages | **none**: the `version` field at offset 16 is a **conflict counter** bumped by every change, not a format version | — | yes |
 | Index catalog page | `INDEX` slot 0 | magic `MLIDX\0`, no version | magic only; each list's region reads as "none declared" when zero | yes |
@@ -73,7 +73,8 @@ marked *covered* is a change to the store format.
 | 1 | The first engine format: one 8 KiB adjacency page per node | Refused, no migration path |
 | 2 | Cell-based adjacency blocks, 512-byte cells doubling to a page ([reports/SCALE.md](reports/SCALE.md)) | Refused, no migration path |
 | 3 | Multi-label nodes: `label_id_2`, `label_id_3`, `label_overflow_id` in the node record's dead `version_ptr`/`xmin` bytes | **Reads as 4.** Its layout is version 4's without vectors: everything added since went into bytes such stores hold as zero |
-| **4** | Vector storage, the `VEC` kind — written as 4 only by a store that has it. Plus every zero-compatible addition before the alpha: the PMA `gen_floor`, the composite-index region of the catalog page, the relationship type cached in adjacency entries | **Current.** The 0.1.0-alpha.1 baseline |
+| 4 | Vector storage, the `VEC` kind — written as 4 only by a store that has it. Plus every zero-compatible addition before the alpha: the PMA `gen_floor`, the composite-index region of the catalog page, the relationship type cached in adjacency entries | The 0.1.0-alpha.1 baseline. **Migrated** by `V4ToV5`, a stamp that rewrites no data |
+| **5** | The `TEMPORAL` property value tag (12): dates, times, date-times with an offset or a region zone, durations ([PROPERTY_STORAGE.md §4.2](PROPERTY_STORAGE.md#42-temporal-values)). The version field is the version in every store; the legacy encoding ended (§2.2) | **Current** |
 
 Versions 1 and 2 predate any migration process and there is no step from them. Such a store has to be dumped by a
 build that reads it and restored with this one, which is exactly what the refusal message says.
@@ -104,17 +105,17 @@ would have needed a migration to be opened. With 4, every one of them opens unch
 | 3 | non-zero | corrupt: refused |
 | 4 | non-zero | **4**, with vector storage |
 | 4 | 0 | corrupt: refused |
-| 5 and up | any | the field, and nothing else |
+| 5 and up | any | the field, and nothing else. Every store this build writes |
 
 Before the definition, the field was bumped per feature and 4 was written **only** by a store with vector storage:
 the field answered two questions at once, the layout and whether vectors were present. The vector question is now
 answered by `vec_stride` and feature bit 0, and the field is the layout.
 
-**Why the code still writes 3.** For as long as the current version is 4, a store without vectors keeps the field at
-3, so that a build from before this change — which accepts exactly 3 and 4 — still opens what this build writes.
-That costs one line (`Manifest.encodeVersion`) and keeps a downgrade inside the alpha baseline possible. At version 5
-it ends: `encodeVersion` returns the version for every store, `decodeVersion` keeps reading 3 and 4 as 4 for as long
-as a step from 4 exists, and an older build refuses 5 on its own.
+**Why the code wrote 3, and why it no longer does.** While the current version was 4, a store without vectors kept
+the field at 3, so that a build from before this change — which accepts exactly 3 and 4 — still opened what this
+build wrote, and a downgrade inside the alpha baseline stayed possible. That ended at version 5: `encodeVersion`
+returns the version for every store, `decodeVersion` keeps reading 3 and 4 as 4 for as long as a step from 4 exists,
+and an older build refuses 5 on its own.
 
 ### 2.3 Frozen bytes
 
@@ -195,7 +196,8 @@ chain is slower than a direct conversion would be, and that is accepted.
 past the target fail when the build starts, not when somebody's data needs them. `path(from)` returns the chain or
 throws a `MigrationException` naming the missing step; `hasPath(from)` is what `MigrationRequiredException` reports.
 
-A step, when the time comes, looks like this:
+A step that rewrites data looks like this (`V4ToV5`, the first real one, rewrites nothing and only reports
+progress):
 
 ```java
 /** Version 4 to 5: <what changes on disk>. */
@@ -392,6 +394,9 @@ metaloom-graph-cli database migrate sales --path=/data/graphs              # do 
 
 Output for the store this build writes (real output):
 
+Captured at version 4; a version 5 build prints `format version   5 (current)` for a store it wrote, and for this
+one `4 (older than this build's 5; written as 3, …)`:
+
 ```
 $ metaloom-graph-cli database info sales --path=/data/graphs
 store            /data/graphs/sales
@@ -498,7 +503,7 @@ In a container, stop the server and run the CLI against the volume:
 ### 6.3 The fixture
 
 ```
-graph-core/src/test/resources/format/v4/
+graph-core/src/test/resources/format/v5/
   root.zip            a root of databases: golden/ (the store, closed cleanly) and .auth/ (an identity file)
   expected.txt        GoldenContent.canonical(golden), read back through a fresh open at generation time
   expected-auth.txt   GoldenContent.canonicalAuth(root)
@@ -511,8 +516,11 @@ noise, because blobs are compressed and a repetitive string would fit in far few
 and one of another length that goes to a blob, five labels on one node (two past the inline three), a node with
 none, lightweight and materialised edges, parallel edges, a self-loop, a hub of forty edges, deleted nodes and
 relationships whose slots are then reused at a higher generation, a composite index, a store-wide and a
-label-scoped unique constraint, and a built HNSW index. The geometry is 4 KiB pages and 32 KiB segments, so the blob
-kind rolls over into a second segment, and the whole root is 1.6 MB unzipped and **71 KB** zipped. `expected.txt`
+label-scoped unique constraint, and a built HNSW index. From v5 on also every temporal kind (a region zone at an
+overlap, an offset date-time, durations from `Period`, `Duration` and a negative half second, one in a list, one on a
+relationship) with an index over a date and three temporal lookups, which `canonical` prints only for a fixture that
+holds them (§6.4). The geometry is 4 KiB pages and 32 KiB segments, so the blob
+kind rolls over into a second segment, and the whole root is 1.6 MB unzipped and about **72 KB** zipped. `expected.txt`
 has no ids in it: nodes by `uid`, references as the `uid` they point at, edges as `(from, type, to)`, plus the answer
 of every access path — label index, property index, composite index, exact and HNSW nearest neighbours — so an index
 whose bytes moved is caught even where the data reads fine.
@@ -545,7 +553,7 @@ was considered and rejected:
 - **The process is cheap when nothing changes on disk**: a step whose layout change is zero-compatible can be a
   stamp, `migrate` doing nothing but the copy and the verification.
 
-Stores written before 0.1.0-alpha.1 that read as version 4 (field 3 or 4) need nothing. Versions 1 and 2 have no
+Stores written before 0.1.0-alpha.1 that read as version 4 (field 3 or 4) take the same 4 → 5 step as an alpha.1 store. Versions 1 and 2 have no
 step and never will.
 
 ### 7.2 Downgrades
@@ -567,8 +575,8 @@ Both are versioned on their own and neither is touched by a store migration.
 
 ## 8. Conventions and Gotchas
 
-- **3 is 4.** A manifest that says 3 is the current version in a store without vectors. Do not "fix" the encoding
-  while the current version is 4; it is what keeps pre-alpha builds able to open what this build writes.
+- **3 is 4.** A manifest that says 3 is version 4 in a store without vectors, and still reads as 4 so the step from 4
+  can migrate it. This build writes 5 everywhere; it never writes 3 again.
 - **Never read an old version through the engine's classes.** They describe the current layout; a step copies the old
   constants it needs.
 - **Never stamp a real manifest to a fake version and expect it to open.** `GraphStore.open` accepts exactly the
@@ -592,11 +600,11 @@ Both are versioned on their own and neither is touched by a store migration.
 | Test | Module | What it pins |
 |------|--------|--------------|
 | `MigrationRunnerTest` | graph-core, `unit` | The runner over a synthetic 1 → 2 → 3 chain (a dictionary rewrite and a trace): plan changes nothing; chained steps in order; original kept byte for byte; failing step and failing verification leave the original untouched; a crash at each of 7 points then a rerun ends in the same state, each step run exactly once; a refused open creates nothing; a server start mid-swap creates nothing; newer, dirty, locked, existing backup, foreign working copy, missing step, inconsistent marker; non-default geometry; the migrated store commits, crashes and recovers |
-| `MigrationRegistryTest` | graph-core, `unit` | The chain, a gap named, below the chain, newer refused, registration mistakes refused at construction, the shipped registry ends at the current version |
-| `StoreFormatVersionTest` | graph-core, `unit` | The legacy encoding still written (3 without vectors, 4 with), encode/decode round trip and the two corrupt combinations, `inspect` changes nothing and its options open the store, an older store refused with the typed exception and nothing changed, the migratable message, a newer store refused, an unknown feature bit refused, the standard migration leaves a current store alone |
+| `MigrationRegistryTest` | graph-core, `unit` | The chain, a gap named, below the chain, newer refused, registration mistakes refused at construction, the shipped registry starts at 4 and ends at the current version |
+| `StoreFormatVersionTest` | graph-core, `unit` | The version written as itself with and without vectors, the legacy encoding of 4 still read (3 without vectors, 4 with), encode/decode round trip and the two corrupt combinations, `inspect` changes nothing and its options open the store, an older store refused with the typed exception and nothing changed, the migratable message, a newer store refused, an unknown feature bit refused, the standard migration leaves a current store alone |
 | `StoreCopierTest` | graph-core, `unit` | Every data file byte for byte without `LOCK` and `wal/`; a 64 MiB file with three runs of data copies as three runs and stays sparse |
 | `GoldenFixtureTest` | graph-core, `unit` | §6.2: a fixture exists for the current version; every fixture is the version it is filed under; the current one reads back as `expected.txt`, passes `verify(FULL)`, matches hand-stated facts, and its identity file authenticates |
-| `GoldenFixtureMigrationTest` | graph-core, `unit` | Every committed fixture migrated by the shipped migration reads back as its own `expected.txt`. Today the identity |
+| `GoldenFixtureMigrationTest` | graph-core, `unit` | Every committed fixture migrated by the shipped migration reads back as its own `expected.txt`: v4 through `V4ToV5`, v5 as the identity |
 | `MigrateCliTest` | graph-cli, `unit` | `info` on a held store and on an older one; nothing to do; no path blocked with exit 1 and nothing changed; newer; missing database not created; `--server` and a stray `--dry-run` refused; dry run of a synthetic chain prints the plan and changes nothing; a full run through the CLI; a held store refused |
 | `GraphServerTest#testStats` | graph-server, `unit` | `storeFormatVersion` in `/api/stats` |
 
@@ -636,7 +644,8 @@ tools/golden-fixture.sh                 # the next version's fixture, after a bu
 | `Manifest` | `io.metaloom.graph.core.store` | The version field: `encodeVersion`, `decodeVersion`, `read` (no create, no lock), `stampVersion` |
 | `FormatMigration` | `io.metaloom.graph.core.migration` | One step, N to N + 1 |
 | `MigrationContext` | `io.metaloom.graph.core.migration` | What a step is given |
-| `MigrationRegistry` | `io.metaloom.graph.core.migration` | The shipped chain (`STANDARD`, empty today), path planning, registration checks |
+| `MigrationRegistry` | `io.metaloom.graph.core.migration` | The shipped chain (`STANDARD`: `V4ToV5`), path planning, registration checks |
+| `V4ToV5` | `io.metaloom.graph.core.migration` | 4 → 5, the temporal tag: a stamp, no data rewritten |
 | `MigrationRunner` | `io.metaloom.graph.core.migration` | Plan, copy, steps, verify, swap, resume |
 | `MigrationMarker` | `io.metaloom.graph.core.migration` | The marker file, the sibling names, and the refusal `GraphStore.open` makes |
 | `StoreCopier` | `io.metaloom.graph.core.migration` | Reflink or sparse copy without `LOCK` and `wal/` |
@@ -660,8 +669,8 @@ tools/golden-fixture.sh                 # the next version's fixture, after a bu
 - [x] Marker-based resume at every point, refusal to open mid-migration, inconsistent states refused
 - [x] `lseek(SEEK_DATA/SEEK_HOLE)` for the copy, registered for GraalVM
 - [x] CLI: `database migrate [--dry-run]`, `database info`; `storeFormatVersion` in `/api/stats`
-- [x] Golden fixture for version 4, generator and script, the read-back and migrate-every-fixture tests
-- [ ] The first real step, 4 → 5, when the format next changes — and with it the end of the legacy encoding
+- [x] Golden fixtures for versions 4 and 5, generator and script, the read-back and migrate-every-fixture tests
+- [x] The first real step, 4 → 5 (the temporal tag), and with it the end of the legacy encoding
 - [ ] A migration of every database under a root in one command (`--all`); today it is one database per run
 - [ ] A disk-space check that refuses up front; today a full disk fails the copy, which is safe but late
 - [ ] Physical backup by reflink, which the copier's reflink path would make nearly free ([BACKUP.md §9](BACKUP.md))
@@ -669,4 +678,4 @@ tools/golden-fixture.sh                 # the next version's fixture, after a bu
 ---
 
 _Git HEAD revision: `8f8caad`_
-_Last updated: 2026-10-25 (format migration process for 0.1.0-alpha.1)_
+_Last updated: 2026-11-06 (store format version 5: the temporal tag, `V4ToV5`, the legacy encoding ended)_

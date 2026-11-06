@@ -63,6 +63,18 @@ final class Aggregates {
 
 	/** Zero over an empty group, not null: summing nothing is nothing, and Cypher says that is 0. */
 	private static Object sum(List<Object> values) {
+		if (!values.isEmpty() && values.get(0) instanceof io.metaloom.graph.cypher.value.CypherDuration) {
+			// Durations add component by component, as + does. Mixed with numbers it is a type error, as + is.
+			Object total = values.get(0);
+			for (int i = 1; i < values.size(); i++) {
+				if (!(values.get(i) instanceof io.metaloom.graph.cypher.value.CypherDuration)) {
+					throw new CypherTypeException("sum() cannot add a " + Values.typeName(values.get(i))
+						+ " to a Duration");
+				}
+				total = Values.add(total, values.get(i));
+			}
+			return total;
+		}
 		boolean integral = true;
 		double asDouble = 0;
 		long asLong = 0;
@@ -92,6 +104,10 @@ final class Aggregates {
 	private static Object average(List<Object> values) {
 		if (values.isEmpty()) {
 			return null;
+		}
+		if (values.get(0) instanceof io.metaloom.graph.cypher.value.CypherDuration) {
+			Object total = sum(values);
+			return Values.divide(total, (long) values.size());
 		}
 		double total = 0;
 		for (Object value : values) {

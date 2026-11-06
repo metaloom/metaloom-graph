@@ -2,7 +2,17 @@ package io.metaloom.graph.core.store.prop;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.DateTimeException;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.time.OffsetTime;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
+import java.time.temporal.TemporalAmount;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -48,6 +58,32 @@ public final class ValueCodec {
 	 * created for, and everything else still escapes to a blob.
 	 */
 	public static final int T_VECTOR_REF = 11;
+	/**
+	 * A Cypher temporal value; the size class is the kind ({@code K_*}). From store format version 5 on.
+	 * <ul>
+	 * <li>{@link #K_DATE}: {@code i64 epochDay}</li>
+	 * <li>{@link #K_LOCAL_TIME}: {@code i64 nanoOfDay}</li>
+	 * <li>{@link #K_TIME}: {@code i64 nanoOfDay, i32 offsetSeconds}</li>
+	 * <li>{@link #K_LOCAL_DATE_TIME}: {@code i64 epochSecond} (as if UTC), {@code i32 nano}</li>
+	 * <li>{@link #K_DATE_TIME_OFFSET}: {@code i64 epochSecond, i32 nano, i32 offsetSeconds}</li>
+	 * <li>{@link #K_DATE_TIME_ZONE}: {@code i64 epochSecond, i32 nano, u8 length, utf8 zoneId}</li>
+	 * <li>{@link #K_DURATION}: {@code i64 months, i64 days, i64 seconds, i32 nanos}</li>
+	 * </ul>
+	 * An {@link OffsetDateTime} is written as {@link #K_DATE_TIME_OFFSET} and reads back as a {@link ZonedDateTime}
+	 * whose zone is that offset; any {@link TemporalAmount} reads back as a {@link StoredDuration}.
+	 */
+	public static final int T_TEMPORAL = 12;
+
+	public static final int K_DATE = 0;
+	public static final int K_LOCAL_TIME = 1;
+	public static final int K_TIME = 2;
+	public static final int K_LOCAL_DATE_TIME = 3;
+	public static final int K_DATE_TIME_OFFSET = 4;
+	public static final int K_DATE_TIME_ZONE = 5;
+	public static final int K_DURATION = 6;
+
+	private static final long NANOS_PER_DAY = 86_400_000_000_000L;
+	private static final int MAX_OFFSET_SECONDS = 18 * 3600;
 
 	/** Values whose inline form would exceed this escape to the blob store. */
 	public static final int MAX_INLINE_BYTES = 255;
@@ -292,6 +328,55 @@ public final class ValueCodec {
 				w.i32(vector.length);
 				w.i64(blobs.store(raw));
 			}
+			case LocalDate d -> {
+				w.u8(tag(T_TEMPORAL, K_DATE));
+				w.i64(d.toEpochDay());
+			}
+			case LocalTime t -> {
+				w.u8(tag(T_TEMPORAL, K_LOCAL_TIME));
+				w.i64(t.toNanoOfDay());
+			}
+			case OffsetTime t -> {
+				w.u8(tag(T_TEMPORAL, K_TIME));
+				w.i64(t.toLocalTime().toNanoOfDay());
+				w.i32(t.getOffset().getTotalSeconds());
+			}
+			case LocalDateTime t -> {
+				w.u8(tag(T_TEMPORAL, K_LOCAL_DATE_TIME));
+				w.i64(t.toEpochSecond(ZoneOffset.UTC));
+				w.i32(t.getNano());
+			}
+			case OffsetDateTime t -> {
+				w.u8(tag(T_TEMPORAL, K_DATE_TIME_OFFSET));
+				w.i64(t.toEpochSecond());
+				w.i32(t.getNano());
+				w.i32(t.getOffset().getTotalSeconds());
+			}
+			case ZonedDateTime t when t.getZone() instanceof ZoneOffset offset -> {
+				w.u8(tag(T_TEMPORAL, K_DATE_TIME_OFFSET));
+				w.i64(t.toEpochSecond());
+				w.i32(t.getNano());
+				w.i32(offset.getTotalSeconds());
+			}
+			case ZonedDateTime t -> {
+				byte[] zone = t.getZone().getId().getBytes(StandardCharsets.UTF_8);
+				if (zone.length > 255) {
+					throw new IllegalArgumentException("Zone id " + t.getZone().getId() + " is longer than 255 bytes");
+				}
+				w.u8(tag(T_TEMPORAL, K_DATE_TIME_ZONE));
+				w.i64(t.toEpochSecond());
+				w.i32(t.getNano());
+				w.u8(zone.length);
+				w.bytes(zone);
+			}
+			case TemporalAmount amount -> {
+				StoredDuration d = StoredDuration.of(amount);
+				w.u8(tag(T_TEMPORAL, K_DURATION));
+				w.i64(d.months());
+				w.i64(d.days());
+				w.i64(d.seconds());
+				w.i32(d.nanos());
+			}
 			case List<?> list -> {
 				w.u8(tag(T_LIST, 0));
 				w.varint(list.size());
@@ -490,6 +575,12 @@ public final class ValueCodec {
 				}
 				return vectors.read(vectorId);
 			}
+			case T_TEMPORAL:
+				if (!materialise) {
+					skipTemporal(r, sizeClass);
+					return null;
+				}
+				return decodeTemporal(r, sizeClass);
 			case T_LIST: {
 				int count = (int) r.varint();
 				List<Object> list = materialise ? new ArrayList<>(Math.min(count, 1024)) : null;
@@ -527,6 +618,86 @@ public final class ValueCodec {
 	private static Object skip(Reader r, int bytes) {
 		r.skip(bytes);
 		return null;
+	}
+
+	/** Advances past one {@link #T_TEMPORAL} payload of the given kind. */
+	private static void skipTemporal(Reader r, int kind) {
+		switch (kind) {
+			case K_DATE, K_LOCAL_TIME -> r.skip(8);
+			case K_TIME, K_LOCAL_DATE_TIME -> r.skip(12);
+			case K_DATE_TIME_OFFSET -> r.skip(16);
+			case K_DATE_TIME_ZONE -> {
+				r.skip(12);
+				r.skip(r.u8());
+			}
+			case K_DURATION -> r.skip(28);
+			default -> throw new PageCorruptException("Unknown temporal kind " + kind + " in a property value");
+		}
+	}
+
+	/**
+	 * One {@link #T_TEMPORAL} payload. The bytes come off a data page and are untrusted: every range the
+	 * {@code java.time} factories would reject with a {@link DateTimeException} is reported as corruption instead, so
+	 * a flipped byte says where it is rather than surfacing as a date-parsing error.
+	 */
+	private static Object decodeTemporal(Reader r, int kind) {
+		try {
+			return switch (kind) {
+				case K_DATE -> LocalDate.ofEpochDay(r.i64());
+				case K_LOCAL_TIME -> LocalTime.ofNanoOfDay(nanoOfDay(r.i64()));
+				case K_TIME -> {
+					long nanoOfDay = nanoOfDay(r.i64());
+					yield OffsetTime.of(LocalTime.ofNanoOfDay(nanoOfDay), offset(r.i32()));
+				}
+				case K_LOCAL_DATE_TIME -> {
+					long epochSecond = r.i64();
+					yield LocalDateTime.ofEpochSecond(epochSecond, nano(r.i32()), ZoneOffset.UTC);
+				}
+				case K_DATE_TIME_OFFSET -> {
+					long epochSecond = r.i64();
+					int nano = nano(r.i32());
+					ZoneOffset offset = offset(r.i32());
+					yield ZonedDateTime.ofInstant(Instant.ofEpochSecond(epochSecond, nano), offset);
+				}
+				case K_DATE_TIME_ZONE -> {
+					long epochSecond = r.i64();
+					int nano = nano(r.i32());
+					String zoneId = new String(r.bytes(r.u8()), StandardCharsets.UTF_8);
+					yield ZonedDateTime.ofInstant(Instant.ofEpochSecond(epochSecond, nano), ZoneId.of(zoneId));
+				}
+				case K_DURATION -> {
+					long months = r.i64();
+					long days = r.i64();
+					long seconds = r.i64();
+					yield new StoredDuration(months, days, seconds, nano(r.i32()));
+				}
+				default -> throw new PageCorruptException("Unknown temporal kind " + kind + " in a property value");
+			};
+		} catch (DateTimeException | ArithmeticException e) {
+			throw new PageCorruptException("A temporal property value of kind " + kind + " is out of range: "
+				+ e.getMessage());
+		}
+	}
+
+	private static long nanoOfDay(long value) {
+		if (value < 0 || value >= NANOS_PER_DAY) {
+			throw new PageCorruptException("A stored time of day is " + value + " ns, outside [0, 86400e9)");
+		}
+		return value;
+	}
+
+	private static int nano(int value) {
+		if (value < 0 || value >= 1_000_000_000) {
+			throw new PageCorruptException("A stored nanosecond field is " + value + ", outside [0, 1e9)");
+		}
+		return value;
+	}
+
+	private static ZoneOffset offset(int seconds) {
+		if (seconds < -MAX_OFFSET_SECONDS || seconds > MAX_OFFSET_SECONDS) {
+			throw new PageCorruptException("A stored zone offset is " + seconds + " s, outside +-18:00");
+		}
+		return ZoneOffset.ofTotalSeconds(seconds);
 	}
 
 	// ---------------------------------------------------------------- reference rewriting
@@ -585,6 +756,9 @@ public final class ValueCodec {
 				return false;
 			case T_UUID:
 				r.skip(16);
+				return false;
+			case T_TEMPORAL:
+				skipTemporal(r, sizeClass);
 				return false;
 			case T_ELEMENT_REF:
 				return patchId(payload, r, map);

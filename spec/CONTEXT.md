@@ -45,9 +45,9 @@ node fills, not a page. It was a page until [reports/SCALE.md](reports/SCALE.md)
 cost — 59 of 61 GiB on a mean-degree-4 graph — and the change took the same graph to 6.2 GiB.
 
 **The on-disk format is versioned and migrated** ([MIGRATION.md](MIGRATION.md)). Store format version **4** is the
-0.1.0-alpha.1 baseline; a build opens exactly one version, refuses an older store with the command that migrates it
-(`metaloom-graph-cli database migrate`), and from alpha.1 on every format change ships a migration step and a golden
-fixture — `GoldenFixtureTest` fails one that does not.
+0.1.0-alpha.1 baseline; **5**, which added temporal property values, is current. A build opens exactly one version,
+refuses an older store with the command that migrates it (`metaloom-graph-cli database migrate`), and from alpha.1 on
+every format change ships a migration step and a golden fixture — `GoldenFixtureTest` fails one that does not.
 
 What is done and what is left: [PROGRESS.md](PROGRESS.md). Per-phase status with the reason for every
 gap: [reports/PHASE_STATUS.md](reports/PHASE_STATUS.md). Measured numbers:

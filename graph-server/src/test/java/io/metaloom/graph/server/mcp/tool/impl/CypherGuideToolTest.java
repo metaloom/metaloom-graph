@@ -36,7 +36,8 @@ public class CypherGuideToolTest {
 		// LOAD CSV left this list when the clause was built. It is still refused over MCP — see QueryTool — but that
 		// is a property of this port rather than of the subset, so it does not belong in the "not implemented" section
 		// the guide and CYPHER.md section 5.5 share.
-		List<String> unsupported = List.of("OPTIONAL MATCH", "FOREACH");
+		// OPTIONAL MATCH left it when it was built; the guide now shows it as a clause.
+		List<String> unsupported = List.of("FOREACH", "IN TRANSACTIONS", "OPTIONAL CALL");
 		for (String construct : unsupported) {
 			assertTrue(spec.contains(construct),
 				construct + " is no longer named in CYPHER.md; if it became supported, update the guide too");
@@ -50,10 +51,11 @@ public class CypherGuideToolTest {
 		int notImplemented = guide.indexOf("## Not implemented");
 		assertTrue(notImplemented > 0, "the guide needs its 'Not implemented' section");
 		String supported = guide.substring(0, notImplemented);
-		// OPTIONAL MATCH is the one a model reaches for first, so it must not appear anywhere it could be read as
-		// available — including in an example.
-		assertFalse(supported.contains("OPTIONAL MATCH\n"),
-			"OPTIONAL MATCH appears above the 'Not implemented' heading, where it reads as supported");
+		// FOREACH is the one a model reaches for next, so it must not appear anywhere it could be read as available.
+		// As a clause, that is: the introduction quotes the refusal message, which names it.
+		assertFalse(supported.contains("FOREACH ("),
+			"FOREACH appears above the 'Not implemented' heading, where it reads as supported");
+		assertTrue(supported.contains("OPTIONAL MATCH"), "OPTIONAL MATCH is built and should be shown as a clause");
 	}
 
 	@Test

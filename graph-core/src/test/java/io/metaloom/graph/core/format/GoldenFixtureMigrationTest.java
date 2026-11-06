@@ -23,10 +23,10 @@ import io.metaloom.graph.core.api.VerifyLevel;
  * ships, and then read back as exactly the content that fixture was generated with.
  *
  * <p>
- * Today there is one fixture and it is the current version, so this is the identity: the plan is empty and the store
- * is left alone. The structure is the point. The day {@link StoreFormat#CURRENT_VERSION} moves to 5, the v4 fixture
- * stays committed, and this test fails until a step from 4 to 5 is registered that takes it there with its content
- * intact — and it keeps running that migration on every build afterwards, through every later step as well.
+ * The v4 fixture goes through {@code V4ToV5} on every build, and through every later step as well once there are
+ * more; the current version's fixture is the identity — the plan is empty and the store is left alone. The day
+ * {@link StoreFormat#CURRENT_VERSION} moves again, this fails until a step is registered that takes every older
+ * fixture there with its content intact.
  * </p>
  */
 @Tag("unit")

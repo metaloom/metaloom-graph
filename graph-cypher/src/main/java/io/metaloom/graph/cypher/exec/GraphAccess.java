@@ -414,9 +414,10 @@ public final class GraphAccess {
 	 * </p>
 	 *
 	 * <p>
-	 * <b>This is not the exact inverse of {@link #normalise}.</b> Reading renders {@code byte[]}, {@code UUID} and
-	 * {@code Instant} as strings, so writing one back stores a string. {@code SET n.x = n.x} on such a property is
-	 * therefore a type change, and there is no way for the query language to write those three types at all.
+	 * <b>This is not the exact inverse of {@link #normalise}.</b> Reading renders {@code byte[]} and {@code UUID} as
+	 * strings, so writing one back stores a string, and an {@code Instant} becomes a {@code DATETIME} in UTC, so
+	 * writing it back stores the temporal type. {@code SET n.x = n.x} on such a property is therefore a type change.
+	 * The temporal types themselves round-trip exactly.
 	 * </p>
 	 */
 	private static io.metaloom.graph.core.api.Properties toStore(Map<String, Object> values) {
@@ -437,6 +438,13 @@ public final class GraphAccess {
 			case Long l -> l;
 			case Double d -> d;
 			case String s -> wholeCharacters(s, key, "value");
+			// Stored natively: the store keeps each temporal type, a region zone included, and a duration's four parts.
+			case java.time.LocalDate d -> d;
+			case java.time.LocalTime t -> t;
+			case java.time.OffsetTime t -> t;
+			case java.time.LocalDateTime d -> d;
+			case java.time.ZonedDateTime d -> d;
+			case io.metaloom.graph.cypher.value.CypherDuration d -> d;
 			case List<?> list -> {
 				List<Object> out = new ArrayList<>(list.size());
 				for (Object element : list) {
@@ -448,7 +456,8 @@ public final class GraphAccess {
 				yield out;
 			}
 			default -> throw new CypherTypeException("The property '" + key + "' cannot hold a "
-				+ Values.typeName(value) + "; a property must be a number, a string, a boolean or a list of those");
+				+ Values.typeName(value) + "; a property must be a number, a string, a boolean, a temporal value or a "
+				+ "list of those");
 		};
 	}
 
@@ -489,10 +498,11 @@ public final class GraphAccess {
 	 * Brings a stored value into Cypher's type system.
 	 *
 	 * <p>
-	 * The store keeps types Cypher has no equivalent for — {@code byte[]}, {@code float[]}, {@code UUID},
-	 * {@code Instant}. They are rendered as strings rather than leaked as Java objects, because a value that reaches a
-	 * query result has to be something the caller can compare, order and serialise. Vectors become a list of numbers,
-	 * which is the one shape a query might genuinely want to index into.
+	 * The store keeps types Cypher has no equivalent for — {@code byte[]}, {@code float[]}, {@code UUID}. They are
+	 * rendered as strings rather than leaked as Java objects, because a value that reaches a query result has to be
+	 * something the caller can compare, order and serialise. Vectors become a list of numbers, which is the one shape a
+	 * query might genuinely want to index into. An {@code Instant} is a {@code DATETIME} in UTC, and the store's own
+	 * duration type is a {@code CypherDuration}.
 	 * </p>
 	 */
 	private static Object normalise(Object value) {
@@ -507,7 +517,8 @@ public final class GraphAccess {
 			}
 			case byte[] bytes -> "0x" + java.util.HexFormat.of().formatHex(bytes);
 			case java.util.UUID uuid -> uuid.toString();
-			case java.time.Instant instant -> instant.toString();
+			case java.time.Instant instant -> io.metaloom.graph.cypher.func.Temporals.normalise(instant);
+			case java.time.temporal.TemporalAmount amount -> io.metaloom.graph.cypher.func.Temporals.normalise(amount);
 			case Integer i -> i.longValue();
 			case Short s -> s.longValue();
 			case Byte b -> b.longValue();

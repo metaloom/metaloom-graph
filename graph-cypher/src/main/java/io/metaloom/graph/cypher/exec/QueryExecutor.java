@@ -64,6 +64,7 @@ public final class QueryExecutor {
 		// one of its own — a second instance would be a second place for the pattern rules to drift.
 		this.writer = new Writer(graph, evaluator, matcher);
 		this.csv = csv == null ? CsvSource.DENY : csv;
+		this.evaluator.subqueries(this::subquery);
 	}
 
 	/**
@@ -152,9 +153,17 @@ public final class QueryExecutor {
 	}
 
 	public Result run(Ast.Query query) {
-		Result result = runSingle(query.parts().get(0));
+		return run(query, new Row());
+	}
+
+	/**
+	 * A whole query — every UNION part — over one seed row. The top level seeds an empty row; a subquery seeds the
+	 * outer row, or the part of it the body imports.
+	 */
+	private Result run(Ast.Query query, Row seed) {
+		Result result = runSingle(query.parts().get(0), seed);
 		for (int i = 1; i < query.parts().size(); i++) {
-			Result next = runSingle(query.parts().get(i));
+			Result next = runSingle(query.parts().get(i), seed);
 			if (!result.columns().equals(next.columns())) {
 				throw new CypherTypeException("All parts of a UNION must return the same columns: "
 					+ result.columns() + " against " + next.columns());
@@ -234,6 +243,11 @@ public final class QueryExecutor {
 		if (clauses.isEmpty() || !(clauses.get(clauses.size() - 1) instanceof Ast.Return)) {
 			return false;
 		}
+		return streams(clauses);
+	}
+
+	/** Whether every one of these clauses can run as a push stage, whatever the last one is. */
+	private static boolean streams(List<Ast.Clause> clauses) {
 		for (Ast.Clause clause : clauses) {
 			boolean ok = switch (clause) {
 				case Ast.Match ignored -> true;
@@ -253,6 +267,8 @@ public final class QueryExecutor {
 				// A call produces its whole result set at once — the index returns k rows, not a stream — so there is
 				// nothing to push. Rows after it stream as usual.
 				case Ast.Call ignored -> false;
+				// Runs a whole query per row, whose result is materialised; the rows after it stream as usual.
+				case Ast.CallSubquery ignored -> false;
 			};
 			if (!ok) {
 				return false;
@@ -385,6 +401,19 @@ public final class QueryExecutor {
 		RowConsumer next = downstream -> push(clauses, index + 1, downstream, stages, out);
 
 		return switch (clauses.get(index)) {
+			case Ast.Match match when match.optional() -> {
+				boolean[] found = { false };
+				boolean more = matcher.match(match.pattern(), match.where(), row, matched -> {
+					if (!keeps(matched, match.where())) {
+						return true;
+					}
+					found[0] = true;
+					return next.accept(matched);
+				});
+				// Decided after the walk, not per candidate: the padded row stands for "nothing matched", so it can only
+				// be produced once every candidate has had its chance.
+				yield !more ? false : found[0] || next.accept(padded(match, row));
+			}
 			case Ast.Match match -> matcher.match(match.pattern(), match.where(), row,
 				matched -> !keeps(matched, match.where()) || next.accept(matched));
 			case Ast.Unwind unwind -> {
@@ -563,11 +592,11 @@ public final class QueryExecutor {
 		return where == null || Values.isTrue(evaluator.evaluate(where, row));
 	}
 
-	private Result runSingle(Ast.SingleQuery query) {
-		// One empty row, so the first clause runs exactly once. A clause that produces rows replaces it; a clause that
-		// filters has something to filter.
+	private Result runSingle(Ast.SingleQuery query, Row start) {
+		// One row, so the first clause runs exactly once: empty at the top level, the imported outer row in a subquery.
+		// A clause that produces rows replaces it; a clause that filters has something to filter.
 		List<Row> seed = new ArrayList<>();
-		seed.add(new Row());
+		seed.add(start);
 		return runClauses(query.clauses(), seed);
 	}
 
@@ -581,12 +610,57 @@ public final class QueryExecutor {
 	 * </p>
 	 */
 	private Result runClauses(List<Ast.Clause> clauses, List<Row> seed) {
+		Pipeline pipeline = pipeline(clauses, seed);
+		List<Row> rows = pipeline.rows();
+		List<String> columns = pipeline.columns();
+		if (!pipeline.returned()) {
+			// A write query with no RETURN. Its result is what it changed, and the counters carry that; projecting the
+			// working rows would report one empty row per element touched, which is a result the query never asked
+			// for. Only a write can reach here — the parser refuses a read that does not end in RETURN.
+			return new Result(List.of(), List.of(), writer.stats());
+		}
+
+		List<List<Object>> output = new ArrayList<>(rows.size());
+		for (Row row : rows) {
+			List<Object> values = new ArrayList<>(columns.size());
+			for (String column : columns) {
+				values.add(row.get(column));
+			}
+			output.add(values);
+		}
+		return new Result(columns, output, writer.stats());
+	}
+
+	/**
+	 * What a clause list leaves behind: its working rows, and the columns of its RETURN if it had one.
+	 *
+	 * <p>
+	 * The rows rather than a result, because a subquery expression without a RETURN — {@code EXISTS { MATCH … }} — is
+	 * answered by the rows themselves.
+	 * </p>
+	 */
+	private record Pipeline(List<Row> rows, List<String> columns, boolean returned) {
+	}
+
+	private Pipeline pipeline(List<Ast.Clause> clauses, List<Row> seed) {
 		List<Row> rows = seed;
 		List<String> columns = List.of();
 		boolean returned = false;
 
 		for (Ast.Clause clause : clauses) {
 			switch (clause) {
+				case Ast.Match match when match.optional() -> {
+					List<Row> next = new ArrayList<>();
+					for (Row row : rows) {
+						List<Row> found = filter(matcher.match(match.pattern(), match.where(), row), match.where());
+						if (found.isEmpty()) {
+							next.add(padded(match, row));
+						} else {
+							next.addAll(found);
+						}
+					}
+					rows = next;
+				}
 				case Ast.Match match -> {
 					List<Row> next = new ArrayList<>();
 					for (Row row : rows) {
@@ -656,25 +730,154 @@ public final class QueryExecutor {
 				case Ast.Remove remove -> rows = writer.remove(remove, rows);
 				case Ast.Delete delete -> rows = writer.delete(delete, rows);
 				case Ast.Call call -> rows = call(call, rows);
+				case Ast.CallSubquery subquery -> rows = callSubquery(subquery, rows);
 			}
 		}
+		return new Pipeline(rows, columns, returned);
+	}
 
-		if (!returned) {
-			// A write query with no RETURN. Its result is what it changed, and the counters carry that; projecting the
-			// working rows would report one empty row per element touched, which is a result the query never asked
-			// for. Only a write can reach here — the parser refuses a read that does not end in RETURN.
-			return new Result(List.of(), List.of(), writer.stats());
+	// ---------------------------------------------------------------- OPTIONAL MATCH
+
+	/**
+	 * The row an OPTIONAL MATCH produces when nothing matched: the input, with every variable the pattern would have
+	 * introduced bound to null.
+	 *
+	 * <p>
+	 * Bound to null and not left unbound, which is the difference that matters downstream: {@code RETURN b} must have a
+	 * column to read, and a later {@code MATCH (b)-->(c)} must match nothing rather than scan for a new {@code b}. A
+	 * variable already bound before the clause keeps its value; the pattern only constrained it.
+	 * </p>
+	 */
+	private static Row padded(Ast.Match match, Row row) {
+		Row out = null;
+		for (Ast.PatternPart part : match.pattern()) {
+			List<String> names = new ArrayList<>();
+			if (part.pathVariable() != null) {
+				names.add(part.pathVariable());
+			}
+			for (int i = 0; i < part.nodes().size(); i++) {
+				names.add(part.nodes().get(i).variable());
+				if (i < part.relationships().size()) {
+					names.add(part.relationships().get(i).variable());
+				}
+			}
+			for (String name : names) {
+				if (name != null && !row.has(name) && (out == null || !out.has(name))) {
+					if (out == null) {
+						out = Row.copyOf(row, names.size());
+					}
+					out.put(name, null);
+				}
+			}
 		}
+		return out == null ? row : out;
+	}
 
-		List<List<Object>> output = new ArrayList<>(rows.size());
+	// ---------------------------------------------------------------- subqueries
+
+	/**
+	 * {@code CALL { … }}: the body once per row, seeded with what it imports.
+	 *
+	 * <p>
+	 * A returning body multiplies the row by its result, and a row the body has no answer for is dropped — as a MATCH
+	 * that finds nothing drops it. A unit body (no RETURN) is run for its writes and lets each row through once.
+	 * </p>
+	 */
+	private List<Row> callSubquery(Ast.CallSubquery subquery, List<Row> rows) {
+		List<Row> out = new ArrayList<>();
 		for (Row row : rows) {
-			List<Object> values = new ArrayList<>(columns.size());
-			for (String column : columns) {
-				values.add(row.get(column));
+			graph.checkAbort();
+			Row seed;
+			if (subquery.importAll()) {
+				seed = row;
+			} else {
+				for (String name : subquery.imports()) {
+					if (!row.has(name)) {
+						throw new CypherTypeException("CALL { … } imports '" + name + "', which is not defined here. "
+							+ "In scope: " + visible(row));
+					}
+				}
+				seed = row.only(subquery.imports());
 			}
-			output.add(values);
+			Result result = run(subquery.body(), seed);
+			if (result.columns().isEmpty()) {
+				out.add(row);
+				continue;
+			}
+			for (String column : result.columns()) {
+				if (row.has(column) && !seed.has(column)) {
+					throw new CypherTypeException("CALL { … } returns '" + column + "', which is already defined "
+						+ "outside it. Rename it with AS");
+				}
+			}
+			for (List<Object> values : result.rows()) {
+				Row joined = Row.copyOf(row, values.size());
+				for (int i = 0; i < values.size(); i++) {
+					joined.put(result.columns().get(i), values.get(i));
+				}
+				out.add(joined);
+			}
 		}
-		return new Result(columns, output, writer.stats());
+		return out;
+	}
+
+	private static List<String> visible(Row row) {
+		List<String> names = new ArrayList<>();
+		for (String name : row.names()) {
+			if (!PatternMatcher.isAnonymous(name)) {
+				names.add(name);
+			}
+		}
+		return names;
+	}
+
+	/**
+	 * {@code EXISTS}, {@code COUNT} and {@code COLLECT}, seeded with the whole outer row.
+	 *
+	 * <p>
+	 * A single-part body whose clauses all stream is pushed, so {@code EXISTS} stops at its first row and
+	 * {@code COUNT} holds none of them: {@code WHERE EXISTS { (n)-[:KNOWS]->() }} costs one expansion step for a node
+	 * that has a friend, not all of them. Anything else is materialised through the ordinary pipeline.
+	 * </p>
+	 */
+	private Object subquery(Ast.Subquery subquery, Row row) {
+		Ast.Query body = subquery.body();
+		if (body.parts().size() == 1 && subquery.kind() != Ast.SubqueryKind.COLLECT
+			&& streams(body.parts().get(0).clauses())) {
+			List<Ast.Clause> clauses = body.parts().get(0).clauses();
+			long[] count = { 0 };
+			boolean exists = subquery.kind() == Ast.SubqueryKind.EXISTS;
+			push(clauses, 0, row, new Stage[clauses.size()], ignored -> {
+				count[0]++;
+				return !exists;
+			});
+			return exists ? (Object) (count[0] > 0) : (Object) count[0];
+		}
+		boolean returns = body.parts().get(0).clauses()
+			.get(body.parts().get(0).clauses().size() - 1) instanceof Ast.Return;
+		if (!returns) {
+			// The rows are the answer. Only a single part can get here: the parser keeps a union's parts alike.
+			long size = 0;
+			for (Ast.SingleQuery part : body.parts()) {
+				List<Row> seed = new ArrayList<>();
+				seed.add(row);
+				size += pipeline(part.clauses(), seed).rows().size();
+			}
+			return subquery.kind() == Ast.SubqueryKind.EXISTS ? (Object) (size > 0) : (Object) size;
+		}
+		Result result = run(body, row);
+		long size = result.rows().size();
+		List<Object> values = new ArrayList<>(result.rows().size());
+		if (subquery.kind() == Ast.SubqueryKind.COLLECT) {
+			for (List<Object> resultRow : result.rows()) {
+				values.add(resultRow.get(0));
+			}
+		}
+		return switch (subquery.kind()) {
+			case EXISTS -> size > 0;
+			case COUNT -> size;
+			case COLLECT -> values;
+		};
 	}
 
 	// ---------------------------------------------------------------- clauses
@@ -811,6 +1014,12 @@ public final class QueryExecutor {
 				|| branch.whens().stream().anyMatch(QueryExecutor::containsAggregate)
 				|| branch.thens().stream().anyMatch(QueryExecutor::containsAggregate)
 				|| containsAggregate(branch.otherwise());
+			// `[x IN collect(n) | x.name]`: the list is the one place an aggregate can sit in a comprehension, since the
+			// rest is evaluated per element.
+			case Ast.ListComprehension comprehension -> containsAggregate(comprehension.list());
+			case Ast.Quantifier quantifier -> containsAggregate(quantifier.list());
+			// An aggregate inside a subquery aggregates the subquery's rows, not this projection's.
+			case Ast.Subquery ignored -> false;
 			case Ast.Literal ignored -> false;
 			case Ast.Variable ignored -> false;
 			case Ast.Parameter ignored -> false;

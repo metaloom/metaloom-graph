@@ -2,7 +2,17 @@ package io.metaloom.graph.core.format;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.time.OffsetTime;
+import java.time.Period;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -37,7 +47,8 @@ import io.metaloom.graph.core.store.prop.ValueCodec;
  * (two past the three the record holds inline), a node with none, lightweight and materialised edges, parallel edges,
  * a self-loop, a hub whose adjacency outgrows the inline slots and its first cell, deleted nodes and relationships
  * whose slots are then reused at a higher generation, and the declared schema — a composite index, a store-wide and a
- * label-scoped unique constraint and a built vector index. The geometry is tiny (4 KiB pages, 32 KiB segments) so the
+ * label-scoped unique constraint and a built vector index. From version 5 on, every temporal kind as well, with an
+ * index over one and lookups that {@link #canonical} prints only when the fixture holds them. The geometry is tiny (4 KiB pages, 32 KiB segments) so the
  * store rolls over into several segments per kind and still compresses to a few kilobytes.
  * </p>
  *
@@ -194,6 +205,35 @@ public final class GoldenContent {
 			txn.commit();
 		}
 
+		// Every temporal kind (format version 5 on): the extremes of a date, a time one nanosecond before midnight, a
+		// local date-time before the epoch with a fraction of a second, an offset date-time (which reads back as a
+		// zoned one), a region zone at an autumn overlap where only the later offset is right, and durations from
+		// Period, Duration and a negative half second. One in a list, one on a relationship, and an index over one.
+		try (Transaction txn = store.begin()) {
+			long chrono = store.createNode(List.of("Chrono"), Properties.of()
+				.set("uid", "chrono")
+				.set("day", LocalDate.of(2024, 2, 29))
+				.set("earliest", LocalDate.MIN)
+				.set("latest", LocalDate.MAX)
+				.set("clock", LocalTime.of(23, 59, 59, 999_999_999))
+				.set("time", OffsetTime.of(8, 30, 0, 0, ZoneOffset.ofHours(-5)))
+				.set("local", LocalDateTime.of(1969, 12, 31, 23, 59, 59, 500_000_000))
+				.set("fixed", ZonedDateTime.of(2024, 10, 27, 2, 30, 0, 0, ZoneOffset.ofHours(2)))
+				.set("offset", OffsetDateTime.of(2001, 9, 9, 1, 46, 40, 123_456_789, ZoneOffset.ofHoursMinutes(5, 30)))
+				.set("vienna", ZonedDateTime.of(LocalDateTime.of(2024, 10, 27, 2, 30), ZoneId.of("Europe/Vienna"))
+					.withLaterOffsetAtOverlap())
+				.set("period", Period.of(1, 2, 3))
+				.set("duration", Duration.ofHours(-25).plusMillis(250))
+				.set("half", Duration.ofMillis(-500))
+				.set("moments", List.of(LocalDate.of(1970, 1, 1), Period.ofDays(-7))));
+			long alice = store.nodesByProperty("uid", "alice").get(0);
+			store.createRelationship(chrono, "SCHEDULED", alice, Properties.of()
+				.set("at", ZonedDateTime.of(2030, 1, 1, 9, 0, 0, 0, ZoneId.of("America/New_York")))
+				.set("for", Duration.ofMinutes(90)));
+			txn.commit();
+		}
+
+		store.createIndex("Chrono", "day");
 		store.createIndex("Person", "name");
 		store.createUniqueConstraint("uid");
 		store.createUniqueConstraint("Product", "name");
@@ -279,6 +319,16 @@ public final class GoldenContent {
 		out.append("lookup Person.name=Bob -> ")
 			.append(uids(store, store.nodesByLabelAndProperty("Person", "name", "Bob"))).append('\n');
 		out.append("lookup uid=leaf-17 -> ").append(uids(store, store.nodesByProperty("uid", "leaf-17"))).append('\n');
+		// Only a fixture that holds temporal values (version 5 on) prints these, so older ones render as they did.
+		if (!store.nodesByProperty("uid", "chrono").isEmpty()) {
+			out.append("lookup Chrono.day=2024-02-29 -> ")
+				.append(uids(store, store.nodesByLabelAndProperty("Chrono", "day", LocalDate.of(2024, 2, 29))))
+				.append('\n');
+			out.append("lookup fixed=2024-10-27T00:30Z -> ").append(uids(store, store.nodesByProperty("fixed",
+				OffsetDateTime.of(2024, 10, 27, 0, 30, 0, 0, ZoneOffset.UTC)))).append('\n');
+			out.append("lookup period=P14M3D -> ")
+				.append(uids(store, store.nodesByProperty("period", Period.of(0, 14, 3)))).append('\n');
+		}
 		out.append("nearest scan -> ").append(neighbours(store,
 			store.nearestByScan("Person", "embedding", vector(1.0f), 3, VectorMetric.COSINE))).append('\n');
 		out.append("nearest index -> ").append(neighbours(store,

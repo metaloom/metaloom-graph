@@ -6,6 +6,18 @@ less than SemVer's `1.0`; see *Compatibility* below. How a release is cut: [spec
 
 ## [Unreleased]
 
+### Added
+
+- **`OPTIONAL MATCH`, `CALL { … }` subqueries, `EXISTS`/`COUNT`/`COLLECT { … }`, list comprehensions and the
+  `all`/`any`/`none`/`single` predicates** in Cypher — the logic callers had to move into application code for want
+  of them. See [CYPHER.md §1.3](spec/CYPHER.md).
+- **Temporal types in Cypher**: `date`, `localtime`, `time`, `localdatetime`, `datetime` and `duration`, with ISO
+  parsing, components, arithmetic, `duration.between` and truncation. They are stored natively rather than as strings,
+  so they compare, sort and index as what they are. `CypherDuration` is a new public type. See
+  [CYPHER.md §1.2](spec/CYPHER.md).
+- **Temporal values leave the process** — dates, times, datetimes and durations over the binary port, as
+  ISO-8601 strings over HTTP and MCP, and in logical dumps.
+
 ### Fixed
 
 - **A node change and a concurrent delete of the same node could both commit**, leaving an index entry
@@ -18,6 +30,7 @@ less than SemVer's `1.0`; see *Compatibility* below. How a release is cut: [spec
 
 ### Changed
 
+- **Temporal property values** are stored natively: store format version 5; a version 4 store needs `database migrate`, which rewrites no data.
 - **The HTTP body limit is configurable** — `--max-body-bytes` / `GRAPH_MAX_BODY_BYTES`, default unchanged at
   one MiB. A body over it is refused with `413` and `error: "too_large"` in the documented JSON error shape,
   naming the limit and the flag, instead of Vert.x's plain-text page.

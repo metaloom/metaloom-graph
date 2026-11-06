@@ -5,6 +5,8 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 
+import io.metaloom.graph.cypher.func.Temporals;
+import io.metaloom.graph.cypher.value.CypherDuration;
 import io.metaloom.graph.cypher.value.CypherNode;
 import io.metaloom.graph.cypher.value.CypherPath;
 import io.metaloom.graph.cypher.value.CypherRelationship;
@@ -181,6 +183,11 @@ public final class Values {
 			return equalKnown(new ArrayList<Object>(a.nodes()), new ArrayList<Object>(b.nodes()))
 				&& equalKnown(new ArrayList<Object>(a.relationships()), new ArrayList<Object>(b.relationships()));
 		}
+		if (Temporals.isTemporal(left) || Temporals.isTemporal(right)) {
+			// Two zoned values are equal when they name the same instant, whatever zone each is written in; values of
+			// two different temporal types never are.
+			return Temporals.isTemporal(left) && Temporals.isTemporal(right) && Temporals.equal(left, right);
+		}
 		return left.equals(right);
 	}
 
@@ -281,7 +288,7 @@ public final class Values {
 				}
 				yield out;
 			}
-			default -> value;
+			default -> Temporals.groupingKey(value);
 		};
 	}
 
@@ -369,15 +376,17 @@ public final class Values {
 			}
 			return Integer.compare(a.size(), b.size());
 		}
-		return null;
+		// Same temporal type only, zoned ones by instant; a duration orders against nothing.
+		return Temporals.compare(left, right);
 	}
 
 	/**
 	 * The total order ORDER BY, {@code min} and {@code max} use: openCypher's orderability.
 	 *
 	 * <p>
-	 * Unlike types order as map, node, relationship, list, path, string, boolean, number, and null last — the order
-	 * openCypher and Neo4j define, so a mixed column sorts the same here as elsewhere. Within a type: numbers exactly
+	 * Unlike types order as map, node, relationship, list, path, datetime, local datetime, date, time, local time,
+	 * duration, string, boolean, number, and null last — the order openCypher and Neo4j define, so a mixed column sorts
+	 * the same here as elsewhere. Within a type: numbers exactly
 	 * across Integer and Float with NaN above every number, nodes and relationships by identity, lists and paths element
 	 * by element. ORDER BY has to be a total order or the sort is undefined, so null goes somewhere definite: last
 	 * ascending.
@@ -410,6 +419,7 @@ public final class Values {
 				yield nodes != 0 ? nodes : orderLists(a.relationships(), ((CypherPath) right).relationships());
 			}
 			case Map<?, ?> a -> orderMaps(a, (Map<?, ?>) right);
+			case Object a when Temporals.isTemporal(a) -> Temporals.orderWithin(a, right);
 			default -> typeName(left).compareTo(typeName(right));
 		};
 	}
@@ -421,11 +431,13 @@ public final class Values {
 			case CypherRelationship ignored -> 2;
 			case List<?> ignored -> 3;
 			case CypherPath ignored -> 4;
-			case String ignored -> 5;
-			case Boolean ignored -> 6;
-			case Number ignored -> 7;
+			// 5 to 10: datetime, local datetime, date, time, local time, duration.
+			case Object temporal when Temporals.isTemporal(temporal) -> 5 + Temporals.orderRank(temporal);
+			case String ignored -> 11;
+			case Boolean ignored -> 12;
+			case Number ignored -> 13;
 			// Anything else a parameter can carry — a float[] query vector — after every Cypher type, before null.
-			default -> 8;
+			default -> 14;
 		};
 	}
 
@@ -566,6 +578,16 @@ public final class Values {
 			joined.addAll(b);
 			return joined;
 		}
+		if (Temporals.isTemporal(left) || Temporals.isTemporal(right)) {
+			Object moved = Temporals.add(left, right);
+			if (moved != null) {
+				return moved;
+			}
+			if (!(left instanceof String) && !(right instanceof String)) {
+				throw new CypherTypeException("+ cannot add a " + typeName(right) + " to a " + typeName(left)
+					+ "; a temporal value takes a Duration");
+			}
+		}
 		// String concatenation shares the operator, and a number joined to a string is a string.
 		if (left instanceof String || right instanceof String) {
 			return stringOf(left) + stringOf(right);
@@ -581,6 +603,14 @@ public final class Values {
 		if (left == null || right == null) {
 			return null;
 		}
+		if (Temporals.isTemporal(left) || Temporals.isTemporal(right)) {
+			Object moved = Temporals.subtract(left, right);
+			if (moved != null) {
+				return moved;
+			}
+			throw new CypherTypeException("- cannot subtract a " + typeName(right) + " from a " + typeName(left)
+				+ "; a temporal value takes a Duration");
+		}
 		Number a = number(left, "-");
 		Number b = number(right, "-");
 		return isIntegral(a) && isIntegral(b)
@@ -592,6 +622,12 @@ public final class Values {
 		if (left == null || right == null) {
 			return null;
 		}
+		if (left instanceof CypherDuration duration && right instanceof Number factor) {
+			return Temporals.multiply(duration, factor);
+		}
+		if (right instanceof CypherDuration duration && left instanceof Number factor) {
+			return Temporals.multiply(duration, factor);
+		}
 		Number a = number(left, "*");
 		Number b = number(right, "*");
 		return isIntegral(a) && isIntegral(b)
@@ -602,6 +638,9 @@ public final class Values {
 	public static Object divide(Object left, Object right) {
 		if (left == null || right == null) {
 			return null;
+		}
+		if (left instanceof CypherDuration duration && right instanceof Number divisor) {
+			return Temporals.divide(duration, divisor);
 		}
 		Number a = number(left, "/");
 		Number b = number(right, "/");
@@ -641,6 +680,9 @@ public final class Values {
 		if (value == null) {
 			return null;
 		}
+		if (value instanceof CypherDuration duration) {
+			return Temporals.negate(duration);
+		}
 		Number number = number(value, "-");
 		return isIntegral(number) ? (Object) exact("-", () -> Math.negateExact(number.longValue()))
 			: (Object) (-number.doubleValue());
@@ -679,6 +721,9 @@ public final class Values {
 			// Cypher prints 1.0 rather than Java's 1.0 for some values and 1 for others; keep it stable.
 			return d.toString();
 		}
+		if (Temporals.isTemporal(value)) {
+			return Temporals.text(value);
+		}
 		return value.toString();
 	}
 
@@ -709,6 +754,10 @@ public final class Values {
 		}
 		if (value instanceof Number number) {
 			return isIntegral(number) ? "Integer" : "Float";
+		}
+		String temporal = Temporals.typeName(value);
+		if (temporal != null) {
+			return temporal;
 		}
 		return value.getClass().getSimpleName();
 	}

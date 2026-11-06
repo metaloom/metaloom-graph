@@ -97,7 +97,7 @@ the event arrives and that the negotiated version came back as 1.1.
 ### 4.1 `graph_cypher_guide` is the one that earns its place
 
 It looks like documentation and it is the highest-value tool here. A model that has seen Neo4j writes
-`OPTIONAL MATCH` within two turns. This engine refuses it at parse time — correctly — and the model is left with an
+`FOREACH` or a map projection within two turns (it used to be `OPTIONAL MATCH`, which is built now). This engine refuses those at parse time — correctly — and the model is left with an
 error it cannot reason its way out of, so it tries a synonym, and then another. One call replaces that whole loop.
 
 The text is a packaged resource, `mcp/cypher-guide.md`, and `CypherGuideToolTest` checks it against

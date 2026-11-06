@@ -93,16 +93,18 @@ public class MigrationRegistryTest {
 	}
 
 	/**
-	 * The shipped registry ends at the current version, and today it is empty: 4 is the first version with a migration
-	 * process. When a step is added this starts failing on the count, which is the reminder to check spec/MIGRATION.md
-	 * section 6 was followed.
+	 * The shipped registry ends at the current version and starts at 4, the first version with a migration process.
+	 * When a step is added this starts failing on the oldest version or the count, which is the reminder to check
+	 * spec/MIGRATION.md section 6 was followed.
 	 */
 	@Test
 	public void testTheStandardRegistryEndsAtTheCurrentVersion() {
 		MigrationRegistry standard = MigrationRegistry.standard();
 		assertEquals(StoreFormat.CURRENT_VERSION, standard.target());
-		assertEquals(StoreFormat.CURRENT_VERSION, standard.oldestMigratable());
+		assertEquals(4, standard.oldestMigratable());
 		assertTrue(standard.path(StoreFormat.CURRENT_VERSION).isEmpty());
-		assertFalse(standard.hasPath(StoreFormat.CURRENT_VERSION - 1));
+		assertEquals(StoreFormat.CURRENT_VERSION - 4, standard.path(4).size());
+		assertTrue(standard.hasPath(4));
+		assertFalse(standard.hasPath(3), "versions before 4 have no step and never will");
 	}
 }

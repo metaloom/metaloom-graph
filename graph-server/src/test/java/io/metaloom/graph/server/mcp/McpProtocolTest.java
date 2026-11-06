@@ -176,8 +176,8 @@ public class McpProtocolTest {
 	@Test
 	public void testTheGuideNamesWhatIsNotSupported() {
 		String guide = textOf(callTool(handler(false), "graph_cypher_guide", new JsonObject()));
-		assertTrue(guide.contains("OPTIONAL MATCH"),
-			"the one construct a model that has seen Neo4j will reach for first");
+		assertTrue(guide.contains("FOREACH"),
+			"a construct a model that has seen Neo4j will reach for, and that this build refuses");
 		assertTrue(guide.contains("$name"), "and the parameter syntax, so it stops interpolating values");
 	}
 

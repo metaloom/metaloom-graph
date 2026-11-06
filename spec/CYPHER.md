@@ -32,11 +32,12 @@ for (CypherRow row : result) {
 ```
 Query        := SingleQuery (UNION [ALL] SingleQuery)*
 SingleQuery  := [PeriodicCommit] Clause+ [Return]   -- Return is required unless the query writes
-Clause       := Match | Unwind | With | Create | Merge | Set | Remove | Delete | Call | LoadCsv
+Clause       := Match | Unwind | With | Create | Merge | Set | Remove | Delete | Call | CallSubquery | LoadCsv
 PeriodicCommit := USING PERIODIC COMMIT [Int]       -- only before a leading LoadCsv; see 5.6
 LoadCsv      := LOAD CSV [WITH HEADERS] FROM Expr AS Variable [FIELDTERMINATOR StringLit]
 Call         := CALL Name '(' [Expr (',' Expr)*] ')' YIELD Variable (',' Variable)*
-Match        := MATCH Pattern [WHERE Expr]
+CallSubquery := CALL ['(' ('*' | [Variable (',' Variable)*]) ')'] '{' Query '}'   -- 1.3
+Match        := [OPTIONAL] MATCH Pattern [WHERE Expr]
 Unwind       := UNWIND Expr AS Variable
 With         := WITH Projection [WHERE Expr]
 Return       := RETURN Projection
@@ -57,6 +58,11 @@ Chain        := NodePattern (RelPattern NodePattern)*
 NodePattern  := '(' [Variable] (':' Label)* [MapLiteral] ')'
 RelPattern   := ('-' | '<-') ['[' [Variable] [':' Type ('|' Type)*] ['*' Range] [MapLiteral] ']'] ('-' | '->')
 Range        := [Int] ['..' [Int]]
+
+-- expression forms beyond the operators below
+ListComp     := '[' Variable IN Expr [WHERE Expr] ['|' Expr] ']'
+Quantifier   := (all | any | none | single) '(' Variable IN Expr WHERE Expr ')'
+SubqueryExpr := (EXISTS | COUNT | COLLECT) '{' (Query | Pattern [WHERE Expr]) '}'  -- read-only; 1.3
 ```
 
 Expression precedence, loosest first: `OR` · `XOR` · `AND` · `NOT` · comparison
@@ -88,6 +94,8 @@ negated and is accepted. A range bound past `2^31` means "unbounded" rather than
 | String | `toString`, `toUpper`, `toLower`, `trim`, `ltrim`, `rtrim`, `substring`, `replace`, `split` |
 | Numeric | `toInteger`, `toFloat`, `toBoolean`, `abs`, `ceil`, `floor`, `round`, `sqrt`, `sign` |
 | Vector | `vector.cosine`, `vector.dot`, `vector.l2` — [VECTOR.md](VECTOR.md) |
+| Temporal | `date`, `localtime`, `time`, `localdatetime`, `datetime`, `duration`; `<type>.truncate`, `<type>.statement` / `.transaction` / `.realtime`, `datetime.fromEpoch`, `datetime.fromEpochMillis`, `duration.between`, `duration.inMonths`, `duration.inDays`, `duration.inSeconds` — §1.2 |
+| Predicate | `all`, `any`, `none`, `single` — §1.3 |
 
 An aggregate may sit anywhere inside a projection item — `size(collect(x))`, `count(*) > 0`,
 `collect(x)[0]`, `{c: count(*)}` — and is folded when evaluation reaches it, so a `CASE` folds only the
@@ -156,7 +164,7 @@ of different lengths are refused rather than scored**, because the overwhelmingl
 query vector written for a different model than the stored one.
 
 **Cypher can read a vector and cannot write one.** `GraphAccess.storable` accepts only `Boolean`,
-`Long`, `Double`, `String` and `List`, so `SET n.embedding = [0.1, 0.2]` stores a list of doubles,
+`Long`, `Double`, `String`, the six temporal types (§1.2) and `List`, so `SET n.embedding = [0.1, 0.2]` stores a list of doubles,
 which is a different value from the `float[]` the Java API writes and will not match it. Populating a
 vector property is a Java API operation today.
 
@@ -168,6 +176,94 @@ still the clearer spelling:
 MATCH (d:Doc) WITH d, vector.cosine(d.embedding, $q) AS score
 ORDER BY score DESC LIMIT 10 RETURN d.name, score
 ```
+
+
+### 1.2 Temporal types
+
+Six types, each carried by the `java.time` value a Java caller already knows, so `CypherRow.get` hands back
+something usable without a conversion layer and the store keeps them without knowing this module:
+
+| Cypher | Java | Literal |
+|---|---|---|
+| `DATE` | `LocalDate` | `date('2015-07-21')` |
+| `LOCAL TIME` | `LocalTime` | `localtime('12:31:14.645')` |
+| `TIME` (zoned) | `OffsetTime` | `time('12:31:14+01:00')` |
+| `LOCAL DATETIME` | `LocalDateTime` | `localdatetime('2015-07-21T21:40:32')` |
+| `DATETIME` (zoned) | `ZonedDateTime` — an offset or a region | `datetime('2015-07-21T21:40[Europe/Vienna]')` |
+| `DURATION` | `CypherDuration` (months, days, seconds, nanos) | `duration('P1Y2M10DT12H')` |
+
+**They are stored natively** — store format 5 ([MIGRATION.md](MIGRATION.md)) — so a date property compares,
+sorts and indexes as a date. Before, the only way to keep one was a string, which orders as text and makes
+every temporal predicate a string comparison. A region zone survives storage (`Europe/Vienna` comes back as
+`Europe/Vienna`, not `+02:00`), and so do a duration's four separate parts.
+
+`CypherDuration` exists because `java.time` has no type for it: `Period` holds months and days, `Duration`
+holds seconds, and `P1M` is not `P30D` — adding each to 31 January gives a different day. It is a
+`TemporalAmount`, which is how the storage layer stores it without depending on this module. **It is the one
+public type this work added to the locked API** ([API_LOCK.md](API_LOCK.md)).
+
+- **Construction**: from an ISO 8601 string (extended or basic, calendar, week `2015-W30-2` and ordinal
+  `2015-202` dates, up to nine fraction digits, offsets `Z`/`+01`/`+0100`/`+01:00`, a region in brackets), from
+  a map (`{year, month, day}`, `{year, week, dayOfWeek}`, `{year, ordinalDay}`, `{year, quarter, dayOfQuarter}`,
+  the time fields to `nanosecond`, `timezone`, `epochSeconds`/`epochMillis`, and `date`/`time`/`datetime` as a
+  source whose fields the others override), or from another temporal value (`date(datetime)`,
+  `datetime(date)`). Text that is none of these is a type error, not null: a typo in a literal is a message
+  rather than a missing row.
+- **No argument is the statement clock**: `datetime()` twice in one query is one instant, as in Neo4j.
+  `.realtime()` reads the clock again. A value with no zone of its own is in **UTC**.
+- **Components**: `d.year`, `.quarter`, `.month`, `.week`, `.weekYear`, `.day`, `.ordinalDay`, `.dayOfWeek`,
+  `.dayOfQuarter`, `.hour` to `.nanosecond`, `.timezone`, `.offset`, `.offsetMinutes`, `.offsetSeconds`,
+  `.epochSeconds`, `.epochMillis`; on a duration `.years` to `.nanoseconds` and the `…Of…` remainders. A
+  component the type lacks — `date.hour` — is an error naming it.
+- **Arithmetic**: temporal `±` duration and duration `±` duration; duration `*` and `/` a number, where a
+  fraction cascades (a month into 30.436875 days, a day into seconds) as Neo4j does. A date takes the whole days
+  of a duration's seconds; a time of day takes only the seconds and wraps. Temporal `-` temporal is refused and
+  names `duration.between`.
+- **Comparison**: same type only. Zoned values compare and are equal by **instant**, so
+  `datetime('2020-01-01T00:00+01:00') = datetime('2019-12-31T23:00Z')` is true and DISTINCT keeps one of them.
+  Two different temporal types are never equal and `<` between them is null. **Durations do not order**:
+  `P1M < P30D` is null, `=` compares the four parts.
+- **Ordering** follows openCypher's orderability: datetime, local datetime, date, time, local time, duration,
+  between paths and strings. Durations sort by their parts in order, which is arbitrary but total.
+- `duration.between(a, b)` is the largest whole months, then days, then seconds; zoned values are compared in
+  `a`'s zone. `inSeconds` between two datetimes is elapsed time, so it is 23 hours across a spring-forward day.
+- **Coming in**: a parameter or a stored `Instant` or `OffsetDateTime` is a `DATETIME`; a `Period`, a
+  `java.time.Duration` or any other `TemporalAmount` of months, days, seconds and nanos is a `DURATION`. A stored
+  `Instant` used to come back as a string; it now comes back as a datetime in UTC.
+- **Index probes** take temporal values: the property index compares a zoned value by its instant and a duration
+  by its parts, so each has one spelling there and §7's twin rule does not apply.
+
+### 1.3 `OPTIONAL MATCH`, subqueries, comprehensions and quantifiers
+
+**`OPTIONAL MATCH`** keeps a row its pattern cannot extend, once, with every variable the pattern would have
+introduced bound to **null**. Three consequences, each covered by `OptionalMatchTest`: the `WHERE` belongs to the
+optional pattern, so a row whose only candidate fails it is padded rather than dropped; a variable bound before
+the clause keeps its value; and a padded null matches nothing in a later `MATCH` (§2's last row). It streams —
+"nothing matched" is decided after the walk for that row, so `LIMIT` still stops the scan.
+
+**`CALL { … }`** runs a query once per incoming row. The body sees **only what it imports**: a leading
+`WITH a, b` of bare variables, or the scope clause `CALL (a, b) { … }`, or `CALL (*)` for everything. Without an
+import, `MATCH (p)` inside the body binds a new `p`. A body ending in `RETURN` multiplies the row by its result
+rows and adds their columns (a column that would shadow an outer variable is refused); one without is a *unit*
+subquery run for its writes, and each row passes through once. A body may be a `UNION`. It counts as a write, a
+file read and a privilege requirement exactly when its body does. `IN TRANSACTIONS` and `OPTIONAL CALL` are
+refused by name. It does not stream: the body's result is materialised per row.
+
+**`EXISTS { … }`, `COUNT { … }`, `COLLECT { … }`** evaluate a read-only query as a value, with **every** outer
+variable visible, so `EXISTS { (p)-[:KNOWS]->() }` is a join on the outer `p`. The body is a query or just a
+pattern with a `WHERE`. A single-part streaming body is pushed, so `EXISTS` stops at its first row and `COUNT`
+holds none. `COLLECT` needs exactly one returned column. A body that writes or loads a file is a syntax error:
+it is evaluated as a value, possibly many times per row, and side effects would make that count observable.
+Subqueries nest at most eight deep, and the expression depth allowed inside halves per level (§1), so a nested
+query cannot multiply the recursion bound.
+
+**List comprehensions** `[x IN list WHERE p | e]` — both parts optional. The variable is local to the brackets
+and may shadow an outer one. A null predicate drops the element. An aggregate may be the list —
+`[x IN collect(n) | x.name]` — and is folded first.
+
+**`all`, `any`, `none`, `single`** `(x IN list WHERE p)` are three-valued: a null predicate is an unknown element
+that decides nothing the known ones have not already decided. `any(x IN [null, 1] WHERE x > 0)` is true, `all`
+over the same list is null. The `WHERE` is required.
 
 ---
 
@@ -547,16 +643,16 @@ The simple form compares under Cypher equality, so `1` and `1.0` select the same
 | | Reason |
 |---|---|
 | `FOREACH` | `UNWIND` covers the common case |
-| `OPTIONAL MATCH` | Needs null-padding semantics through the rest of the pipeline |
-| List comprehensions, map projections, pattern comprehensions | Not built. `[x IN list]` is refused too: in openCypher it is always a comprehension, so reading it as a one-element list of booleans would be a different answer rather than a refusal |
+| Map projections, pattern comprehensions | Not built. List comprehensions are (§1.3) |
 | List slicing, `list[1..2]` | Not built; indexing one element is |
-| `ALL`/`ANY`/`NONE`/`SINGLE` predicates, `EXISTS` subqueries | Not built. `exists(n.prop)`, the function, is |
+| Pattern predicates, `WHERE (a)-->(b)` | Not built; `WHERE EXISTS { (a)-->(b) }` is the same question and is (§1.3) |
+| `CALL { … } IN TRANSACTIONS`, `OPTIONAL CALL` | Refused by name. `USING PERIODIC COMMIT` with `LOAD CSV` is how a load is batched here |
 | User-defined procedures | No procedure *registry* exists. `CALL` itself is built and there is exactly one procedure: `CALL vector.query(label, key, vector, k) YIELD node, score` — see [VECTOR.md](VECTOR.md). Any other name is refused at execution with that message |
-| Temporal and spatial types | The store has `Instant`; Cypher's temporal algebra is not implemented |
+| Spatial types | Not built. The temporal types are (§1.2) |
 
-**Each of these is refused at parse time, by name, with a caret.** That claim was untrue for list
-comprehensions, map projections, `EXISTS { … }` and slicing — they failed as an unexpected `|`, `{` or
-`..` somewhere further on — until `CypherSemanticsTest` asserted it. The parser accepts only what the
+**Each of these is refused at parse time, by name, with a caret.** That claim was untrue for map
+projections and slicing (and for list comprehensions and `EXISTS { … }`, before they were built) — they failed
+as an unexpected `|`, `{` or `..` somewhere further on — until `CypherSemanticsTest` asserted it. The parser accepts only what the
 executor can run, so "this build cannot do that" and "you typed it wrong" are different messages:
 
 ```
@@ -796,12 +892,13 @@ the query language uses an index it cannot create.
 
 | Streams | Blocks, and why |
 |---|---|
-| `MATCH`, `WHERE`, `UNWIND` | `ORDER BY` — the first row out depends on the last row in |
+| `MATCH`, `OPTIONAL MATCH`, `WHERE`, `UNWIND` | `ORDER BY` — the first row out depends on the last row in |
 | `WITH` / `RETURN` projection | `DISTINCT` — cannot know a value is new without the ones before it |
 | `SKIP` / `LIMIT`, per stage | Any aggregate — same |
 | | `RETURN *` / `WITH *` — the column set is the union of variable names over *every* row, and the header goes out first |
 | | `UNION` (the deduplicating form). `UNION ALL` could stream and does not yet |
 | | Every write clause — §5.2 |
+| | `CALL { … }` — the body's result is materialised per row (an `EXISTS`/`COUNT` body streams *inside*, §1.3) |
 
 **All or nothing per query part**, rather than the longest streaming prefix. A blocking clause buffers
 its whole input whatever runs above it, so pushing only the prefix would bound nothing; the one thing
@@ -927,6 +1024,12 @@ together would collapse onto one value and merge two nodes into one circle. Any 
 the safe range is stringified for the same reason — `RETURN id(n)` has to give back something a caller
 can paste into another query. Found by running the UI, so there is now a test.
 
+**Temporal values cross as their ISO-8601 strings**, as Neo4j's HTTP API sends them: `2024-02-29`, `10:15:30.123`,
+`10:00+01:00`, `2020-01-01T10:00`, `2020-01-01T10:00+01:00`, `2020-01-01T10:00+01:00[Europe/Vienna]`, and a duration
+as `P1Y2M3DT4H5M6.5S`. Any `TemporalAmount` is printed through `CypherDuration`, so a duration the store hands back as
+some other amount still prints all four components. The same rendering serves the MCP query tool; the UI shows them
+as the strings they are (`ResultJsonTemporalTest`). The binary port carries them typed — [WIRE.md §2](WIRE.md).
+
 **Queries run on worker threads**, never the event loop: an unindexed query is a full scan, bounded by
 the data rather than by the request. They also run under a deadline — `--query-timeout`, 30 s by
 default, 0 to disable — which is enforced by the engine consulting an abort signal *while it scans*
@@ -1049,10 +1152,14 @@ together: both have to permit, and the flag can only subtract.
 
 | Class | Cases | |
 |---|---|---|
-| `CypherParserTest` | 30 | Tokens, precedence, ranges, every refusal naming itself with a caret, and that a label or property key named after a keyword keeps its spelling |
+| `CypherParserTest` | 31 | Tokens, precedence, ranges, every refusal naming itself with a caret, and that a label or property key named after a keyword keeps its spelling |
 | `io/CsvRowReaderTest` | 15 | RFC 4180: quoted newlines, the `""` escape, BOM, `\r\n`, a custom terminator, and a record straddling the buffer |
 | `LoadCsvTest` | 27 | §5.6 end to end: both row shapes, both execution paths, the reader closed on every exit including an early `LIMIT`, `DENY` by default, and periodic commit's partial-failure semantics |
 | `NullSemanticsTest` | 17 | §2, on its own |
+| `TemporalTest` | 22 | §1.2: every ISO form, maps and conversions, the statement clock, components, durations and their cascade, `duration.between` across a DST change, arithmetic, instant equality, orderability, truncation, parameters in `java.time` types, and every type stored, indexed and read back as itself |
+| `OptionalMatchTest` | 9 | §1.3: padding, the WHERE belonging to the pattern, a padded null matching nothing later — every query on both execution paths |
+| `SubqueryTest` | 20 | §1.3: `CALL { … }` scoping, both import spellings, unions, unit writes and their privileges; `EXISTS`/`COUNT`/`COLLECT`, their refusal to write, the early stop, and the nesting bound |
+| `ListComprehensionTest` | 13 | §1.3: the three comprehension shapes, local scope, over an aggregate, and the quantifiers' three-valued answers |
 | `CypherSemanticsTest` | 28 | §2.1 and the rest of this round's semantic defects, one case each, every one failing on the code before it: list `+`, exact numeric comparison, orderability, code points, lone surrogates, null-bound pattern variables, rebinding, self-loops, MERGE on null and on a numeric list, SET item order, refusals by name |
 | `CypherDifferentialTest` | 5 | Random predicates, groupings, orderings and variable-length patterns against an evaluator written separately over the Java API, and one equality through every access path with and without a declared index. Found the numeric-list probe (§7) |
 | `integration/CypherFuzzTest` | 1 (+1 `fuzz`) | Grammar, mutated corpus and noise: every input ends in a documented outcome — a result or a classifiable exception — within its deadline; every successful read gives the same rows streamed and materialised; every rolled-back write leaves the graph as it was. Seeded, replayable by (seed, input), failures minimised. Found five defects |
@@ -1178,4 +1285,4 @@ previous bundle. Every assertion in the first run failed against markup that no 
 ---
 
 _Git HEAD revision: `f2b6d5f`_
-_Last updated: 2026-10-24 (client, server and CLI review: closed streams, budget leak, slot release order, shutdown grace, strict UTF-8, MCP argument shapes, atomic backups)_
+_Last updated: 2026-11-06 (OPTIONAL MATCH, CALL subqueries, EXISTS/COUNT/COLLECT, list comprehensions, quantifiers, native temporal types)_

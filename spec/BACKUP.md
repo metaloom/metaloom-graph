@@ -159,6 +159,35 @@ the convention `WireValueCodec` set, so one reader can be checked against the ot
 code. It drops `ELEMENT_REF` and `VECTOR_REF` entirely: both name a location inside a specific store,
 which is the one thing a dump must not depend on.
 
+**Temporal properties are tag 15**, the first number free in the storage, wire and dump codecs alike,
+with the size class naming the kind — the wire's layout ([WIRE.md §2](WIRE.md)) in the dump's
+primitives:
+
+| Size class | Value | Payload |
+|---|---|---|
+| 0 | `LocalDate` | `u64` epoch day |
+| 1 | `LocalTime` | `u64` nano of day |
+| 2 | `OffsetTime` | `u64` nano of day, `u32` offset seconds |
+| 3 | `LocalDateTime` | `u64` epoch second read as UTC, `u32` nano |
+| 4 | `ZonedDateTime` at a `ZoneOffset` | `u64` instant epoch second, `u32` nano, `u32` offset seconds |
+| 5 | `ZonedDateTime` in a region | `u64` instant epoch second, `u32` nano, `string` zone id |
+| 6 | a duration | `u64` months, `u64` days, `u64` seconds, `u32` nanos in `[0, 1e9)` |
+
+A duration is written from **any** `TemporalAmount` the store hands back, read by its units (years fold
+into months; any unit other than years, months, days, seconds and nanos is a `DumpFormatException`, a
+bug rather than a value to round). It is read back as a package-private `TemporalAmount` in exactly
+`MONTHS`, `DAYS`, `SECONDS` and `NANOS` — what the store accepts. Not a `Period`, which has no seconds,
+and not a `Duration`, which has no months: a month is not thirty days, so either would change the value.
+Reading is as strict as the wire's: every field range-checked, a nanosecond field outside `[0, 1e9)`
+refused, and a zone id must be a known region in its canonical spelling.
+
+**Adding the tag did not bump the dump format version**, and that is the rule for a new value tag:
+every version-1 dump reads exactly as before, and a build without the tag meeting one stops with
+"Value tag 15 is not one this build writes; the dump is corrupt or was written by a newer version" —
+loud, and during restore into a staging directory, so the target is untouched (§5). A bump would make
+an older build refuse every new dump, including the ones with no temporal value in them. A change to
+what an existing tag or section means is a bump.
+
 ### 3.4 Untrusted input
 
 A dump is the file somebody reaches for when things have already gone wrong, which makes it the file
@@ -348,6 +377,7 @@ Two changes, both narrow:
 |---|---|
 | `SnapshotScanTest` (graph-core) | **The foundation.** A scan under a view does not see nodes committed after it, still sees nodes deleted after it, and a paced scan sees the same set while a writer commits throughout |
 | `BackupRoundTripTest` | Dump, restore, compare. Multi-label and label-less nodes, lightweight edges, a self-loop, parallel edges, every property type including the four no other codec carries, and the declared schema. Ends in `verify(FULL)` — and a store after two thirds of it was deleted and it was compacted, vectors and a vector index included, whose restored copy still answers a nearest-neighbour query with a survivor |
+| `DumpTemporalCodecTest` | Tag 15 at the codec: every kind round-trips exactly at `MIN`/`MAX`; a duration from `Period`, `Duration` and the dump's own type keeps months, days, seconds and nanos apart; an `HOURS` amount refused; out-of-range fields, bad zone ids, kind 7 and every truncation refused with `DumpFormatException`. At the codec because the store in this tree cannot hold a temporal property yet — once it can, `BackupRoundTripTest`'s every-type node gains them |
 | `BackupUnderLoadTest` | A backup taken while a writer commits: every edge joins one generation and every generation is present whole, so the dump is one instant — **and** the writer made progress, so it was online |
 | `DumpHostileInputTest` | §3.4: every truncation, every single-byte corruption, 200 random inputs, a huge length, deep nesting, a non-terminating varint |
 | `CliOptionsTest` | The command line, both directions, and that every dispatched command is documented |
@@ -387,4 +417,4 @@ Two changes, both narrow:
 ---
 
 _Git HEAD revision: `8f8caad`_
-_Last updated: 2026-10-25 (dump versus migration; reflink's first caller)_
+_Last updated: 2026-11-06 (temporal properties, tag 15; a new value tag is not a version bump)_

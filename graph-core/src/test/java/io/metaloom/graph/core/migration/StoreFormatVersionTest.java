@@ -61,40 +61,39 @@ public class StoreFormatVersionTest {
 	}
 
 	/**
-	 * The compatibility promise to builds from before the store format version was defined: a store without vectors
-	 * still says 3 and one with vectors still says 4, which are the only two values those builds accept, so a store
-	 * this build has written stays openable by them for as long as the current version is 4.
+	 * From version 5 on the field is the version, for every store: the legacy encoding of version 4 — 3 for a store
+	 * without vectors — ended with the bump (spec/MIGRATION.md section 2.2), and the field no longer says whether vectors
+	 * are present.
 	 */
 	@Test
-	public void testVersionFourIsStillWrittenInItsLegacyEncoding() throws IOException {
-		assertEquals(4, StoreFormat.CURRENT_VERSION, "this test describes the encoding of version 4 only");
+	public void testTheVersionIsWrittenAsItselfWithAndWithoutVectors() throws IOException {
 		Path plain = create("plain", TempStore.options());
 		Path vectors = create("vectors", withVectors());
-		assertEquals(3, versionField(plain));
-		assertEquals(4, versionField(vectors));
+		assertEquals(StoreFormat.CURRENT_VERSION, versionField(plain));
+		assertEquals(StoreFormat.CURRENT_VERSION, versionField(vectors));
 		StoreFormat.Info plainInfo = StoreFormat.inspect(plain);
 		StoreFormat.Info vectorInfo = StoreFormat.inspect(vectors);
-		assertEquals(4, plainInfo.version());
-		assertEquals(4, vectorInfo.version());
+		assertEquals(StoreFormat.CURRENT_VERSION, plainInfo.version());
+		assertEquals(StoreFormat.CURRENT_VERSION, vectorInfo.version());
 		assertTrue(plainInfo.isCurrent() && vectorInfo.isCurrent());
 		assertEquals(0, plainInfo.vectorStride());
 		assertEquals(4, vectorInfo.vectorDimensions());
 		assertEquals(Manifest.FEATURE_VECTORS, vectorInfo.featureFlags());
-		assertTrue(plainInfo.describeVersion().contains("written as 3"), plainInfo.describeVersion());
+		assertFalse(plainInfo.describeVersion().contains("written as"), plainInfo.describeVersion());
 		assertFalse(vectorInfo.describeVersion().contains("written as"), vectorInfo.describeVersion());
 	}
 
 	@Test
 	public void testTheEncodingRoundTrips() {
-		assertEquals(3, Manifest.encodeVersion(4, 0));
-		assertEquals(4, Manifest.encodeVersion(4, 512));
-		assertEquals(5, Manifest.encodeVersion(5, 0), "from 5 on the field is the version");
-		assertEquals(5, Manifest.encodeVersion(5, 512));
-		for (int version : new int[] { 1, 2, 4, 5, 6, 100 }) {
+		assertEquals(5, Manifest.encodeVersion(5), "from 5 on the field is the version");
+		for (int version : new int[] { 1, 2, 5, 6, 100 }) {
 			for (int stride : new int[] { 0, 512 }) {
-				assertEquals(version, Manifest.decodeVersion(Manifest.encodeVersion(version, stride), stride, root));
+				assertEquals(version, Manifest.decodeVersion(Manifest.encodeVersion(version), stride, root));
 			}
 		}
+		// The legacy encoding of version 4 is still read, for as long as there is a step from 4.
+		assertEquals(4, Manifest.decodeVersion(3, 0, root), "3 without vectors is version 4");
+		assertEquals(4, Manifest.decodeVersion(4, 512, root), "4 with vectors is version 4");
 		assertThrows(PageCorruptException.class, () -> Manifest.decodeVersion(3, 512, root),
 			"3 claims no vectors, so a stride means one of the two is corrupt");
 		assertThrows(PageCorruptException.class, () -> Manifest.decodeVersion(4, 0, root));
@@ -176,7 +175,7 @@ public class StoreFormatVersionTest {
 		Manifest.stampVersion(store, 2);
 		assertEquals(2, versionField(store));
 		Manifest.stampVersion(store, StoreFormat.CURRENT_VERSION);
-		assertEquals(4, versionField(store), "re-encoded for a store with vectors");
+		assertEquals(StoreFormat.CURRENT_VERSION, versionField(store));
 		try (GraphStore graph = GraphStore.open(store, withVectors())) {
 			assertEquals(1, graph.nodesByLabel("Person").size());
 		}

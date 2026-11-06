@@ -120,8 +120,8 @@ public final class McpJsonRpcHandler {
 			// Read by a client that shows the user what a server is for, and by the model as context. Naming the
 			// read-only posture here means it is known before the first refused write rather than after it.
 			.put("instructions", "A graph database speaking a subset of openCypher. Call graph_schema to learn the "
-				+ "labels, then graph_cypher_guide before writing anything non-trivial — OPTIONAL MATCH and several "
-				+ "other constructs are not implemented. This server is "
+				+ "labels, then graph_cypher_guide before writing anything non-trivial — FOREACH, map projections and "
+				+ "several other constructs are not implemented. This server is "
 				+ (allowWrite ? "writable." : "READ-ONLY: CREATE, SET, REMOVE and DELETE will be refused."));
 	}
 

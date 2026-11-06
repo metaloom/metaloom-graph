@@ -67,9 +67,18 @@ public final class Functions {
 			throw new CypherTypeException(call.name()
 				+ " is an aggregating function and can only be used in a RETURN or WITH projection");
 		}
+		if (Temporals.FUNCTIONS.contains(name)) {
+			List<Object> args = new ArrayList<>(call.arguments().size());
+			for (Ast.Expr argument : call.arguments()) {
+				args.add(evaluator.evaluate(argument, row));
+			}
+			return Temporals.call(name, call.name(), args, evaluator.statementTime());
+		}
 		if (!SCALARS.contains(name)) {
-			throw new CypherTypeException("Unknown function " + call.name() + "(). Available: "
-				+ new java.util.TreeSet<>(SCALARS) + " and the aggregates " + new java.util.TreeSet<>(AGGREGATES));
+			java.util.Set<String> available = new java.util.TreeSet<>(SCALARS);
+			available.addAll(Temporals.FUNCTIONS);
+			throw new CypherTypeException("Unknown function " + call.name() + "(). Available: " + available
+				+ " and the aggregates " + new java.util.TreeSet<>(AGGREGATES));
 		}
 
 		// coalesce is the one function that must not evaluate every argument: its whole purpose is to stop at the
