@@ -7,7 +7,7 @@
 format: 1
 module: graph-cypher
 policy: alpha
-sha256: d05fef9935e1e00684de93e7c10ede8606ec70bc356d0051dfac009cc87fd6d1
+sha256: 680c0c15de6f1af0121f81074fcde27a43dd3f2cb9b73504904c4817e387f969
 
 scope package io.metaloom.graph.cypher
 scope package io.metaloom.graph.cypher.value
@@ -109,6 +109,22 @@ io.metaloom.graph.cypher.parse.CypherSyntaxException constructor public CypherSy
 io.metaloom.graph.cypher.parse.CypherSyntaxException method public int column()
 io.metaloom.graph.cypher.parse.CypherSyntaxException method public int line()
 io.metaloom.graph.cypher.parse.CypherSyntaxException method public java.lang.String query()
+io.metaloom.graph.cypher.value.CypherDuration type public record CypherDuration implements java.time.temporal.TemporalAmount
+io.metaloom.graph.cypher.value.CypherDuration components (long months, long days, long seconds, int nanos)
+io.metaloom.graph.cypher.value.CypherDuration constructor public CypherDuration(long, long, long, int)
+io.metaloom.graph.cypher.value.CypherDuration method public final boolean equals(java.lang.Object)
+io.metaloom.graph.cypher.value.CypherDuration method public final int hashCode()
+io.metaloom.graph.cypher.value.CypherDuration method public int nanos()
+io.metaloom.graph.cypher.value.CypherDuration method public java.lang.String toString()
+io.metaloom.graph.cypher.value.CypherDuration method public java.time.temporal.Temporal addTo(java.time.temporal.Temporal)
+io.metaloom.graph.cypher.value.CypherDuration method public java.time.temporal.Temporal subtractFrom(java.time.temporal.Temporal)
+io.metaloom.graph.cypher.value.CypherDuration method public java.util.List<java.time.temporal.TemporalUnit> getUnits()
+io.metaloom.graph.cypher.value.CypherDuration method public long days()
+io.metaloom.graph.cypher.value.CypherDuration method public long get(java.time.temporal.TemporalUnit)
+io.metaloom.graph.cypher.value.CypherDuration method public long months()
+io.metaloom.graph.cypher.value.CypherDuration method public long seconds()
+io.metaloom.graph.cypher.value.CypherDuration method public static io.metaloom.graph.cypher.value.CypherDuration from(java.time.temporal.TemporalAmount)
+io.metaloom.graph.cypher.value.CypherDuration method public static io.metaloom.graph.cypher.value.CypherDuration of(long, long, long, long)
 io.metaloom.graph.cypher.value.CypherNode type public record CypherNode
 io.metaloom.graph.cypher.value.CypherNode components (long id, java.util.List<java.lang.String> labels, java.util.Map<java.lang.String, java.lang.Object> properties)
 io.metaloom.graph.cypher.value.CypherNode constructor public CypherNode(long, java.util.List<java.lang.String>, java.util.Map<java.lang.String, java.lang.Object>)

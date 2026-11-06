@@ -7,7 +7,7 @@
 format: 1
 module: graph-protocol
 policy: alpha
-sha256: c645793e2ef58d79462154796f13de982f434ee9fe7db1aaf7ae0b2cc042a701
+sha256: 14aa79ec9deef977f91333cb6d97ecc9263ba7a1d208afbbda0eead1edea40b7
 
 scope package io.metaloom.graph.protocol
 io.metaloom.graph.protocol.Credentials type public record Credentials
@@ -46,7 +46,7 @@ io.metaloom.graph.protocol.Frames method public static java.lang.String typeName
 io.metaloom.graph.protocol.Frames method public static void checkLength(int)
 io.metaloom.graph.protocol.Protocol type public final class Protocol
 io.metaloom.graph.protocol.Protocol field public static final int DEFAULT_PORT = 8081
-io.metaloom.graph.protocol.Protocol field public static final int VERSION = 4
+io.metaloom.graph.protocol.Protocol field public static final int VERSION = 5
 io.metaloom.graph.protocol.QuerySummary type public record QuerySummary
 io.metaloom.graph.protocol.QuerySummary components (long rows, long elapsedMicros, long nodesCreated, long nodesDeleted, long relationshipsCreated, long relationshipsDeleted, long propertiesSet, long labelsAdded, long labelsRemoved)
 io.metaloom.graph.protocol.QuerySummary field public static final int BYTES = 72
