@@ -160,6 +160,7 @@ public final class GraphServer implements AutoCloseable {
 	private AuthPolicy auth = AuthPolicy.disabled();
 	/** Past this, a query is abandoned rather than allowed to hold a worker thread and a read view indefinitely. */
 	private final long queryTimeoutMillis;
+	private volatile int maxBodyBytes = GraphServerOptions.DEFAULT_MAX_BODY_BYTES;
 	/** How long an abandoned query is given to unwind before the stores are closed regardless. */
 	private static final long ABORT_UNWIND_MILLIS = 2_000;
 	private HttpServer server;
@@ -248,6 +249,23 @@ public final class GraphServer implements AutoCloseable {
 	 */
 	public void allowBackup(boolean allowBackup) {
 		this.allowBackup = allowBackup;
+	}
+
+	/**
+	 * Sets the largest request body the HTTP port accepts, before {@link #listen(int)}.
+	 *
+	 * <p>
+	 * A larger body is refused with {@code 413} and {@code error: "too_large"} — the same JSON shape as every other
+	 * refusal here — rather than Vert.x's plain-text page, which a client parsing the documented error body could not
+	 * read. It was a fixed one MiB, which a loader sending {@code UNWIND $rows} batches of article text reached at a
+	 * few hundred rows with nothing saying where the limit was or how to move it.
+	 * </p>
+	 */
+	public void maxBodyBytes(int maxBodyBytes) {
+		if (maxBodyBytes < 1) {
+			throw new IllegalArgumentException("maxBodyBytes must be positive, was " + maxBodyBytes);
+		}
+		this.maxBodyBytes = maxBodyBytes;
 	}
 
 	/**
@@ -355,6 +373,7 @@ public final class GraphServer implements AutoCloseable {
 		server.slowQueryMillis = options.slowQueryMillis();
 		server.authPolicy(authPolicy);
 		server.allowBackup(options.allowBackup());
+		server.maxBodyBytes(options.maxBodyBytes());
 		if (options.allowLoadCsv()) {
 			// Constructed here rather than lazily, so an unreadable or missing import directory is a start-up failure
 			// naming the path — not a 500 on the first query somebody tries months later.
@@ -486,7 +505,11 @@ public final class GraphServer implements AutoCloseable {
 			context.response().putHeader("connection", "close");
 			fail(context, 503, "shutdown", "The server is shutting down and is not accepting requests");
 		});
-		router.route().handler(BodyHandler.create().setBodyLimit(1 << 20));
+		int bodyLimit = maxBodyBytes;
+		router.route().handler(BodyHandler.create().setBodyLimit(bodyLimit));
+		router.errorHandler(413, context -> fail(context, 413, "too_large",
+			"The request body is larger than this server accepts (" + bodyLimit + " bytes). Send it in smaller "
+				+ "parts, or start the server with --max-body-bytes."));
 
 		// The CSRF half that SameSite cannot cover: with --no-auth there is no cookie to withhold. A form can POST
 		// text/plain, urlencoded or multipart cross-origin without a preflight, and a text/plain body can be valid
@@ -510,8 +533,8 @@ public final class GraphServer implements AutoCloseable {
 
 		// The declared composite indexes of one database. A collection, so it takes ?database= like everything else,
 		// and one of them is named by its two path segments — the pair is the identity, not a generated id.
-		// Registered before BodyHandler would matter and streamed by hand: a dump is not a JSON body and the 1 MiB
-		// body limit above has nothing to do with it.
+		// Registered before BodyHandler would matter and streamed by hand: a dump is not a JSON body and the body
+		// limit above (--max-body-bytes) has nothing to do with it.
 		router.get("/api/databases/:name/backup").handler(this::backupDatabase);
 		router.get("/api/indexes").handler(this::listIndexes);
 		router.post("/api/indexes").handler(this::createIndex);

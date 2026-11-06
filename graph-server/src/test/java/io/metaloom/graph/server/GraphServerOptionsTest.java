@@ -1,5 +1,7 @@
 package io.metaloom.graph.server;
 
+import java.util.List;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -32,6 +34,33 @@ public class GraphServerOptionsTest {
 		assertEquals(Path.of("/data/mygraph"), options.root());
 		assertEquals(9000, options.port());
 		assertFalse(options.demo(), "demo data is never the default: it writes");
+	}
+
+	@Test
+	public void testTheBodyLimitDefaultsToOneMebibyte() {
+		assertEquals(GraphServerOptions.DEFAULT_MAX_BODY_BYTES, parse("/data/g").maxBodyBytes());
+		assertEquals(1 << 20, GraphServerOptions.DEFAULT_MAX_BODY_BYTES, "the limit the server always had");
+	}
+
+	@Test
+	public void testTheBodyLimitComesFromTheFlagOrTheEnvironment() {
+		assertEquals(8_388_608, parse("--max-body-bytes=8388608", "/data/g").maxBodyBytes());
+		GraphServerOptions fromEnv = GraphServerOptions.parse(new String[] { "/data/g" },
+			name -> "GRAPH_MAX_BODY_BYTES".equals(name) ? "4194304" : null);
+		assertEquals(4_194_304, fromEnv.maxBodyBytes());
+		GraphServerOptions both = GraphServerOptions.parse(new String[] { "--max-body-bytes=2097152", "/data/g" },
+			name -> "GRAPH_MAX_BODY_BYTES".equals(name) ? "4194304" : null);
+		assertEquals(2_097_152, both.maxBodyBytes(), "a flag overrides the environment, as everywhere here");
+		assertTrue(parse("--max-body-bytes=8388608", "/data/g").toString().contains("maxBodyBytes=8388608"));
+	}
+
+	@Test
+	public void testABodyLimitThatCannotWorkIsRefused() {
+		for (String value : List.of("0", "-1", "1023", "abc", "1MiB", "3000000000")) {
+			IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+				() -> parse("--max-body-bytes=" + value, "/data/g"), value);
+			assertTrue(thrown.getMessage().contains("--max-body-bytes"), thrown.getMessage());
+		}
 	}
 
 	@Test
@@ -239,7 +268,7 @@ public class GraphServerOptionsTest {
 		}
 		// And the reverse direction, spelled out: the count is asserted so that adding a variable to the parser
 		// without adding it to VARIABLES fails here rather than being noticed by an operator.
-		assertEquals(29, GraphServerOptions.VARIABLES.size(),
+		assertEquals(30, GraphServerOptions.VARIABLES.size(),
 			"a variable was added or removed; update this count and check --help still prints all of them");
 	}
 

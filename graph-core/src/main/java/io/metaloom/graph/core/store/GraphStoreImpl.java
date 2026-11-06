@@ -846,9 +846,27 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 				}
 			}
 		}
-		if (!context.tracksReads()) {
-			return;
+		if (context.tracksReads()) {
+			validateReads(txn, context, versions, since);
 		}
+		// The records the engine itself decided from (WriteContext#guard): any byte of one overwritten since the snapshot
+		// is a conflict, whatever this transaction wrote. Checked after the read set, which at SERIALIZABLE covers the same
+		// records page-wide and reports them as what they are there, a read conflict. Slots this transaction allocated
+		// itself are exempt, as above.
+		for (long[] range : context.guarded()) {
+			long key = range[0];
+			for (int[] part : outside(new int[] { (int) range[1], (int) range[2] }, owned.get(key))) {
+				long conflict = versions.conflictingLsn(key, part[0], part[1], since);
+				if (conflict > 0) {
+					throw new TransactionConflictException(txn.id(), key, since, conflict, false,
+						describe(key, part[0], part[1]));
+				}
+			}
+		}
+	}
+
+	/** The SERIALIZABLE half of {@link #validate}: the pages read, and the names looked up and not found. */
+	private void validateReads(TransactionImpl txn, WriteContext context, PageVersions versions, long since) {
 		for (long key : context.readSet()) {
 			long conflict = versions.changedSince(key, since);
 			if (conflict > 0) {
@@ -1665,6 +1683,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			// transactional — the dictionary is appended and flushed immediately — so a label interned for a write that
 			// then fails stays in the dictionary for the life of the store.
 			int[] before = nodes.labels(nodeId);
+			guardNode(nodeId);
 			int labelId = catalog.internLabel(label);
 			if (holdsLabel(before, labelId)) {
 				return false;
@@ -1691,6 +1710,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		}
 		return write(() -> {
 			int[] before = nodes.labels(nodeId);
+			guardNode(nodeId);
 			// lookupLabel rather than internLabel: removing a label the store has never seen must not mint a dictionary
 			// id for it. Ids are never reclaimed, so that would be a permanent entry describing something that never
 			// existed.
@@ -1710,6 +1730,22 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 			maintainVectorMembership(nodeId);
 			return true;
 		});
+	}
+
+	/**
+	 * Registers the node's record for validation at commit (WriteContext#guard): a change to this node's labels or
+	 * properties, or its deletion, must not commit over a concurrent one that it did not see.
+	 */
+	private void guardNode(long nodeId) {
+		WriteContext context = contexts.current();
+		if (context == null) {
+			return;
+		}
+		long offset = geometry.byteOffset(Kind.NODE, ElementId.slot(nodeId));
+		int pageSize = geometry.pageSize();
+		int inPage = (int) (offset % pageSize);
+		context.guard(PageOverlay.key(Kind.NODE, ElementId.segment(nodeId), (int) (offset / pageSize)), inPage,
+			geometry.stride(Kind.NODE));
 	}
 
 	private static boolean holdsLabel(int[] labelIds, int labelId) {
@@ -2523,6 +2559,7 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	public void setNodeProperties(long nodeId, Properties props) throws IOException {
 		write(() -> {
 			long old = nodes.propBlockId(nodeId);
+			guardNode(nodeId);
 			int[] labelIds = nodes.labels(nodeId);
 			Map<Integer, Object> before = properties.read(old);
 			Map<Integer, Object> after = toKeyIds(props);
@@ -2540,6 +2577,9 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	@Override
 	public void deleteNode(long nodeId) throws IOException {
 		write(() -> {
+			// The index entries removed below are those of the labels and properties this snapshot holds; a concurrent
+			// change to either that committed first must make this a conflict, not leave its entries behind.
+			guardNode(nodeId);
 			// Every relationship touching the node goes first, on both endpoints, so no dangling adjacency survives.
 			for (long edge : adjacency.edges(nodeId)) {
 				if (PackedEdge.isMaterialised(edge)) {
@@ -2590,6 +2630,10 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 		write(() -> {
 			requireNode(fromId);
 			requireNode(toId);
+			// An edge onto a node deleted since this snapshot would be an adjacency entry pointing at a freed slot:
+			// the delete wrote the slot's generation, this writes the degree, and the two never met at commit.
+			guardNode(fromId);
+			guardNode(toId);
 			int typeId = catalog.internEdgeType(type);
 			if (!Catalog.packable(typeId)) {
 				// A type id beyond the 14 bit field cannot be a lightweight entry, so the edge escalates to a
@@ -2661,6 +2705,8 @@ public final class GraphStoreImpl implements GraphStore, TransactionImpl.Complet
 	}
 
 	private long createRelationshipInternal(long fromId, int typeId, long toId, Properties props) throws IOException {
+		guardNode(fromId);
+		guardNode(toId);
 		long relId = rels.create(fromId, typeId, toId, ElementId.NULL);
 		if (props != null && !props.isEmpty()) {
 			rels.propBlockId(relId, properties.store(toKeyIds(props), relId));

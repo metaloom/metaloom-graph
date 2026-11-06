@@ -136,7 +136,41 @@ public class HttpRouteEdgeCaseTest {
 	public void testABodyOverTheLimitIsA413() throws Exception {
 		String query = "RETURN '" + "x".repeat(2 * 1024 * 1024) + "'";
 		HttpResponse<String> response = postRaw("/api/query", new JsonObject().put("query", query).encode());
-		assertEquals(413, response.statusCode(), "a body over 1 MiB");
+		// The documented error shape, not Vert.x's text page: a client that parses `error` on every refusal could not
+		// read this one, and the message is the only place that says how to move the limit.
+		assertClientError(response, 413, "a body over 1 MiB");
+		JsonObject body = new JsonObject(response.body());
+		assertEquals("too_large", body.getString("error"));
+		assertTrue(body.getString("message").contains("--max-body-bytes"), body.encode());
+		assertTrue(body.getString("message").contains(String.valueOf(GraphServerOptions.DEFAULT_MAX_BODY_BYTES)),
+			"the message names the limit in force: " + body.encode());
+	}
+
+	@Test
+	public void testARaisedBodyLimitAcceptsALargerBatch() throws Exception {
+		server.close();
+		server = new GraphServer(databases, GraphDatabases.DEFAULT_NAME,
+			GraphServerOptions.DEFAULT_QUERY_TIMEOUT_MILLIS, true, true);
+		server.maxBodyBytes(8 * 1024 * 1024);
+		int port = server.listen(0).toCompletionStage().toCompletableFuture().join();
+		base = "http://127.0.0.1:" + port;
+
+		// The case that found the limit: a loader sending one UNWIND batch of a few hundred article texts.
+		JsonArray rows = new JsonArray();
+		for (int i = 0; i < 300; i++) {
+			rows.add(new JsonObject().put("id", "a" + i).put("text", "y".repeat(10_000)));
+		}
+		JsonObject request = new JsonObject()
+			.put("query", "UNWIND $rows AS row CREATE (:Article {id: row.id, text: row.text}) RETURN count(*) AS n")
+			.put("parameters", new JsonObject().put("rows", rows));
+		HttpResponse<String> response = postRaw("/api/query", request.encode());
+		assertEquals(200, response.statusCode(), response.body().substring(0, Math.min(300, response.body().length())));
+		assertEquals(300, new JsonObject(response.body()).getJsonArray("rows").getJsonArray(0).getInteger(0));
+
+		String tooBig = "RETURN '" + "x".repeat(9 * 1024 * 1024) + "'";
+		HttpResponse<String> refused = postRaw("/api/query", new JsonObject().put("query", tooBig).encode());
+		assertClientError(refused, 413, "a body over the raised limit");
+		assertTrue(new JsonObject(refused.body()).getString("message").contains(String.valueOf(8 * 1024 * 1024)));
 	}
 
 	@Test

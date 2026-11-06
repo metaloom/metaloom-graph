@@ -97,6 +97,19 @@ considered. `SnapshotIsolationTest` therefore asserts the mechanism instead of t
 (`TransactionConflictException.isReadConflict()`), and at `SERIALIZABLE` one of the pair always is
 refused. Relying on the index collision for safety would be relying on an accident.
 
+**What the engine itself decides from is guarded at every level.** Write skew between transactions'
+*data* is `SNAPSHOT`'s documented cost; write skew between two *engine operations* on one node is a
+corruption, and it happened: `deleteNode` removes the index entries of the labels its snapshot held and
+frees the slot — the generation and the allocation bitmap — while a concurrent `addNodeLabel` writes the
+label bytes and the index. Disjoint bytes, so both committed, and the index kept an entry for a node that
+was gone (`IsolationAnomalyStressTest`, about once per hundred seconds of load, and only when the two
+index entries sat on different leaves — on one leaf they collide by accident). Node mutations —
+`addNodeLabel`, `removeNodeLabel`, `setNodeProperties`, `deleteNode`, and both endpoints of
+`createEdge`/`createRelationship` — therefore register the node's record range
+(`WriteContext#guard`), and the commit refuses them if any byte of it was overwritten since the
+snapshot, as a write conflict. The range is the record, not the page: two writers on neighbouring
+nodes still commit side by side. `DeleteRaceTest` pins each case in both commit orders.
+
 ### 3.1 Visibility rule
 
 Visibility is resolved per **page**, at one choke point — `SegmentFile.readSlice` — rather than per

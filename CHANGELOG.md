@@ -4,6 +4,24 @@ All notable changes to MetaLoom // Graph. The format follows [Keep a Changelog](
 and versions follow [Semantic Versioning](https://semver.org/) — with the caveat that a `0.x` pre-release promises
 less than SemVer's `1.0`; see *Compatibility* below. How a release is cut: [spec/RELEASE.md](spec/RELEASE.md).
 
+## [Unreleased]
+
+### Fixed
+
+- **A node change and a concurrent delete of the same node could both commit**, leaving an index entry
+  (or an adjacency entry) for a node that no longer exists — `verify(FULL)` then reports the store damaged.
+  `deleteNode` writes the slot's generation and the allocation bitmap; `addNodeLabel`, `removeNodeLabel`,
+  `setNodeProperties`, `createEdge` and `createRelationship` write other bytes, so first-committer-wins never
+  saw them meet. Each of them now guards the node record it decided from, and the second to commit is refused
+  as a conflict (auto-commit statements retry). Found by `IsolationAnomalyStressTest` about once per hundred
+  seconds of load; pinned deterministically, in both commit orders, by `DeleteRaceTest`.
+
+### Changed
+
+- **The HTTP body limit is configurable** — `--max-body-bytes` / `GRAPH_MAX_BODY_BYTES`, default unchanged at
+  one MiB. A body over it is refused with `413` and `error: "too_large"` in the documented JSON error shape,
+  naming the limit and the flag, instead of Vert.x's plain-text page.
+
 ## [0.1.0-alpha.1] - Unreleased
 
 The first release: an **alpha**, for trying the engine on real data and telling us what breaks. It is

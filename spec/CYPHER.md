@@ -902,6 +902,12 @@ query and the engine has no notion of a second store.
 | `POST /api/indexes` | `{"label": "...", "key": "...", "unique": false}` declares one, backfill included. `DELETE /api/indexes/{label}/{key}` drops it. Both need `--allow-write` |
 | `GET /` | The UI |
 
+**A request body is at most one MiB by default** — `--max-body-bytes` / `GRAPH_MAX_BODY_BYTES` moves it. A larger
+one is refused before it is parsed with `413` and `error: "too_large"`, in the same JSON shape as every refusal here;
+it used to be Vert.x's plain-text page from a fixed limit, which a client reading `error` could not parse and which
+said nothing about how to raise it (`HttpRouteEdgeCaseTest`). A loader batching parameters (`UNWIND $rows`) is the
+usual reason to raise it: a few hundred rows of article text exceed one MiB.
+
 **A request of the wrong shape is a 400, never a 500.** A body that is not JSON, JSON that is not an object, a `query`
 that is not a string, `parameters` that are not an object, an index `label`, `key` or `unique` of the wrong type — each
 is `400` with `error: "json"`, `"empty"` or `"parameters"` and a message saying what to send. They used to escape

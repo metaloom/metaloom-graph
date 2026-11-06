@@ -114,6 +114,11 @@ import io.metaloom.graph.server.wire.WireTlsOptions;
  *            none. It does not replace {@link #wirePort} — both are open unless {@link #wirePlaintext} says otherwise
  *            — and it affects the binary port only: the HTTP and MCP ports are unchanged, and are still expected to
  *            sit behind an ingress or a reverse proxy that terminates TLS for them. {@code spec/WIRE.md} section 9
+ * @param maxBodyBytes
+ *            the largest request body the HTTP port accepts, in bytes. A larger one is refused with
+ *            {@code 413} and an {@code error: "too_large"} body before any of it is parsed. One MiB by default: far more
+ *            than a typed query needs, and a bound on what an unauthenticated peer can make the server buffer. A loader
+ *            sending parameter batches (an {@code UNWIND $rows}) is the case for raising it
  * @param wirePlaintext
  *            whether the unencrypted binary listener is opened. True unless {@code --wire-tls-only} was given, so that
  *            adding a certificate never closes a port under the clients already on it
@@ -123,7 +128,7 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 	boolean metrics, int metricsPort, boolean mcp, int mcpPort, String mcpHost,
 	String database, boolean allowDrop, boolean allowWrite, boolean allowLoadCsv, Path importDir,
 	boolean allowBackup, boolean auth, String initialPassword, long sessionTimeoutMillis,
-	WireTlsOptions wireTls, boolean wirePlaintext) {
+	WireTlsOptions wireTls, boolean wirePlaintext, int maxBodyBytes) {
 
 	static final int DEFAULT_PORT = 8080;
 
@@ -137,6 +142,12 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 	 * </p>
 	 */
 	public static final long DEFAULT_QUERY_TIMEOUT_MILLIS = 30_000;
+
+	/** The default HTTP body limit, one MiB: what the server enforced before it could be configured. */
+	public static final int DEFAULT_MAX_BODY_BYTES = 1 << 20;
+
+	/** The smallest body limit accepted: below this not even a login fits comfortably. */
+	static final int MIN_MAX_BODY_BYTES = 1024;
 
 	/**
 	 * One second, above which a query is written to the slow query log.
@@ -198,6 +209,7 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 		new EnvVar("GRAPH_DEMO", "Seed an empty default database with the demo graph. true/false."),
 		new EnvVar("GRAPH_DEMO_SIZE", "tiny | small | medium | large, or a number of airports. Implies GRAPH_DEMO."),
 		new EnvVar("GRAPH_QUERY_TIMEOUT_MILLIS", "Abandon a query that runs longer than this. 0 disables."),
+		new EnvVar("GRAPH_MAX_BODY_BYTES", "The largest HTTP request body accepted, in bytes."),
 		new EnvVar("GRAPH_SLOW_QUERY_MILLIS", "Log a query that takes at least this long. 0 disables."),
 		new EnvVar("GRAPH_WIRE_ENABLED", "Open the binary streaming port. true/false."),
 		new EnvVar("GRAPH_WIRE_PORT", "The binary streaming port."),
@@ -289,7 +301,8 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 			+ ", allowBackup=" + allowBackup + ", auth=" + auth
 			+ ", initialPassword=" + (initialPassword == null ? "<unset>" : "<set>")
 			+ ", sessionTimeoutMillis=" + sessionTimeoutMillis
-			+ ", wireTls=" + (wireTls == null ? "<none>" : wireTls) + ", wirePlaintext=" + wirePlaintext + "]";
+			+ ", wireTls=" + (wireTls == null ? "<none>" : wireTls) + ", wirePlaintext=" + wirePlaintext
+			+ ", maxBodyBytes=" + maxBodyBytes + "]";
 	}
 
 	/** Parses the command line against the real environment. */
@@ -317,6 +330,7 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 		int airports = DemoData.SMALL;
 		long queryTimeout = DEFAULT_QUERY_TIMEOUT_MILLIS;
 		long slowQuery = DEFAULT_SLOW_QUERY_MILLIS;
+		int maxBodyBytes = DEFAULT_MAX_BODY_BYTES;
 		boolean wire = true;
 		int wirePort = Protocol.DEFAULT_PORT;
 		String wireHost = WireServerOptions.DEFAULT_HOST;
@@ -395,6 +409,9 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 		if ((value = read(env, "GRAPH_SLOW_QUERY_MILLIS")) != null) {
 			slowQuery = parseMillis(value, "GRAPH_SLOW_QUERY_MILLIS");
 		}
+		if ((value = read(env, "GRAPH_MAX_BODY_BYTES")) != null) {
+			maxBodyBytes = parseBodyLimit(value, "GRAPH_MAX_BODY_BYTES");
+		}
 		if ((value = read(env, "GRAPH_WIRE_ENABLED")) != null) {
 			wire = parseBoolean(value, "GRAPH_WIRE_ENABLED");
 		}
@@ -448,6 +465,8 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 				queryTimeout = parseMillis(argument.substring("--query-timeout=".length()), "--query-timeout");
 			} else if (argument.startsWith("--slow-query-millis=")) {
 				slowQuery = parseMillis(argument.substring("--slow-query-millis=".length()), "--slow-query-millis");
+			} else if (argument.startsWith("--max-body-bytes=")) {
+				maxBodyBytes = parseBodyLimit(argument.substring("--max-body-bytes=".length()), "--max-body-bytes");
 			} else if (argument.equals("--no-wire")) {
 				wire = false;
 			} else if (argument.startsWith("--wire-port=")) {
@@ -533,7 +552,7 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 
 		return new GraphServerOptions(store, port, demo, airports, queryTimeout, slowQuery, wire, wirePort, wireHost,
 			streams, metrics, metricsPort, mcp, mcpPort, mcpHost, database, allowDrop, allowWrite, allowLoadCsv,
-			importDir, allowBackup, auth, initialPassword, sessionTimeout, wireTls, wirePlaintext);
+			importDir, allowBackup, auth, initialPassword, sessionTimeout, wireTls, wirePlaintext, maxBodyBytes);
 	}
 
 	private static String read(UnaryOperator<String> env, String name) {
@@ -598,6 +617,20 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 			throw new IllegalArgumentException(source + " must not be negative, was " + millis);
 		}
 		return millis;
+	}
+
+	private static int parseBodyLimit(String argument, String source) {
+		long bytes;
+		try {
+			bytes = Long.parseLong(argument);
+		} catch (NumberFormatException e) {
+			throw new IllegalArgumentException(source + " must be a number of bytes, was '" + argument + "'");
+		}
+		if (bytes < MIN_MAX_BODY_BYTES || bytes > Integer.MAX_VALUE) {
+			throw new IllegalArgumentException(source + " must be between " + MIN_MAX_BODY_BYTES + " and "
+				+ Integer.MAX_VALUE + " bytes, was " + bytes);
+		}
+		return (int) bytes;
 	}
 
 	private static boolean parseBoolean(String argument, String source) {
@@ -692,6 +725,9 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 			                        Write a query taking at least this long to the slow query log.
 			                        0 logs none. Must be below --query-timeout to ever fire.
 			                        (default: %d)
+			  --max-body-bytes=<n>  The largest HTTP request body accepted; a larger one is refused
+			                        with 413 before it is parsed. Raise it for a loader that sends
+			                        large parameter batches. (default: %d)
 			  --wire-port=<port>    The binary streaming port. 0 for any free one. (default: %d)
 			  --wire-host=<addr>    What the binary port binds. (default: %s)
 			  --no-wire             No binary port.
@@ -745,7 +781,8 @@ public record GraphServerOptions(Path root, int port, boolean demo, int demoAirp
 			hubs, and routes between airports carrying distance, duration and flight number. See
 			spec/CYPHER.md for queries to try.
 			""".formatted(GraphDatabases.DEFAULT_NAME, DEFAULT_SESSION_TIMEOUT_MILLIS, DemoData.TINY, DemoData.SMALL, DemoData.MEDIUM,
-				DemoData.LARGE, DEFAULT_QUERY_TIMEOUT_MILLIS, DEFAULT_SLOW_QUERY_MILLIS, Protocol.DEFAULT_PORT,
+				DemoData.LARGE, DEFAULT_QUERY_TIMEOUT_MILLIS, DEFAULT_SLOW_QUERY_MILLIS, DEFAULT_MAX_BODY_BYTES,
+				Protocol.DEFAULT_PORT,
 				WireServerOptions.DEFAULT_HOST, WireTlsOptions.DEFAULT_PORT, DEFAULT_MAX_CONCURRENT_STREAMS,
 				DEFAULT_METRICS_PORT, DEFAULT_MCP_PORT, DEFAULT_MCP_HOST, environment);
 	}

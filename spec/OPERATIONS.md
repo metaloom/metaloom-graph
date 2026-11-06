@@ -107,6 +107,7 @@ what lets the image's `CMD` carry no arguments at all.
 | `GRAPH_DEMO_SIZE` | `--demo-size=` | small |
 | `GRAPH_QUERY_TIMEOUT_MILLIS` | `--query-timeout=` | 30000 |
 | `GRAPH_SLOW_QUERY_MILLIS` | `--slow-query-millis=` | 1000 — see §4.2 |
+| `GRAPH_MAX_BODY_BYTES` | `--max-body-bytes=` | 1048576 — the largest HTTP request body; a larger one is a `413` with `error: "too_large"`. Raise it for a loader that sends large `UNWIND $rows` batches; it is also what an unauthenticated peer can make the server buffer |
 | `GRAPH_WIRE_ENABLED` | `--no-wire` | true |
 | `GRAPH_WIRE_PORT` | `--wire-port=` | 8081 |
 | `GRAPH_WIRE_HOST` | `--wire-host=` | 127.0.0.1 |

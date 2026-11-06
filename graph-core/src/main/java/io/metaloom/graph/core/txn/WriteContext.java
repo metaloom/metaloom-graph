@@ -160,6 +160,37 @@ public final class WriteContext {
 		}
 	}
 
+	/**
+	 * Byte ranges this transaction's changes were decided from and must not have been overwritten by a commit since its
+	 * snapshot, at <b>every</b> isolation level: {@code {pageKey, offset, length}}.
+	 *
+	 * <p>
+	 * Not a read set. A read set guards what the <i>caller</i> decided from, and {@code SNAPSHOT} deliberately does not
+	 * keep one. This guards what the <i>engine</i> decided from: a node's record, read by {@code deleteNode} to know
+	 * which index entries to remove and by {@code addNodeLabel} to know the node is there. Two such operations on one
+	 * node can write disjoint bytes — the delete the slot's generation and the allocation bitmap, the label change the
+	 * label fields — so first-committer-wins does not see them meet, both commit, and the index keeps an entry for a
+	 * node that is gone. Validating the record's whole range makes the second of them a conflict whatever bytes each
+	 * wrote. {@code DeleteRaceTest} pins both commit orders.
+	 * </p>
+	 */
+	private List<long[]> guarded;
+
+	/** {@code offset} and {@code length} within the page, the shape every other run here has. */
+	public void guard(long pageKey, int offset, int length) {
+		if (replaying) {
+			return;
+		}
+		if (guarded == null) {
+			guarded = new ArrayList<>();
+		}
+		guarded.add(new long[] { pageKey, offset, length });
+	}
+
+	public List<long[]> guarded() {
+		return guarded == null ? List.of() : guarded;
+	}
+
 	public Set<Long> readSet() {
 		return readSet == null ? Set.of() : readSet;
 	}
